@@ -53,7 +53,11 @@ pub async fn create_user(db: &sqlx::PgPool, email: &str, name: &str, password: &
         return Err(ApiError::BadRequest("invalid email".into()));
     }
     if password.len() < 12 {
-        return Err(ApiError::BadRequest("password must be at least 12 characters".into()));
+        // Report the received length: a mangled env var (e.g. `$` expanded by compose) is the usual cause.
+        return Err(ApiError::BadRequest(format!(
+            "password must be at least 12 characters (got {})",
+            password.chars().count()
+        )));
     }
     let pw = password.to_string();
     let hash = tokio::task::spawn_blocking(move || auth::hash_password(&pw)).await.map_err(anyhow::Error::from)??;
