@@ -1,0 +1,128 @@
+mod collect;
+mod config;
+mod conn;
+mod jobs;
+mod service;
+mod shell;
+mod software;
+
+use std::path::PathBuf;
+
+use anyhow::Result;
+use clap::{Parser, Subcommand};
+use tracing_subscriber::EnvFilter;
+
+#[derive(Parser)]
+#[command(name = "rmm-agent", version, about = "RMM endpoint agent")]
+struct Cli {
+    /// Path to agent.toml (defaults to the platform system location).
+    #[arg(long, global = true, env = "RMM_AGENT_CONFIG")]
+    config: Option<PathBuf>,
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Register this machine with a server using an enrollment token.
+    Enroll {
+        /// Server base URL, e.g. https://rmm.example.com
+        #[arg(long)]
+        server: String,
+        #[arg(long, env = "RMM_ENROLL_TOKEN")]
+        token: String,
+        /// Also install and start the system service.
+        #[arg(long)]
+        install: bool,
+    },
+    /// Run in the foreground (what the service runs).
+    Run,
+    /// Install and start the system service (systemd / Windows service).
+    Install,
+    /// Stop and remove the system service.
+    Uninstall,
+    /// Print collected metrics and inventory as JSON, then exit. Useful for debugging.
+    Inspect,
+    /// Entry point used by the Windows Service Control Manager.
+    #[command(hide = true)]
+    Service,
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    let config_path = cli.config.unwrap_or_else(config::default_path);
+
+    // Windows SCM entry must happen before we build a runtime; it builds its own.
+    if let Cmd::Service = cli.cmd {
+        return service::run_as_service(config_path);
+    }
+
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        .init();
+    install_crypto();
+
+    match cli.cmd {
+        Cmd::Enroll { server, token, install } => {
+            let cfg = runtime()?.block_on(conn::enroll(&server, &token))?;
+            cfg.save(&config_path)?;
+            println!("enrolled as {} (config: {})", cfg.agent_id, config_path.display());
+            if install {
+                service::install(&config_path)?;
+            }
+            Ok(())
+        }
+        Cmd::Run => {
+            let cfg = config::Config::load(&config_path)?;
+            runtime()?.block_on(async {
+                let (tx, rx) = tokio::sync::watch::channel(false);
+                tokio::spawn(async move {
+                    let _ = tokio::signal::ctrl_c().await;
+                    let _ = tx.send(true);
+                });
+                conn::run_forever(cfg, rx).await;
+            });
+            Ok(())
+        }
+        Cmd::Install => service::install(&config_path),
+        Cmd::Uninstall => service::uninstall(),
+        Cmd::Inspect => {
+            let mut c = collect::Collector::new()?;
+            std::thread::sleep(std::time::Duration::from_millis(300)); // CPU usage needs two samples
+            let out = serde_json_like(&c.metrics(), &c.inventory());
+            println!("{out}");
+            Ok(())
+        }
+        Cmd::Service => unreachable!(),
+    }
+}
+
+pub(crate) fn install_crypto() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
+pub(crate) fn runtime() -> Result<tokio::runtime::Runtime> {
+    // Small fixed pool: an agent should never compete with the workloads it monitors.
+    Ok(tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?)
+}
+
+fn serde_json_like(m: &rmm_proto::Metrics, i: &rmm_proto::Inventory) -> String {
+    format!("metrics:\n{m:#?}\n\ninventory ({} packages):\n{:#?}", i.software.len(), InvSummary(i))
+}
+
+struct InvSummary<'a>(&'a rmm_proto::Inventory);
+impl std::fmt::Debug for InvSummary<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let i = self.0;
+        f.debug_struct("Inventory")
+            .field("system", &i.system)
+            .field("cpu", &i.cpu_brand)
+            .field("cores", &(i.cpu_cores_physical, i.cpu_cores_logical))
+            .field("mem_total", &i.mem_total)
+            .field("disks", &i.disks)
+            .field("network", &i.network)
+            .field("users", &i.logged_in_users)
+            .field("software_sample", &i.software.iter().take(5).collect::<Vec<_>>())
+            .finish()
+    }
+}

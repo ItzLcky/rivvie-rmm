@@ -1,0 +1,28 @@
+[package]
+name = "rmm-server"
+description = "RMM control server: agent hub, REST API, and dashboard host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rmm-proto.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+tokio.workspace = true
+futures-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+sha2.workspace = true
+hex.workspace = true
+axum = { version = "0.8", features = ["ws", "macros"] }
+tower-http = { version = "0.7", features = ["fs", "trace", "limit"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "migrate", "derive", "macros"] }
+argon2 = "0.6"
+getrandom = "0.4"
+subtle = "2"

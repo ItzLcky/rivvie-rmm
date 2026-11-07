@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  rust:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy (agent + proto)
+        run: cargo clippy -p rmm-agent -p rmm-proto --all-targets -- -D warnings
+      - name: Test (agent + proto)
+        run: cargo test -p rmm-agent -p rmm-proto
+      - name: Server (Linux only)
+        if: runner.os == 'Linux'
+        run: cargo clippy -p rmm-server --all-targets -- -D warnings && cargo test -p rmm-server
+      - name: Release agent
+        run: cargo build --release -p rmm-agent
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rmm-agent-${{ runner.os }}
+          path: |
+            target/release/rmm-agent
+            target/release/rmm-agent.exe
+
+  web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm ci
+      - run: npm run check
+      - run: npm run build

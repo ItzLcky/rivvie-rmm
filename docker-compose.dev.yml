@@ -1,0 +1,6 @@
+# Local development database only.
+services:
+  db:
+    image: postgres:17-alpine
+    environment: { POSTGRES_USER: rmm, POSTGRES_PASSWORD: rmm, POSTGRES_DB: rmm }
+    ports: ["5432:5432"]

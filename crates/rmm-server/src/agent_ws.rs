@@ -1,0 +1,351 @@
+//! `/api/agent/ws`: the single endpoint every agent connects to.
+
+use sqlx::AssertSqlSafe;
+use std::sync::Arc;
+use std::time::Duration;
+
+use axum::extract::ws::{Message, WebSocket};
+use axum::extract::{State, WebSocketUpgrade};
+use axum::response::Response;
+use chrono::Utc;
+use futures_util::{SinkExt, StreamExt};
+use rmm_proto::{AgentMsg, Interpreter, Inventory, JobStatus, Metrics, OutputStream, PROTOCOL_VERSION, ScriptJob, ServerMsg, SystemInfo};
+use subtle::ConstantTimeEq;
+use tokio::sync::mpsc;
+use tracing::{debug, info, warn};
+use uuid::Uuid;
+
+use crate::auth::{random_token, token_hash};
+use crate::hub::{AgentHandle, ShellEvent};
+use crate::state::AppState;
+
+const MAX_FRAME: usize = 16 * 1024 * 1024;
+const JOB_OUTPUT_CAP: i32 = 1024 * 1024;
+const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(15);
+const PING_EVERY: Duration = Duration::from_secs(30);
+
+pub async fn handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> Response {
+    ws.max_message_size(MAX_FRAME).on_upgrade(move |socket| async move {
+        if let Err(e) = handle(socket, state).await {
+            debug!("agent socket ended: {e:#}");
+        }
+    })
+}
+
+async fn send(ws: &mut WebSocket, msg: &ServerMsg) -> anyhow::Result<()> {
+    ws.send(Message::Binary(rmm_proto::encode(msg)?.into())).await?;
+    Ok(())
+}
+
+async fn handle(mut ws: WebSocket, state: Arc<AppState>) -> anyhow::Result<()> {
+    let first = match tokio::time::timeout(FIRST_FRAME_TIMEOUT, ws.recv()).await {
+        Ok(Some(Ok(Message::Binary(b)))) => rmm_proto::decode::<AgentMsg>(&b)?,
+        _ => return Ok(()),
+    };
+
+    match first {
+        AgentMsg::Enroll { protocol, token, system } => {
+            let reply = match enroll(&state, protocol, &token, &system).await {
+                Ok((agent_id, secret)) => ServerMsg::Enrolled { agent_id, secret },
+                Err(reason) => ServerMsg::AuthFailed { reason },
+            };
+            send(&mut ws, &reply).await?;
+            let _ = ws.close().await;
+            Ok(())
+        }
+        AgentMsg::Auth { protocol, agent_id, secret, agent_version } => {
+            if protocol != PROTOCOL_VERSION {
+                send(&mut ws, &ServerMsg::AuthFailed { reason: format!("unsupported protocol {protocol}") }).await?;
+                return Ok(());
+            }
+            if !authenticate(&state, agent_id, &secret).await? {
+                warn!(%agent_id, "agent auth failed");
+                send(&mut ws, &ServerMsg::AuthFailed { reason: "invalid credentials".into() }).await?;
+                return Ok(());
+            }
+            send(
+                &mut ws,
+                &ServerMsg::AuthOk { heartbeat_secs: state.cfg.heartbeat_secs, inventory_secs: state.cfg.inventory_secs },
+            )
+            .await?;
+            run_session(ws, state, agent_id, agent_version).await
+        }
+        _ => Ok(()),
+    }
+}
+
+async fn enroll(state: &AppState, protocol: u32, token: &str, sys: &SystemInfo) -> Result<(Uuid, String), String> {
+    if protocol != PROTOCOL_VERSION {
+        return Err(format!("unsupported protocol {protocol}"));
+    }
+    let db_err = |e: sqlx::Error| {
+        tracing::error!("enroll db error: {e}");
+        "server error".to_string()
+    };
+    let mut tx = state.db.begin().await.map_err(db_err)?;
+
+    // Atomically consume one use of the token.
+    let site_id: Option<Uuid> = sqlx::query_scalar(
+        "UPDATE enrollment_tokens SET uses = uses + 1
+          WHERE token_hash = $1
+            AND (expires_at IS NULL OR expires_at > now())
+            AND (max_uses IS NULL OR uses < max_uses)
+          RETURNING site_id",
+    )
+    .bind(token_hash(token))
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    let Some(site_id) = site_id else {
+        return Err("invalid or expired enrollment token".into());
+    };
+
+    let secret = random_token();
+    let agent_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO agents (id, site_id, secret_hash, machine_id, hostname, os_family, os_name, os_version, kernel_version, arch, agent_version)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+         ON CONFLICT (site_id, machine_id) WHERE machine_id IS NOT NULL
+         DO UPDATE SET secret_hash = EXCLUDED.secret_hash, hostname = EXCLUDED.hostname,
+                       os_family = EXCLUDED.os_family, os_name = EXCLUDED.os_name, os_version = EXCLUDED.os_version,
+                       kernel_version = EXCLUDED.kernel_version, arch = EXCLUDED.arch, agent_version = EXCLUDED.agent_version
+         RETURNING id",
+    )
+    .bind(Uuid::new_v4())
+    .bind(site_id)
+    .bind(token_hash(&secret))
+    .bind(&sys.machine_id)
+    .bind(&sys.hostname)
+    .bind(sys.os_family.as_str())
+    .bind(&sys.os_name)
+    .bind(&sys.os_version)
+    .bind(&sys.kernel_version)
+    .bind(&sys.arch)
+    .bind(&sys.agent_version)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    tx.commit().await.map_err(db_err)?;
+
+    info!(%agent_id, hostname = %sys.hostname, %site_id, "agent enrolled");
+    crate::auth::audit(&state.db, None, "agent.enroll", Some(("agent", agent_id)), serde_json::json!({ "hostname": sys.hostname })).await;
+    Ok((agent_id, secret))
+}
+
+async fn authenticate(state: &AppState, agent_id: Uuid, secret: &str) -> anyhow::Result<bool> {
+    let stored: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT secret_hash FROM agents WHERE id = $1").bind(agent_id).fetch_optional(&state.db).await?;
+    Ok(stored.is_some_and(|h| bool::from(h.ct_eq(&token_hash(secret)))))
+}
+
+async fn run_session(ws: WebSocket, state: Arc<AppState>, agent_id: Uuid, agent_version: String) -> anyhow::Result<()> {
+    let conn_id = Uuid::new_v4();
+    let (tx, mut rx) = mpsc::channel::<ServerMsg>(1024);
+    if let Some(old) = state.hub.register(agent_id, AgentHandle { conn_id, tx: tx.clone() }) {
+        debug!(%agent_id, old = %old.conn_id, "replacing stale connection");
+    }
+    sqlx::query("UPDATE agents SET online = true, last_seen_at = now(), agent_version = $2 WHERE id = $1")
+        .bind(agent_id)
+        .bind(&agent_version)
+        .execute(&state.db)
+        .await?;
+    info!(%agent_id, %agent_version, "agent online");
+
+    let (mut sink, mut stream) = ws.split();
+    let writer = tokio::spawn(async move {
+        let mut ping = tokio::time::interval(PING_EVERY);
+        ping.tick().await;
+        loop {
+            let frame = tokio::select! {
+                m = rx.recv() => match m {
+                    Some(m) => match rmm_proto::encode(&m) {
+                        Ok(b) => Message::Binary(b.into()),
+                        Err(_) => continue,
+                    },
+                    None => break,
+                },
+                _ = ping.tick() => Message::Ping(Vec::new().into()),
+            };
+            if sink.send(frame).await.is_err() {
+                break;
+            }
+        }
+        let _ = sink.close().await;
+    });
+
+    // Ask for fresh inventory and flush anything queued while the agent was offline.
+    let _ = tx.send(ServerMsg::RequestInventory).await;
+    if let Err(e) = dispatch_queued(&state, agent_id, &tx).await {
+        warn!(%agent_id, "dispatching queued jobs: {e}");
+    }
+    drop(tx);
+
+    // Idle timeout: 3 missed pings and we consider the agent gone.
+    let idle = PING_EVERY * 3;
+    loop {
+        let frame = match tokio::time::timeout(idle, stream.next()).await {
+            Ok(Some(Ok(f))) => f,
+            Ok(Some(Err(_))) | Ok(None) | Err(_) => break,
+        };
+        let msg = match frame {
+            Message::Binary(b) => match rmm_proto::decode::<AgentMsg>(&b) {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!(%agent_id, "bad frame: {e}");
+                    continue;
+                }
+            },
+            Message::Close(_) => break,
+            _ => continue,
+        };
+        if let Err(e) = on_message(&state, agent_id, msg).await {
+            warn!(%agent_id, "handling message: {e:#}");
+        }
+    }
+
+    writer.abort();
+    if state.hub.unregister(agent_id, conn_id) {
+        state.hub.drop_agent_shells(agent_id);
+        let _ = sqlx::query("UPDATE agents SET online = false, last_seen_at = now() WHERE id = $1")
+            .bind(agent_id)
+            .execute(&state.db)
+            .await;
+        info!(%agent_id, "agent offline");
+    }
+    Ok(())
+}
+
+pub async fn dispatch_queued(state: &AppState, agent_id: Uuid, tx: &mpsc::Sender<ServerMsg>) -> anyhow::Result<()> {
+    let rows: Vec<(Uuid, String, String, serde_json::Value, i32)> = sqlx::query_as(
+        "UPDATE jobs SET status = 'sent', sent_at = now()
+          WHERE agent_id = $1 AND status = 'queued'
+          RETURNING id, interpreter, body, args, timeout_secs",
+    )
+    .bind(agent_id)
+    .fetch_all(&state.db)
+    .await?;
+    for (job_id, interp, body, args, timeout) in rows {
+        let Some(interpreter) = parse_interpreter(&interp) else { continue };
+        let job = ScriptJob {
+            job_id,
+            interpreter,
+            script: body,
+            args: serde_json::from_value(args).unwrap_or_default(),
+            timeout_secs: timeout.max(1) as u32,
+        };
+        let _ = tx.send(ServerMsg::RunScript(job)).await;
+    }
+    Ok(())
+}
+
+pub fn parse_interpreter(s: &str) -> Option<Interpreter> {
+    Some(match s {
+        "sh" => Interpreter::Sh,
+        "bash" => Interpreter::Bash,
+        "powershell" => Interpreter::PowerShell,
+        "cmd" => Interpreter::Cmd,
+        "python" => Interpreter::Python,
+        _ => return None,
+    })
+}
+
+async fn on_message(state: &AppState, agent_id: Uuid, msg: AgentMsg) -> anyhow::Result<()> {
+    match msg {
+        AgentMsg::Heartbeat(m) => store_metrics(state, agent_id, &m).await?,
+        AgentMsg::Inventory(inv) => store_inventory(state, agent_id, &inv).await?,
+        AgentMsg::JobOutput { job_id, stream, data } => {
+            let col = match stream {
+                OutputStream::Stdout => "stdout",
+                OutputStream::Stderr => "stderr",
+            };
+            // Cap stored output so a chatty script can't bloat the DB.
+            let sql = format!(
+                "UPDATE jobs SET {col} = {col} || left($3, GREATEST(0, $4 - length({col})))
+                  WHERE id = $1 AND agent_id = $2"
+            );
+            sqlx::query(AssertSqlSafe(sql))
+                .bind(job_id)
+                .bind(agent_id)
+                .bind(String::from_utf8_lossy(&data).as_ref())
+                .bind(JOB_OUTPUT_CAP)
+                .execute(&state.db)
+                .await?;
+        }
+        AgentMsg::JobFinished { job_id, status, exit_code, duration_ms } => {
+            sqlx::query(
+                "UPDATE jobs SET status = $3, exit_code = $4, duration_ms = $5, finished_at = now()
+                  WHERE id = $1 AND agent_id = $2",
+            )
+            .bind(job_id)
+            .bind(agent_id)
+            .bind(status_str(status))
+            .bind(exit_code)
+            .bind(duration_ms as i64)
+            .execute(&state.db)
+            .await?;
+        }
+        AgentMsg::ShellOpened { session_id } => state.hub.route_shell(agent_id, session_id, ShellEvent::Opened).await,
+        AgentMsg::ShellOutput { session_id, data } => state.hub.route_shell(agent_id, session_id, ShellEvent::Output(data)).await,
+        AgentMsg::ShellClosed { session_id, reason } => {
+            state.hub.route_shell(agent_id, session_id, ShellEvent::Closed(reason)).await
+        }
+        AgentMsg::Pong { .. } => {}
+        AgentMsg::Enroll { .. } | AgentMsg::Auth { .. } => {}
+    }
+    Ok(())
+}
+
+fn status_str(s: JobStatus) -> &'static str {
+    s.as_str()
+}
+
+async fn store_metrics(state: &AppState, agent_id: Uuid, m: &Metrics) -> anyhow::Result<()> {
+    let disk_max_pct = m
+        .disks
+        .iter()
+        .filter(|d| d.total > 0)
+        .map(|d| 100.0 * (d.total - d.available.min(d.total)) as f32 / d.total as f32)
+        .fold(0.0f32, f32::max);
+    let mut tx = state.db.begin().await?;
+    sqlx::query("UPDATE agents SET last_seen_at = now(), online = true, last_metrics = $2 WHERE id = $1")
+        .bind(agent_id)
+        .bind(serde_json::to_value(m)?)
+        .execute(&mut *tx)
+        .await?;
+    // Use server time: agent clocks drift, and the PK must not collide on clock jumps.
+    sqlx::query(
+        "INSERT INTO agent_metrics (agent_id, ts, cpu_percent, mem_used, mem_total, disk_max_pct, net_rx_bytes, net_tx_bytes)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT DO NOTHING",
+    )
+    .bind(agent_id)
+    .bind(Utc::now())
+    .bind(m.cpu_percent)
+    .bind(m.mem_used as i64)
+    .bind(m.mem_total as i64)
+    .bind(disk_max_pct)
+    .bind(m.net_rx_bytes as i64)
+    .bind(m.net_tx_bytes as i64)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn store_inventory(state: &AppState, agent_id: Uuid, inv: &Inventory) -> anyhow::Result<()> {
+    let s = &inv.system;
+    sqlx::query(
+        "UPDATE agents SET inventory = $2, inventory_at = now(), hostname = $3, os_family = $4, os_name = $5,
+                os_version = $6, kernel_version = $7, arch = $8, last_seen_at = now()
+          WHERE id = $1",
+    )
+    .bind(agent_id)
+    .bind(serde_json::to_value(inv)?)
+    .bind(&s.hostname)
+    .bind(s.os_family.as_str())
+    .bind(&s.os_name)
+    .bind(&s.os_version)
+    .bind(&s.kernel_version)
+    .bind(&s.arch)
+    .execute(&state.db)
+    .await?;
+    Ok(())
+}
