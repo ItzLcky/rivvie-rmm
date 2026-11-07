@@ -18,7 +18,7 @@ use clap::{Parser, Subcommand};
 use sqlx::postgres::PgPoolOptions;
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::state::{AppState, Settings};
@@ -156,18 +156,30 @@ async fn serve(db: sqlx::PgPool, args: ServeArgs) -> Result<()> {
 /// no users exist yet, create that admin. Ignored once any user exists, so the
 /// variables can be left in place (but should be removed after first login).
 async fn bootstrap_admin(db: &sqlx::PgPool) -> Result<()> {
-    let (Ok(email), Ok(password)) = (std::env::var("RMM_ADMIN_EMAIL"), std::env::var("RMM_ADMIN_PASSWORD")) else {
-        return Ok(());
+    // Compose passes `${VAR:-}` through as an empty string, so empty means "not set".
+    let var = |k: &str| std::env::var(k).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    let (email, password) = match (var("RMM_ADMIN_EMAIL"), var("RMM_ADMIN_PASSWORD")) {
+        (None, None) => return Ok(()),
+        (Some(e), Some(p)) => (e, p),
+        (e, p) => {
+            warn!(
+                email_set = e.is_some(),
+                password_set = p.is_some(),
+                "set both RMM_ADMIN_EMAIL and RMM_ADMIN_PASSWORD to create the first admin; skipping"
+            );
+            return Ok(());
+        }
     };
     let users: i64 = sqlx::query_scalar("SELECT count(*) FROM users").fetch_one(db).await?;
     if users > 0 {
-        warn!("RMM_ADMIN_EMAIL/RMM_ADMIN_PASSWORD are set but users already exist; ignoring (you can remove them)");
+        info!("users already exist; ignoring RMM_ADMIN_EMAIL/RMM_ADMIN_PASSWORD (you can remove them)");
         return Ok(());
     }
-    api::create_user_cli(db, &email, "Administrator", &password, auth::Role::Admin)
-        .await
-        .map_err(|e| anyhow::anyhow!("creating bootstrap admin {email}: {e}"))?;
-    info!("created initial admin user {email}");
+    // Don't crash-loop the container over bad bootstrap input; log it and keep serving.
+    match api::create_user_cli(db, &email, "Administrator", &password, auth::Role::Admin).await {
+        Ok(_) => info!("created initial admin user {email}"),
+        Err(e) => error!("could not create initial admin '{email}': {e}"),
+    }
     Ok(())
 }
 
