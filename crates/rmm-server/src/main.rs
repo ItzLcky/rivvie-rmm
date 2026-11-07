@@ -118,6 +118,7 @@ async fn main() -> Result<()> {
 async fn serve(db: sqlx::PgPool, args: ServeArgs) -> Result<()> {
     // Nothing is connected yet, whatever the DB says from the last run.
     sqlx::query("UPDATE agents SET online = false WHERE online").execute(&db).await?;
+    bootstrap_admin(&db).await?;
 
     let state = Arc::new(AppState {
         db,
@@ -148,6 +149,25 @@ async fn serve(db: sqlx::PgPool, args: ServeArgs) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(args.bind).await.with_context(|| format!("binding {}", args.bind))?;
     info!("listening on {} (public url {})", args.bind, args.public_url);
     axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()).await?;
+    Ok(())
+}
+
+/// Container-friendly first run: if RMM_ADMIN_EMAIL and RMM_ADMIN_PASSWORD are set and
+/// no users exist yet, create that admin. Ignored once any user exists, so the
+/// variables can be left in place (but should be removed after first login).
+async fn bootstrap_admin(db: &sqlx::PgPool) -> Result<()> {
+    let (Ok(email), Ok(password)) = (std::env::var("RMM_ADMIN_EMAIL"), std::env::var("RMM_ADMIN_PASSWORD")) else {
+        return Ok(());
+    };
+    let users: i64 = sqlx::query_scalar("SELECT count(*) FROM users").fetch_one(db).await?;
+    if users > 0 {
+        warn!("RMM_ADMIN_EMAIL/RMM_ADMIN_PASSWORD are set but users already exist; ignoring (you can remove them)");
+        return Ok(());
+    }
+    api::create_user_cli(db, &email, "Administrator", &password, auth::Role::Admin)
+        .await
+        .map_err(|e| anyhow::anyhow!("creating bootstrap admin {email}: {e}"))?;
+    info!("created initial admin user {email}");
     Ok(())
 }
 

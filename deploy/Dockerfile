@@ -20,5 +20,6 @@ COPY --from=web /web/build /srv/web
 ENV RMM_WEB_DIR=/srv/web RMM_BIND=0.0.0.0:8080
 USER rmm
 EXPOSE 8080
+HEALTHCHECK --interval=30s --timeout=3s --start-period=20s CMD wget -qO- http://127.0.0.1:8080/healthz || exit 1
 ENTRYPOINT ["rmm-server"]
 CMD ["serve"]

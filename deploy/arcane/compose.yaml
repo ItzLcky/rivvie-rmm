@@ -1,0 +1,37 @@
+# rivvie-rmm for Arcane (or any Docker Compose host).
+# Paste this as the project's compose file and deploy/arcane/.env.example as its .env.
+#
+# The server speaks plain HTTP on port 8080. Put it behind your HTTPS reverse proxy
+# (it must pass WebSocket upgrades for /api/agent/ws and /api/agents/*/shell).
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: rmm
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: rmm
+    volumes:
+      - rmm-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rmm"]
+      interval: 5s
+      retries: 10
+
+  server:
+    image: ghcr.io/itzlcky/rivvie-rmm:${RMM_TAG:-latest}
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://rmm:${POSTGRES_PASSWORD}@db/rmm
+      RMM_PUBLIC_URL: ${RMM_PUBLIC_URL:?set RMM_PUBLIC_URL}
+      RMM_ADMIN_EMAIL: ${RMM_ADMIN_EMAIL:-}
+      RMM_ADMIN_PASSWORD: ${RMM_ADMIN_PASSWORD:-}
+      RUST_LOG: ${RUST_LOG:-info}
+    ports:
+      - "${RMM_PORT:-8080}:8080"
+
+volumes:
+  rmm-pgdata:
