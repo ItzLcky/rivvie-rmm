@@ -21,7 +21,7 @@ clap.workspace = true
 sha2.workspace = true
 hex.workspace = true
 axum = { version = "0.8", features = ["ws", "macros"] }
-tower-http = { version = "0.7", features = ["fs", "trace", "limit"] }
+tower-http = { version = "0.7", features = ["fs", "trace", "limit", "set-header"] }
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "migrate", "derive", "macros"] }
 argon2 = "0.6"
 getrandom = "0.4"

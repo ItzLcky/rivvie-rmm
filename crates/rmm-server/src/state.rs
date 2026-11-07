@@ -15,6 +15,7 @@ pub struct Settings {
     pub heartbeat_secs: u32,
     pub inventory_secs: u32,
     pub metrics_retention_days: u32,
+    pub job_queue_days: u32,
 }
 
 impl Settings {

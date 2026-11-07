@@ -68,6 +68,9 @@ struct ServeArgs {
     inventory_secs: u32,
     #[arg(long, env = "RMM_METRICS_RETENTION_DAYS", default_value_t = 30)]
     metrics_retention_days: u32,
+    /// Jobs queued for an offline agent expire after this many days instead of running late.
+    #[arg(long, env = "RMM_JOB_QUEUE_DAYS", default_value_t = 7)]
+    job_queue_days: u32,
 }
 
 impl Default for ServeArgs {
@@ -81,6 +84,7 @@ impl Default for ServeArgs {
             heartbeat_secs: env("RMM_HEARTBEAT_SECS", "30").parse().unwrap_or(30),
             inventory_secs: env("RMM_INVENTORY_SECS", "21600").parse().unwrap_or(21600),
             metrics_retention_days: env("RMM_METRICS_RETENTION_DAYS", "30").parse().unwrap_or(30),
+            job_queue_days: env("RMM_JOB_QUEUE_DAYS", "7").parse().unwrap_or(7),
         }
     }
 }
@@ -118,6 +122,14 @@ async fn main() -> Result<()> {
 async fn serve(db: sqlx::PgPool, args: ServeArgs) -> Result<()> {
     // Nothing is connected yet, whatever the DB says from the last run.
     sqlx::query("UPDATE agents SET online = false WHERE online").execute(&db).await?;
+    // Their connections died with the previous process, so they can never report.
+    sqlx::query(
+        "UPDATE jobs SET status = 'lost', finished_at = now(),
+                stderr = stderr || E'\\n[rmm] the server restarted before the agent reported a result\\n'
+          WHERE status = 'sent'",
+    )
+    .execute(&db)
+    .await?;
     bootstrap_admin(&db).await?;
 
     let state = Arc::new(AppState {
@@ -128,6 +140,7 @@ async fn serve(db: sqlx::PgPool, args: ServeArgs) -> Result<()> {
             heartbeat_secs: args.heartbeat_secs,
             inventory_secs: args.inventory_secs,
             metrics_retention_days: args.metrics_retention_days,
+            job_queue_days: args.job_queue_days,
         },
     });
     tokio::spawn(housekeeping(state.clone()));
@@ -143,13 +156,28 @@ async fn serve(db: sqlx::PgPool, args: ServeArgs) -> Result<()> {
         .nest("/api", api::router())
         .fallback_service(ServeDir::new(&args.web_dir).fallback(ServeFile::new(index)))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(8 * 1024 * 1024))
-        .layer(TraceLayer::new_for_http())
-        .with_state(state);
+        .layer(TraceLayer::new_for_http());
+    let https = state.cfg.secure_cookies();
+    let app = security_headers(app.with_state(state), https);
 
     let listener = tokio::net::TcpListener::bind(args.bind).await.with_context(|| format!("binding {}", args.bind))?;
     info!("listening on {} (public url {})", args.bind, args.public_url);
     axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()).await?;
     Ok(())
+}
+
+/// Baseline browser hardening for the dashboard. The CSP only restricts framing, plugins and
+/// `<base>`; a script-src policy needs SvelteKit's hash-based CSP, which is a separate change.
+fn security_headers(router: Router, https: bool) -> Router {
+    use axum::http::{HeaderName, HeaderValue, header};
+    use tower_http::set_header::SetResponseHeaderLayer;
+    let set = |name: HeaderName, value: &'static str| SetResponseHeaderLayer::if_not_present(name, HeaderValue::from_static(value));
+    let router = router
+        .layer(set(header::CONTENT_SECURITY_POLICY, "frame-ancestors 'none'; object-src 'none'; base-uri 'self'"))
+        .layer(set(header::X_FRAME_OPTIONS, "DENY"))
+        .layer(set(header::X_CONTENT_TYPE_OPTIONS, "nosniff"))
+        .layer(set(header::REFERRER_POLICY, "same-origin"));
+    if https { router.layer(set(header::STRICT_TRANSPORT_SECURITY, "max-age=31536000")) } else { router }
 }
 
 /// Container-friendly first run: if RMM_ADMIN_EMAIL and RMM_ADMIN_PASSWORD are set and
@@ -183,20 +211,46 @@ async fn bootstrap_admin(db: &sqlx::PgPool) -> Result<()> {
     Ok(())
 }
 
-/// Periodic cleanup: expired sessions, old metrics.
+/// Periodic cleanup: expired sessions, old metrics, jobs that will never finish.
 async fn housekeeping(state: Arc<AppState>) {
-    let mut tick = tokio::time::interval(Duration::from_secs(3600));
+    let mut tick = tokio::time::interval(Duration::from_secs(300));
+    let mut runs: u64 = 0;
     loop {
         tick.tick().await;
-        let r1 = sqlx::query("DELETE FROM user_sessions WHERE expires_at < now()").execute(&state.db).await;
-        let r2 = sqlx::query("DELETE FROM agent_metrics WHERE ts < now() - make_interval(days => $1)")
-            .bind(state.cfg.metrics_retention_days as i32)
-            .execute(&state.db)
-            .await;
-        if let (Err(e), _) | (_, Err(e)) = (&r1, &r2) {
+        let db = &state.db;
+        let mut results = vec![
+            // The agent enforces the timeout itself; well past it, the result isn't coming
+            // (agent hung, or the message was lost while the socket was dying).
+            sqlx::query(
+                "UPDATE jobs SET status = 'lost', finished_at = now(),
+                        stderr = stderr || E'\\n[rmm] no result from the agent long after the job timeout\\n'
+                  WHERE status = 'sent' AND sent_at + make_interval(secs => timeout_secs + 600) < now()",
+            )
+            .execute(db)
+            .await,
+            sqlx::query(
+                "UPDATE jobs SET status = 'expired', finished_at = now()
+                  WHERE status = 'queued' AND created_at < now() - make_interval(days => $1)",
+            )
+            .bind(state.cfg.job_queue_days as i32)
+            .execute(db)
+            .await,
+        ];
+        // The rest is bulk deletion; hourly is plenty.
+        if runs.is_multiple_of(12) {
+            results.push(sqlx::query("DELETE FROM user_sessions WHERE expires_at < now()").execute(db).await);
+            results.push(
+                sqlx::query("DELETE FROM agent_metrics WHERE ts < now() - make_interval(days => $1)")
+                    .bind(state.cfg.metrics_retention_days as i32)
+                    .execute(db)
+                    .await,
+            );
+        }
+        runs += 1;
+        for e in results.iter().filter_map(|r| r.as_ref().err()) {
             warn!("housekeeping: {e}");
         }
-        info!(online = state.hub.online_count(), "housekeeping done");
+        tracing::debug!(online = state.hub.online_count(), "housekeeping done");
     }
 }
 

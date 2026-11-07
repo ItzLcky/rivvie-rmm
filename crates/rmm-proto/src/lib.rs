@@ -44,6 +44,11 @@ pub enum AgentMsg {
         protocol: u32,
         token: String,
         system: SystemInfo,
+        /// The credential from a previous enrollment of this machine, if it still has one.
+        /// Only a valid one lets the server reuse the existing agent record; a bare token
+        /// always creates a new record, so a leaked token can't take over existing agents.
+        #[serde(default)]
+        previous: Option<PreviousCredential>,
     },
     /// Reconnect of an already enrolled agent.
     Auth {
@@ -81,6 +86,12 @@ pub enum AgentMsg {
     Pong {
         nonce: u64,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreviousCredential {
+    pub agent_id: Uuid,
+    pub secret: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -319,5 +330,27 @@ mod tests {
         });
         let buf = encode(&msg).unwrap();
         assert!(matches!(decode::<ServerMsg>(&buf).unwrap(), ServerMsg::RunScript(_)));
+    }
+
+    /// Agents built before `previous` existed must still be able to enroll.
+    #[test]
+    fn enroll_without_previous_decodes() {
+        #[derive(Serialize)]
+        #[serde(tag = "t", rename_all = "snake_case")]
+        enum Old {
+            Enroll { protocol: u32, token: String, system: SystemInfo },
+        }
+        let system = SystemInfo {
+            hostname: "h".into(),
+            os_family: OsFamily::Linux,
+            os_name: String::new(),
+            os_version: String::new(),
+            kernel_version: String::new(),
+            arch: String::new(),
+            machine_id: None,
+            agent_version: String::new(),
+        };
+        let buf = encode(&Old::Enroll { protocol: 1, token: "t".into(), system }).unwrap();
+        assert!(matches!(decode::<AgentMsg>(&buf).unwrap(), AgentMsg::Enroll { previous: None, .. }));
     }
 }

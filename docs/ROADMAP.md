@@ -13,15 +13,31 @@
 
 ## Phase 2: Hardening (do before real customers)
 
-- [ ] **Test the Windows agent on real hosts** (Windows 10/11, Server 2019/2022). CI compiles it but nobody has run it.
-- [ ] Windows: run jobs inside a Job Object so a timeout kills the whole process tree (Unix already uses process groups)
-- [ ] Windows: lock the `C:\ProgramData\RMM` ACL to SYSTEM and Administrators when installing
-- [ ] Agent self-update: signed binaries (ed25519), staged download, swap, rollback if the new binary doesn't reconnect within N seconds
-- [ ] MSI installer (WiX) and `.deb`/`.rpm` packages with the server URL and token baked in
+Done:
+
+- [x] Enrollment can't take over existing agents: a record is reused only when the agent proves its old secret; a bare token always creates a new record
+- [x] Agent detects dead connections (100 s read timeout) and no longer waits for running jobs before reconnecting
+- [x] Job lifecycle: in-flight jobs become `lost` on disconnect, server restart, or long past their timeout; queued jobs `expire` after `RMM_JOB_QUEUE_DAYS`
+- [x] Agent refuses plain `http://` servers except localhost unless `--insecure`
+- [x] Security headers: `frame-ancestors 'none'`, X-Frame-Options, nosniff, Referrer-Policy, HSTS when the public URL is https
+- [x] systemd unit: dropped `MemoryMax=128M`/`Nice=10`, which every script and shell inherited
+- [x] Windows: `C:\ProgramData\RMM` restricted to SYSTEM and Administrators (on enroll and every service start); job scripts written there instead of the shared temp dir
+- [x] Windows: service binary copied to `C:\Program Files\RMM`, SCM restart-on-failure, file logging to `C:\ProgramData\RMM\logs\agent.log`
+
+To do:
+
+- [ ] Integration tests: Postgres in CI, a real agent driven against the server. Start from the manual e2e run: enrollment reuse/takeover, `lost`/`expired` jobs, headers.
+- [ ] Rate-limit `/auth/login` and enrollment. Behind Caddy, key on `X-Forwarded-For` only when it comes from a trusted proxy.
+- [ ] Account management: change password, admin reset, re-enable users, list and revoke sessions; consider an idle timeout shorter than the fixed 7 days
 - [ ] TOTP 2FA for dashboard users; enforce it on admin accounts
-- [ ] Per-client access control for technicians (`user_clients` table) and an optional client-portal role
-- [ ] Rate-limit `/auth/login` and enrollment
-- [ ] Integration tests: spin up Postgres in CI and drive a real agent against the server (mirroring the manual e2e run)
+- [ ] Per-client access control for technicians (`user_clients` table) and an optional client-portal role. Touches every query; decide first whether scripts are global or per client.
+- [ ] **Test the Windows agent on real hosts** (Windows 10/11, Server 2019/2022). CI compiles it but nobody has run it. Check the ACL, the Program Files copy, the recovery actions and logging first.
+- [ ] Windows: run jobs and shells inside a Job Object so timeouts and session close kill the whole process tree (Unix jobs already use process groups; shells on both OSes only kill the direct child)
+- [ ] Agent self-update: signed binaries (ed25519), staged download, swap, rollback if the new binary doesn't reconnect within N seconds. Keep the signing key off the server (it already controls agents via scripts; signing protects the download path). Rollback needs a watchdog outside the new binary, and restarting under systemd's default `KillMode=control-group` kills running jobs.
+- [ ] MSI installer (WiX) and `.deb`/`.rpm` packages with the server URL and token baked in. Default baked tokens to an expiry and a `max_uses` limit.
+- [ ] Agent buffers job results across reconnects instead of losing them (today they become `lost`)
+- [ ] Script-src CSP via SvelteKit's hash-based `kit.csp`
+- [ ] Postgres backups in the deploy stack
 
 ## Phase 3: Monitoring and alerting
 

@@ -38,7 +38,7 @@ export interface Script {
 	created_at: string; updated_at: string;
 }
 
-export type JobStatus = 'queued' | 'sent' | 'succeeded' | 'failed' | 'timed_out' | 'error' | 'cancelled';
+export type JobStatus = 'queued' | 'sent' | 'succeeded' | 'failed' | 'timed_out' | 'error' | 'cancelled' | 'lost' | 'expired';
 export interface Job {
 	id: string; agent_id: string; hostname: string; script_id: string | null; script_name: string | null; interpreter: Interpreter;
 	status: JobStatus; exit_code: number | null; created_by_name: string | null; created_at: string; sent_at: string | null;

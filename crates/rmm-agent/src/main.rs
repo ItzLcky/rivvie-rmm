@@ -34,6 +34,10 @@ enum Cmd {
         /// Also install and start the system service.
         #[arg(long)]
         install: bool,
+        /// Allow a plain http:// server that isn't localhost. The agent secret and every
+        /// script would cross the network unencrypted; only use this on a trusted lab network.
+        #[arg(long)]
+        insecure: bool,
     },
     /// Run in the foreground (what the service runs).
     Run,
@@ -63,8 +67,12 @@ fn main() -> Result<()> {
     install_crypto();
 
     match cli.cmd {
-        Cmd::Enroll { server, token, install } => {
-            let cfg = runtime()?.block_on(conn::enroll(&server, &token))?;
+        Cmd::Enroll { server, token, install, insecure } => {
+            let server = config::normalize_server_url(&server, insecure)?;
+            // Re-enrolling: prove ownership of the existing record so the server keeps it.
+            // Never hand the old secret to a different server.
+            let previous = config::Config::load(&config_path).ok().filter(|c| c.server_url == server);
+            let cfg = runtime()?.block_on(conn::enroll(&server, &token, previous.as_ref()))?;
             cfg.save(&config_path)?;
             println!("enrolled as {} (config: {})", cfg.agent_id, config_path.display());
             if install {

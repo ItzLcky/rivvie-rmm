@@ -136,6 +136,20 @@ fn command_for(interp: Interpreter, path: &std::path::Path) -> Result<Command> {
     Ok(cmd)
 }
 
+/// On Windows, SYSTEM's temp dir is shared with other accounts' scratch files, so use the
+/// agent's locked-down data directory. On Unix, /tmp with O_EXCL and mode 0700 is fine.
+#[cfg(windows)]
+fn scratch_dir() -> Result<PathBuf> {
+    let dir = crate::config::data_dir().context("no data directory")?.join("jobs");
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    Ok(dir)
+}
+
+#[cfg(not(windows))]
+fn scratch_dir() -> Result<PathBuf> {
+    Ok(std::env::temp_dir())
+}
+
 /// Script written to a private temp file, removed on drop.
 struct ScriptFile {
     path: PathBuf,
@@ -149,7 +163,7 @@ impl ScriptFile {
             Interpreter::Python => "py",
             Interpreter::Sh | Interpreter::Bash => "sh",
         };
-        let path = std::env::temp_dir().join(format!("rmm-job-{}.{ext}", job.job_id));
+        let path = scratch_dir()?.join(format!("rmm-job-{}.{ext}", job.job_id));
         let mut opts = std::fs::OpenOptions::new();
         // create_new => O_EXCL, so a pre-planted symlink in /tmp can't redirect the write.
         opts.write(true).create_new(true);

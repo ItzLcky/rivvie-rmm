@@ -39,14 +39,18 @@ impl Hub {
         self.agents.write().unwrap().insert(agent_id, handle)
     }
 
-    /// Removes the agent only if `conn_id` is still the current connection.
+    /// Removes the agent only if `conn_id` is still the current connection. Returns true if
+    /// the agent is now offline (false if a newer connection has replaced this one).
     pub fn unregister(&self, agent_id: Uuid, conn_id: Uuid) -> bool {
         let mut agents = self.agents.write().unwrap();
-        if agents.get(&agent_id).is_some_and(|h| h.conn_id == conn_id) {
-            agents.remove(&agent_id);
-            true
-        } else {
-            false
+        match agents.get(&agent_id) {
+            Some(h) if h.conn_id == conn_id => {
+                agents.remove(&agent_id);
+                true
+            }
+            Some(_) => false,
+            // Kicked (agent deleted or re-enrolled) while this connection was open.
+            None => true,
         }
     }
 

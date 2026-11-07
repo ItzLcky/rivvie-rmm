@@ -8,7 +8,9 @@
 		failed: 'bg-red-950 text-red-300',
 		timed_out: 'bg-amber-950 text-amber-300',
 		error: 'bg-red-950 text-red-300',
-		cancelled: 'bg-slate-800 text-slate-400'
+		cancelled: 'bg-slate-800 text-slate-400',
+		lost: 'bg-amber-950 text-amber-300',
+		expired: 'bg-slate-800 text-slate-400'
 	};
 	const labels: Partial<Record<JobStatus, string>> = { sent: 'running', timed_out: 'timed out' };
 </script>

@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::{SinkExt, StreamExt};
-use rmm_proto::{AgentMsg, PROTOCOL_VERSION, ServerMsg};
+use rmm_proto::{AgentMsg, PROTOCOL_VERSION, PreviousCredential, ServerMsg};
 use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, error, info, warn};
@@ -20,6 +20,9 @@ use crate::{jobs, shell};
 type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
+/// The server pings every 30s. Hearing nothing for this long means the connection is dead
+/// (NAT timeout, server crash without a FIN) even if the OS still thinks it's open.
+const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(100);
 
 async fn connect(url: &str) -> Result<Ws> {
     let (ws, _resp) = tokio::time::timeout(HANDSHAKE_TIMEOUT, tokio_tungstenite::connect_async(url))
@@ -48,11 +51,14 @@ async fn recv(ws: &mut Ws) -> Result<ServerMsg> {
     }
 }
 
-/// One-time registration. Exchanges an enrollment token for a permanent agent credential.
-pub async fn enroll(server_url: &str, token: &str) -> Result<Config> {
+/// Exchanges an enrollment token for a permanent agent credential. Passing the existing
+/// credential (re-enrolling the same machine) keeps its agent record and history.
+pub async fn enroll(server_url: &str, token: &str, previous: Option<&Config>) -> Result<Config> {
     let url = config::ws_url(server_url);
     let mut ws = connect(&url).await?;
-    send(&mut ws, &AgentMsg::Enroll { protocol: PROTOCOL_VERSION, token: token.to_string(), system: system_info() }).await?;
+    let previous = previous.map(|c| PreviousCredential { agent_id: c.agent_id, secret: c.secret.clone() });
+    send(&mut ws, &AgentMsg::Enroll { protocol: PROTOCOL_VERSION, token: token.to_string(), system: system_info(), previous })
+        .await?;
     match recv(&mut ws).await? {
         ServerMsg::Enrolled { agent_id, secret } => {
             let _ = ws.close(None).await;
@@ -144,10 +150,11 @@ async fn session(cfg: &Config, collector: Arc<Mutex<Collector>>) -> Result<()> {
 
     let mut shells: HashMap<Uuid, ShellSession> = HashMap::new();
     let result = loop {
-        let frame = match stream.next().await {
-            None => break Ok(()),
-            Some(Err(e)) => break Err(e.into()),
-            Some(Ok(f)) => f,
+        let frame = match tokio::time::timeout(READ_IDLE_TIMEOUT, stream.next()).await {
+            Err(_) => break Err(anyhow!("nothing from the server for {}s; reconnecting", READ_IDLE_TIMEOUT.as_secs())),
+            Ok(None) => break Ok(()),
+            Ok(Some(Err(e))) => break Err(e.into()),
+            Ok(Some(Ok(f))) => f,
         };
         let msg: ServerMsg = match frame {
             Message::Binary(b) => match rmm_proto::decode(&b) {
@@ -167,7 +174,12 @@ async fn session(cfg: &Config, collector: Arc<Mutex<Collector>>) -> Result<()> {
     inventory.abort();
     drop(shells);
     drop(tx);
-    let _ = writer.await;
+    // Running jobs hold sender clones, so the writer won't end on its own until they finish,
+    // and a dead socket can stall it mid-send. Give it a moment to flush, then move on.
+    let abort = writer.abort_handle();
+    if tokio::time::timeout(Duration::from_secs(5), writer).await.is_err() {
+        abort.abort();
+    }
     result
 }
 

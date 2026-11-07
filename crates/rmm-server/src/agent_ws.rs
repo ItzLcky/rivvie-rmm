@@ -9,7 +9,10 @@ use axum::extract::{State, WebSocketUpgrade};
 use axum::response::Response;
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
-use rmm_proto::{AgentMsg, Interpreter, Inventory, JobStatus, Metrics, OutputStream, PROTOCOL_VERSION, ScriptJob, ServerMsg, SystemInfo};
+use rmm_proto::{
+    AgentMsg, Interpreter, Inventory, JobStatus, Metrics, OutputStream, PROTOCOL_VERSION, PreviousCredential, ScriptJob, ServerMsg,
+    SystemInfo,
+};
 use subtle::ConstantTimeEq;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -44,8 +47,8 @@ async fn handle(mut ws: WebSocket, state: Arc<AppState>) -> anyhow::Result<()> {
     };
 
     match first {
-        AgentMsg::Enroll { protocol, token, system } => {
-            let reply = match enroll(&state, protocol, &token, &system).await {
+        AgentMsg::Enroll { protocol, token, system, previous } => {
+            let reply = match enroll(&state, protocol, &token, &system, previous.as_ref()).await {
                 Ok((agent_id, secret)) => ServerMsg::Enrolled { agent_id, secret },
                 Err(reason) => ServerMsg::AuthFailed { reason },
             };
@@ -74,7 +77,13 @@ async fn handle(mut ws: WebSocket, state: Arc<AppState>) -> anyhow::Result<()> {
     }
 }
 
-async fn enroll(state: &AppState, protocol: u32, token: &str, sys: &SystemInfo) -> Result<(Uuid, String), String> {
+async fn enroll(
+    state: &AppState,
+    protocol: u32,
+    token: &str,
+    sys: &SystemInfo,
+    previous: Option<&PreviousCredential>,
+) -> Result<(Uuid, String), String> {
     if protocol != PROTOCOL_VERSION {
         return Err(format!("unsupported protocol {protocol}"));
     }
@@ -100,17 +109,32 @@ async fn enroll(state: &AppState, protocol: u32, token: &str, sys: &SystemInfo) 
         return Err("invalid or expired enrollment token".into());
     };
 
+    // Reuse the existing record only if the agent proves it owns it, and only within the
+    // token's site. A bare token never touches an existing agent's credential.
+    let reuse = match previous {
+        Some(p) => {
+            let stored: Option<Vec<u8>> = sqlx::query_scalar("SELECT secret_hash FROM agents WHERE id = $1 AND site_id = $2")
+                .bind(p.agent_id)
+                .bind(site_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(db_err)?;
+            stored.is_some_and(|h| bool::from(h.ct_eq(&token_hash(&p.secret)))).then_some(p.agent_id)
+        }
+        None => None,
+    };
+
     let secret = random_token();
     let agent_id: Uuid = sqlx::query_scalar(
         "INSERT INTO agents (id, site_id, secret_hash, machine_id, hostname, os_family, os_name, os_version, kernel_version, arch, agent_version)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-         ON CONFLICT (site_id, machine_id) WHERE machine_id IS NOT NULL
-         DO UPDATE SET secret_hash = EXCLUDED.secret_hash, hostname = EXCLUDED.hostname,
+         ON CONFLICT (id)
+         DO UPDATE SET secret_hash = EXCLUDED.secret_hash, machine_id = EXCLUDED.machine_id, hostname = EXCLUDED.hostname,
                        os_family = EXCLUDED.os_family, os_name = EXCLUDED.os_name, os_version = EXCLUDED.os_version,
                        kernel_version = EXCLUDED.kernel_version, arch = EXCLUDED.arch, agent_version = EXCLUDED.agent_version
          RETURNING id",
     )
-    .bind(Uuid::new_v4())
+    .bind(reuse.unwrap_or_else(Uuid::new_v4))
     .bind(site_id)
     .bind(token_hash(&secret))
     .bind(&sys.machine_id)
@@ -126,8 +150,19 @@ async fn enroll(state: &AppState, protocol: u32, token: &str, sys: &SystemInfo) 
     .map_err(db_err)?;
     tx.commit().await.map_err(db_err)?;
 
-    info!(%agent_id, hostname = %sys.hostname, %site_id, "agent enrolled");
-    crate::auth::audit(&state.db, None, "agent.enroll", Some(("agent", agent_id)), serde_json::json!({ "hostname": sys.hostname })).await;
+    // The old credential is now invalid; drop its live connection, if any.
+    if reuse.is_some() {
+        state.hub.kick(agent_id);
+    }
+    info!(%agent_id, hostname = %sys.hostname, %site_id, reused = reuse.is_some(), "agent enrolled");
+    crate::auth::audit(
+        &state.db,
+        None,
+        "agent.enroll",
+        Some(("agent", agent_id)),
+        serde_json::json!({ "hostname": sys.hostname, "reused": reuse.is_some() }),
+    )
+    .await;
     Ok((agent_id, secret))
 }
 
@@ -140,6 +175,10 @@ async fn authenticate(state: &AppState, agent_id: Uuid, secret: &str) -> anyhow:
 async fn run_session(ws: WebSocket, state: Arc<AppState>, agent_id: Uuid, agent_version: String) -> anyhow::Result<()> {
     let conn_id = Uuid::new_v4();
     let (tx, mut rx) = mpsc::channel::<ServerMsg>(1024);
+    // Results are reported over the connection a job was sent on, so anything still marked
+    // `sent` from an earlier connection can never finish. Do this before registering: a job
+    // created in between sees the agent offline, stays queued, and is dispatched below.
+    mark_lost(&state.db, agent_id).await?;
     if let Some(old) = state.hub.register(agent_id, AgentHandle { conn_id, tx: tx.clone() }) {
         debug!(%agent_id, old = %old.conn_id, "replacing stale connection");
     }
@@ -209,8 +248,24 @@ async fn run_session(ws: WebSocket, state: Arc<AppState>, agent_id: Uuid, agent_
             .bind(agent_id)
             .execute(&state.db)
             .await;
+        if let Err(e) = mark_lost(&state.db, agent_id).await {
+            warn!(%agent_id, "marking in-flight jobs lost: {e}");
+        }
         info!(%agent_id, "agent offline");
     }
+    Ok(())
+}
+
+/// Dispatched jobs whose connection is gone can't report a result any more.
+pub async fn mark_lost(db: &sqlx::PgPool, agent_id: Uuid) -> sqlx::Result<()> {
+    sqlx::query(
+        "UPDATE jobs SET status = 'lost', finished_at = now(),
+                stderr = stderr || E'\\n[rmm] the agent disconnected before reporting a result\\n'
+          WHERE agent_id = $1 AND status = 'sent'",
+    )
+    .bind(agent_id)
+    .execute(db)
+    .await?;
     Ok(())
 }
 
@@ -272,8 +327,9 @@ async fn on_message(state: &AppState, agent_id: Uuid, msg: AgentMsg) -> anyhow::
         }
         AgentMsg::JobFinished { job_id, status, exit_code, duration_ms } => {
             sqlx::query(
+                // `lost` too: the timeout reaper may have given up on a job that then finished.
                 "UPDATE jobs SET status = $3, exit_code = $4, duration_ms = $5, finished_at = now()
-                  WHERE id = $1 AND agent_id = $2",
+                  WHERE id = $1 AND agent_id = $2 AND status IN ('sent', 'lost')",
             )
             .bind(job_id)
             .bind(agent_id)

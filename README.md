@@ -37,9 +37,9 @@ docs/           Roadmap and design notes
 ```
 
 - **Tenancy:** clients → sites → agents. Enrollment tokens are scoped to a site, so an agent lands in the right client automatically.
-- **Enrollment:** `rmm-agent enroll --server URL --token T` swaps a time- and use-limited token for a permanent per-agent secret. The server stores only a SHA-256 of it. Re-enrolling the same machine (same machine-id) into the same site reuses its record.
-- **Transport:** the agent dials out, so endpoints need no inbound ports. Everything is multiplexed over one WebSocket: heartbeats (every 30 s), inventory (every 6 h or on demand), script jobs, and PTY streams. The agent reconnects with jittered exponential backoff.
-- **Jobs:** sending a script to an offline agent queues it, and it runs on reconnect. Output streams into Postgres (capped at 1 MB per stream). Timeouts kill the whole process tree.
+- **Enrollment:** `rmm-agent enroll --server URL --token T` swaps a time- and use-limited token for a permanent per-agent secret. The server stores only a SHA-256 of it. Re-enrolling a machine that still has its config keeps its agent record (the agent proves it holds the old secret); a token alone always creates a new record, so a leaked token can't take over existing agents. The agent refuses plain `http://` servers other than localhost unless you pass `--insecure`.
+- **Transport:** the agent dials out, so endpoints need no inbound ports. Everything is multiplexed over one WebSocket: heartbeats (every 30 s), inventory (every 6 h or on demand), script jobs, and PTY streams. The agent reconnects with jittered exponential backoff, and treats 100 s of silence from the server as a dead connection.
+- **Jobs:** sending a script to an offline agent queues it, and it runs on reconnect (queued jobs expire after `RMM_JOB_QUEUE_DAYS`). Output streams into Postgres (capped at 1 MB per stream). Timeouts kill the whole process tree on Unix. A job whose agent disconnects before reporting is marked `lost`.
 - **Terminal:** xterm.js ↔ server relay ↔ PTY on the agent (bash/zsh on Linux, PowerShell through ConPTY on Windows).
 - **Security:** argon2id passwords; opaque, revocable session tokens in an HttpOnly SameSite=Strict cookie; an Origin check on the terminal socket; three roles (admin / technician / readonly); an audit log covering logins, shells, jobs, enrollment, and deletes.
 
@@ -92,12 +92,14 @@ production; the agent verifies certificates against the OS trust store.
 # Linux (as root): copies itself to /usr/local/bin and installs a systemd unit
 sudo ./rmm-agent enroll --server https://rmm.example.com --token <TOKEN> --install
 
-# Windows (elevated PowerShell): installs the "RmmAgent" service running as LocalSystem
+# Windows (elevated PowerShell): copies itself to C:\Program Files\RMM and installs the
+# "RmmAgent" service running as LocalSystem, restarted automatically on failure
 .\rmm-agent.exe enroll --server https://rmm.example.com --token <TOKEN> --install
 ```
 
 Config lives in `/etc/rmm-agent/agent.toml` (mode 0600) on Linux and in
-`C:\ProgramData\RMM\agent.toml` on Windows.
+`C:\ProgramData\RMM\agent.toml` on Windows, where the agent restricts `C:\ProgramData\RMM`
+to SYSTEM and Administrators. Windows service logs go to `C:\ProgramData\RMM\logs\agent.log`.
 
 ## Server configuration
 
@@ -110,5 +112,6 @@ Config lives in `/etc/rmm-agent/agent.toml` (mode 0600) on Linux and in
 | `RMM_HEARTBEAT_SECS` | `30` | Agent metrics interval |
 | `RMM_INVENTORY_SECS` | `21600` | Agent inventory interval |
 | `RMM_METRICS_RETENTION_DAYS` | `30` | Metric history kept |
+| `RMM_JOB_QUEUE_DAYS` | `7` | Jobs queued for an offline agent expire after this |
 
 See [docs/ROADMAP.md](docs/ROADMAP.md) for what's next: patch management, remote desktop, alerting, and more.
