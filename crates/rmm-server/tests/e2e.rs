@@ -454,7 +454,7 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
         if let Ok(out) = Command::new(tool.0).args(&tool.1).arg(&path).stderr(Stdio::null()).output() {
             let listing = String::from_utf8_lossy(&out.stdout);
             assert!(out.status.success(), "{} rejected the package", tool.0);
-            assert!(listing.contains("/usr/bin/rmm-agent") && listing.contains("/etc/rmm-agent/enroll.toml"), "{listing}");
+            assert!(listing.contains("usr/bin/rmm-agent") && listing.contains("etc/rmm-agent/enroll.toml"), "{listing}");
             println!("{} accepted the .{key}", tool.0);
         }
     }
