@@ -85,6 +85,18 @@ RMM_E2E_DATABASE_URL=postgres://rmm:rmm@localhost:5432/postgres \
   cargo test -p rmm-server --test e2e -- --ignored --nocapture
 ```
 
+The dashboard has visual regression and accessibility tests. Playwright screenshots every page,
+in light and dark, against a mocked API, and runs WCAG 2.2 AA checks with axe. The baselines are
+rendered in the Playwright Docker image, so run the tests there to match CI:
+
+```sh
+cd web
+npm run test:visual:docker                          # compare against the baselines
+npm run test:visual:docker -- --update-snapshots    # after an intended UI change
+```
+
+`npm run dev` also serves a component gallery at `/dev/ui`.
+
 > **Note for this checkout:** the repo lives on a NAS mount that doesn't support symlinks, so
 > `web/.npmrc` sets `bin-links=false` and the npm scripts call each tool's JS entry point directly.
 > Use `npm`, not `pnpm`. pnpm's layout always needs symlinks.

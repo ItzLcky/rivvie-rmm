@@ -1,20 +1,41 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
 	import { api } from '#lib/api.js';
-	import { interpreters } from '#lib/format.js';
+	import { interpreterLabel, interpreters, plural } from '#lib/format.js';
+	import { toast } from '#lib/toast.svelte.js';
 	import type { AgentSummary, Interpreter, Script } from '#lib/types.js';
-	import Modal from './Modal.svelte';
+	import Button from '#lib/ui/Button.svelte';
+	import Combobox from '#lib/ui/Combobox.svelte';
+	import Field from '#lib/ui/Field.svelte';
+	import Input from '#lib/ui/Input.svelte';
+	import Modal from '#lib/ui/Modal.svelte';
+	import Select from '#lib/ui/Select.svelte';
+	import Textarea from '#lib/ui/Textarea.svelte';
+	import CodeEditor from './CodeEditor.svelte';
 
-	let { agents, onclose }: { agents: Pick<AgentSummary, 'id' | 'hostname' | 'os_family' | 'client_id'>[]; onclose: () => void } = $props();
+	let {
+		agents,
+		onclose,
+		initial
+	}: {
+		agents: Pick<AgentSummary, 'id' | 'hostname' | 'os_family' | 'client_id'>[];
+		onclose: () => void;
+		/** Prefill (e.g. from a script page's "Run"). */
+		initial?: { scriptId?: string };
+	} = $props();
 
 	const windowsOnly = $derived(agents.every((a) => a.os_family === 'windows'));
+	const ADHOC = '__adhoc';
 	let scripts = $state<Script[]>([]);
-	let scriptId = $state('');
+	let scriptId = $state(ADHOC);
+	$effect.pre(() => {
+		if (initial?.scriptId) scriptId = initial.scriptId;
+	});
 	let interpreter = $state<Interpreter>('bash');
 	let body = $state('');
+	let args = $state('');
 	let timeout = $state(300);
 	let busy = $state(false);
-	let error = $state('');
 
 	$effect(() => {
 		interpreter = windowsOnly ? 'powershell' : 'bash';
@@ -23,60 +44,64 @@
 	});
 
 	const selected = $derived(scripts.find((s) => s.id === scriptId));
+	const items = $derived([
+		{ value: ADHOC, label: 'Ad-hoc script', hint: 'type it below' },
+		...scripts.map((s) => ({ value: s.id, label: s.name, hint: `${interpreterLabel(s.interpreter)}${s.client_name ? ` · ${s.client_name}` : ''}` }))
+	]);
+	const argList = $derived(args.split('\n').map((a) => a.trim()).filter(Boolean));
 
-	async function run() {
+	async function run(e: SubmitEvent) {
+		e.preventDefault();
 		busy = true;
-		error = '';
 		try {
+			const ids = agents.map((a) => a.id);
 			const payload = selected
-				? { agent_ids: agents.map((a) => a.id), script_id: selected.id }
-				: { agent_ids: agents.map((a) => a.id), interpreter, body, timeout_secs: timeout };
-			const res = await api.post<{ jobs: { job_id: string }[] }>('/jobs', payload);
+				? { agent_ids: ids, script_id: selected.id, args: argList }
+				: { agent_ids: ids, interpreter, body, args: argList, timeout_secs: timeout };
+			const res = await api.post<{ jobs: { job_id: string; status: string }[]; skipped: string[] }>('/jobs', payload);
 			onclose();
+			const queued = res.jobs.filter((j) => j.status === 'queued').length;
+			toast.success(
+				`Started on ${plural(res.jobs.length, 'agent')}${queued ? ` (${queued} offline, queued)` : ''}${res.skipped.length ? `; ${res.skipped.length} skipped` : ''}.`
+			);
 			await goto(res.jobs.length === 1 ? `/jobs/${res.jobs[0].job_id}` : '/jobs');
 		} catch (e) {
-			error = (e as Error).message;
+			toast.error(e);
 		} finally {
 			busy = false;
 		}
 	}
 </script>
 
-<Modal title="Run script on {agents.length === 1 ? agents[0].hostname : `${agents.length} agents`}" {onclose} wide>
-	<div class="space-y-3">
-		<div>
-			<label class="label" for="script">Saved script</label>
-			<select id="script" class="input" bind:value={scriptId}>
-				<option value="">Ad-hoc script…</option>
-				{#each scripts as s (s.id)}<option value={s.id}>{s.name} ({s.interpreter}){s.client_name ? ` · ${s.client_name}` : ''}</option>{/each}
-			</select>
-		</div>
+<Modal title="Run script" description="On {agents.length === 1 ? agents[0].hostname : plural(agents.length, 'agent')}. Offline agents queue the job and run it when they reconnect." {onclose} size="lg">
+	<form id="run-script" class="space-y-4" onsubmit={run}>
+		<Field label="Script" id="rs-script">
+			<Combobox id="rs-script" bind:value={scriptId} {items} placeholder="Pick a saved script…" />
+		</Field>
 		{#if selected}
-			<pre class="max-h-64 overflow-auto rounded-md bg-slate-950 p-3 font-mono text-xs text-slate-300">{selected.body}</pre>
-		{:else}
-			<div class="grid grid-cols-2 gap-3">
-				<div>
-					<label class="label" for="interp">Interpreter</label>
-					<select id="interp" class="input" bind:value={interpreter}>
-						{#each interpreters as i (i.value)}<option value={i.value}>{i.label}</option>{/each}
-					</select>
-				</div>
-				<div>
-					<label class="label" for="timeout">Timeout (seconds)</label>
-					<input id="timeout" class="input" type="number" min="1" bind:value={timeout} />
-				</div>
-			</div>
 			<div>
-				<label class="label" for="body">Script</label>
-				<textarea id="body" class="input h-48 font-mono text-xs" spellcheck="false" bind:value={body}
-					placeholder={interpreter === 'powershell' ? 'Get-Service | Where-Object Status -eq Running' : 'uptime && df -h'}></textarea>
+				<div class="label">{interpreterLabel(selected.interpreter)} · timeout {selected.timeout_secs}s</div>
+				<pre class="code-block max-h-64">{selected.body}</pre>
 			</div>
+		{:else}
+			<div class="grid gap-3 sm:grid-cols-2">
+				<Field label="Interpreter" id="rs-interp">
+					<Select id="rs-interp" bind:value={interpreter} options={interpreters.map((i) => ({ value: i.value, label: i.label }))} />
+				</Field>
+				<Field label="Timeout (seconds)" id="rs-timeout">
+					<Input id="rs-timeout" type="number" min="1" max="86400" bind:value={timeout} />
+				</Field>
+			</div>
+			<Field label="Script body" id="rs-body">
+				<CodeEditor id="rs-body" bind:value={body} {interpreter} minHeight="12rem" />
+			</Field>
 		{/if}
-		{#if error}<p class="text-sm text-red-400">{error}</p>{/if}
-		<div class="flex justify-end gap-2">
-			<button class="btn-ghost" onclick={onclose}>Cancel</button>
-			<button class="btn-primary" disabled={busy || (!selected && !body.trim())} onclick={run}>{busy ? 'Starting…' : 'Run'}</button>
-		</div>
-		<p class="text-xs text-slate-500">Offline agents queue the job and run it when they reconnect.</p>
-	</div>
+		<Field label="Arguments" id="rs-args" hint="One per line, passed in order: $1… in sh/bash, $args in PowerShell, %1… in cmd, sys.argv in Python.">
+			<Textarea id="rs-args" rows={2} class="font-mono text-xs" spellcheck="false" bind:value={args} />
+		</Field>
+	</form>
+	{#snippet footer()}
+		<Button onclick={onclose}>Cancel</Button>
+		<Button variant="primary" type="submit" form="run-script" loading={busy} disabled={!selected && !body.trim()}>Run</Button>
+	{/snippet}
 </Modal>

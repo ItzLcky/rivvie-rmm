@@ -1,108 +1,108 @@
 <script lang="ts">
+	import { FileCode2, Plus, Search } from '@lucide/svelte';
 	import { api } from '#lib/api.js';
-	import { datetime, interpreters } from '#lib/format.js';
+	import { ago, interpreterLabel } from '#lib/format.js';
+	import { resource } from '#lib/resource.svelte.js';
+	import { clientId, clients, currentClient } from '#lib/scope.svelte.js';
 	import { can } from '#lib/session.svelte.js';
-	import type { Client, Interpreter, Script } from '#lib/types.js';
-	import Modal from '#lib/components/Modal.svelte';
+	import type { Script } from '#lib/types.js';
+	import { param, setParams, sortState } from '#lib/url.svelte.js';
+	import Badge from '#lib/ui/Badge.svelte';
+	import Button from '#lib/ui/Button.svelte';
+	import DataTable, { type Column } from '#lib/ui/DataTable.svelte';
+	import EmptyState from '#lib/ui/EmptyState.svelte';
+	import ErrorState from '#lib/ui/ErrorState.svelte';
+	import Input from '#lib/ui/Input.svelte';
+	import PageHeader from '#lib/ui/PageHeader.svelte';
+	import Select from '#lib/ui/Select.svelte';
 
-	type Draft = { id?: string; name: string; description: string; interpreter: Interpreter; body: string; timeout_secs: number; client_id: string | null };
-	let scripts = $state<Script[]>([]);
-	let clients = $state<Client[]>([]);
-	let draft = $state<Draft | null>(null);
-	let error = $state('');
-
-	const load = () => api.get<Script[]>('/scripts').then((s) => (scripts = s));
+	const res = resource(() => api.get<Script[]>('/scripts'));
+	const sort = sortState('name');
+	let q = $state(param('q'));
 	$effect(() => {
-		load();
-		api.get<Client[]>('/clients').then((c) => (clients = c));
+		const v = q;
+		const t = setTimeout(() => setParams({ q: v.trim() || null }), 250);
+		return () => clearTimeout(t);
 	});
+	const interp = $derived(param('interpreter'));
+	const scoped = $derived(currentClient());
 
-	// MSP-wide scripts run on every client, so only admins change them.
-	const canEdit = (clientId: string | null) => (clientId === null ? can('admin') : can('technician'));
-	const blank = (): Draft => ({
-		name: '', description: '', interpreter: 'powershell', body: '', timeout_secs: 300,
-		client_id: can('admin') ? null : (clients[0]?.id ?? null)
+	const keyed: Record<string, (s: Script) => string | number> = {
+		name: (s) => s.name.toLowerCase(),
+		scope: (s) => (s.client_name ?? '').toLowerCase(),
+		interpreter: (s) => s.interpreter,
+		timeout: (s) => s.timeout_secs,
+		updated: (s) => s.updated_at
+	};
+	const rows = $derived.by(() => {
+		const f = param('q').toLowerCase();
+		const cid = clientId();
+		const list = (res.data ?? []).filter(
+			(s) =>
+				(!f || `${s.name} ${s.description}`.toLowerCase().includes(f)) &&
+				(!interp || s.interpreter === interp) &&
+				// A client scope shows MSP-wide scripts plus that client's own.
+				(!cid || !s.client_id || s.client_id === cid)
+		);
+		const k = keyed[sort.key] ?? keyed.name;
+		const sign = sort.dir === 'asc' ? 1 : -1;
+		return [...list].sort((a, b) => (k(a) < k(b) ? -sign : k(a) > k(b) ? sign : 0));
 	});
-	const edit = (s: Script): Draft => ({
-		id: s.id, name: s.name, description: s.description, interpreter: s.interpreter, body: s.body, timeout_secs: s.timeout_secs, client_id: s.client_id
-	});
-
-	async function save() {
-		if (!draft) return;
-		error = '';
-		try {
-			const { id, ...body } = draft;
-			if (id) await api.put(`/scripts/${id}`, body);
-			else await api.post('/scripts', body);
-			draft = null;
-			await load();
-		} catch (e) {
-			error = (e as Error).message;
-		}
-	}
-	async function remove(s: Script) {
-		if (!confirm(`Delete script "${s.name}"?`)) return;
-		await api.del(`/scripts/${s.id}`);
-		await load();
-	}
+	const canCreate = $derived(can('admin') || (can('technician') && clients.list.length > 0));
 </script>
 
-<div class="mb-4 flex items-center justify-between">
-	<h1 class="text-xl font-semibold">Script library</h1>
-	{#if can('admin') || (can('technician') && clients.length)}<button class="btn-primary" onclick={() => (draft = blank())}>New script</button>{/if}
-</div>
+<PageHeader title="Scripts" count={res.data ? rows.length : null} description={scoped ? `MSP-wide scripts, plus scripts for ${scoped.name} only.` : undefined}>
+	{#snippet actions()}
+		{#if canCreate}<Button variant="primary" icon={Plus} href="/scripts/new">New script</Button>{/if}
+	{/snippet}
+</PageHeader>
 
-<div class="card overflow-x-auto">
-	<table class="table">
-		<thead><tr><th>Name</th><th>Scope</th><th>Interpreter</th><th>Timeout</th><th>Updated</th><th></th></tr></thead>
-		<tbody>
-			{#each scripts as s (s.id)}
-				<tr>
-					<td><div class="font-medium">{s.name}</div><div class="text-xs text-slate-500">{s.description}</div></td>
-					<td class="text-xs">{#if s.client_name}{s.client_name}{:else}<span class="text-slate-400">All clients</span>{/if}</td>
-					<td>{interpreters.find((i) => i.value === s.interpreter)?.label ?? s.interpreter}</td>
-					<td class="tabular-nums">{s.timeout_secs}s</td>
-					<td class="text-xs text-slate-400">{datetime(s.updated_at)}</td>
-					<td class="text-right">
-						{#if canEdit(s.client_id)}
-							<button class="btn-ghost py-1 text-xs" onclick={() => (draft = edit(s))}>Edit</button>
-							<button class="btn-danger ml-1 py-1 text-xs" onclick={() => remove(s)}>Delete</button>
-						{/if}
-					</td>
-				</tr>
+{#if res.error && !res.data}
+	<div class="card"><ErrorState error={res.error} onretry={() => res.reload()} /></div>
+{:else}
+	{#snippet nameCell(s: Script)}
+		<a class="hover:text-accent font-medium" href="/scripts/{s.id}">{s.name}</a>
+		{#if s.description}<div class="text-muted max-w-md truncate text-xs">{s.description}</div>{/if}
+	{/snippet}
+	{#snippet scopeCell(s: Script)}{#if s.client_name}<Badge>{s.client_name}</Badge>{:else}<Badge tone="accent">All clients</Badge>{/if}{/snippet}
+	{#snippet interpCell(s: Script)}{interpreterLabel(s.interpreter)}{/snippet}
+	{#snippet timeoutCell(s: Script)}{s.timeout_secs}s{/snippet}
+	{#snippet updatedCell(s: Script)}<span class="text-muted text-xs">{ago(s.updated_at)}</span>{/snippet}
+
+	<DataTable
+		id="scripts"
+		caption="Scripts"
+		{rows}
+		key={(s) => s.id}
+		loading={res.loading}
+		{sort}
+		rowHref={(s) => `/scripts/${s.id}`}
+		columns={[
+			{ id: 'name', label: 'Name', sort: 'name', cell: nameCell, hideable: false },
+			{ id: 'scope', label: 'Scope', sort: 'scope', cell: scopeCell, from: 'sm' },
+			{ id: 'interpreter', label: 'Interpreter', sort: 'interpreter', cell: interpCell, from: 'md' },
+			{ id: 'timeout', label: 'Timeout', sort: 'timeout', cell: timeoutCell, align: 'right', from: 'lg' },
+			{ id: 'updated', label: 'Updated', sort: 'updated', cell: updatedCell, from: 'md' }
+		] satisfies Column<Script>[]}
+	>
+		{#snippet toolbar()}
+			<Input icon={Search} data-search placeholder="Name or description…" aria-label="Search scripts" class="w-full sm:w-64" bind:value={q} />
+			<Select
+				aria-label="Interpreter"
+				class="w-auto"
+				value={interp}
+				onchange={(e) => setParams({ interpreter: e.currentTarget.value })}
+				options={[{ value: '', label: 'Any interpreter' }, ...['bash', 'sh', 'powershell', 'cmd', 'python'].map((v) => ({ value: v, label: interpreterLabel(v) }))]}
+			/>
+		{/snippet}
+		{#snippet empty()}
+			{#if param('q') || interp}
+				<EmptyState compact title="No scripts match" />
 			{:else}
-				<tr><td colspan="6" class="py-8 text-center text-slate-500">No saved scripts. Run them from the Agents page once created.</td></tr>
-			{/each}
-		</tbody>
-	</table>
-</div>
-
-{#if draft}
-	<Modal title={draft.id ? 'Edit script' : 'New script'} onclose={() => (draft = null)} wide>
-		<div class="space-y-3">
-			<div class="grid grid-cols-3 gap-3">
-				<div class="col-span-2"><label class="label" for="n">Name</label><input id="n" class="input" bind:value={draft.name} /></div>
-				<div>
-					<label class="label" for="i">Interpreter</label>
-					<select id="i" class="input" bind:value={draft.interpreter}>
-						{#each interpreters as i (i.value)}<option value={i.value}>{i.label}</option>{/each}
-					</select>
-				</div>
-			</div>
-			<div>
-				<label class="label" for="sc">Scope</label>
-				<select id="sc" class="input" bind:value={draft.client_id}>
-					{#if can('admin')}<option value={null}>All clients (MSP-wide)</option>{/if}
-					{#each clients as c (c.id)}<option value={c.id}>{c.name} only</option>{/each}
-				</select>
-			</div>
-			<div class="grid grid-cols-3 gap-3">
-				<div class="col-span-2"><label class="label" for="d">Description</label><input id="d" class="input" bind:value={draft.description} /></div>
-				<div><label class="label" for="t">Timeout (s)</label><input id="t" class="input" type="number" min="1" bind:value={draft.timeout_secs} /></div>
-			</div>
-			<div><label class="label" for="b">Body</label><textarea id="b" class="input h-72 font-mono text-xs" spellcheck="false" bind:value={draft.body}></textarea></div>
-			{#if error}<p class="text-sm text-red-400">{error}</p>{/if}
-			<div class="flex justify-end gap-2"><button class="btn-ghost" onclick={() => (draft = null)}>Cancel</button><button class="btn-primary" onclick={save}>Save</button></div>
-		</div>
-	</Modal>
+				<EmptyState icon={FileCode2} title="No saved scripts" description="Save scripts you run often. Run them on one agent, a selection, or from the command palette.">
+					{#snippet action()}{#if canCreate}<Button variant="primary" icon={Plus} href="/scripts/new">New script</Button>{/if}{/snippet}
+				</EmptyState>
+			{/if}
+		{/snippet}
+	</DataTable>
 {/if}

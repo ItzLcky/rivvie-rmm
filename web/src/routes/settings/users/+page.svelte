@@ -1,190 +1,210 @@
 <script lang="ts">
+	import { Building2, KeyRound, MonitorSmartphone, ShieldOff, UserCheck, UserPlus, UserX } from '@lucide/svelte';
 	import { api } from '#lib/api.js';
+	import { confirmAction } from '#lib/confirm.svelte.js';
 	import { ago } from '#lib/format.js';
+	import { resource } from '#lib/resource.svelte.js';
+	import { clients } from '#lib/scope.svelte.js';
 	import { session } from '#lib/session.svelte.js';
-	import Modal from '#lib/components/Modal.svelte';
-	import Sessions from '#lib/components/Sessions.svelte';
+	import { attempt } from '#lib/toast.svelte.js';
+	import Badge from '#lib/ui/Badge.svelte';
+	import Button from '#lib/ui/Button.svelte';
+	import DataTable, { type Column } from '#lib/ui/DataTable.svelte';
+	import Field from '#lib/ui/Field.svelte';
+	import Input from '#lib/ui/Input.svelte';
+	import Menu from '#lib/ui/Menu.svelte';
+	import Modal from '#lib/ui/Modal.svelte';
+	import Select from '#lib/ui/Select.svelte';
 	import ClientAccess from '#lib/components/ClientAccess.svelte';
-	import type { Client } from '#lib/types.js';
+	import Sessions from '#lib/components/Sessions.svelte';
 
 	interface UserRow {
 		id: string; email: string; name: string; role: string; disabled: boolean; totp_enabled: boolean; last_login_at: string | null;
 		all_clients: boolean; client_ids: string[];
 	}
-	let users = $state<UserRow[]>([]);
-	let clients = $state<Client[]>([]);
-	let adding = $state(false);
-	const blank = () => ({ email: '', name: '', password: '', role: 'technician', all_clients: true, client_ids: [] as string[] });
-	let form = $state(blank());
-	let error = $state('');
-
-	const load = () => api.get<UserRow[]>('/users').then((u) => (users = u));
-	$effect(() => {
-		load();
-		api.get<Client[]>('/clients').then((c) => (clients = c));
-	});
+	const res = resource(() => api.get<UserRow[]>('/users'));
 
 	function access(u: UserRow): string {
-		if (u.role === 'admin' || u.all_clients) return 'All';
-		const names = clients.filter((c) => u.client_ids.includes(c.id)).map((c) => c.name);
+		if (u.role === 'admin' || u.all_clients) return 'All clients';
+		const names = clients.list.filter((c) => u.client_ids.includes(c.id)).map((c) => c.name);
 		return names.length === 0 ? 'None' : names.length <= 2 ? names.join(', ') : `${names.length} clients`;
+	}
+
+	const blank = () => ({ email: '', name: '', password: '', role: 'technician', all_clients: true, client_ids: [] as string[] });
+	let adding = $state(false);
+	let form = $state(blank());
+	let busy = $state(false);
+	async function add(e: SubmitEvent) {
+		e.preventDefault();
+		busy = true;
+		const ok = await attempt(() => api.post('/users', form), `${form.email} added.`);
+		busy = false;
+		if (ok) {
+			adding = false;
+			form = blank();
+			res.reload();
+		}
 	}
 
 	let editingAccess = $state<UserRow | null>(null);
 	let accessForm = $state({ all_clients: true, client_ids: [] as string[] });
-	let accessError = $state('');
-	async function saveAccess() {
-		accessError = '';
-		try {
-			await api.put(`/users/${editingAccess!.id}/access`, accessForm);
+	async function saveAccess(e: SubmitEvent) {
+		e.preventDefault();
+		if (await attempt(() => api.put(`/users/${editingAccess!.id}/access`, accessForm), 'Client access saved.')) {
 			editingAccess = null;
-			await load();
-		} catch (e) {
-			accessError = (e as Error).message;
+			res.reload();
 		}
 	}
 
-	async function add() {
-		error = '';
-		try {
-			await api.post('/users', form);
-			adding = false;
-			form = blank();
-			await load();
-		} catch (e) {
-			error = (e as Error).message;
-		}
-	}
 	async function disable(u: UserRow) {
-		if (!confirm(`Disable ${u.email}? Their sessions will be revoked.`)) return;
-		await api.del(`/users/${u.id}`);
-		await load();
+		const ok = await confirmAction({ title: `Disable ${u.email}?`, message: 'They are signed out everywhere and can’t sign in until re-enabled.', confirmLabel: 'Disable', danger: true });
+		if (ok && (await attempt(() => api.del(`/users/${u.id}`), `${u.email} disabled.`))) res.reload();
 	}
 	async function enable(u: UserRow) {
-		await api.post(`/users/${u.id}/enable`);
-		await load();
+		if (await attempt(() => api.post(`/users/${u.id}/enable`), `${u.email} enabled.`)) res.reload();
 	}
 
 	let resetting = $state<UserRow | null>(null);
 	let resetPw = $state('');
-	let resetError = $state('');
-	async function reset() {
-		resetError = '';
-		try {
-			await api.post(`/users/${resetting!.id}/password`, { password: resetPw });
+	async function reset(e: SubmitEvent) {
+		e.preventDefault();
+		if (await attempt(() => api.post(`/users/${resetting!.id}/password`, { password: resetPw }), 'Password reset; they were signed out everywhere.')) {
 			resetting = null;
 			resetPw = '';
-		} catch (e) {
-			resetError = (e as Error).message;
 		}
 	}
 
 	let viewing = $state<UserRow | null>(null);
 
-	let resetting2fa = $state<UserRow | null>(null);
-	let reset2faError = $state('');
-	async function reset2fa() {
-		reset2faError = '';
-		try {
-			await api.del(`/users/${resetting2fa!.id}/totp`);
-			resetting2fa = null;
-			await load();
-		} catch (e) {
-			reset2faError = (e as Error).message;
-		}
+	async function reset2fa(u: UserRow) {
+		const ok = await confirmAction({
+			title: `Reset 2FA for ${u.email}?`,
+			message: 'Removes their authenticator and recovery codes and signs them out everywhere. Do this when they’ve lost their phone, after confirming it’s really them. If 2FA is required for them, they set it up again at their next sign-in.',
+			confirmLabel: 'Reset 2FA',
+			danger: true
+		});
+		if (ok && (await attempt(() => api.del(`/users/${u.id}/totp`), '2FA reset.'))) res.reload();
 	}
+
+	const roles: Record<string, string> = { admin: 'Admin', technician: 'Technician', readonly: 'Read-only' };
 </script>
 
-<div class="mb-4 flex items-center justify-between">
-	<p class="text-sm text-slate-400">People who can sign in to this console.</p>
-	<button class="btn-primary" onclick={() => (adding = true)}>Add user</button>
+<div class="mb-3 flex items-center justify-between gap-3">
+	<p class="text-muted text-sm">People who can sign in to this console.</p>
+	<Button variant="primary" icon={UserPlus} onclick={() => (adding = true)}>Add user</Button>
 </div>
-<div class="card overflow-x-auto">
-	<table class="table">
-		<thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Clients</th><th>2FA</th><th>Last login</th><th></th></tr></thead>
-		<tbody>
-			{#each users as u (u.id)}
-				<tr>
-					<td class={u.disabled ? 'opacity-50' : ''}>{u.name}</td><td class={u.disabled ? 'opacity-50' : ''}>{u.email}</td><td class="capitalize {u.disabled ? 'opacity-50' : ''}">{u.role}</td><td class="text-xs {u.disabled ? 'opacity-50' : ''} {access(u) === 'None' ? 'text-amber-300' : 'text-slate-300'}">{access(u)}</td><td class="text-xs {u.disabled ? 'opacity-50' : ''}">{#if u.totp_enabled}<span class="text-emerald-400">On</span>{:else if u.role === 'admin'}<span class="text-amber-300">Not set up</span>{:else}<span class="text-slate-500">Off</span>{/if}</td><td class="text-xs text-slate-400 {u.disabled ? 'opacity-50' : ''}">{ago(u.last_login_at)}</td>
-					<td class="text-right">
-						<div class="flex justify-end gap-1.5">
-							{#if u.id === session.user?.id}
-								<a class="btn-ghost py-1 text-xs" href="/account">Account</a>
-							{:else if u.disabled}
-								<span class="self-center text-xs text-slate-500">disabled</span>
-								<button class="btn-ghost py-1 text-xs" onclick={() => enable(u)}>Enable</button>
-							{:else}
-								{#if u.role !== 'admin'}<button class="btn-ghost py-1 text-xs" onclick={() => { editingAccess = u; accessForm = { all_clients: u.all_clients, client_ids: [...u.client_ids] }; accessError = ''; }}>Clients</button>{/if}
-								<button class="btn-ghost py-1 text-xs" onclick={() => (viewing = u)}>Sessions</button>
-								<button class="btn-ghost py-1 text-xs" onclick={() => { resetting = u; resetPw = ''; resetError = ''; }}>Reset password</button>
-								{#if u.totp_enabled}<button class="btn-ghost py-1 text-xs" onclick={() => { resetting2fa = u; reset2faError = ''; }}>Reset 2FA</button>{/if}
-								<button class="btn-danger py-1 text-xs" onclick={() => disable(u)}>Disable</button>
-							{/if}
-						</div>
-					</td>
-				</tr>
-			{/each}
-		</tbody>
-	</table>
-</div>
+
+{#snippet nameCell(u: UserRow)}
+	<div class={u.disabled ? 'opacity-60' : ''}>
+		<div class="font-medium">{u.name}{#if u.id === session.user?.id}<span class="text-muted font-normal"> (you)</span>{/if}</div>
+		<div class="text-muted text-xs">{u.email}</div>
+	</div>
+{/snippet}
+{#snippet roleCell(u: UserRow)}<span class={u.disabled ? 'opacity-60' : ''}>{roles[u.role] ?? u.role}</span>{/snippet}
+{#snippet accessCell(u: UserRow)}<span class="text-xs {access(u) === 'None' ? 'text-warning' : 'text-muted'}">{access(u)}</span>{/snippet}
+{#snippet mfaCell(u: UserRow)}
+	{#if u.totp_enabled}<Badge tone="success">On</Badge>{:else if u.role === 'admin'}<Badge tone="warning">Not set up</Badge>{:else}<Badge>Off</Badge>{/if}
+{/snippet}
+{#snippet statusCell(u: UserRow)}{#if u.disabled}<Badge tone="danger">Disabled</Badge>{:else}<span class="text-muted text-xs">{u.last_login_at ? `Signed in ${ago(u.last_login_at)}` : 'Never signed in'}</span>{/if}{/snippet}
+{#snippet actionsCell(u: UserRow)}
+	{#if u.id === session.user?.id}
+		<Button size="xs" variant="ghost" href="/account">Account</Button>
+	{:else if u.disabled}
+		<Button size="xs" icon={UserCheck} onclick={() => enable(u)}>Enable</Button>
+	{:else}
+		<Menu
+			label="Actions for {u.email}"
+			items={[
+				...(u.role !== 'admin'
+					? [{ label: 'Client access', icon: Building2, onSelect: () => ((editingAccess = u), (accessForm = { all_clients: u.all_clients, client_ids: [...u.client_ids] })) }]
+					: []),
+				{ label: 'Sessions', icon: MonitorSmartphone, onSelect: () => (viewing = u) },
+				{ label: 'Reset password', icon: KeyRound, onSelect: () => ((resetting = u), (resetPw = '')) },
+				...(u.totp_enabled ? [{ label: 'Reset 2FA', icon: ShieldOff, onSelect: () => reset2fa(u) }] : []),
+				{ separator: true },
+				{ label: 'Disable user', icon: UserX, danger: true, onSelect: () => disable(u) }
+			]}
+		/>
+	{/if}
+{/snippet}
+
+<DataTable
+	id="users"
+	caption="Users"
+	rows={res.data ?? []}
+	key={(u) => u.id}
+	loading={res.loading}
+	scroll={false}
+	columns={[
+		{ id: 'name', label: 'User', cell: nameCell, hideable: false },
+		{ id: 'role', label: 'Role', cell: roleCell },
+		{ id: 'access', label: 'Clients', cell: accessCell, from: 'md' },
+		{ id: 'mfa', label: '2FA', cell: mfaCell, from: 'sm' },
+		{ id: 'status', label: 'Last sign-in', cell: statusCell, from: 'lg' },
+		{ id: 'actions', label: '', cell: actionsCell, hideable: false, align: 'right', class: 'w-16' }
+	] satisfies Column<UserRow>[]}
+/>
 
 {#if adding}
 	<Modal title="Add user" onclose={() => (adding = false)}>
-		<div class="space-y-3">
-			<div><label class="label" for="ue">Email</label><input id="ue" class="input" type="email" bind:value={form.email} /></div>
-			<div><label class="label" for="un">Name</label><input id="un" class="input" bind:value={form.name} /></div>
-			<div><label class="label" for="up">Password (min 12 chars)</label><input id="up" class="input" type="password" autocomplete="new-password" bind:value={form.password} /></div>
-			<div>
-				<label class="label" for="ur">Role</label>
-				<select id="ur" class="input" bind:value={form.role}>
-					<option value="admin">Admin: everything, including users and clients</option>
-					<option value="technician">Technician: scripts, terminal, enrollment</option>
-					<option value="readonly">Read-only: view only</option>
-				</select>
-			</div>
+		<form id="add-user" class="space-y-3" onsubmit={add}>
+			<Field label="Email" id="ue" required><Input id="ue" type="email" required autocomplete="off" bind:value={form.email} /></Field>
+			<Field label="Name" id="un" required><Input id="un" required bind:value={form.name} /></Field>
+			<Field label="Password" id="up" hint="At least 12 characters. Share it over a separate channel." required>
+				<Input id="up" type="password" autocomplete="new-password" minlength={12} required bind:value={form.password} />
+			</Field>
+			<Field label="Role" id="ur">
+				<Select
+					id="ur"
+					bind:value={form.role}
+					options={[
+						{ value: 'admin', label: 'Admin: everything, including users and clients' },
+						{ value: 'technician', label: 'Technician: scripts, terminal, enrollment' },
+						{ value: 'readonly', label: 'Read-only: view only' }
+					]}
+				/>
+			</Field>
 			{#if form.role !== 'admin'}
-				<div><div class="label">Client access</div><ClientAccess {clients} bind:value={form} /></div>
+				<div><div class="label">Client access</div><ClientAccess clients={clients.list} bind:value={form} /></div>
 			{/if}
-			{#if error}<p class="text-sm text-red-400">{error}</p>{/if}
-			<div class="flex justify-end gap-2"><button class="btn-ghost" onclick={() => (adding = false)}>Cancel</button><button class="btn-primary" onclick={add}>Create</button></div>
-		</div>
+		</form>
+		{#snippet footer()}
+			<Button onclick={() => (adding = false)}>Cancel</Button>
+			<Button variant="primary" type="submit" form="add-user" loading={busy}>Create user</Button>
+		{/snippet}
 	</Modal>
 {/if}
 
 {#if editingAccess}
-	<Modal title="Client access for {editingAccess.email}" onclose={() => (editingAccess = null)}>
-		<div class="space-y-3">
-			<p class="text-sm text-slate-400">They only see agents, sites, jobs and client scripts of these clients. MSP-wide scripts stay visible. Takes effect on their next request.</p>
-			<ClientAccess {clients} bind:value={accessForm} />
-			{#if accessError}<p class="text-sm text-red-400">{accessError}</p>{/if}
-			<div class="flex justify-end gap-2"><button class="btn-ghost" onclick={() => (editingAccess = null)}>Cancel</button><button class="btn-primary" onclick={saveAccess}>Save</button></div>
-		</div>
+	<Modal title="Client access" description={editingAccess.email} onclose={() => (editingAccess = null)}>
+		<form id="access" class="space-y-3" onsubmit={saveAccess}>
+			<p class="text-muted text-sm">They only see agents, sites, jobs and client scripts of these clients. MSP-wide scripts stay visible. Takes effect on their next request.</p>
+			<ClientAccess clients={clients.list} bind:value={accessForm} />
+		</form>
+		{#snippet footer()}
+			<Button onclick={() => (editingAccess = null)}>Cancel</Button>
+			<Button variant="primary" type="submit" form="access">Save</Button>
+		{/snippet}
 	</Modal>
 {/if}
 
 {#if resetting}
-	<Modal title="Reset password for {resetting.email}" onclose={() => (resetting = null)}>
-		<form class="space-y-3" onsubmit={(e) => { e.preventDefault(); reset(); }}>
-			<p class="text-sm text-slate-400">Sets a new password and signs them out of every session. Share it with them over a separate channel.</p>
-			<div><label class="label" for="rp">New password (min 12 chars)</label><input id="rp" class="input" type="password" autocomplete="new-password" bind:value={resetPw} /></div>
-			{#if resetError}<p class="text-sm text-red-400">{resetError}</p>{/if}
-			<div class="flex justify-end gap-2"><button type="button" class="btn-ghost" onclick={() => (resetting = null)}>Cancel</button><button class="btn-primary">Reset password</button></div>
+	<Modal title="Reset password" description={resetting.email} onclose={() => (resetting = null)} size="sm">
+		<form id="reset" class="space-y-3" onsubmit={reset}>
+			<p class="text-muted text-sm">Sets a new password and signs them out of every session. Share it with them over a separate channel.</p>
+			<Field label="New password" id="rp" hint="At least 12 characters." required>
+				<Input id="rp" type="password" autocomplete="new-password" minlength={12} required bind:value={resetPw} />
+			</Field>
 		</form>
+		{#snippet footer()}
+			<Button onclick={() => (resetting = null)}>Cancel</Button>
+			<Button variant="primary" type="submit" form="reset">Reset password</Button>
+		{/snippet}
 	</Modal>
 {/if}
 
 {#if viewing}
-	<Modal title="Sessions for {viewing.email}" onclose={() => (viewing = null)}>
-		<Sessions base="/users/{viewing.id}/sessions" revokeAllLabel="Revoke all" />
-	</Modal>
-{/if}
-
-{#if resetting2fa}
-	<Modal title="Reset 2FA for {resetting2fa.email}" onclose={() => (resetting2fa = null)}>
-		<div class="space-y-3">
-			<p class="text-sm text-slate-400">Removes their authenticator and recovery codes and signs them out everywhere. Do this when they've lost their phone, after confirming it's really them. If 2FA is required for them, they set it up again at their next sign-in.</p>
-			{#if reset2faError}<p class="text-sm text-red-400">{reset2faError}</p>{/if}
-			<div class="flex justify-end gap-2"><button class="btn-ghost" onclick={() => (resetting2fa = null)}>Cancel</button><button class="btn-danger" onclick={reset2fa}>Reset 2FA</button></div>
-		</div>
+	<Modal title="Sessions" description={viewing.email} onclose={() => (viewing = null)}>
+		<Sessions base="/users/{viewing.id}/sessions" revokeAllLabel="Sign out everywhere" />
 	</Modal>
 {/if}

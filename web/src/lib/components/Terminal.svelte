@@ -3,15 +3,28 @@
 	import { Terminal } from '@xterm/xterm';
 	import { FitAddon } from '@xterm/addon-fit';
 	import '@xterm/xterm/css/xterm.css';
+	import { AArrowDown, AArrowUp, Maximize2, Minimize2, RotateCcw } from '@lucide/svelte';
+	import { prefs, setPref } from '#lib/prefs.svelte.js';
+	import { cx } from '#lib/format.js';
+	import Button from '#lib/ui/Button.svelte';
+	import IconButton from '#lib/ui/IconButton.svelte';
 
-	let { agentId }: { agentId: string } = $props();
+	/** The browser terminal. Loaded only when its tab opens (xterm.js is large). */
+	let { agentId, hostname }: { agentId: string; hostname: string } = $props();
 
 	let el: HTMLDivElement;
 	let status = $state<'connecting' | 'open' | 'closed'>('connecting');
 	let reason = $state('');
+	let full = $state(false);
 	let term: Terminal | undefined;
+	let fit: FitAddon | undefined;
 	let ws: WebSocket | undefined;
 	let ro: ResizeObserver | undefined;
+	const size = $derived(prefs.terminalFontSize ?? 13);
+
+	function css(name: string) {
+		return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+	}
 
 	function connect() {
 		term?.dispose();
@@ -21,11 +34,12 @@
 
 		term = new Terminal({
 			cursorBlink: true,
-			fontFamily: 'JetBrains Mono, ui-monospace, Menlo, monospace',
-			fontSize: 13,
-			theme: { background: '#020617', foreground: '#e2e8f0', cursor: '#38bdf8', selectionBackground: '#334155' }
+			fontFamily: "'JetBrains Mono Variable', ui-monospace, Menlo, Consolas, monospace",
+			fontSize: size,
+			scrollback: 5000,
+			theme: { background: css('--terminal-bg'), foreground: css('--terminal-fg'), cursor: css('--accent'), selectionBackground: '#3b4a63' }
 		});
-		const fit = new FitAddon();
+		fit = new FitAddon();
 		term.loadAddon(fit);
 		term.open(el);
 		fit.fit();
@@ -56,8 +70,17 @@
 		term.onResize(({ cols, rows }) => ws?.readyState === WebSocket.OPEN && ws.send(JSON.stringify({ type: 'resize', cols, rows })));
 
 		ro?.disconnect();
-		ro = new ResizeObserver(() => fit.fit());
+		ro = new ResizeObserver(() => fit?.fit());
 		ro.observe(el);
+	}
+
+	function setSize(n: number) {
+		const v = Math.min(22, Math.max(10, n));
+		setPref('terminalFontSize', v);
+		if (term) {
+			term.options.fontSize = v;
+			fit?.fit();
+		}
 	}
 
 	onMount(connect);
@@ -68,12 +91,27 @@
 	});
 </script>
 
-<div class="card overflow-hidden">
-	<div class="flex items-center justify-between border-b border-slate-800 px-3 py-2 text-xs">
-		<span class={status === 'open' ? 'text-emerald-400' : status === 'connecting' ? 'text-amber-400' : 'text-slate-500'}>
-			● {status === 'open' ? 'Connected' : status === 'connecting' ? 'Connecting…' : 'Disconnected'}
+<svelte:window onkeydown={(e) => full && e.key === 'Escape' && e.shiftKey && (full = false)} />
+
+<div class={cx('card flex flex-col overflow-hidden', full ? 'fixed inset-2 z-40' : 'h-[calc(100dvh-14rem)] min-h-80')}>
+	<div class="border-border flex items-center gap-2 border-b px-3 py-1.5 text-xs">
+		<span class={cx('inline-flex items-center gap-1.5 font-medium', status === 'open' ? 'text-success' : status === 'connecting' ? 'text-warning' : 'text-muted')}>
+			<span class={cx('size-2 rounded-full', status === 'open' ? 'bg-success' : status === 'connecting' ? 'bg-warning animate-pulse' : 'bg-subtle')}></span>
+			{status === 'open' ? 'Connected' : status === 'connecting' ? 'Connecting…' : 'Disconnected'}
 		</span>
-		{#if status === 'closed'}<button class="btn-ghost py-0.5 text-xs" onclick={connect}>Reconnect</button>{/if}
+		<span class="text-muted truncate font-mono">{hostname}</span>
+		<div class="ml-auto flex items-center gap-0.5">
+			<IconButton icon={AArrowDown} label="Smaller text" size="sm" onclick={() => setSize(size - 1)} />
+			<span class="text-muted w-6 text-center tabular">{size}</span>
+			<IconButton icon={AArrowUp} label="Larger text" size="sm" onclick={() => setSize(size + 1)} />
+			<IconButton icon={full ? Minimize2 : Maximize2} label={full ? 'Exit full screen (Shift+Esc)' : 'Full screen'} size="sm" onclick={() => ((full = !full), setTimeout(() => fit?.fit(), 50))} />
+		</div>
 	</div>
-	<div bind:this={el} class="h-[60vh] bg-[#020617] p-2"></div>
+	{#if status === 'closed'}
+		<div class="border-border bg-warning-soft text-warning flex flex-wrap items-center gap-3 border-b px-3 py-2 text-sm" role="status">
+			<span class="flex-1">The session ended{reason ? `: ${reason}` : ''}.</span>
+			<Button size="sm" icon={RotateCcw} onclick={connect}>Reconnect</Button>
+		</div>
+	{/if}
+	<div bind:this={el} class="min-h-0 flex-1 p-2" style="background: var(--terminal-bg)"></div>
 </div>

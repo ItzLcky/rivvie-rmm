@@ -2,7 +2,9 @@ mod agent_ws;
 mod api;
 mod auth;
 mod error;
+mod events;
 mod hub;
+mod paging;
 mod ratelimit;
 mod shell_ws;
 mod state;
@@ -284,6 +286,9 @@ async fn housekeeping(state: Arc<AppState>) {
             .execute(db)
             .await,
         ];
+        if results.iter().any(|r| r.as_ref().is_ok_and(|r| r.rows_affected() > 0)) {
+            state.hub.publish(hub::Event::Jobs);
+        }
         // The rest is bulk deletion; hourly is plenty.
         if runs.is_multiple_of(12) {
             state.limits.prune();

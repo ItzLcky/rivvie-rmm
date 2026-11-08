@@ -1,8 +1,17 @@
 <script lang="ts">
-	let { online }: { online: boolean } = $props();
+	import { cx } from '#lib/format.js';
+
+	/**
+	 * Online/offline: a dot plus the word, never colour alone. The text stays neutral (online is
+	 * the normal state and shouldn't shout); only the dot carries the colour. It inherits the
+	 * cell's font size, and sits in a 20 px box like Badge so rows stay on one baseline.
+	 */
+	let { online, size = 'sm' }: { online: boolean; size?: 'sm' | 'md' } = $props();
 </script>
 
-<span class="inline-flex items-center gap-1.5 text-xs {online ? 'text-emerald-400' : 'text-slate-500'}">
-	<span class="size-2 rounded-full {online ? 'bg-emerald-400 shadow-[0_0_6px] shadow-emerald-400/60' : 'bg-slate-600'}"></span>
+<span class={cx('inline-flex h-5 items-center gap-1.5 align-middle leading-5 whitespace-nowrap', size === 'md' && 'text-sm', online ? 'text-fg' : 'text-muted')}>
+	<span class={cx('relative inline-flex size-2 shrink-0 rounded-full', online ? 'bg-success' : 'border-subtle border-[1.5px]')}>
+		{#if online}<span class="bg-success absolute inset-0 animate-ping rounded-full opacity-40 [animation-duration:2.5s]"></span>{/if}
+	</span>
 	{online ? 'Online' : 'Offline'}
 </span>

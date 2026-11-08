@@ -2,6 +2,11 @@
 	import { api } from '#lib/api.js';
 	import { session } from '#lib/session.svelte.js';
 	import type { User } from '#lib/types.js';
+	import Button from '#lib/ui/Button.svelte';
+	import Field from '#lib/ui/Field.svelte';
+	import Input from '#lib/ui/Input.svelte';
+	import Badge from '#lib/ui/Badge.svelte';
+	import Skeleton from '#lib/ui/Skeleton.svelte';
 
 	interface Status { enabled: boolean; required: boolean; recovery_codes_left: number }
 	interface Setup { secret: string; uri: string; qr_svg: string }
@@ -106,70 +111,73 @@
 	}
 </script>
 
-{#if status}
+{#if !status}
+	<Skeleton lines={2} />
+{:else}
 	{#if session.user?.mfa_setup_required && step !== 'codes'}
-		<p class="mb-3 rounded-md border border-amber-800 bg-amber-950/40 px-3 py-2 text-sm text-amber-200">
+		<p class="border-warning/40 bg-warning-soft text-warning mb-4 rounded-md border px-3 py-2 text-sm" role="status">
 			Your account needs two-factor authentication. Set it up to continue using the dashboard.
 		</p>
 	{/if}
 
 	{#if step === 'codes'}
-		<p class="mb-2 text-sm text-slate-300">Save these recovery codes somewhere safe. Each one signs you in once if you lose your phone. They won't be shown again.</p>
-		<div class="mb-3 grid grid-cols-2 gap-1 rounded-md bg-slate-950 p-3 font-mono text-sm">
+		<p class="mb-3 text-sm">Save these recovery codes somewhere safe. Each one signs you in once if you lose your phone. They won't be shown again.</p>
+		<div class="code-block mb-3 grid grid-cols-2 gap-1 text-sm">
 			{#each codes as c (c)}<span>{c}</span>{/each}
 		</div>
-		{#if notice}<p class="mb-2 text-xs text-slate-400">{notice}</p>{/if}
+		{#if notice}<p class="text-muted mb-3 text-xs">{notice}</p>{/if}
 		<div class="flex justify-end gap-2">
-			<button class="btn-ghost" onclick={copy}>{copied ? 'Copied' : 'Copy'}</button>
-			<button class="btn-primary" onclick={done}>I've saved them</button>
+			<Button onclick={copy}>{copied ? 'Copied' : 'Copy'}</Button>
+			<Button variant="primary" onclick={done}>I've saved them</Button>
 		</div>
 	{:else if step === 'password'}
 		<form class="space-y-3" onsubmit={start}>
 			<input type="email" class="hidden" autocomplete="username" value={session.user?.email ?? ''} readonly />
-			<div><label class="label" for="tp">Confirm your password</label><input id="tp" class="input" type="password" autocomplete="current-password" required bind:value={password} /></div>
-			{#if error}<p class="text-sm text-red-400">{error}</p>{/if}
-			<div class="flex justify-end gap-2"><button type="button" class="btn-ghost" onclick={() => go('idle')}>Cancel</button><button class="btn-primary" disabled={busy}>Continue</button></div>
+			<Field label="Confirm your password" id="tp" {error}><Input id="tp" type="password" autocomplete="current-password" required bind:value={password} invalid={!!error} /></Field>
+			<div class="flex justify-end gap-2"><Button onclick={() => go('idle')}>Cancel</Button><Button variant="primary" type="submit" loading={busy}>Continue</Button></div>
 		</form>
 	{:else if step === 'scan' && setup}
-		<form class="space-y-3" onsubmit={confirm}>
-			<p class="text-sm text-slate-300">Scan this with an authenticator app (1Password, Bitwarden, Google Authenticator, Authy…), then enter the code it shows.</p>
+		<form class="space-y-4" onsubmit={confirm}>
+			<p class="text-sm">Scan this with an authenticator app (1Password, Bitwarden, Google Authenticator, Authy…), then enter the code it shows.</p>
 			<div class="flex flex-wrap items-start gap-4">
 				<!-- Server-rendered SVG from our own API. -->
-				<div class="size-44 shrink-0 overflow-hidden rounded-md bg-white p-1 [&>svg]:size-full">{@html setup.qr_svg}</div>
-				<div class="min-w-0 flex-1 space-y-1 text-xs text-slate-400">
+				<div class="border-border size-44 shrink-0 overflow-hidden rounded-md border bg-white p-1 [&>svg]:size-full">{@html setup.qr_svg}</div>
+				<div class="text-muted min-w-0 flex-1 space-y-1 text-xs">
 					<div>Can't scan? Enter this key:</div>
-					<code class="block rounded bg-slate-950 p-2 font-mono text-sm break-all text-slate-200 select-all">{setup.secret.match(/.{1,4}/g)?.join(' ')}</code>
+					<code class="code-block block text-sm break-all select-all">{setup.secret.match(/.{1,4}/g)?.join(' ')}</code>
 				</div>
 			</div>
-			<div><label class="label" for="tc">6-digit code</label><input id="tc" class="input max-w-40 font-mono tracking-widest" inputmode="numeric" autocomplete="one-time-code" maxlength="6" required bind:value={code} /></div>
-			{#if error}<p class="text-sm text-red-400">{error}</p>{/if}
-			<div class="flex justify-end gap-2"><button type="button" class="btn-ghost" onclick={() => go('idle')}>Cancel</button><button class="btn-primary" disabled={busy}>Turn on</button></div>
+			<Field label="6-digit code" id="tc" {error}>
+				<Input id="tc" class="max-w-40 font-mono tracking-widest" inputmode="numeric" autocomplete="one-time-code" maxlength={6} required bind:value={code} invalid={!!error} />
+			</Field>
+			<div class="flex justify-end gap-2"><Button onclick={() => go('idle')}>Cancel</Button><Button variant="primary" type="submit" loading={busy}>Turn on</Button></div>
 		</form>
 	{:else if step === 'disable'}
 		<form class="space-y-3" onsubmit={turnOff}>
 			<input type="email" class="hidden" autocomplete="username" value={session.user?.email ?? ''} readonly />
-			{#if status.required}<p class="text-sm text-amber-300">Two-factor is required for your account, so you'll have to set it up again straight away (e.g. on a new phone).</p>{/if}
-			<div><label class="label" for="dp">Password</label><input id="dp" class="input" type="password" autocomplete="current-password" required bind:value={password} /></div>
-			<div><label class="label" for="dc">Code from your app, or a recovery code</label><input id="dc" class="input font-mono" autocomplete="one-time-code" required bind:value={code} /></div>
-			{#if error}<p class="text-sm text-red-400">{error}</p>{/if}
-			<div class="flex justify-end gap-2"><button type="button" class="btn-ghost" onclick={() => go('idle')}>Cancel</button><button class="btn-danger" disabled={busy}>Turn off</button></div>
+			{#if status.required}<p class="text-warning text-sm">Two-factor is required for your account, so you'll have to set it up again straight away (e.g. on a new phone).</p>{/if}
+			<Field label="Password" id="dp"><Input id="dp" type="password" autocomplete="current-password" required bind:value={password} /></Field>
+			<Field label="Code from your app, or a recovery code" id="dc" {error}><Input id="dc" class="font-mono" autocomplete="one-time-code" required bind:value={code} invalid={!!error} /></Field>
+			<div class="flex justify-end gap-2"><Button onclick={() => go('idle')}>Cancel</Button><Button variant="danger" type="submit" loading={busy}>Turn off</Button></div>
 		</form>
 	{:else if step === 'regen'}
 		<form class="space-y-3" onsubmit={regen}>
-			<p class="text-sm text-slate-400">Your current recovery codes stop working.</p>
-			<div><label class="label" for="rc">Code from your app</label><input id="rc" class="input max-w-40 font-mono tracking-widest" autocomplete="one-time-code" required bind:value={code} /></div>
-			{#if error}<p class="text-sm text-red-400">{error}</p>{/if}
-			<div class="flex justify-end gap-2"><button type="button" class="btn-ghost" onclick={() => go('idle')}>Cancel</button><button class="btn-primary" disabled={busy}>New codes</button></div>
+			<p class="text-muted text-sm">Your current recovery codes stop working.</p>
+			<Field label="Code from your app" id="rc" {error}><Input id="rc" class="max-w-40 font-mono tracking-widest" autocomplete="one-time-code" required bind:value={code} invalid={!!error} /></Field>
+			<div class="flex justify-end gap-2"><Button onclick={() => go('idle')}>Cancel</Button><Button variant="primary" type="submit" loading={busy}>New codes</Button></div>
 		</form>
 	{:else if status.enabled}
-		<p class="mb-3 text-sm"><span class="text-emerald-400">On.</span> <span class="text-slate-400">{status.recovery_codes_left} recovery code{status.recovery_codes_left === 1 ? '' : 's'} left.</span></p>
-		{#if status.recovery_codes_left <= 3}<p class="mb-3 text-xs text-amber-300">Running low on recovery codes: generate new ones.</p>{/if}
-		<div class="flex justify-end gap-2">
-			<button class="btn-ghost" onclick={() => go('regen')}>New recovery codes</button>
-			<button class="btn-danger" onclick={() => go('disable')}>Turn off</button>
+		<p class="mb-3 flex items-center gap-2 text-sm">
+			<Badge tone="success">On</Badge>
+			<span class="text-muted">{status.recovery_codes_left} recovery code{status.recovery_codes_left === 1 ? '' : 's'} left</span>
+		</p>
+		{#if status.recovery_codes_left <= 3}<p class="text-warning mb-3 text-xs">Running low on recovery codes: generate new ones.</p>{/if}
+		<div class="flex flex-wrap justify-end gap-2">
+			<Button onclick={() => go('regen')}>New recovery codes</Button>
+			<Button variant="danger-ghost" onclick={() => go('disable')}>Turn off</Button>
 		</div>
 	{:else}
-		<p class="mb-3 text-sm text-slate-400">{status.required ? 'Required for your account.' : 'Off.'} Sign-in will ask for a code from your phone as well as your password.</p>
-		<div class="flex justify-end"><button class="btn-primary" onclick={() => go('password')}>Set up</button></div>
+		<p class="text-muted mb-3 text-sm">{status.required ? 'Required for your account.' : 'Off.'} Sign-in will ask for a code from your phone as well as your password.</p>
+		<div class="flex justify-end"><Button variant="primary" onclick={() => go('password')}>Set up</Button></div>
 	{/if}
 {/if}

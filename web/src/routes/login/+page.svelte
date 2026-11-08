@@ -5,6 +5,10 @@
 	import { brand, session } from '#lib/session.svelte.js';
 	import type { User } from '#lib/types.js';
 	import favicon from '#lib/assets/favicon.svg';
+	import { loadPrefs } from '#lib/prefs.svelte.js';
+	import Button from '#lib/ui/Button.svelte';
+	import Field from '#lib/ui/Field.svelte';
+	import Input from '#lib/ui/Input.svelte';
 
 	let email = $state('');
 	let password = $state('');
@@ -22,6 +26,7 @@
 			const res = await api.post<{ user: User }>('/auth/login', { email, password, code: needCode ? code : undefined });
 			session.user = res.user;
 			session.loaded = true;
+			loadPrefs(res.user.preferences);
 			const next = page.url.searchParams.get('next');
 			await goto(res.user.mfa_setup_required ? '/account' : next && next.startsWith('/') && !next.startsWith('//') ? next : '/');
 		} catch (e) {
@@ -45,30 +50,27 @@
 	}
 </script>
 
-<div class="flex min-h-screen items-center justify-center p-4">
-	<form class="card w-full max-w-sm space-y-4 p-6" onsubmit={submit}>
-		<div class="flex items-center gap-2 text-lg font-semibold"><img src={favicon} alt="" class="size-7" /> Sign in to {brand()}</div>
-		{#if !needCode}
-			<div>
-				<label class="label" for="email">Email</label>
-				<input id="email" class="input" type="email" autocomplete="username" required bind:value={email} />
-			</div>
-			<div>
-				<label class="label" for="pw">Password</label>
-				<input id="pw" class="input" type="password" autocomplete="current-password" required bind:value={password} />
-			</div>
-		{:else}
-			<div>
-				<label class="label" for="code">Two-factor code</label>
-				<!-- svelte-ignore a11y_autofocus -->
-				<input id="code" class="input font-mono tracking-widest" autocomplete="one-time-code" required autofocus maxlength="20" bind:value={code} />
-				<p class="mt-1 text-xs text-slate-500">Enter the 6-digit code from your authenticator app, or one of your recovery codes.</p>
-			</div>
-		{/if}
-		{#if error}<p class="text-sm text-red-400">{error}</p>{/if}
-		<button class="btn-primary w-full justify-center" disabled={busy}>{busy ? 'Signing in…' : needCode ? 'Verify' : 'Sign in'}</button>
-		{#if needCode}
-			<button type="button" class="w-full text-center text-xs text-slate-400 hover:text-slate-200" onclick={back}>Use a different account</button>
-		{/if}
-	</form>
+<div class="bg-surface flex min-h-dvh flex-col items-center justify-center p-4">
+	<div class="w-full max-w-sm">
+		<div class="mb-6 flex flex-col items-center gap-3 text-center">
+			<img src={favicon} alt="" class="size-10" />
+			<h1 class="text-xl font-semibold tracking-tight">Sign in to {brand()}</h1>
+		</div>
+		<form class="card space-y-4 p-6" onsubmit={submit}>
+			{#if !needCode}
+				<Field label="Email" id="email"><Input id="email" type="email" autocomplete="username" required bind:value={email} /></Field>
+				<Field label="Password" id="pw"><Input id="pw" type="password" autocomplete="current-password" required bind:value={password} /></Field>
+			{:else}
+				<Field label="Two-factor code" id="code" hint="The 6-digit code from your authenticator app, or one of your recovery codes.">
+					<!-- svelte-ignore a11y_autofocus -->
+					<Input id="code" class="font-mono tracking-widest" autocomplete="one-time-code" required autofocus maxlength={20} bind:value={code} />
+				</Field>
+			{/if}
+			{#if error}<p class="bg-danger-soft text-danger rounded-md px-3 py-2 text-sm" role="alert">{error}</p>{/if}
+			<Button variant="primary" type="submit" class="w-full" loading={busy}>{needCode ? 'Verify' : 'Sign in'}</Button>
+			{#if needCode}
+				<button type="button" class="text-muted hover:text-fg w-full text-center text-xs" onclick={back}>Use a different account</button>
+			{/if}
+		</form>
+	</div>
 </div>

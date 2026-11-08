@@ -1,5 +1,7 @@
 <script lang="ts">
 	import type { Client } from '#lib/types.js';
+	import Checkbox from '#lib/ui/Checkbox.svelte';
+	import Switch from '#lib/ui/Switch.svelte';
 
 	/** Which clients a non-admin user can see. Admins always see every client. */
 	let { clients, value = $bindable() }: { clients: Client[]; value: { all_clients: boolean; client_ids: string[] } } = $props();
@@ -9,22 +11,16 @@
 	}
 </script>
 
-<div class="space-y-2">
-	<label class="flex items-center gap-2 text-sm">
-		<input type="checkbox" bind:checked={value.all_clients} />
-		All clients, including ones added later
-	</label>
+<div class="space-y-3">
+	<Switch bind:checked={value.all_clients}>All clients, including ones added later</Switch>
 	{#if !value.all_clients}
-		<div class="max-h-56 space-y-1 overflow-y-auto rounded-md border border-slate-800 p-2">
+		<div class="border-border max-h-56 space-y-2 overflow-y-auto rounded-md border p-3">
 			{#each clients as c (c.id)}
-				<label class="flex items-center gap-2 text-sm">
-					<input type="checkbox" checked={value.client_ids.includes(c.id)} onchange={(e) => toggle(c.id, e.currentTarget.checked)} />
-					{c.name}
-				</label>
+				<div><Checkbox checked={value.client_ids.includes(c.id)} onchange={(on) => toggle(c.id, on)}>{c.name}</Checkbox></div>
 			{:else}
-				<p class="text-sm text-slate-500">No clients yet.</p>
+				<p class="text-muted text-sm">No clients yet.</p>
 			{/each}
 		</div>
-		{#if value.client_ids.length === 0}<p class="text-xs text-amber-300">With no clients selected, this user sees no agents at all.</p>{/if}
+		{#if value.client_ids.length === 0}<p class="text-warning text-xs">With no clients selected, this user sees no agents at all.</p>{/if}
 	{/if}
 </div>

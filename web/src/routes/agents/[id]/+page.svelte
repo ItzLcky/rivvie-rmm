@@ -1,240 +1,402 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
+	import { CloudDownload, Copy, Play, RefreshCw, Search, SquareTerminal, Trash2 } from '@lucide/svelte';
 	import { api } from '#lib/api.js';
-	import { ago, bytes, datetime, duration, pct } from '#lib/format.js';
+	import { confirmAction } from '#lib/confirm.svelte.js';
+	import { ago, bytes, datetime, duration, ms, num, pct } from '#lib/format.js';
+	import { liveReload, onLive } from '#lib/live.svelte.js';
+	import { forgetAgent, rememberAgent } from '#lib/recent.js';
+	import { resource } from '#lib/resource.svelte.js';
 	import { can } from '#lib/session.svelte.js';
-	import type { AgentDetail, Job, MetricPoint, Release } from '#lib/types.js';
-	import Status from '#lib/components/Status.svelte';
-	import OsBadge from '#lib/components/OsBadge.svelte';
-	import UsageBar from '#lib/components/UsageBar.svelte';
+	import { attempt, toast } from '#lib/toast.svelte.js';
+	import type { AgentDetail, AuditRow, Job, MetricPoint, Page, Release, Software } from '#lib/types.js';
+	import { param, setParams } from '#lib/url.svelte.js';
+	import Async from '#lib/ui/Async.svelte';
+	import Badge from '#lib/ui/Badge.svelte';
+	import Button from '#lib/ui/Button.svelte';
+	import DataTable, { type Column } from '#lib/ui/DataTable.svelte';
+	import EmptyState from '#lib/ui/EmptyState.svelte';
+	import Input from '#lib/ui/Input.svelte';
+	import MoreLink from '#lib/ui/MoreLink.svelte';
+	import PageHeader from '#lib/ui/PageHeader.svelte';
+	import Segmented from '#lib/ui/Segmented.svelte';
+	import Skeleton from '#lib/ui/Skeleton.svelte';
+	import Spinner from '#lib/ui/Spinner.svelte';
+	import Tabs from '#lib/ui/Tabs.svelte';
 	import Chart from '#lib/components/Chart.svelte';
+	import HealthBadge from '#lib/components/HealthBadge.svelte';
 	import JobBadge from '#lib/components/JobBadge.svelte';
+	import OsBadge from '#lib/components/OsBadge.svelte';
 	import RunScript from '#lib/components/RunScript.svelte';
-	import Terminal from '#lib/components/Terminal.svelte';
+	import Status from '#lib/components/Status.svelte';
+	import UsageBar from '#lib/components/UsageBar.svelte';
 
 	const id = $derived(page.params.id!);
-	type Tab = 'overview' | 'software' | 'hardware' | 'jobs' | 'terminal';
-	let tab = $state<Tab>('overview');
-	let agent = $state<AgentDetail | null>(null);
-	let history = $state<MetricPoint[]>([]);
-	let jobs = $state<Job[]>([]);
-	let hours = $state(24);
-	let swq = $state('');
-	let running = $state(false);
-	let notice = $state('');
-	let releases = $state<Release[]>([]);
+	const tab = $derived(param('tab', 'overview'));
+	const ranges = { '1h': 1, '24h': 24, '7d': 168, '30d': 720 } as const;
+	type Range = keyof typeof ranges;
+	const range = $derived((param('range', '24h') in ranges ? param('range', '24h') : '24h') as Range);
+
+	const agent = resource(() => api.get<AgentDetail>(`/agents/${id}`), { keep: false });
+	const history = resource(() => api.get<MetricPoint[]>(`/agents/${id}/metrics?hours=${ranges[range]}`));
+	const recentJobs = resource(() => api.get<Page<Job>>(`/jobs?agent_id=${id}&limit=6`));
 
 	$effect(() => {
-		if (can('admin')) api.get<{ releases: Release[] }>('/agent-updates').then((r) => (releases = r.releases)).catch(() => {});
+		const a = agent.data;
+		if (a) rememberAgent(a);
 	});
-	const release = $derived(agent ? releases.find((r) => r.platform === `${agent!.os_family}-${agent!.arch}`) : undefined);
+
+	onLive((e) => {
+		if (e.type === 'agent' && e.id === id && agent.data) {
+			agent.data.online = e.online;
+			if (e.last_metrics) agent.data.last_metrics = e.last_metrics;
+		}
+	});
+	liveReload(() => agent.reload(), (e) => e.type === 'agent' && e.id === id && !e.last_metrics, { debounceMs: 500, pollMs: 15000 });
+	liveReload(() => recentJobs.reload(), (e) => (e.type === 'job' && e.agent_id === id && !e.output) || e.type === 'jobs', { debounceMs: 500 });
+	// Metrics charts: refresh every minute, the heartbeat events carry only the latest sample.
+	$effect(() => {
+		const t = setInterval(() => history.reload(), 60000);
+		return () => clearInterval(t);
+	});
+
+	const releases = resource(() => (can('admin') ? api.get<{ releases: Release[] }>('/agent-updates').then((r) => r.releases) : Promise.resolve([] as Release[])));
+	const release = $derived(agent.data ? releases.data?.find((r) => r.platform === `${agent.data!.os_family}-${agent.data!.arch}`) : undefined);
 	const updateLabels: Record<string, string> = {
 		offered: 'offered', downloading: 'downloading', waiting: 'waiting for jobs', applying: 'restarting',
 		completed: 'updated', rolled_back: 'rolled back', failed: 'failed'
 	};
 
+	let running = $state(false);
+
 	async function update() {
-		try {
+		await attempt(async () => {
 			const r = await api.post<{ version: string }>(`/agents/${id}/update`);
-			notice = `Update to v${r.version} sent. The agent downloads it, waits for running jobs, then restarts.`;
-		} catch (e) {
-			notice = (e as Error).message;
-		}
+			toast.success(`Update to v${r.version} sent. The agent downloads it, waits for running jobs, then restarts.`);
+		});
 	}
-
-	$effect(() => {
-		const load = () => api.get<AgentDetail>(`/agents/${id}`).then((a) => (agent = a));
-		load();
-		const t = setInterval(load, 10000);
-		return () => clearInterval(t);
-	});
-	$effect(() => {
-		api.get<MetricPoint[]>(`/agents/${id}/metrics?hours=${hours}`).then((m) => (history = m));
-	});
-	$effect(() => {
-		if (tab === 'jobs') api.get<Job[]>(`/agents/${id}/jobs`).then((j) => (jobs = j));
-	});
-
-	const m = $derived(agent?.last_metrics);
-	const inv = $derived(agent?.inventory);
-	const software = $derived(
-		(inv?.software ?? []).filter((s) => !swq || `${s.name} ${s.publisher ?? ''}`.toLowerCase().includes(swq.toLowerCase()))
-	);
-	const cpuSeries = $derived(history.map((p) => ({ t: Date.parse(p.ts), v: p.cpu_percent })));
-	const memSeries = $derived(history.map((p) => ({ t: Date.parse(p.ts), v: pct(p.mem_used, p.mem_total) })));
-
 	async function refreshInventory() {
-		try {
-			await api.post(`/agents/${id}/inventory/refresh`);
-			notice = 'Inventory refresh requested; it will update shortly.';
-		} catch (e) {
-			notice = (e as Error).message;
-		}
+		await attempt(() => api.post(`/agents/${id}/inventory/refresh`), 'Inventory refresh requested; it updates in a few seconds.');
+		setTimeout(() => agent.reload(), 4000);
 	}
 	async function remove() {
-		if (!agent || !confirm(`Remove ${agent.hostname}? The agent will be disconnected and must be re-enrolled.`)) return;
-		await api.del(`/agents/${id}`);
-		await goto('/agents');
+		const a = agent.data!;
+		const ok = await confirmAction({
+			title: `Remove ${a.hostname}?`,
+			message: 'The agent is disconnected and its history deleted. To manage the machine again it must be re-enrolled.',
+			confirmLabel: 'Remove agent',
+			danger: true,
+			typeToConfirm: a.hostname
+		});
+		if (!ok) return;
+		if (await attempt(() => api.del(`/agents/${id}`), `${a.hostname} removed.`)) {
+			forgetAgent(id);
+			await goto('/agents');
+		}
 	}
+
+	const cpuSeries = $derived((history.data ?? []).map((p) => ({ t: Date.parse(p.ts), v: p.cpu_percent })));
+	const memSeries = $derived((history.data ?? []).map((p) => ({ t: Date.parse(p.ts), v: pct(p.mem_used, p.mem_total) })));
+	const diskSeries = $derived((history.data ?? []).map((p) => ({ t: Date.parse(p.ts), v: p.disk_max_pct })));
+
+	// Software: filtered and sorted locally (it's one agent's list).
+	let swq = $state('');
+	let swSort = $state<{ key: string; dir: 'asc' | 'desc' }>({ key: 'name', dir: 'asc' });
+	const swSortState = {
+		get key() {
+			return swSort.key;
+		},
+		get dir() {
+			return swSort.dir;
+		},
+		toggle: (k: string) => (swSort = { key: k, dir: swSort.key === k && swSort.dir === 'asc' ? 'desc' : 'asc' })
+	};
+	const software = $derived.by(() => {
+		const q = swq.trim().toLowerCase();
+		const list = (agent.data?.inventory?.software ?? []).filter((s) => !q || `${s.name} ${s.publisher ?? ''} ${s.version}`.toLowerCase().includes(q));
+		const k = swSort.key as keyof Software;
+		const sign = swSort.dir === 'asc' ? 1 : -1;
+		return [...list].sort((a, b) => sign * String(a[k] ?? '').localeCompare(String(b[k] ?? ''), undefined, { numeric: true, sensitivity: 'base' }));
+	});
+
+	const jobs = resource(() => (tab === 'jobs' ? api.get<Page<Job>>(`/jobs?agent_id=${id}&limit=200`) : Promise.resolve(null)));
+	const activity = resource(() => (tab === 'activity' ? api.get<AuditRow[]>(`/agents/${id}/activity`) : Promise.resolve(null)));
+	liveReload(() => tab === 'jobs' && jobs.reload(), (e) => e.type === 'job' && e.agent_id === id && !e.output);
+
+	function describe(r: AuditRow): string {
+		const d = r.details as Record<string, string>;
+		const labels: Record<string, string> = {
+			'agent.delete': 'Removed the agent',
+			'agent.update_offer': `Offered update to v${d.version}`,
+			'agent.update_completed': `Updated to v${d.version}`,
+			'agent.update_rolled_back': `Update to v${d.version} rolled back${d.detail ? `: ${d.detail}` : ''}`,
+			'agent.update_failed': `Update to v${d.version} failed${d.detail ? `: ${d.detail}` : ''}`
+		};
+		return labels[r.action] ?? r.action;
+	}
+
+	// The terminal (xterm.js) loads only when its tab opens.
+	const terminal = $derived(tab === 'terminal' ? import('#lib/components/Terminal.svelte') : null);
 </script>
 
-{#if agent}
-	<div class="mb-1 text-sm text-slate-500"><a href="/agents" class="hover:text-slate-300">Agents</a> / {agent.client_name} / {agent.site_name}</div>
-	<div class="mb-4 flex flex-wrap items-center justify-between gap-3">
-		<div class="flex items-center gap-3">
-			<h1 class="text-xl font-semibold">{agent.hostname}</h1>
-			<OsBadge os={agent.os_family} />
-			<Status online={agent.online} />
-		</div>
-		<div class="flex gap-2">
-			{#if can('technician')}
-				<button class="btn-ghost" disabled={!agent.online} onclick={() => (tab = 'terminal')}>Terminal</button>
-				<button class="btn-primary" onclick={() => (running = true)}>Run script</button>
-			{/if}
-			{#if can('admin') && release && release.version !== agent.agent_version}
-				<button class="btn-ghost" disabled={!agent.online} onclick={update} title="Signed release {release.sha256.slice(0, 12)}…">Update to v{release.version}</button>
-			{/if}
-			{#if can('admin')}<button class="btn-danger" onclick={remove}>Remove</button>{/if}
-		</div>
-	</div>
+<svelte:head>{#if agent.data}<title>{agent.data.hostname}</title>{/if}</svelte:head>
 
-	<div class="mb-4 flex gap-1 border-b border-slate-800">
-		{#each [['overview', 'Overview'], ['software', `Software (${inv?.software.length ?? 0})`], ['hardware', 'Hardware & network'], ['jobs', 'Jobs'], ['terminal', 'Terminal']] as [k, label] (k)}
-			{#if k !== 'terminal' || can('technician')}
-				<button class="tab {tab === k ? 'tab-active' : ''}" onclick={() => (tab = k as Tab)}>{label}</button>
-			{/if}
-		{/each}
-	</div>
-
-	{#if notice}<p class="mb-3 text-sm text-sky-300">{notice}</p>{/if}
-
-	{#if tab === 'overview'}
-		<div class="grid gap-4 lg:grid-cols-3">
-			<div class="card p-4">
-				<h2 class="mb-3 text-sm font-semibold">System</h2>
-				<dl class="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5 text-sm">
-					<dt class="text-slate-500">OS</dt><dd>{agent.os_version || agent.os_name}</dd>
-					<dt class="text-slate-500">Kernel</dt><dd>{agent.kernel_version}</dd>
-					<dt class="text-slate-500">Arch</dt><dd>{agent.arch}</dd>
-					<dt class="text-slate-500">CPU</dt><dd>{inv?.cpu_brand ?? '–'}{#if inv}{' '}({inv.cpu_cores_physical ?? '?'}C/{inv.cpu_cores_logical}T){/if}</dd>
-					<dt class="text-slate-500">Memory</dt><dd>{bytes(inv?.mem_total ?? m?.mem_total)}</dd>
-					<dt class="text-slate-500">Uptime</dt><dd>{m ? duration(m.uptime_secs) : '–'}</dd>
-					<dt class="text-slate-500">Users</dt><dd>{inv?.logged_in_users.join(', ') || '–'}</dd>
-					<dt class="text-slate-500">Agent</dt>
-					<dd>
-						v{agent.agent_version}
-						{#if agent.update_state && agent.update_version && agent.update_version !== agent.agent_version || agent.update_state === 'rolled_back' || agent.update_state === 'failed'}
-							<span class="ml-1 text-xs {agent.update_state === 'failed' || agent.update_state === 'rolled_back' ? 'text-red-400' : 'text-sky-300'}" title={agent.update_detail ?? ''}>
-								→ v{agent.update_version}: {updateLabels[agent.update_state ?? ''] ?? agent.update_state}{agent.update_detail ? ` (${agent.update_detail})` : ''}
-							</span>
-						{/if}
-					</dd>
-					<dt class="text-slate-500">Last seen</dt><dd>{agent.online ? 'now' : ago(agent.last_seen_at)}</dd>
-					<dt class="text-slate-500">Enrolled</dt><dd>{datetime(agent.enrolled_at)}</dd>
-				</dl>
-			</div>
-			<div class="card p-4 lg:col-span-2">
-				<div class="mb-3 flex items-center justify-between">
-					<h2 class="text-sm font-semibold">Live</h2>
-					<select class="input w-auto py-0.5 text-xs" bind:value={hours}>
-						<option value={1}>1 hour</option><option value={24}>24 hours</option><option value={168}>7 days</option><option value={720}>30 days</option>
-					</select>
-				</div>
-				{#if m}
-					<div class="mb-4 grid grid-cols-2 gap-4 text-sm md:grid-cols-4">
-						<div><div class="label">CPU</div><UsageBar value={m.cpu_percent} /></div>
-						<div><div class="label">Memory</div><UsageBar value={pct(m.mem_used, m.mem_total)} label="{bytes(m.mem_used)} / {bytes(m.mem_total)}" /></div>
-						<div><div class="label">Swap</div><UsageBar value={pct(m.swap_used, m.swap_total)} /></div>
-						<div><div class="label">Load / procs</div><span class="tabular-nums">{m.load_avg ? m.load_avg.map((l) => l.toFixed(2)).join(' ') : '–'} · {m.process_count}</span></div>
-					</div>
+<Async res={agent}>
+	{#snippet skeleton()}
+		<div class="mb-4 space-y-2"><Skeleton class="h-3 w-48" /><Skeleton class="h-7 w-64" /></div>
+		<Skeleton class="mb-4 h-9 w-full" />
+		<div class="grid gap-4 lg:grid-cols-[20rem_1fr]"><div class="card space-y-2 p-4"><Skeleton lines={8} /></div><div class="card space-y-2 p-4"><Skeleton class="h-40 w-full" /></div></div>
+	{/snippet}
+	{#snippet children(a)}
+		{@const m = a.last_metrics}
+		{@const inv = a.inventory}
+		<PageHeader
+			title={a.hostname}
+			crumbs={[{ label: 'Clients', href: '/clients' }, { label: a.client_name, href: `/clients/${a.client_id}` }, { label: a.site_name, href: `/agents?client=${a.client_id}&site=${a.site_id}` }, { label: a.hostname }]}
+			menu={[
+				...(can('technician') ? [{ label: 'Refresh inventory', icon: RefreshCw, onSelect: refreshInventory, disabled: !a.online }] : []),
+				...(can('admin') && release && release.version !== a.agent_version ? [{ label: `Update agent to v${release.version}`, icon: CloudDownload, onSelect: update, disabled: !a.online }] : []),
+				{ label: 'Copy agent ID', icon: Copy, onSelect: () => navigator.clipboard?.writeText(a.id).then(() => toast.success('Agent ID copied.')) },
+				...(can('admin') ? [{ separator: true } as const, { label: 'Remove agent…', icon: Trash2, onSelect: remove, danger: true }] : [])
+			]}
+		>
+			{#snippet subtitle()}
+				<Status online={a.online} size="md" />
+				<HealthBadge health={a.health} agent={a} />
+				<OsBadge os={a.os_family} name={a.os_version || a.os_name} />
+				<span>{a.client_name} › {a.site_name}</span>
+			{/snippet}
+			{#snippet actions()}
+				{#if can('technician')}
+					<Button icon={SquareTerminal} disabled={!a.online} onclick={() => setParams({ tab: 'terminal' })} title={a.online ? undefined : 'The agent is offline'}>Terminal</Button>
+					<Button variant="primary" icon={Play} onclick={() => (running = true)}>Run script</Button>
 				{/if}
-				<div class="label">CPU %</div>
-				<Chart points={cpuSeries} />
-				<div class="label mt-3">Memory %</div>
-				<Chart points={memSeries} color="#a78bfa" />
-			</div>
-			<div class="card p-4 lg:col-span-3">
-				<h2 class="mb-3 text-sm font-semibold">Volumes</h2>
-				<table class="table">
-					<thead><tr><th>Mount</th><th>Size</th><th>Free</th><th class="w-64">Used</th></tr></thead>
-					<tbody>
-						{#each m?.disks ?? [] as d (d.mount)}
-							<tr><td class="font-mono text-xs">{d.mount}</td><td>{bytes(d.total)}</td><td>{bytes(d.available)}</td><td><UsageBar value={pct(d.total - d.available, d.total)} /></td></tr>
-						{/each}
-					</tbody>
-				</table>
-			</div>
-		</div>
-	{:else if tab === 'software'}
-		<div class="mb-3 flex items-center gap-3">
-			<input class="input max-w-sm" placeholder="Filter software…" bind:value={swq} />
-			<span class="text-xs text-slate-500">Collected {ago(agent.inventory_at)}</span>
-			{#if can('technician')}<button class="btn-ghost ml-auto" disabled={!agent.online} onclick={refreshInventory}>Refresh inventory</button>{/if}
-		</div>
-		<div class="card overflow-x-auto">
-			<table class="table">
-				<thead><tr><th>Name</th><th>Version</th><th>Publisher</th><th>Source</th></tr></thead>
-				<tbody>
-					{#each software.slice(0, 1000) as s (s.source + s.name + s.version)}
-						<tr><td>{s.name}</td><td class="font-mono text-xs">{s.version}</td><td class="text-slate-400">{s.publisher ?? ''}</td><td class="text-xs text-slate-500">{s.source}</td></tr>
-					{/each}
-				</tbody>
-			</table>
-			{#if software.length > 1000}<p class="p-3 text-xs text-slate-500">Showing 1000 of {software.length}; refine the filter.</p>{/if}
-		</div>
-	{:else if tab === 'hardware'}
-		<div class="grid gap-4 lg:grid-cols-2">
-			<div class="card p-4">
-				<h2 class="mb-3 text-sm font-semibold">Disks</h2>
-				<table class="table">
-					<thead><tr><th>Device</th><th>Mount</th><th>FS</th><th>Type</th><th>Size</th></tr></thead>
-					<tbody>
-						{#each inv?.disks ?? [] as d (d.mount)}
-							<tr><td class="font-mono text-xs">{d.name}</td><td class="font-mono text-xs">{d.mount}</td><td>{d.fs}</td><td>{d.kind}{d.removable ? ' (removable)' : ''}</td><td>{bytes(d.total)}</td></tr>
-						{/each}
-					</tbody>
-				</table>
-			</div>
-			<div class="card p-4">
-				<h2 class="mb-3 text-sm font-semibold">Network interfaces</h2>
-				<table class="table">
-					<thead><tr><th>Name</th><th>MAC</th><th>Addresses</th></tr></thead>
-					<tbody>
-						{#each inv?.network ?? [] as n (n.name)}
-							<tr><td>{n.name}</td><td class="font-mono text-xs">{n.mac}</td><td class="font-mono text-xs">{n.addrs.join(', ')}</td></tr>
-						{/each}
-					</tbody>
-				</table>
-			</div>
-		</div>
-	{:else if tab === 'jobs'}
-		<div class="card overflow-x-auto">
-			<table class="table">
-				<thead><tr><th>Started</th><th>Script</th><th>Status</th><th>Exit</th><th>Duration</th><th>By</th></tr></thead>
-				<tbody>
-					{#each jobs as j (j.id)}
-						<tr>
-							<td><a class="text-sky-400 hover:underline" href="/jobs/{j.id}">{datetime(j.created_at)}</a></td>
-							<td>{j.script_name ?? `ad-hoc ${j.interpreter}`}</td>
-							<td><JobBadge status={j.status} /></td>
-							<td class="tabular-nums">{j.exit_code ?? ''}</td>
-							<td class="tabular-nums">{j.duration_ms != null ? `${(j.duration_ms / 1000).toFixed(1)}s` : ''}</td>
-							<td class="text-slate-400">{j.created_by_name ?? ''}</td>
-						</tr>
-					{:else}
-						<tr><td colspan="6" class="py-6 text-center text-slate-500">No jobs yet.</td></tr>
-					{/each}
-				</tbody>
-			</table>
-		</div>
-	{:else if tab === 'terminal'}
-		{#if agent.online}
-			<Terminal agentId={agent.id} />
-		{:else}
-			<p class="text-slate-500">The agent is offline.</p>
-		{/if}
-	{/if}
+			{/snippet}
+		</PageHeader>
 
-	{#if running}<RunScript agents={[agent]} onclose={() => (running = false)} />{/if}
-{/if}
+		<Tabs
+			label="Agent sections"
+			class="mb-4"
+			value={tab}
+			onchange={(v) => setParams({ tab: v === 'overview' ? null : v }, { push: true })}
+			items={[
+				{ value: 'overview', label: 'Overview' },
+				{ value: 'inventory', label: 'Hardware & network' },
+				{ value: 'software', label: 'Software', count: inv ? num(inv.software.length) : undefined },
+				{ value: 'jobs', label: 'Jobs' },
+				{ value: 'activity', label: 'Activity' },
+				{ value: 'terminal', label: 'Terminal', hidden: !can('technician') }
+			]}
+		/>
+
+		{#if tab === 'overview'}
+			<div class="grid gap-4 lg:grid-cols-[minmax(18rem,22rem)_1fr]">
+				<section class="card self-start p-4" aria-label="System">
+					<h2 class="mb-3 text-sm font-semibold">System</h2>
+					<dl class="dl">
+						<dt>Client</dt><dd><a class="link" href="/clients/{a.client_id}">{a.client_name}</a><span class="text-subtle mx-1" aria-hidden="true">›</span>{a.site_name}</dd>
+						<dt>OS</dt><dd>{a.os_version || a.os_name}</dd>
+						<dt>Kernel</dt><dd class="font-mono text-[13px]">{a.kernel_version || '–'}</dd>
+						<dt>Arch</dt><dd>{a.arch}</dd>
+						<dt>CPU</dt><dd>{inv?.cpu_brand ?? '–'}{#if inv}<span class="text-muted block text-xs">{inv.cpu_cores_physical ?? '?'} cores, {inv.cpu_cores_logical} threads</span>{/if}</dd>
+						<dt>Memory</dt><dd>{bytes(inv?.mem_total ?? m?.mem_total)}</dd>
+						<dt>Uptime</dt><dd>{m ? duration(m.uptime_secs) : '–'}</dd>
+						<dt>Signed in</dt><dd>{inv?.logged_in_users.join(', ') || '–'}</dd>
+						<dt>Last seen</dt><dd>{a.online ? 'now' : ago(a.last_seen_at)}</dd>
+						<dt>Enrolled</dt><dd>{datetime(a.enrolled_at)}</dd>
+						<dt>Agent</dt>
+						<dd>
+							<span class="font-mono text-[13px]">v{a.agent_version}</span>
+							{#if (a.update_state && a.update_version && a.update_version !== a.agent_version) || a.update_state === 'rolled_back' || a.update_state === 'failed'}
+								<Badge tone={a.update_state === 'failed' || a.update_state === 'rolled_back' ? 'danger' : 'info'} title={a.update_detail ?? ''}>
+									v{a.update_version}: {updateLabels[a.update_state ?? ''] ?? a.update_state}
+								</Badge>
+							{/if}
+						</dd>
+						<dt>Agent ID</dt><dd class="text-muted font-mono text-[13px] break-all">{a.id}</dd>
+					</dl>
+				</section>
+
+				<div class="min-w-0 space-y-4">
+					<section class="card p-4" aria-label="Performance">
+						<div class="mb-3 flex flex-wrap items-center justify-between gap-2">
+							<h2 class="text-sm font-semibold">Performance</h2>
+							<Segmented label="Time range" value={range} onchange={(v) => setParams({ range: v === '24h' ? null : v })} options={Object.keys(ranges).map((r) => ({ value: r as Range, label: r }))} />
+						</div>
+						{#if m}
+							<div class="mb-4 grid grid-cols-2 gap-x-6 gap-y-3 md:grid-cols-4">
+								<div><div class="label text-muted">CPU</div><UsageBar value={a.online ? m.cpu_percent : 0} /></div>
+								<div><div class="label text-muted">Memory <span class="font-normal">{bytes(m.mem_used)} / {bytes(m.mem_total)}</span></div><UsageBar value={pct(m.mem_used, m.mem_total)} /></div>
+								<div><div class="label text-muted">Swap</div><UsageBar value={pct(m.swap_used, m.swap_total)} /></div>
+								<div><div class="label text-muted">Load · processes</div><span class="text-sm tabular">{m.load_avg ? m.load_avg.map((l) => l.toFixed(2)).join(' ') : '–'} · {m.process_count}</span></div>
+							</div>
+						{/if}
+						<div class="space-y-4" aria-busy={history.busy}>
+							<Chart label="CPU" points={cpuSeries} />
+							<Chart label="Memory" points={memSeries} />
+							<Chart label="Fullest disk" points={diskSeries} />
+						</div>
+					</section>
+
+					<div class="grid gap-4 xl:grid-cols-2">
+						<section class="card" aria-label="Recent jobs">
+							<header class="border-border flex items-center justify-between border-b px-4 py-2.5">
+								<h2 class="text-sm font-semibold">Recent jobs</h2>
+								<MoreLink onclick={() => setParams({ tab: 'jobs' }, { push: true })}>All jobs</MoreLink>
+							</header>
+							{#if recentJobs.data?.items.length}
+								<ul class="divide-border divide-y">
+									{#each recentJobs.data.items as j (j.id)}
+										<li>
+											<a href="/jobs/{j.id}" class="hover:bg-hover/60 flex items-center gap-3 px-4 py-2 text-sm">
+												<JobBadge status={j.status} />
+												<span class="min-w-0 flex-1 truncate">{j.script_name ?? `Ad-hoc ${j.interpreter}`}</span>
+												<span class="text-muted shrink-0 text-xs">{ago(j.created_at)}</span>
+											</a>
+										</li>
+									{/each}
+								</ul>
+							{:else if recentJobs.loading}
+								<div class="space-y-2 p-4"><Skeleton lines={3} /></div>
+							{:else}
+								<EmptyState compact title="No jobs yet" />
+							{/if}
+						</section>
+						<section class="card" aria-label="Volumes">
+							<header class="border-border border-b px-4 py-2.5"><h2 class="text-sm font-semibold">Volumes</h2></header>
+							{#if m?.disks.length}
+								<ul class="divide-border divide-y">
+									{#each m.disks as d (d.mount)}
+										<li class="grid grid-cols-[minmax(0,1fr)_9rem] items-center gap-3 px-4 py-2 text-sm">
+											<div class="min-w-0"><div class="truncate font-mono text-xs">{d.mount}</div><div class="text-muted text-xs">{bytes(d.available)} free of {bytes(d.total)}</div></div>
+											<UsageBar value={pct(d.total - d.available, d.total)} />
+										</li>
+									{/each}
+								</ul>
+							{:else}
+								<EmptyState compact title="No volume data yet" />
+							{/if}
+						</section>
+					</div>
+				</div>
+			</div>
+		{:else if tab === 'inventory'}
+			<div class="mb-3 flex items-center gap-3">
+				<span class="text-muted text-xs">Collected {ago(a.inventory_at)}</span>
+				{#if can('technician')}<Button size="sm" icon={RefreshCw} class="ml-auto" disabled={!a.online} onclick={refreshInventory}>Refresh</Button>{/if}
+			</div>
+			<div class="grid gap-4 xl:grid-cols-2">
+				<section class="card overflow-x-auto" aria-label="Disks">
+					<header class="border-border border-b px-4 py-2.5"><h2 class="text-sm font-semibold">Disks</h2></header>
+					<table class="table">
+						<thead><tr><th>Device</th><th>Mount</th><th>FS</th><th>Type</th><th class="text-right">Size</th></tr></thead>
+						<tbody>
+							{#each inv?.disks ?? [] as d (d.mount)}
+								<tr><td class="font-mono text-xs">{d.name}</td><td class="font-mono text-xs">{d.mount}</td><td>{d.fs}</td><td>{d.kind}{d.removable ? ' (removable)' : ''}</td><td class="text-right tabular">{bytes(d.total)}</td></tr>
+							{:else}
+								<tr><td colspan="5" class="text-muted py-6 text-center">No inventory yet.</td></tr>
+							{/each}
+						</tbody>
+					</table>
+				</section>
+				<section class="card overflow-x-auto" aria-label="Network interfaces">
+					<header class="border-border border-b px-4 py-2.5"><h2 class="text-sm font-semibold">Network interfaces</h2></header>
+					<table class="table">
+						<thead><tr><th>Name</th><th>MAC</th><th>Addresses</th></tr></thead>
+						<tbody>
+							{#each inv?.network ?? [] as n (n.name)}
+								<tr><td>{n.name}</td><td class="font-mono text-xs">{n.mac}</td><td class="font-mono text-xs">{n.addrs.join(', ')}</td></tr>
+							{:else}
+								<tr><td colspan="3" class="text-muted py-6 text-center">No inventory yet.</td></tr>
+							{/each}
+						</tbody>
+					</table>
+				</section>
+			</div>
+		{:else if tab === 'software'}
+			{#snippet nameCell(s: Software)}<span class="font-medium">{s.name}</span>{/snippet}
+			{#snippet versionCell(s: Software)}<span class="font-mono text-xs">{s.version}</span>{/snippet}
+			{#snippet publisherCell(s: Software)}<span class="text-muted">{s.publisher ?? ''}</span>{/snippet}
+			{#snippet sourceCell(s: Software)}<span class="text-muted text-xs">{s.source}</span>{/snippet}
+			<DataTable
+				id="software"
+				caption="Installed software"
+				rows={software.slice(0, 2000)}
+				key={(s) => `${s.source}|${s.name}|${s.version}`}
+				sort={swSortState}
+				columns={[
+					{ id: 'name', label: 'Name', sort: 'name', cell: nameCell, hideable: false },
+					{ id: 'version', label: 'Version', sort: 'version', cell: versionCell },
+					{ id: 'publisher', label: 'Publisher', sort: 'publisher', cell: publisherCell, from: 'md' },
+					{ id: 'source', label: 'Source', sort: 'source', cell: sourceCell, from: 'sm' }
+				] satisfies Column<Software>[]}
+			>
+				{#snippet toolbar()}
+					<Input icon={Search} data-search placeholder="Filter software…" aria-label="Filter software" class="w-full sm:w-72" bind:value={swq} />
+					<span class="text-muted text-xs">{num(software.length)} packages · collected {ago(a.inventory_at)}</span>
+				{/snippet}
+				{#snippet empty()}<EmptyState compact title={swq ? 'No packages match' : 'No software inventory yet'} />{/snippet}
+				{#snippet footer()}{#if software.length > 2000}<p class="text-muted px-3 py-2 text-xs">Showing 2,000 of {num(software.length)}; refine the filter.</p>{/if}{/snippet}
+			</DataTable>
+		{:else if tab === 'jobs'}
+			{#snippet startedCell(j: Job)}<a class="hover:text-accent" href="/jobs/{j.id}">{datetime(j.created_at)}</a>{/snippet}
+			{#snippet scriptCell(j: Job)}{j.script_name ?? `Ad-hoc ${j.interpreter}`}{/snippet}
+			{#snippet statusCell(j: Job)}<JobBadge status={j.status} />{/snippet}
+			{#snippet exitCell(j: Job)}{#if j.exit_code != null}{j.exit_code}{:else}<span class="text-muted" aria-label="none">–</span>{/if}{/snippet}
+			{#snippet durCell(j: Job)}{#if j.duration_ms != null}{ms(j.duration_ms)}{:else}<span class="text-muted" aria-label="none">–</span>{/if}{/snippet}
+			{#snippet byCell(j: Job)}<span class="text-muted">{j.created_by_name ?? '–'}</span>{/snippet}
+			<DataTable
+				id="agent-jobs"
+				caption="Jobs on this agent"
+				rows={jobs.data?.items ?? []}
+				key={(j) => j.id}
+				loading={jobs.loading}
+				rowHref={(j) => `/jobs/${j.id}`}
+				scroll={false}
+				columns={[
+					{ id: 'created', label: 'Started', cell: startedCell, hideable: false },
+					{ id: 'script', label: 'Script', cell: scriptCell },
+					{ id: 'status', label: 'Status', cell: statusCell },
+					{ id: 'exit', label: 'Exit', cell: exitCell, align: 'right', from: 'sm' },
+					{ id: 'duration', label: 'Duration', cell: durCell, align: 'right', from: 'sm' },
+					{ id: 'by', label: 'By', cell: byCell, from: 'md' }
+				] satisfies Column<Job>[]}
+			>
+				{#snippet empty()}<EmptyState compact title="No jobs on this agent yet" />{/snippet}
+				{#snippet footer()}{#if jobs.data?.next}<p class="text-muted px-3 py-2 text-xs">Showing the latest 200. <a class="link" href="/jobs?q={encodeURIComponent(a.hostname)}">See all in Jobs</a></p>{/if}{/snippet}
+			</DataTable>
+		{:else if tab === 'activity'}
+			<section class="card" aria-label="Activity">
+				<Async res={activity} compact>
+					{#snippet children(rows)}
+						{#if rows?.length}
+							<ol class="divide-border divide-y">
+								{#each rows as r (r.id)}
+									<li class="flex flex-wrap items-baseline gap-x-3 gap-y-0.5 px-4 py-2.5 text-sm">
+										<span class="min-w-0 flex-1">{describe(r)}</span>
+										<span class="text-muted text-xs">{r.user_name ?? 'System'} · <time datetime={r.ts} title={datetime(r.ts)}>{ago(r.ts)}</time></span>
+									</li>
+								{/each}
+							</ol>
+						{:else}
+							<EmptyState compact title="No activity recorded yet" description="Update offers and results show up here. Jobs have their own tab." />
+						{/if}
+					{/snippet}
+				</Async>
+			</section>
+		{:else if tab === 'terminal'}
+			{#if !a.online}
+				<div class="card"><EmptyState title="The agent is offline" description="The terminal opens once the agent reconnects." /></div>
+			{:else if terminal}
+				{#await terminal}
+					<div class="card flex h-64 items-center justify-center"><Spinner label="Loading terminal" /></div>
+				{:then T}
+					<T.default agentId={a.id} hostname={a.hostname} />
+				{/await}
+			{/if}
+		{/if}
+
+		{#if running}<RunScript agents={[a]} onclose={() => (running = false)} />{/if}
+	{/snippet}
+</Async>

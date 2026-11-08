@@ -7,8 +7,47 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 
 use rmm_proto::ServerMsg;
-use tokio::sync::mpsc;
+use serde::Serialize;
+use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
+
+/// Something the dashboard should redraw: pushed to browsers over `/api/events`.
+///
+/// `client_id` scopes delivery: users only get events for clients they can see. `None`
+/// carries no data about any one client and goes to everyone.
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Event {
+    /// Came online, went offline, or sent fresh metrics.
+    Agent {
+        id: Uuid,
+        #[serde(skip)]
+        client_id: Uuid,
+        online: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        last_metrics: Option<serde_json::Value>,
+    },
+    /// A job was created, changed status, or produced output (`output: true`).
+    Job {
+        id: Uuid,
+        agent_id: Uuid,
+        #[serde(skip)]
+        client_id: Uuid,
+        status: String,
+        output: bool,
+    },
+    /// Many jobs changed at once (the housekeeping sweep): refetch job lists.
+    Jobs,
+}
+
+impl Event {
+    pub fn client_id(&self) -> Option<Uuid> {
+        match self {
+            Event::Agent { client_id, .. } | Event::Job { client_id, .. } => Some(*client_id),
+            Event::Jobs => None,
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct AgentHandle {
@@ -27,13 +66,30 @@ struct ShellRoute {
     tx: mpsc::Sender<ShellEvent>,
 }
 
-#[derive(Default)]
 pub struct Hub {
     agents: RwLock<HashMap<Uuid, AgentHandle>>,
     shells: RwLock<HashMap<Uuid, ShellRoute>>,
+    events: broadcast::Sender<Event>,
+}
+
+impl Default for Hub {
+    fn default() -> Self {
+        // A browser that falls this far behind gets a `resync` and refetches instead.
+        let (events, _) = broadcast::channel(4096);
+        Hub { agents: Default::default(), shells: Default::default(), events }
+    }
 }
 
 impl Hub {
+    /// Publishes to every open dashboard. Never blocks; a no-op when nobody is listening.
+    pub fn publish(&self, ev: Event) {
+        let _ = self.events.send(ev);
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<Event> {
+        self.events.subscribe()
+    }
+
     /// Registers a connection, returning the one it replaced (if the agent reconnected).
     pub fn register(&self, agent_id: Uuid, handle: AgentHandle) -> Option<AgentHandle> {
         self.agents.write().unwrap().insert(agent_id, handle)

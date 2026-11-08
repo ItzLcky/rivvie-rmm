@@ -112,8 +112,34 @@ pub async fn logout(State(st): State<Arc<AppState>>, headers: HeaderMap) -> ApiR
     Ok((AppendHeaders([(header::SET_COOKIE, auth::clear_cookie())]), Json(json!({ "ok": true }))))
 }
 
-pub async fn me(user: User) -> Json<User> {
-    Json(user)
+/// The signed-in user, plus their saved UI preferences.
+pub async fn me(State(st): State<Arc<AppState>>, user: User) -> ApiResult<Json<serde_json::Value>> {
+    let prefs: serde_json::Value =
+        sqlx::query_scalar("SELECT preferences FROM users WHERE id = $1").bind(user.id).fetch_one(&st.db).await?;
+    let mut v = serde_json::to_value(&user).map_err(anyhow::Error::from)?;
+    v["preferences"] = prefs;
+    Ok(Json(v))
+}
+
+/// Merges keys into the user's UI preferences (theme, table columns, density...). A key set to
+/// null is removed. The dashboard owns the contents; the server only bounds the size.
+pub async fn update_preferences(
+    State(st): State<Arc<AppState>>,
+    user: User,
+    Json(patch): Json<serde_json::Map<String, serde_json::Value>>,
+) -> ApiResult<Json<serde_json::Value>> {
+    // The size check is in the UPDATE, so an oversized patch leaves the stored value alone.
+    let prefs: Option<serde_json::Value> = sqlx::query_scalar(
+        "UPDATE users SET preferences = jsonb_strip_nulls(preferences || $2)
+          WHERE id = $1 AND octet_length(jsonb_strip_nulls(preferences || $2)::text) <= 32768
+          RETURNING preferences",
+    )
+    .bind(user.id)
+    .bind(serde_json::Value::Object(patch))
+    .fetch_optional(&st.db)
+    .await?;
+    let prefs = prefs.ok_or_else(|| ApiError::BadRequest("preferences too large".into()))?;
+    Ok(Json(prefs))
 }
 
 #[derive(Deserialize)]

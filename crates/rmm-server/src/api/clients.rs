@@ -28,21 +28,26 @@ pub struct ClientOut {
     sites: Vec<SiteRow>,
 }
 
-pub async fn list(State(st): State<Arc<AppState>>, u: User) -> ApiResult<Json<Vec<ClientOut>>> {
-    let clients: Vec<(Uuid, String, DateTime<Utc>)> =
-        sqlx::query_as("SELECT id, name, created_at FROM clients WHERE ($1::uuid[] IS NULL OR id = ANY($1)) ORDER BY name")
-            .bind(u.scope())
-            .fetch_all(&st.db)
-            .await?;
+/// Clients (all visible ones, or just `only`) with their sites and agent counts.
+async fn load(st: &AppState, u: &User, only: Option<Uuid>) -> ApiResult<Vec<ClientOut>> {
+    let clients: Vec<(Uuid, String, DateTime<Utc>)> = sqlx::query_as(
+        "SELECT id, name, created_at FROM clients
+          WHERE ($1::uuid[] IS NULL OR id = ANY($1)) AND ($2::uuid IS NULL OR id = $2) ORDER BY lower(name)",
+    )
+    .bind(u.scope())
+    .bind(only)
+    .fetch_all(&st.db)
+    .await?;
     let sites: Vec<SiteRow> = sqlx::query_as(
         "SELECT s.id, s.client_id, s.name,
                 count(a.id) AS agent_count,
                 count(a.id) FILTER (WHERE a.online) AS online_count
            FROM sites s LEFT JOIN agents a ON a.site_id = s.id
-          WHERE ($1::uuid[] IS NULL OR s.client_id = ANY($1))
-          GROUP BY s.id ORDER BY s.name",
+          WHERE ($1::uuid[] IS NULL OR s.client_id = ANY($1)) AND ($2::uuid IS NULL OR s.client_id = $2)
+          GROUP BY s.id ORDER BY lower(s.name)",
     )
     .bind(u.scope())
+    .bind(only)
     .fetch_all(&st.db)
     .await?;
     let mut out: Vec<ClientOut> =
@@ -52,7 +57,48 @@ pub async fn list(State(st): State<Arc<AppState>>, u: User) -> ApiResult<Json<Ve
             c.sites.push(s);
         }
     }
-    Ok(Json(out))
+    Ok(out)
+}
+
+pub async fn list(State(st): State<Arc<AppState>>, u: User) -> ApiResult<Json<Vec<ClientOut>>> {
+    Ok(Json(load(&st, &u, None).await?))
+}
+
+pub async fn get(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uuid>) -> ApiResult<Json<ClientOut>> {
+    super::access::client(&u, id)?;
+    load(&st, &u, Some(id)).await?.pop().map(Json).ok_or(ApiError::NotFound("client"))
+}
+
+pub async fn rename(
+    State(st): State<Arc<AppState>>,
+    u: User,
+    Path(id): Path<Uuid>,
+    Json(b): Json<NameBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    u.require(Role::Admin)?;
+    let name = clean_name(&b.name)?;
+    let n = sqlx::query("UPDATE clients SET name = $2 WHERE id = $1").bind(id).bind(&name).execute(&st.db).await?.rows_affected();
+    if n == 0 {
+        return Err(ApiError::NotFound("client"));
+    }
+    auth::audit(&st.db, Some(u.id), "client.rename", Some(("client", id)), json!({ "name": name })).await;
+    Ok(Json(json!({ "ok": true })))
+}
+
+pub async fn rename_site(
+    State(st): State<Arc<AppState>>,
+    u: User,
+    Path(id): Path<Uuid>,
+    Json(b): Json<NameBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    u.require(Role::Admin)?;
+    let name = clean_name(&b.name)?;
+    let n = sqlx::query("UPDATE sites SET name = $2 WHERE id = $1").bind(id).bind(&name).execute(&st.db).await?.rows_affected();
+    if n == 0 {
+        return Err(ApiError::NotFound("site"));
+    }
+    auth::audit(&st.db, Some(u.id), "site.rename", Some(("site", id)), json!({ "name": name })).await;
+    Ok(Json(json!({ "ok": true })))
 }
 
 #[derive(Deserialize)]

@@ -1,189 +1,151 @@
 <script lang="ts">
+	import { goto } from '$app/navigation';
+	import { Building2, Plus, Search } from '@lucide/svelte';
 	import { api } from '#lib/api.js';
-	import { bytes, datetime } from '#lib/format.js';
+	import { ago, num, pct } from '#lib/format.js';
+	import { liveReload } from '#lib/live.svelte.js';
+	import { resource } from '#lib/resource.svelte.js';
+	import { loadClients } from '#lib/scope.svelte.js';
 	import { can } from '#lib/session.svelte.js';
-	import type { Client, Site } from '#lib/types.js';
-	import Modal from '#lib/components/Modal.svelte';
+	import { toast } from '#lib/toast.svelte.js';
+	import type { Client, ClientHealth, Dashboard } from '#lib/types.js';
+	import { param, setParams, sortState } from '#lib/url.svelte.js';
+	import Button from '#lib/ui/Button.svelte';
+	import DataTable, { type Column } from '#lib/ui/DataTable.svelte';
+	import EmptyState from '#lib/ui/EmptyState.svelte';
+	import ErrorState from '#lib/ui/ErrorState.svelte';
+	import Field from '#lib/ui/Field.svelte';
+	import Input from '#lib/ui/Input.svelte';
+	import Modal from '#lib/ui/Modal.svelte';
+	import PageHeader from '#lib/ui/PageHeader.svelte';
 
-	interface Token { id: string; label: string; max_uses: number | null; uses: number; expires_at: string | null; created_at: string }
-	interface AgentDownload { id: string; label: string; file_name: string; size: number; sha256: string; url: string }
-	interface NewToken {
-		token: string; expires_at: string | null; max_uses: number | null; install: { linux: string; windows: string };
-		packages: { deb: string; rpm: string; install_deb: string; install_rpm: string } | null;
-	}
+	type Row = Client & { health?: ClientHealth; agents: number; online: number };
+	const res = resource(async () => {
+		const [clients, dash] = await Promise.all([api.get<Client[]>('/clients'), api.get<Dashboard>('/dashboard')]);
+		return clients.map((c): Row => {
+			const health = dash.client_health.find((h) => h.id === c.id);
+			return { ...c, health, agents: c.sites.reduce((n, s) => n + s.agent_count, 0), online: c.sites.reduce((n, s) => n + s.online_count, 0) };
+		});
+	});
+	liveReload(() => res.reload(), (e) => e.type === 'agent' && !e.last_metrics, { debounceMs: 2000, pollMs: 30000 });
 
-	let clients = $state<Client[]>([]);
-	let newClient = $state('');
-	let error = $state('');
-	let tokenSite = $state<{ client: Client; site: Site } | null>(null);
-	let tokens = $state<Token[]>([]);
-	let downloads = $state<AgentDownload[] | null>(null);
-	let created = $state<NewToken | null>(null);
-	let label = $state('');
-	let maxUses = $state<number | null>(null);
-	let expiresHours = $state(168);
-
-	const load = () => api.get<Client[]>('/clients').then((c) => (clients = c));
-	$effect(() => {
-		load();
+	let q = $state('');
+	const sort = sortState('name');
+	const keyed: Record<string, (r: Row) => string | number> = {
+		name: (r) => r.name.toLowerCase(),
+		agents: (r) => r.agents,
+		online: (r) => (r.agents ? r.online / r.agents : -1),
+		health: (r) => (r.health?.unhealthy ?? 0) * 1e6 + (r.health?.attention ?? 0) * 1e3 + (r.agents - r.online),
+		created: (r) => r.created_at
+	};
+	const rows = $derived.by(() => {
+		const f = q.trim().toLowerCase();
+		const list = (res.data ?? []).filter((c) => !f || c.name.toLowerCase().includes(f) || c.sites.some((s) => s.name.toLowerCase().includes(f)));
+		const k = keyed[sort.key] ?? keyed.name;
+		const sign = sort.dir === 'asc' ? 1 : -1;
+		return [...list].sort((a, b) => (k(a) < k(b) ? -sign : k(a) > k(b) ? sign : 0));
 	});
 
-	async function act(fn: () => Promise<unknown>) {
-		error = '';
-		try {
-			await fn();
-			await load();
-		} catch (e) {
-			error = (e as Error).message;
+	// "Add client" (also reachable from the command palette as ?new=1).
+	let adding = $state(false);
+	$effect(() => {
+		if (param('new') && can('admin')) {
+			adding = true;
+			setParams({ new: null });
 		}
-	}
-
-	const addClient = (e: SubmitEvent) => {
+	});
+	let name = $state('');
+	let busy = $state(false);
+	async function add(e: SubmitEvent) {
 		e.preventDefault();
-		act(async () => {
-			await api.post('/clients', { name: newClient });
-			newClient = '';
-		});
-	};
-	const addSite = (c: Client) => {
-		const name = prompt(`New site name for ${c.name}`);
-		if (name) act(() => api.post(`/clients/${c.id}/sites`, { name }));
-	};
-	const delClient = (c: Client) => confirm(`Delete ${c.name} and ALL its sites and agents?`) && act(() => api.del(`/clients/${c.id}`));
-	const delSite = (s: Site) => confirm(`Delete site ${s.name} and its ${s.agent_count} agents?`) && act(() => api.del(`/sites/${s.id}`));
-
-	async function openTokens(client: Client, site: Site) {
-		tokenSite = { client, site };
-		created = null;
-		downloads ??= await api.get<AgentDownload[]>('/agent-downloads').catch(() => []);
-		tokens = await api.get<Token[]>(`/sites/${site.id}/enrollment-tokens`);
-	}
-	let tokenError = $state('');
-	async function createToken(purpose: 'package' | null = null) {
-		if (!tokenSite) return;
-		tokenError = '';
+		busy = true;
 		try {
-			created = await api.post<NewToken>(`/sites/${tokenSite.site.id}/enrollment-tokens`, purpose
-				? { label: label || 'Linux package', purpose, max_uses: maxUses || null, expires_in_hours: expiresHours || null }
-				: { label, max_uses: maxUses || null, expires_in_hours: expiresHours });
-			tokens = await api.get<Token[]>(`/sites/${tokenSite.site.id}/enrollment-tokens`);
-		} catch (e) {
-			tokenError = (e as Error).message;
+			const r = await api.post<{ id: string }>('/clients', { name });
+			toast.success(`${name} added, with a site called Main.`);
+			adding = false;
+			name = '';
+			loadClients(true);
+			await goto(`/clients/${r.id}?tab=sites`);
+		} catch (err) {
+			toast.error(err);
+		} finally {
+			busy = false;
 		}
-	}
-	async function revoke(t: Token) {
-		await api.del(`/enrollment-tokens/${t.id}`);
-		tokens = tokens.filter((x) => x.id !== t.id);
 	}
 </script>
 
-<h1 class="mb-4 text-xl font-semibold">Clients & Sites</h1>
+<PageHeader title="Clients & Sites" count={res.data?.length ?? null}>
+	{#snippet actions()}
+		{#if can('admin')}<Button variant="primary" icon={Plus} onclick={() => (adding = true)}>Add client</Button>{/if}
+	{/snippet}
+</PageHeader>
 
-{#if can('admin')}
-	<form class="mb-4 flex max-w-md gap-2" onsubmit={addClient}>
-		<input class="input" placeholder="New client name" bind:value={newClient} required />
-		<button class="btn-primary shrink-0">Add client</button>
-	</form>
-{/if}
-{#if error}<p class="mb-3 text-sm text-red-400">{error}</p>{/if}
-
-<div class="space-y-4">
-	{#each clients as c (c.id)}
-		<div class="card">
-			<div class="flex items-center justify-between border-b border-slate-800 px-4 py-3">
-				<a class="font-semibold hover:text-sky-400" href="/agents?client_id={c.id}">{c.name}</a>
-				{#if can('admin')}
-					<div class="flex gap-2"><button class="btn-ghost py-1 text-xs" onclick={() => addSite(c)}>Add site</button><button class="btn-danger py-1 text-xs" onclick={() => delClient(c)}>Delete</button></div>
-				{/if}
+{#if res.error && !res.data}
+	<div class="card"><ErrorState error={res.error} onretry={() => res.reload()} /></div>
+{:else}
+	{#snippet nameCell(c: Row)}<a class="hover:text-accent font-medium" href="/clients/{c.id}">{c.name}</a>{/snippet}
+	{#snippet sitesCell(c: Row)}<span class="text-muted">{c.sites.map((s) => s.name).join(', ')}</span>{/snippet}
+	{#snippet onlineCell(c: Row)}
+		{#if c.agents}
+			<div class="flex items-center gap-2">
+				<span class="bg-sunken border-border h-1.5 w-20 overflow-hidden rounded-full border"><span class="bg-success block h-full" style="width: {pct(c.online, c.agents)}%"></span></span>
+				<span class="text-muted text-xs tabular">{num(c.online)} / {num(c.agents)}</span>
 			</div>
-			<table class="table">
-				<tbody>
-					{#each c.sites as s (s.id)}
-						<tr>
-							<td>{s.name}</td>
-							<td class="text-slate-400">{s.online_count} / {s.agent_count} online</td>
-							<td class="text-right">
-								{#if can('technician')}<button class="btn-ghost py-1 text-xs" onclick={() => openTokens(c, s)}>Enroll agents</button>{/if}
-								{#if can('admin')}<button class="btn-danger ml-1 py-1 text-xs" onclick={() => delSite(s)}>Delete</button>{/if}
-							</td>
-						</tr>
-					{/each}
-				</tbody>
-			</table>
-		</div>
-	{:else}
-		<p class="text-slate-500">No clients yet. Add one to start enrolling agents.</p>
-	{/each}
-</div>
+		{:else}<span class="text-muted text-xs">no agents</span>{/if}
+	{/snippet}
+	{#snippet healthCell(c: Row)}
+		<span class="flex flex-wrap gap-1.5 text-xs">
+			{#if c.health?.unhealthy}<a class="bg-danger-soft text-danger rounded px-1.5 py-0.5 font-medium" href="/agents?client={c.id}&health=unhealthy">{c.health.unhealthy} unhealthy</a>{/if}
+			{#if c.health?.attention}<a class="bg-warning-soft text-warning rounded px-1.5 py-0.5 font-medium" href="/agents?client={c.id}&health=attention">{c.health.attention} attention</a>{/if}
+			{#if c.agents - c.online}<a class="text-muted hover:text-fg px-0.5 py-0.5" href="/agents?client={c.id}&view=offline">{c.agents - c.online} offline</a>{/if}
+			{#if c.agents && !c.health?.unhealthy && !c.health?.attention && c.agents === c.online}<span class="text-success">All good</span>{/if}
+		</span>
+	{/snippet}
+	{#snippet createdCell(c: Row)}<span class="text-muted text-xs">{ago(c.created_at)}</span>{/snippet}
 
-{#if tokenSite}
-	<Modal title="Enroll agents into {tokenSite.client.name} / {tokenSite.site.name}" onclose={() => (tokenSite = null)} wide>
-		<div class="mb-4">
-			<div class="label">Download agent</div>
-			{#if downloads === null}
-				<p class="text-sm text-slate-500">Loading…</p>
-			{:else if downloads.length}
-				<div class="flex flex-wrap gap-2">
-					{#each downloads as d (d.id)}
-						<a class="btn-ghost" href={d.url} download={d.file_name} title="SHA-256 {d.sha256}">
-							<svg class="size-4" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true"><path d="M10 3a1 1 0 0 1 1 1v7.59l2.3-2.3a1 1 0 1 1 1.4 1.42l-4 4a1 1 0 0 1-1.4 0l-4-4a1 1 0 1 1 1.4-1.42l2.3 2.3V4a1 1 0 0 1 1-1ZM4 15a1 1 0 0 1 1 1v1h10v-1a1 1 0 1 1 2 0v2a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1v-2a1 1 0 0 1 1-1Z" /></svg>
-							{d.label}
-							<span class="text-xs text-slate-500">{bytes(d.size)}</span>
-						</a>
-					{/each}
-				</div>
-				<p class="mt-1 text-xs text-slate-500">Or create a token below: the install commands download the agent themselves.</p>
+	<DataTable
+		id="clients"
+		caption="Clients"
+		{rows}
+		key={(c) => c.id}
+		loading={res.loading}
+		{sort}
+		rowHref={(c) => `/clients/${c.id}`}
+		scroll={false}
+		columns={[
+			{ id: 'name', label: 'Client', sort: 'name', cell: nameCell, hideable: false },
+			{ id: 'health', label: 'Health', sort: 'health', cell: healthCell },
+			{ id: 'online', label: 'Agents online', sort: 'online', cell: onlineCell, from: 'sm' },
+			{ id: 'sites', label: 'Sites', cell: sitesCell, from: 'md' },
+			{ id: 'created', label: 'Added', sort: 'created', cell: createdCell, from: 'lg', defaultHidden: true }
+		] satisfies Column<Row>[]}
+	>
+		{#snippet toolbar()}
+			<Input icon={Search} data-search placeholder="Client or site…" aria-label="Filter clients" class="w-full sm:w-64" bind:value={q} />
+		{/snippet}
+		{#snippet empty()}
+			{#if q}
+				<EmptyState compact title="No clients match" />
 			{:else}
-				<p class="text-sm text-slate-500">This server has no agent binaries. Put them in <code>RMM_AGENT_DIR</code> (the server image includes them).</p>
+				<EmptyState icon={Building2} title="No clients yet" description="Each customer is a client with one or more sites. Agents enroll into a site.">
+					{#snippet action()}{#if can('admin')}<Button variant="primary" icon={Plus} onclick={() => (adding = true)}>Add client</Button>{/if}{/snippet}
+				</EmptyState>
 			{/if}
-		</div>
-		{#if created}
-			<div class="mb-4 rounded-md border border-emerald-900 bg-emerald-950/30 p-3 text-sm">
-				<p class="mb-2 text-emerald-300">Token created. Copy it now, it won't be shown again.</p>
-				<div class="label">Linux (as root)</div>
-				<pre class="mb-2 overflow-x-auto rounded bg-slate-950 p-2 font-mono text-xs select-all">{created.install.linux}</pre>
-				<div class="label">Windows (elevated PowerShell)</div>
-				<pre class="overflow-x-auto rounded bg-slate-950 p-2 font-mono text-xs select-all">{created.install.windows}</pre>
-				{#if created.packages}
-					<div class="label mt-3">Linux package (the token is baked in; the package enrolls and starts the agent on install)</div>
-					<div class="mb-2 flex gap-2">
-						<a class="btn-ghost py-1 text-xs" href={created.packages.deb}>Download .deb</a>
-						<a class="btn-ghost py-1 text-xs" href={created.packages.rpm}>Download .rpm</a>
-					</div>
-					<div class="label">Debian / Ubuntu</div>
-					<pre class="mb-2 overflow-x-auto rounded bg-slate-950 p-2 font-mono text-xs select-all">{created.packages.install_deb}</pre>
-					<div class="label">RHEL / Fedora</div>
-					<pre class="overflow-x-auto rounded bg-slate-950 p-2 font-mono text-xs select-all">{created.packages.install_rpm}</pre>
-					<p class="mt-2 text-xs text-slate-400">Anyone with the package can enroll machines into this site until the token expires or runs out of uses{created.max_uses ? ` (${created.max_uses})` : ''}. Push it with your configuration management, and revoke the token when the rollout is done.</p>
-				{/if}
-			</div>
-		{/if}
-		<div class="mb-4 grid grid-cols-3 gap-2">
-			<div><label class="label" for="tl">Label</label><input id="tl" class="input" bind:value={label} placeholder="e.g. Office rollout" /></div>
-			<div><label class="label" for="tm">Max uses</label><input id="tm" class="input" type="number" min="1" bind:value={maxUses} placeholder="Unlimited" /></div>
-			<div>
-				<label class="label" for="te">Expires</label>
-				<select id="te" class="input" bind:value={expiresHours}>
-					<option value={1}>1 hour</option><option value={24}>1 day</option><option value={168}>7 days</option><option value={720}>30 days</option><option value={0}>Never</option>
-				</select>
-			</div>
-		</div>
-		<div class="mb-4 flex flex-wrap items-center gap-2">
-			<button class="btn-primary" onclick={() => createToken()}>Create enrollment token</button>
-			<button class="btn-ghost" onclick={() => createToken('package')} title="A token limited to 50 uses and 30 days unless set above, plus .deb/.rpm downloads with it baked in">Create Linux package</button>
-		</div>
-		{#if tokenError}<p class="mb-3 text-sm text-red-400">{tokenError}</p>{/if}
-		<table class="table">
-			<thead><tr><th>Label</th><th>Uses</th><th>Expires</th><th></th></tr></thead>
-			<tbody>
-				{#each tokens as t (t.id)}
-					<tr>
-						<td>{t.label || '–'}</td><td class="tabular-nums">{t.uses}{t.max_uses ? ` / ${t.max_uses}` : ''}</td>
-						<td class="text-xs text-slate-400">{t.expires_at ? datetime(t.expires_at) : 'never'}</td>
-						<td class="text-right"><button class="btn-danger py-0.5 text-xs" onclick={() => revoke(t)}>Revoke</button></td>
-					</tr>
-				{/each}
-			</tbody>
-		</table>
+		{/snippet}
+	</DataTable>
+{/if}
+
+{#if adding}
+	<Modal title="Add client" description="It starts with one site, Main. Add more sites on its page." onclose={() => (adding = false)} size="sm">
+		<form id="add-client" onsubmit={add}>
+			<Field label="Name" id="client-name" required>
+				<!-- svelte-ignore a11y_autofocus -->
+				<Input id="client-name" bind:value={name} required maxlength={200} autofocus autocomplete="off" />
+			</Field>
+		</form>
+		{#snippet footer()}
+			<Button onclick={() => (adding = false)}>Cancel</Button>
+			<Button variant="primary" type="submit" form="add-client" loading={busy} disabled={!name.trim()}>Add client</Button>
+		{/snippet}
 	</Modal>
 {/if}

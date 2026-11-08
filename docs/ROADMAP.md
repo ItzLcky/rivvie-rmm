@@ -43,102 +43,118 @@ To do:
 - [ ] MSI installer (WiX) with the server URL and token baked in, like the `.deb`/`.rpm`
 - [ ] Persist the agent's job buffer to disk, so results also survive an agent restart (today those jobs become `lost`)
 
-## Phase 3: UI redesign
+## Phase 3: UI redesign (done)
 
-Do this before the feature phases. The dashboard is still small (about 1,200 lines over 14 pages), so redoing it is cheap now. Every phase after this one adds screens, and the PSA alone adds six top-level sections. They should be built on the new components rather than redone later.
+The dashboard was rebuilt on a design system before the feature phases add their screens. Other RMMs were surveyed first ([docs/research/rmm-ui-survey.md](research/rmm-ui-survey.md)), which added the health model, built-in views, worst-first client health and the agent Activity tab to the plan.
 
-### What's wrong today
+### Decisions (the former open questions)
 
-- Styling is Tailwind classes with hard-coded `slate`/`sky` colours, plus a few shared classes in `layout.css`. There are no design tokens, and only a dark theme.
-- Inter and JetBrains Mono are in the font stack but never loaded, so everyone gets the system font.
-- Destructive actions use the browser's `confirm()`. Some load failures are swallowed: if `/dashboard` fails, the page stays blank. Nothing shows a loading state.
-- The sidebar is a fixed 224 px, with no layout for narrow screens.
-- `Modal` doesn't trap focus or return it when it closes.
-- Every list page polls the API every 10–15 s.
-- Tables have no sorting, paging or column choice. The agents list fetches every agent.
-- Some filters are read from the URL but never written back to it, so a filtered view can't be bookmarked or shared.
+- **Branding:** no separate product name for now. The company name from Company settings is shown in the sidebar, sign-in page and tab title. Colours are tokens in one file, so per-MSP white-labelling for the PSA portal changes values, not components.
+- **Default theme:** follows the OS. Light and dark ship together, with a per-user override saved server-side.
+- **Mockups:** designed in code against `/dev/ui`, with no Figma pass.
+- **Live updates:** Server-Sent Events rather than a WebSocket. The stream is one-way, so SSE is enough, the browser reconnects it, and it goes through proxies as plain HTTP.
 
-### Design system
+### Done
 
-- **Tokens:** CSS variables in `@theme` for colour roles: surface, raised, border, text, muted, accent, success, warning, danger, info. Define a light and a dark theme. Default to the OS setting, with an override saved per user on the Account page.
-- **Fonts:** self-host them as woff2 files under `static/`, so they keep working under the strict CSP from Phase 2. Or drop them and use the system stack.
-- **Components** in `src/lib/ui/`:
-  - controls: Button, IconButton, Input, Select, Combobox (searchable, for client/site/agent pickers), Checkbox, Switch;
-  - navigation and overlays: Tabs, Breadcrumbs, PageHeader, Dropdown menu, Tooltip, Modal, Drawer;
-  - feedback: Toast, ConfirmDialog (big deletes make you type the name), EmptyState, Skeleton, Badge;
-  - data: DataTable, Pagination.
-- **Headless primitives:** build menus, comboboxes, dialogs and tooltips on Bits UI (headless, written for Svelte 5), so focus and keyboard handling are right. Style them with our tokens.
-- **Icons:** Lucide (`@lucide/svelte`), replacing text glyphs such as `✕`.
-- **Component gallery:** a `/dev/ui` route, in dev builds only, that shows every component in every state in both themes. Cheaper than Storybook.
+Design system:
 
-### Navigation and layout
+- [x] **Tokens:** CSS variables for colour roles (surface, raised, sunken, border, fg, muted, accent, success, warning, danger, info, chart, syntax, terminal) in `web/src/routes/layout.css`, in light and dark. `static/theme.js` applies the saved theme before first paint.
+- [x] **Preferences:** theme, table density, hidden columns, page size, sidebar state and terminal font size, in `users.preferences` (`PUT /api/auth/preferences`).
+- [x] **Fonts:** Inter and JetBrains Mono, bundled as same-origin woff2. Vite never inlines them, because the CSP's `font-src 'self'` rejects `data:` URIs.
+- [x] **Components** in `src/lib/ui/`: Button, IconButton, Input, Textarea, Select, Combobox, Checkbox, Switch, Field, Tabs, Segmented, Breadcrumbs, PageHeader, Menu, Tooltip, Modal, Drawer, Toaster, ConfirmHost, EmptyState, ErrorState, Skeleton, Spinner, Badge, Kbd, CodeBlock, CopyButton, DataTable and Pagination. Overlays use Bits UI, which handles focus trapping and return, and keyboard navigation. Icons are Lucide.
+- [x] **Gallery:** `/dev/ui` shows every component in every state. It exists only in dev builds, or with `VITE_UI_GALLERY=1`.
 
-- **Grouped sidebar:**
-  - Overview: Dashboard
-  - Devices: Agents, Clients & Sites
-  - Automation: Scripts, Jobs, later Schedules and Patches
-  - Alerts (Phase 4)
-  - Service desk (Phase 7)
-  - Admin: Audit log, Company settings
+Layout:
 
-  It collapses to icons, and becomes a drawer on screens narrower than `lg`.
-- **Command palette** (Ctrl+K) in a top bar. It jumps to any agent, client, script or ticket and runs actions ("Run script on…", "New ticket"). Needs a server `/search` endpoint.
-- **Client switcher:** pick a client to scope every list. Keep the choice in the URL (`?client=`) so links carry it. This matches the per-client access control in Phase 2.
-- **Breadcrumbs** on detail pages: Client › Site › Agent.
-- **Standard page header:** title, item count, the primary action, and secondary actions in an overflow menu.
+- [x] **Sidebar:** grouped (Overview, Devices, Automation, Admin). It collapses to icons and becomes a drawer below `lg`.
+- [x] **Top bar:** client switcher, search, live-update indicator and account menu.
+- [x] **Command palette** (Ctrl/⌘ K), backed by a new `GET /api/search`:
+  - finds agents (by hostname, OS, IP or signed-in user), clients, sites, scripts and pages;
+  - follows the client switcher, with a "search all clients" option;
+  - shows recently viewed agents before you type;
+  - has actions: run a script on an agent, new script, add client, enroll, theme, shortcuts.
+- [x] **Client switcher:** `?client=` in the URL scopes the dashboard, agents, jobs, clients and scripts. Nav links carry it. The Client column turns into Site while a client is selected.
+- [x] **Breadcrumbs and page headers:** a standard header with title, count, primary action and overflow menu.
 
-### Data and feedback
+Data:
 
-- **DataTable:**
-  - sorting and paging done on the server, with keyset pagination (agent and job tables keep growing);
-  - column visibility saved per user;
+- [x] **Server paging:** keyset paging and sorting for agents, jobs and the audit log (`crates/rmm-server/src/paging.rs`). Responses are `{items, next, prev, total, total_exact}`; counts stop at 10,000.
+- [x] **Agents:** sort by hostname, client, OS, status, health, last seen, enrolled date, CPU, memory, disk or version. Filter by client, site, OS, online, health, enrolled in the last N days, or a search across hostname, IP and user.
+- [x] **Jobs:** filter by status, script, client, agent or text.
+- [x] **Audit log:** filter by action prefix, user or target.
+- [x] **DataTable:**
+  - server or local sorting;
+  - column visibility and density saved per user;
   - row selection with a bulk-action bar;
-  - sticky header, and a compact/comfortable density toggle.
-- **URL state:** every filter and sort goes in the URL, so views can be bookmarked and shared. Saved views (Phase 8) build on this.
-- **Live updates:** replace per-page polling with a single WebSocket (or SSE stream) for the dashboard. The server pushes agents going online/offline, new metrics and job status changes; pages subscribe to what they show. The hub already sees these events. Fall back to polling if the socket drops.
-- **Load states:** every fetch shows a skeleton while loading, plus empty and error states with a retry button. Put this in one shared load helper instead of repeating it on each page.
-- **Feedback:** toasts report whether actions succeeded. ConfirmDialog replaces `confirm()`. Offer undo where it's cheap; small toggles update optimistically.
+  - sticky header, skeleton rows and an empty state;
+  - columns that hide on phones;
+  - whole-row click.
+- [x] **URL state:** every filter, sort, cursor, view and tab is in the URL.
+- [x] **Live updates:** `GET /api/events`, one SSE stream per tab.
+  - It carries agent online/offline and metrics, and job status and output.
+  - Updates are coalesced to at most one per agent or job per second.
+  - Events are filtered to the clients the user can see.
+  - The session is re-checked every minute, so revocations and access changes take effect.
+  - A `resync` event is sent when a browser falls behind.
+  - Pages poll instead while the stream is down.
+- [x] **Load states:** one helper (`resource()` with `<Async>`) gives skeletons, errors with Retry, and stale-while-revalidate.
+- [x] **Toasts and confirmation:**
+  - toasts report success and failure, and are announced to screen readers;
+  - ConfirmDialog replaces every `confirm()`, and deleting a client, site or agent requires typing its name;
+  - the script editor asks before discarding unsaved changes.
 
-### Key screens
+Screens:
 
-- **Dashboard:** lead with what needs attention: offline agents, failed jobs and full disks; later, alerts, patch compliance and SLA breaches. Add a health grid per client. Configurable widgets can wait until after v1.
-- **Agent detail:**
-  - a header with status, OS, client/site and quick actions (terminal, run script, later reboot);
-  - tabs: Overview, Inventory, Software, Jobs and Terminal, later Patches, Alerts and Tickets;
-  - charts with a time-range picker.
-- **Clients & Sites:** a client list with a health summary (agents online/total, later alerts). Each client gets a detail page with its sites, agents and enrolment tokens, and later its contracts and tickets. Today all of this is on one page.
-- **Jobs:** stream output live on the job page, filter by status, script and client, and rerun failed jobs.
-- **Script editor:** CodeMirror 6 with syntax highlighting per interpreter, and a form for arguments. Version history later.
-- **Terminal:** full height, with a reconnect banner and a font-size control.
+- [x] **Health model:** healthy, needs attention, unhealthy or no data, computed by the server from:
+  - disk at or above 90% (needs attention) or 95% (unhealthy);
+  - jobs that failed in the last 24 hours;
+  - agent updates that failed or rolled back in the last 7 days.
 
-### Quality bar
+  It's separate from online/offline, because a workstation that's switched off isn't broken.
+- [x] **Dashboard:**
+  - attention tiles for offline agents, agents needing attention, failed jobs and full disks, each linking to the filtered list;
+  - lists of recently offline agents, failed jobs and the fullest disks;
+  - client health sorted worst first;
+  - a fleet summary.
 
-- **Accessibility:** WCAG 2.2 AA:
-  - everything reachable by keyboard, with visible focus rings;
-  - contrast checked in both themes;
-  - status never shown by colour alone (`Status` already has a text label; keep it that way);
-  - labelled form controls, and `aria-live` for toasts.
-- **Phones:** triage should work on a 375 px screen: check status, read and acknowledge alerts, run a script. Full editing can stay desktop-only.
-- **Keyboard shortcuts:** `/` focuses search, `g a` goes to agents, `j`/`k` move through lists, and `?` lists the shortcuts.
-- **Performance:** lazy-load heavy dependencies (xterm, charts, CodeMirror) on the pages that use them, so the first load stays small.
-- **Visual regression:** Playwright screenshots of `/dev/ui` and the main pages in both themes. Run them in CI next to the Phase 2 integration tests.
+  It narrows to one client with the switcher.
+- [x] **Agents:** built-in views (All, Online, Offline, Needs attention, New in the last 7 days); bulk Run script and Update; rows update live.
+- [x] **Agent detail:**
+  - a header with status, health, OS and client › site, and Terminal, Run script and overflow actions;
+  - URL tabs: Overview (facts, performance with a 1h/24h/7d/30d range, recent jobs, volumes), Hardware & network, Software (sortable, filterable), Jobs, Activity (new: `GET /api/agents/{id}/activity`) and Terminal.
+- [x] **Clients:**
+  - a list with health summaries;
+  - client detail pages (`GET /api/clients/{id}`) with health tiles, an Agents tab, and a Sites & enrollment tab;
+  - rename for clients and sites (`PUT /api/clients/{id}`, `PUT /api/sites/{id}`).
+- [x] **Jobs:**
+  - live output, fetching only new output via `?since_stdout=&since_stderr=`, with follow-scroll and copy;
+  - Rerun from the list and from the job page.
+- [x] **Scripts:**
+  - a full-page editor (`/scripts/{id}`, `/scripts/new`) on CodeMirror 6, with highlighting for bash/sh, PowerShell and Python;
+  - Ctrl/⌘ S saves;
+  - the Run dialog takes arguments.
+- [x] **Terminal:** fills the page height, with a reconnect banner, a font-size control (saved per user) and full screen.
+- [x] **Account:** an Appearance section for theme and density.
 
-### Build order
+Quality:
 
-1. Tokens, themes, fonts, icons, the core components and `/dev/ui`.
-2. The new layout: grouped sidebar, mobile drawer, top bar, breadcrumbs, and the command palette with its search endpoint.
-3. DataTable with URL state and server-side paging. Move Agents, Jobs and the Audit log to it.
-4. Loading, error, toast and confirm patterns on every page.
-5. Live updates over the single socket.
-6. The reworked Dashboard, Agent detail and Clients pages (Clients split into detail pages).
+- [x] **Accessibility:** axe checks every page and the gallery against WCAG 2.2 AA in both themes, in CI. Visible focus rings; status always has a text label; labelled controls; live regions for toasts; 24 px minimum targets; a skip link.
+- [x] **Phones:** at 375 px, the agents list stacks status, client and health under the hostname, and navigation is a drawer.
+- [x] **Keyboard:** `/` focuses the page's search, `g` + `d/a/c/s/j/l/,` goes to a section, `j`/`k`/Enter/`x` work in lists, and `?` lists the shortcuts.
+- [x] **Performance:** xterm and CodeMirror load only on the pages that use them. The first load is about 380 KB of JS before compression.
+- [x] **Visual regression:** `web/tests/visual/`, 62 Playwright tests against a mocked API with a frozen clock.
+  - Every main page in both themes, phone layouts, the gallery, the palette and ConfirmDialog are screenshotted.
+  - Shortcuts and URL state are tested.
+  - Baselines are rendered in the Playwright Docker image (`npm run test:visual:docker`), and the CI `visual` job runs in that image.
 
-Each step ships separately. Old and new pages can run side by side, because pages adopt the new components one at a time.
+### Later
 
-### Open questions
-
-- **Branding:** does the product get its own name and logo, beyond the company name shown today? The PSA client portal will want per-MSP white-labelling, which the tokens make easy.
-- **Default theme:** light or dark?
-- **Mockups first?** A design pass in Figma before step 1, or design directly in code against `/dev/ui`.
+- [ ] Undo on cheap actions (toasts already support an action button), and optimistic updates for small toggles.
+- [ ] A peek drawer from the agents list, favourites and tags on agents, and agent notes. Tags and notes belong with custom fields in Phase 8.
+- [ ] Select every row matching a filter, not just the rows on screen, for bulk actions.
+- [ ] Saved views (Phase 8), built on the URL state.
+- [ ] Configurable dashboard widgets; script version history.
+- [ ] Agent tabs added by later phases: Patches (5), Alerts (4), Tickets (7). Move tabs to a side sub-nav once there are more than about eight.
 
 ## Phase 4: Monitoring and alerting
 

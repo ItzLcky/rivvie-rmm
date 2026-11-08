@@ -1,27 +1,250 @@
 @import 'tailwindcss';
 
-@theme {
-	--font-sans: 'Inter', ui-sans-serif, system-ui, sans-serif;
-	--font-mono: 'JetBrains Mono', ui-monospace, 'SFMono-Regular', Menlo, monospace;
+/*
+ * Design tokens. Components use the role names (bg-surface, text-muted, border-border,
+ * bg-accent...), never raw palette colours, so both themes and later white-labelling only
+ * touch this file. Light is the base; [data-theme='dark'] on <html> swaps the values.
+ * static/theme.js sets that attribute before first paint from the saved choice (or the OS).
+ */
+:root {
+	--surface: #f6f7f9; /* page background */
+	--raised: #ffffff; /* cards, menus, dialogs */
+	--sunken: #eef0f3; /* inputs' wells, code, table headers */
+	--hover: #eceef2;
+	--border: #e1e4e9;
+	--border-strong: #c9ced6;
+	--fg: #151a22;
+	--muted: #586170; /* secondary text: 6:1 on white */
+	--subtle: #8a929e; /* placeholders and decoration only, not for meaningful text */
+	--accent: #2c5bcc;
+	--accent-hover: #244fb5;
+	--accent-soft: #e7edfb;
+	--on-accent: #ffffff;
+	--success: #18794a;
+	--success-soft: #e3f4ea;
+	--warning: #9a5a00;
+	--warning-soft: #fdf0d9;
+	--danger: #c03029;
+	--on-danger: #ffffff;
+	--danger-soft: #fbe6e4;
+	--info: #2667a8;
+	--info-soft: #e3eef9;
+	--focus: #2c5bcc;
+	--overlay: rgb(15 18 24 / 0.45);
+	--shadow: 0 1px 2px rgb(16 24 40 / 0.06), 0 1px 3px rgb(16 24 40 / 0.08);
+	--shadow-lg: 0 12px 32px -8px rgb(16 24 40 / 0.22), 0 4px 8px -4px rgb(16 24 40 / 0.08);
+	/* Charts get their own roles so series stay distinguishable in both themes. */
+	--chart-1: #2c5bcc;
+	--chart-2: #8a46c8;
+	--chart-3: #0f8a7e;
+	--chart-grid: #e6e9ee;
+	--terminal-bg: #0d1117;
+	--terminal-fg: #e6edf3;
+	--syntax-keyword: #a626a4;
+	--syntax-string: #276b2a;
+	--syntax-comment: #5f6975;
+	--syntax-number: #9c4a08;
+	--syntax-variable: #1e5bb8;
+	--syntax-function: #7343c9;
+	color-scheme: light;
+}
+
+[data-theme='dark'] {
+	--surface: #0d1015;
+	--raised: #151a21;
+	--sunken: #0a0c10;
+	--hover: #1d232c;
+	--border: #242b35;
+	--border-strong: #343d49;
+	--fg: #e4e8ee;
+	--muted: #9aa3b0;
+	--subtle: #6a7381;
+	/* Lighter and less saturated than the light accent: bright blue on black is hard to read. */
+	--accent: #7aa2f7;
+	--accent-hover: #93b4fa;
+	--accent-soft: #1b2741;
+	--on-accent: #0b1220;
+	--success: #55c48c;
+	--success-soft: #12291e;
+	--warning: #e3a84a;
+	--warning-soft: #2e2311;
+	--danger: #f2756c;
+	--on-danger: #1a0a09;
+	--danger-soft: #331817;
+	--info: #6fb0ea;
+	--info-soft: #132536;
+	--focus: #7aa2f7;
+	--overlay: rgb(0 0 0 / 0.6);
+	--shadow: 0 1px 2px rgb(0 0 0 / 0.4);
+	--shadow-lg: 0 16px 40px -8px rgb(0 0 0 / 0.6), 0 4px 10px -4px rgb(0 0 0 / 0.4);
+	--chart-1: #7aa2f7;
+	--chart-2: #c39bf0;
+	--chart-3: #4fc7b5;
+	--chart-grid: #222932;
+	--terminal-bg: #0a0c10;
+	--terminal-fg: #e4e8ee;
+	--syntax-keyword: #d197f2;
+	--syntax-string: #9ad08b;
+	--syntax-comment: #7d8693;
+	--syntax-number: #f2b072;
+	--syntax-variable: #8fb6ff;
+	--syntax-function: #c2a4ff;
+	color-scheme: dark;
+}
+
+/* Table and control density, switched on <html> from the user's preference. */
+:root {
+	--row-y: 0.4rem;
+	--cell-x: 0.75rem;
+}
+[data-density='comfortable'] {
+	--row-y: 0.7rem;
+	--cell-x: 1rem;
+}
+
+@theme inline {
+	--font-sans: 'Inter Variable', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+	--font-mono: 'JetBrains Mono Variable', ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace;
+
+	--color-surface: var(--surface);
+	--color-raised: var(--raised);
+	--color-sunken: var(--sunken);
+	--color-hover: var(--hover);
+	--color-border: var(--border);
+	--color-border-strong: var(--border-strong);
+	--color-fg: var(--fg);
+	--color-muted: var(--muted);
+	--color-subtle: var(--subtle);
+	--color-accent: var(--accent);
+	--color-accent-hover: var(--accent-hover);
+	--color-accent-soft: var(--accent-soft);
+	--color-on-accent: var(--on-accent);
+	--color-success: var(--success);
+	--color-success-soft: var(--success-soft);
+	--color-warning: var(--warning);
+	--color-warning-soft: var(--warning-soft);
+	--color-danger: var(--danger);
+	--color-on-danger: var(--on-danger);
+	--color-danger-soft: var(--danger-soft);
+	--color-info: var(--info);
+	--color-info-soft: var(--info-soft);
+	--color-overlay: var(--overlay);
+
+	--shadow-card: var(--shadow);
+	--shadow-pop: var(--shadow-lg);
 }
 
 @layer base {
-	html { color-scheme: dark; }
-	body { @apply bg-slate-950 text-slate-200 antialiased; }
+	html {
+		-webkit-text-size-adjust: 100%;
+		font-feature-settings: 'cv11', 'ss01';
+	}
+	body {
+		@apply bg-surface text-fg font-sans text-sm antialiased;
+	}
+	/* One focus ring everywhere, only for keyboard focus. */
+	:focus-visible {
+		outline: 2px solid var(--focus);
+		outline-offset: 2px;
+		border-radius: 4px;
+	}
+	::selection {
+		background: color-mix(in srgb, var(--accent) 30%, transparent);
+	}
+	code,
+	kbd,
+	pre {
+		@apply font-mono;
+	}
+	a {
+		@apply text-inherit no-underline;
+	}
+	@media (prefers-reduced-motion: reduce) {
+		*,
+		*::before,
+		*::after {
+			animation-duration: 0.01ms !important;
+			transition-duration: 0.01ms !important;
+		}
+	}
 }
 
 @layer components {
-	.card { @apply rounded-lg border border-slate-800 bg-slate-900/60; }
-	.btn, .btn-primary, .btn-ghost, .btn-danger { @apply inline-flex cursor-pointer items-center gap-1.5 rounded-md px-3 py-1.5 text-sm font-medium transition disabled:cursor-not-allowed disabled:opacity-50; }
-	.btn-primary { @apply bg-sky-600 text-white hover:bg-sky-500; }
-	.btn-ghost { @apply border border-slate-700 text-slate-200 hover:bg-slate-800; }
-	.btn-danger { @apply border border-red-900 text-red-300 hover:bg-red-950; }
-	.input { @apply w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-1.5 text-sm text-slate-100 placeholder:text-slate-500 focus:border-sky-500 focus:outline-none; }
-	.label { @apply mb-1 block text-xs font-medium tracking-wide text-slate-400 uppercase; }
-	.table { @apply w-full text-left text-sm; }
-	.table th { @apply border-b border-slate-800 px-3 py-2 text-xs font-medium tracking-wide text-slate-400 uppercase; }
-	.table td { @apply border-b border-slate-800/60 px-3 py-2; }
-	.table tbody tr:hover { @apply bg-slate-800/30; }
-	.tab { @apply border-b-2 border-transparent px-3 py-2 text-sm text-slate-400 hover:text-slate-200; }
-	.tab-active { @apply border-sky-500 text-slate-100; }
+	.card {
+		@apply border-border bg-raised shadow-card rounded-lg border;
+	}
+	.link {
+		@apply text-accent decoration-accent/40 hover:decoration-accent underline underline-offset-2;
+	}
+	/* Form controls share one look; Input/Select/Textarea components apply these. */
+	.control {
+		@apply border-border-strong bg-raised text-fg placeholder:text-subtle h-8 w-full rounded-md border px-2.5 text-sm transition-colors outline-none;
+		@apply focus-visible:border-accent focus-visible:ring-accent/25 focus-visible:ring-3 focus-visible:outline-none;
+		@apply disabled:bg-sunken disabled:text-muted disabled:cursor-not-allowed;
+		@apply aria-invalid:border-danger;
+	}
+	textarea.control {
+		@apply h-auto py-1.5;
+	}
+	select.control {
+		@apply appearance-none bg-[length:16px] bg-[right_0.4rem_center] bg-no-repeat pr-7;
+		background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23888' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m7 10 5 5 5-5'/%3E%3C/svg%3E");
+	}
+	.label {
+		@apply text-fg mb-1 block text-xs font-medium;
+	}
+	.hint {
+		@apply text-muted mt-1 text-xs;
+	}
+	.kbd {
+		@apply border-border bg-sunken text-muted inline-flex h-5 min-w-5 items-center justify-center rounded border px-1 font-mono text-[11px] leading-none;
+	}
+	.code-block {
+		@apply border-border bg-sunken overflow-auto rounded-md border p-3 font-mono text-xs leading-relaxed;
+	}
+	/* Plain tables (small, client-side). DataTable has its own styles on top. */
+	.table {
+		@apply w-full border-separate border-spacing-0 text-left text-sm;
+	}
+	.table th {
+		@apply border-border bg-sunken text-muted border-b text-xs font-medium whitespace-nowrap;
+		padding: var(--row-y) var(--cell-x);
+	}
+	.table td {
+		@apply border-border border-b align-middle;
+		padding: var(--row-y) var(--cell-x);
+	}
+	.table tbody tr:last-child td {
+		@apply border-b-0;
+	}
+	.table tbody tr:hover td {
+		@apply bg-hover/60;
+	}
+	.dl {
+		@apply grid grid-cols-[minmax(6rem,auto)_1fr] gap-x-4 gap-y-2 text-sm;
+	}
+	.dl dt {
+		@apply text-muted;
+	}
+	.dl dd {
+		@apply min-w-0 break-words;
+	}
+}
+
+@layer utilities {
+	.tabular {
+		font-variant-numeric: tabular-nums;
+	}
+	/* Fades the clipped edge of a scrolling strip; --fl/--fr are set by the scrollFade action. */
+	.scroll-fade {
+		mask-image: linear-gradient(to right, transparent, #000 var(--fl, 0px), #000 calc(100% - var(--fr, 0px)), transparent);
+	}
+	.scrollbar-thin {
+		scrollbar-width: thin;
+	}
+}
+
+/* xterm brings its own stylesheet; keep its viewport the terminal colour in both themes. */
+.xterm .xterm-viewport {
+	background-color: var(--terminal-bg) !important;
 }

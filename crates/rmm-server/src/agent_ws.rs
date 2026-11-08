@@ -20,7 +20,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::auth::{random_token, token_hash};
-use crate::hub::{AgentHandle, ShellEvent};
+use crate::hub::{AgentHandle, Event, ShellEvent};
 use crate::ratelimit::ClientIp;
 use crate::state::AppState;
 
@@ -197,7 +197,7 @@ async fn run_session(
     // The agent resends output and results for the jobs it still holds; anything else marked
     // `sent` can never finish. Do this before registering: a job created in between sees the
     // agent offline, stays queued, and is dispatched below.
-    mark_lost(&state.db, agent_id, &held_jobs).await?;
+    let lost = mark_lost(&state.db, agent_id, &held_jobs).await?;
     if let Some(old) = state.hub.register(agent_id, AgentHandle { conn_id, tx: tx.clone() }) {
         debug!(%agent_id, old = %old.conn_id, "replacing stale connection");
     }
@@ -207,6 +207,13 @@ async fn run_session(
         .execute(&state.db)
         .await?;
     info!(%agent_id, %agent_version, "agent online");
+    // Agents don't move between clients, so this holds for the whole connection.
+    let client_id: Uuid =
+        sqlx::query_scalar("SELECT s.client_id FROM agents a JOIN sites s ON s.id = a.site_id WHERE a.id = $1")
+            .bind(agent_id)
+            .fetch_one(&state.db)
+            .await?;
+    state.hub.publish(Event::Agent { id: agent_id, client_id, online: true, last_metrics: None });
 
     let (mut sink, mut stream) = ws.split();
     let writer = tokio::spawn(async move {
@@ -232,8 +239,12 @@ async fn run_session(
 
     // Ask for fresh inventory and flush anything queued while the agent was offline.
     let _ = tx.send(ServerMsg::RequestInventory).await;
-    if let Err(e) = dispatch_queued(&state, agent_id, &tx).await {
+    let dispatched = dispatch_queued(&state, agent_id, &tx).await.unwrap_or_else(|e| {
         warn!(%agent_id, "dispatching queued jobs: {e}");
+        0
+    });
+    if lost > 0 || dispatched > 0 {
+        state.hub.publish(Event::Jobs);
     }
     // Replies to this connection only (job acks). Weak, so the writer still ends when the
     // hub drops the agent (kick) and every other sender is gone.
@@ -262,7 +273,7 @@ async fn run_session(
         // Auto-update waits for the first heartbeat: the agent reports how its last update
         // went (e.g. rolled back) before it, so that's already recorded when we decide.
         let first_heartbeat = !auto_update_checked && matches!(msg, AgentMsg::Heartbeat(_));
-        if let Err(e) = on_message(&state, agent_id, &reply, msg).await {
+        if let Err(e) = on_message(&state, agent_id, client_id, &reply, msg).await {
             warn!(%agent_id, "handling message: {e:#}");
         }
         if first_heartbeat {
@@ -280,6 +291,7 @@ async fn run_session(
             .bind(agent_id)
             .execute(&state.db)
             .await;
+        state.hub.publish(Event::Agent { id: agent_id, client_id, online: false, last_metrics: None });
         info!(%agent_id, "agent offline");
     }
     Ok(())
@@ -304,7 +316,8 @@ pub async fn mark_lost(db: &sqlx::PgPool, agent_id: Uuid, held: &[Uuid]) -> sqlx
     Ok(n)
 }
 
-pub async fn dispatch_queued(state: &AppState, agent_id: Uuid, tx: &mpsc::Sender<ServerMsg>) -> anyhow::Result<()> {
+/// Sends every queued job to a freshly connected agent; returns how many.
+pub async fn dispatch_queued(state: &AppState, agent_id: Uuid, tx: &mpsc::Sender<ServerMsg>) -> anyhow::Result<usize> {
     let rows: Vec<(Uuid, String, String, serde_json::Value, i32)> = sqlx::query_as(
         "UPDATE jobs SET status = 'sent', sent_at = now()
           WHERE agent_id = $1 AND status = 'queued'
@@ -313,6 +326,7 @@ pub async fn dispatch_queued(state: &AppState, agent_id: Uuid, tx: &mpsc::Sender
     .bind(agent_id)
     .fetch_all(&state.db)
     .await?;
+    let n = rows.len();
     for (job_id, interp, body, args, timeout) in rows {
         let Some(interpreter) = parse_interpreter(&interp) else { continue };
         let job = ScriptJob {
@@ -324,7 +338,7 @@ pub async fn dispatch_queued(state: &AppState, agent_id: Uuid, tx: &mpsc::Sender
         };
         let _ = tx.send(ServerMsg::RunScript(job)).await;
     }
-    Ok(())
+    Ok(n)
 }
 
 pub fn parse_interpreter(s: &str) -> Option<Interpreter> {
@@ -341,11 +355,21 @@ pub fn parse_interpreter(s: &str) -> Option<Interpreter> {
 async fn on_message(
     state: &AppState,
     agent_id: Uuid,
+    client_id: Uuid,
     reply: &mpsc::WeakSender<ServerMsg>,
     msg: AgentMsg,
 ) -> anyhow::Result<()> {
+    // Job rows changed by this message, announced once it's stored.
+    let job_event = |id: Uuid, status: Option<String>, output: bool| {
+        if let Some(status) = status {
+            state.hub.publish(Event::Job { id, agent_id, client_id, status, output });
+        }
+    };
     match msg {
-        AgentMsg::Heartbeat(m) => store_metrics(state, agent_id, &m).await?,
+        AgentMsg::Heartbeat(m) => {
+            store_metrics(state, agent_id, &m).await?;
+            state.hub.publish(Event::Agent { id: agent_id, client_id, online: true, last_metrics: serde_json::to_value(&m).ok() });
+        }
         AgentMsg::Inventory(inv) => store_inventory(state, agent_id, &inv).await?,
         AgentMsg::JobOutput { job_id, stream, data } => {
             let col = match stream {
@@ -355,29 +379,31 @@ async fn on_message(
             // Cap stored output so a chatty script can't bloat the DB.
             let sql = format!(
                 "UPDATE jobs SET {col} = {col} || left($3, GREATEST(0, $4 - length({col})))
-                  WHERE id = $1 AND agent_id = $2"
+                  WHERE id = $1 AND agent_id = $2 RETURNING status"
             );
-            sqlx::query(AssertSqlSafe(sql))
+            let status = sqlx::query_scalar(AssertSqlSafe(sql))
                 .bind(job_id)
                 .bind(agent_id)
                 .bind(String::from_utf8_lossy(&data).as_ref())
                 .bind(JOB_OUTPUT_CAP)
-                .execute(&state.db)
+                .fetch_optional(&state.db)
                 .await?;
+            job_event(job_id, status, true);
         }
         AgentMsg::JobFinished { job_id, status, exit_code, duration_ms } => {
-            sqlx::query(
+            let status = sqlx::query_scalar(
                 // `lost` too: the timeout reaper may have given up on a job that then finished.
                 "UPDATE jobs SET status = $3, exit_code = $4, duration_ms = $5, finished_at = now()
-                  WHERE id = $1 AND agent_id = $2 AND status IN ('sent', 'lost')",
+                  WHERE id = $1 AND agent_id = $2 AND status IN ('sent', 'lost') RETURNING status",
             )
             .bind(job_id)
             .bind(agent_id)
             .bind(status_str(status))
             .bind(exit_code)
             .bind(duration_ms as i64)
-            .execute(&state.db)
+            .fetch_optional(&state.db)
             .await?;
+            job_event(job_id, status, false);
             // Stored (or already final from an earlier delivery): the agent can forget it.
             if let Some(tx) = reply.upgrade() {
                 let _ = tx.send(ServerMsg::JobAck { job_id }).await;
@@ -385,17 +411,18 @@ async fn on_message(
         }
         AgentMsg::JobSync { job_id, stdout, stderr } => {
             // Replaces what arrived before the reconnect; the agent's copy is a superset.
-            sqlx::query(
+            let status = sqlx::query_scalar(
                 "UPDATE jobs SET stdout = left($3, $5), stderr = left($4, $5)
-                  WHERE id = $1 AND agent_id = $2 AND status NOT IN ('queued', 'expired')",
+                  WHERE id = $1 AND agent_id = $2 AND status NOT IN ('queued', 'expired') RETURNING status",
             )
             .bind(job_id)
             .bind(agent_id)
             .bind(String::from_utf8_lossy(&stdout).as_ref())
             .bind(String::from_utf8_lossy(&stderr).as_ref())
             .bind(JOB_OUTPUT_CAP)
-            .execute(&state.db)
+            .fetch_optional(&state.db)
             .await?;
+            job_event(job_id, status, true);
         }
         AgentMsg::ShellOpened { session_id } => state.hub.route_shell(agent_id, session_id, ShellEvent::Opened).await,
         AgentMsg::ShellOutput { session_id, data } => state.hub.route_shell(agent_id, session_id, ShellEvent::Output(data)).await,

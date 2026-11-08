@@ -35,6 +35,10 @@ export default defineConfig({
 			}
 		})
 	],
+	build: {
+		// Fonts are always separate files: the CSP's font-src 'self' rejects inlined data: URIs.
+		assetsInlineLimit: (file) => (file.endsWith('.woff2') || file.endsWith('.woff') ? false : undefined)
+	},
 	server: {
 		proxy: { '/api': { target: backend, ws: true, changeOrigin: false } }
 	}

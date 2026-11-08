@@ -12,10 +12,11 @@ mod clients;
 mod downloads;
 mod jobs;
 mod packages;
+mod search;
 mod scripts;
 mod settings;
 mod totp;
-mod users;
+pub(crate) mod users;
 
 pub use totp::clear as clear_totp;
 pub use users::create_user as create_user_cli;
@@ -37,6 +38,9 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/auth/login", post(auth::login))
         .route("/auth/logout", post(auth::logout))
         .route("/auth/me", get(auth::me))
+        .route("/auth/preferences", axum::routing::put(auth::update_preferences))
+        .route("/events", get(crate::events::handler))
+        .route("/search", get(search::search))
         .route("/auth/password", post(auth::change_password))
         .route("/auth/sessions", get(auth::my_sessions).delete(auth::revoke_other_sessions))
         .route("/auth/sessions/{id}", delete(auth::revoke_my_session))
@@ -47,9 +51,9 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/auth/totp/recovery-codes", post(totp::regenerate_recovery))
         .route("/dashboard", get(agents::dashboard))
         .route("/clients", get(clients::list).post(clients::create))
-        .route("/clients/{id}", delete(clients::remove))
+        .route("/clients/{id}", get(clients::get).put(clients::rename).delete(clients::remove))
         .route("/clients/{id}/sites", post(clients::create_site))
-        .route("/sites/{id}", delete(clients::remove_site))
+        .route("/sites/{id}", axum::routing::put(clients::rename_site).delete(clients::remove_site))
         .route("/sites/{id}/enrollment-tokens", get(clients::list_tokens).post(clients::create_token))
         .route("/enrollment-tokens/{id}", delete(clients::revoke_token))
         .route("/agent-downloads", get(downloads::list))
@@ -58,6 +62,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/agents", get(agents::list))
         .route("/agents/{id}", get(agents::get).delete(agents::remove))
         .route("/agents/{id}/metrics", get(agents::metrics))
+        .route("/agents/{id}/activity", get(agents::activity))
         .route("/agents/{id}/inventory/refresh", post(agents::refresh_inventory))
         .route("/agents/{id}/update", post(agents::update))
         .route("/agent-updates", get(agents::releases))

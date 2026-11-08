@@ -162,14 +162,13 @@ pub fn extract_token(headers: &header::HeaderMap) -> Option<String> {
         .find_map(|kv| kv.trim().strip_prefix(&format!("{COOKIE}=")).map(str::to_string))
 }
 
-impl FromRequestParts<Arc<AppState>> for User {
-    type Rejection = ApiError;
-
-    async fn from_request_parts(parts: &mut Parts, state: &Arc<AppState>) -> Result<Self, ApiError> {
-        let token = extract_token(&parts.headers).ok_or(ApiError::Unauthorized)?;
-        // Valid = not past the absolute expiry and used within the idle window. last_seen_at is
-        // only rewritten when a minute old, so polling pages don't cost a write per request.
-        let user = sqlx::query_as::<_, User>(concat!(
+/// The user a session token belongs to, if the session is still valid: not past its absolute
+/// expiry, used within the idle window, and the account not disabled. Also re-read
+/// periodically by long-lived streams, so revoked sessions and access changes take effect.
+pub async fn session_user(state: &AppState, token: &str) -> sqlx::Result<Option<User>> {
+    // last_seen_at is only rewritten when a minute old, so polling pages don't cost a write
+    // per request.
+    sqlx::query_as::<_, User>(concat!(
             "WITH s AS (
                  SELECT ", user_columns!("$3", "s.id"), "
                    FROM user_sessions s JOIN users u ON u.id = s.user_id
@@ -181,12 +180,19 @@ impl FromRequestParts<Arc<AppState>> for User {
              )
              SELECT * FROM s",
         ))
-        .bind(token_hash(&token))
+        .bind(token_hash(token))
         .bind(state.session_idle_hours())
         .bind(state.company().require_2fa_all)
         .fetch_optional(&state.db)
-        .await?
-        .ok_or(ApiError::Unauthorized)?;
+        .await
+}
+
+impl FromRequestParts<Arc<AppState>> for User {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &Arc<AppState>) -> Result<Self, ApiError> {
+        let token = extract_token(&parts.headers).ok_or(ApiError::Unauthorized)?;
+        let user = session_user(state, &token).await?.ok_or(ApiError::Unauthorized)?;
         if user.mfa_setup_required {
             // Nested routers see a stripped URI; OriginalUri has the full path.
             let path = parts

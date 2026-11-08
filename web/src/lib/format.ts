@@ -44,3 +44,32 @@ export const interpreters = [
 	{ value: 'cmd', label: 'cmd.exe', os: 'windows' },
 	{ value: 'python', label: 'Python', os: 'any' }
 ] as const;
+
+const nf = new Intl.NumberFormat();
+export function num(n: number | null | undefined): string {
+	return n == null ? '–' : nf.format(n);
+}
+
+export function plural(n: number, one: string, many = `${one}s`): string {
+	return `${num(n)} ${n === 1 ? one : many}`;
+}
+
+/** Milliseconds as "820 ms", "4.2 s", "3m 10s". */
+export function ms(v: number | null | undefined): string {
+	if (v == null) return '–';
+	if (v < 1000) return `${v} ms`;
+	if (v < 60000) return `${(v / 1000).toFixed(1)} s`;
+	const s = Math.round(v / 1000);
+	return `${Math.floor(s / 60)}m ${s % 60}s`;
+}
+
+export const osLabels: Record<string, string> = { linux: 'Linux', windows: 'Windows', macos: 'macOS', other: 'Other' };
+
+export function interpreterLabel(v: string): string {
+	return interpreters.find((i) => i.value === v)?.label ?? v;
+}
+
+/** Joins class names, skipping falsy ones. */
+export function cx(...c: (string | false | null | undefined)[]): string {
+	return c.filter(Boolean).join(' ');
+}

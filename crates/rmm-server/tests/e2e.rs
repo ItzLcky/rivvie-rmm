@@ -239,6 +239,46 @@ impl Api {
     }
 }
 
+/// An open `/api/events` stream (Server-Sent Events).
+struct Events {
+    res: reqwest::Response,
+    buf: String,
+}
+
+impl Events {
+    async fn open(api: &Api) -> Self {
+        let res = api.http.get(format!("{}/events", api.base)).send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(res.headers()["content-type"].to_str().unwrap().starts_with("text/event-stream"));
+        let mut ev = Events { res, buf: String::new() };
+        assert!(ev.next_matching(5, |v| v["type"] == "hello").await.is_some(), "hello on connect");
+        ev
+    }
+
+    /// The next event matching `pred` within `secs`, skipping others.
+    async fn next_matching(&mut self, secs: u64, pred: impl Fn(&Value) -> bool) -> Option<Value> {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        loop {
+            while let Some(end) = self.buf.find("\n\n") {
+                let frame: String = self.buf.drain(..end + 2).collect();
+                for line in frame.lines() {
+                    if let Some(data) = line.strip_prefix("data: ")
+                        && let Ok(v) = serde_json::from_str::<Value>(data)
+                        && pred(&v)
+                    {
+                        return Some(v);
+                    }
+                }
+            }
+            let left = deadline.checked_duration_since(Instant::now())?;
+            match tokio::time::timeout(left, self.res.chunk()).await {
+                Ok(Ok(Some(b))) => self.buf.push_str(&String::from_utf8_lossy(&b)),
+                _ => return None,
+            }
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs Postgres and a built agent: see the module docs"]
 async fn end_to_end() {
@@ -330,6 +370,79 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
     assert_eq!(j["exit_code"], 3);
     assert_eq!(j["stdout"], "hello\n");
     assert_eq!(j["stderr"], "oops\n");
+    assert_eq!(j["stdout_len"], 6);
+    let tail = admin.get(&format!("/jobs/{job}?since_stdout=6&since_stderr=2")).await;
+    assert_eq!((tail["stdout"].as_str(), tail["stderr"].as_str()), (Some(""), Some("ps\n")), "output from the given offsets");
+
+    // --- live events: job status pushed over /api/events -----------------------------------
+    let mut events = Events::open(&admin).await;
+    let live = admin.run_script(&id1, "echo live", 30).await;
+    let finished = events
+        .next_matching(20, |v| v["type"] == "job" && v["id"] == live.as_str() && v["status"] == "succeeded")
+        .await;
+    assert!(finished.is_some(), "a job event reports the result");
+    assert!(events.next_matching(15, |v| v["type"] == "agent" && v["id"] == id1.as_str()).await.is_some(), "heartbeats too");
+
+    // --- paging, sorting, filters ----------------------------------------------------------
+    let p1 = admin.get("/agents?limit=1&sort=hostname").await;
+    assert_eq!((p1["items"].as_array().unwrap().len(), p1["total"].as_i64()), (1, Some(2)), "{p1}");
+    assert!(p1["prev"].is_null());
+    let p2 = admin.get(&format!("/agents?limit=1&sort=hostname&after={}", p1["next"].as_str().unwrap())).await;
+    assert_eq!(p2["items"].as_array().unwrap().len(), 1);
+    assert_ne!(p2["items"][0]["id"], p1["items"][0]["id"]);
+    assert!(p2["next"].is_null(), "{p2}");
+    let back = admin.get(&format!("/agents?limit=1&sort=hostname&before={}", p2["prev"].as_str().unwrap())).await;
+    assert_eq!(back["items"][0]["id"], p1["items"][0]["id"], "before= returns to the first page");
+    for sort in ["client", "os", "status", "health", "last_seen", "enrolled", "cpu", "mem", "disk", "version"] {
+        for dir in ["asc", "desc"] {
+            let p = admin.get(&format!("/agents?limit=1&sort={sort}&dir={dir}")).await;
+            let next = p["next"].as_str().unwrap_or_else(|| panic!("{sort} {dir}: {p}"));
+            let q = admin.get(&format!("/agents?limit=1&sort={sort}&dir={dir}&after={next}")).await;
+            assert_ne!(q["items"][0]["id"], p["items"][0]["id"], "{sort} {dir}");
+        }
+    }
+    let (s, _) = admin.call(reqwest::Method::GET, "/agents?sort=password", None).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let unknown = admin.get("/agents?health=unknown").await;
+    assert_eq!(unknown["items"][0]["id"], id3.as_str(), "an agent that never reported has unknown health");
+    assert_eq!(admin.get("/agents?online=true").await["items"][0]["id"], id1.as_str());
+    let failed = admin.get("/jobs?status=failed").await;
+    assert_eq!(failed["items"][0]["id"], job.as_str());
+    let mine = admin.get(&format!("/jobs?agent_id={id1}&limit=1")).await;
+    assert!(mine["next"].is_string() && mine["total"].as_i64() >= Some(2), "{mine}");
+    let a1_info = admin.get(&format!("/agents/{id1}")).await;
+    // A failed job in the last day needs attention (or worse, if this machine's disk is full).
+    assert!(matches!(a1_info["health"].as_str(), Some("attention" | "unhealthy")), "{a1_info}");
+    let hostname = a1_info["hostname"].as_str().unwrap().to_string();
+
+    // --- search, dashboard, client detail, preferences -------------------------------------
+    let hits = admin.get(&format!("/search?q={}", &hostname[..hostname.len().min(3)])).await;
+    assert!(hits["agents"].as_array().unwrap().iter().any(|a| a["id"] == id1.as_str()), "{hits}");
+    let hits = admin.get("/search?q=client").await;
+    assert_eq!(hits["clients"].as_array().unwrap().len(), 2);
+    let hits = admin.get(&format!("/search?q=client&client_id={b_id}")).await;
+    assert_eq!(hits["clients"].as_array().unwrap().len(), 1, "narrowed to one client");
+    let dash = admin.get("/dashboard").await;
+    assert_eq!(dash["offline"][0]["id"], id3.as_str());
+    assert!(dash["failed_jobs"].as_array().unwrap().iter().any(|j| j["id"] == job.as_str()));
+    assert_eq!(dash["client_health"][0]["id"], a_id, "the client with problems sorts first: {dash}");
+    assert_eq!(admin.get(&format!("/dashboard?client_id={b_id}")).await["agents_total"], 0);
+    let detail = admin.get(&format!("/clients/{a_id}")).await;
+    assert_eq!((detail["name"].as_str(), detail["sites"][0]["agent_count"].as_i64()), (Some("Client A"), Some(2)));
+    let (s, _) = admin.call(reqwest::Method::PUT, &format!("/clients/{b_id}"), Some(json!({ "name": "Client B2" }))).await;
+    assert!(s.is_success());
+    let (s, v) = admin.call(reqwest::Method::PUT, "/auth/preferences", Some(json!({ "theme": "dark", "density": "compact" }))).await;
+    assert!(s.is_success() && v["theme"] == "dark", "{v}");
+    admin.call(reqwest::Method::PUT, "/auth/preferences", Some(json!({ "theme": null }))).await;
+    let prefs = &admin.get("/auth/me").await["preferences"];
+    assert!(prefs.get("theme").is_none() && prefs["density"] == "compact", "{prefs}");
+    let (s, _) = admin.call(reqwest::Method::PUT, "/auth/preferences", Some(json!({ "big": "x".repeat(40_000) }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(admin.get("/auth/me").await["preferences"]["density"], "compact", "a rejected patch keeps the old value");
+    let audit = admin.get("/audit?limit=2").await;
+    assert!(audit["items"].as_array().unwrap().len() == 2 && audit["next"].is_string(), "{audit}");
+    let audit = admin.get("/audit?action=client.").await;
+    assert!(audit["items"].as_array().unwrap().iter().all(|r| r["action"].as_str().unwrap().starts_with("client.")));
 
     // --- queued job for an offline agent expires --------------------------------------------
     let stale = admin.run_script(&id3, "echo never", 30).await;
@@ -374,7 +487,20 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
         .await;
     let tech = Api::new(&url);
     tech.post("/auth/login", json!({ "email": "tech@e2e.test", "password": "tech-password-123" })).await;
-    assert_eq!(tech.get("/agents").await.as_array().unwrap().len(), 0, "client A's agents are hidden");
+    assert_eq!(tech.get("/agents").await["total"], 0, "client A's agents are hidden");
+    let (s, _) = tech.call(reqwest::Method::GET, &format!("/clients/{a_id}"), None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    assert_eq!(tech.get(&format!("/search?q={hostname}")).await["agents"], json!([]));
+    let (s, _) = tech.call(reqwest::Method::GET, &format!("/dashboard?client_id={a_id}"), None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    // Events about client A never reach them.
+    let mut tech_events = Events::open(&tech).await;
+    admin.run_script(&id1, "true", 30).await;
+    assert!(
+        tech_events.next_matching(4, |v| v["type"] == "job" || v["type"] == "agent").await.is_none(),
+        "no events for another client's agents"
+    );
+    drop(tech_events);
     let clients = tech.get("/clients").await;
     assert_eq!(clients.as_array().unwrap().len(), 1);
     assert_eq!(clients[0]["id"], b_id);

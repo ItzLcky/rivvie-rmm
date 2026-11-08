@@ -1,123 +1,250 @@
 <script lang="ts">
-	import { page } from '$app/state';
-	import { api, qs } from '#lib/api.js';
-	import { ago, maxDiskPct, pct } from '#lib/format.js';
+	import { CloudDownload, Play, Plus, Search, X } from '@lucide/svelte';
+	import { api } from '#lib/api.js';
+	import { ago, num, plural } from '#lib/format.js';
+	import { liveReload, onLive } from '#lib/live.svelte.js';
+	import { paged } from '#lib/paged.svelte.js';
+	import { resource } from '#lib/resource.svelte.js';
+	import { clientId, currentClient, withClient } from '#lib/scope.svelte.js';
 	import { can } from '#lib/session.svelte.js';
-	import type { AgentSummary, Client, Release } from '#lib/types.js';
-	import Status from '#lib/components/Status.svelte';
+	import { attempt, toast } from '#lib/toast.svelte.js';
+	import { confirmAction } from '#lib/confirm.svelte.js';
+	import type { AgentSummary, Page, Release } from '#lib/types.js';
+	import { param, qs, setParams, sortState } from '#lib/url.svelte.js';
+	import Button from '#lib/ui/Button.svelte';
+	import DataTable, { type Column } from '#lib/ui/DataTable.svelte';
+	import EmptyState from '#lib/ui/EmptyState.svelte';
+	import ErrorState from '#lib/ui/ErrorState.svelte';
+	import Input from '#lib/ui/Input.svelte';
+	import PageHeader from '#lib/ui/PageHeader.svelte';
+	import Pagination from '#lib/ui/Pagination.svelte';
+	import Select from '#lib/ui/Select.svelte';
+	import Tabs from '#lib/ui/Tabs.svelte';
+	import HealthBadge from '#lib/components/HealthBadge.svelte';
 	import OsBadge from '#lib/components/OsBadge.svelte';
-	import UsageBar from '#lib/components/UsageBar.svelte';
 	import RunScript from '#lib/components/RunScript.svelte';
+	import Status from '#lib/components/Status.svelte';
+	import UsageBar from '#lib/components/UsageBar.svelte';
 
-	let agents = $state<AgentSummary[]>([]);
-	let clients = $state<Client[]>([]);
-	let q = $state('');
-	let clientId = $state(page.url.searchParams.get('client_id') ?? '');
-	let online = $state(page.url.searchParams.get('online') ?? '');
-	let os = $state('');
-	let selected = $state<Set<string>>(new Set());
+	// Built-in views are presets over the same filters.
+	const views = {
+		all: {},
+		online: { online: true },
+		offline: { online: false },
+		attention: { health: 'attention,unhealthy' },
+		new: { new_days: 7 }
+	} as const;
+	type View = keyof typeof views;
+	const view = $derived((param('view', 'all') in views ? param('view', 'all') : 'all') as View);
+	const sort = sortState('hostname');
+
+	// The search box updates the URL as you type (debounced), so the view is shareable.
+	let q = $state(param('q'));
+	$effect(() => {
+		const v = q;
+		const t = setTimeout(() => setParams({ q: v.trim() || null }), 250);
+		return () => clearTimeout(t);
+	});
+
+	const list = paged<AgentSummary>(() =>
+		`/agents${qs({
+			...views[view],
+			client_id: clientId(),
+			site_id: param('site'),
+			os: param('os'),
+			health: param('health') || (views[view] as { health?: string }).health,
+			q: param('q'),
+			sort: sort.key,
+			dir: sort.dir
+		})}`
+	);
+
+	// Online/offline flips change which rows match: refetch. Metrics only update rows in place.
+	liveReload(() => list.reload(), (e) => e.type === 'agent' && !e.last_metrics && view !== 'all', { debounceMs: 1500 });
+	onLive((e) => {
+		if (e.type !== 'agent') return;
+		const row = list.data?.items.find((a) => a.id === e.id);
+		if (!row) return;
+		row.online = e.online;
+		if (e.last_metrics) row.last_metrics = e.last_metrics;
+		if (!e.online) row.last_seen_at = new Date().toISOString();
+	});
+
+	let selected = $state(new Set<string>());
+	// Remember the selected rows (not just ids) across pages, for Run script.
+	const picked = new Map<string, AgentSummary>();
+	$effect(() => {
+		for (const a of list.rows) if (selected.has(a.id)) picked.set(a.id, a);
+		for (const id of [...picked.keys()]) if (!selected.has(id)) picked.delete(id);
+	});
 	let running = $state(false);
 
-	let releases = $state<Release[]>([]);
-	let notice = $state('');
-	const outdated = $derived(releases.reduce((n, r) => n + r.outdated, 0));
-
-	$effect(() => {
-		api.get<Client[]>('/clients').then((c) => (clients = c));
-		if (can('admin')) api.get<{ releases: Release[] }>('/agent-updates').then((r) => (releases = r.releases)).catch(() => {});
-	});
-
-	async function rollout() {
-		const ids = selected.size ? [...selected] : null;
-		const what = ids ? `${ids.length} selected agents` : `every online agent (${outdated} out of date)`;
-		if (!confirm(`Update ${what} to the latest signed release? Each agent waits for its running jobs, then restarts.`)) return;
-		try {
+	const releases = resource(() => (can('admin') ? api.get<{ releases: Release[] }>('/agent-updates').then((r) => r.releases) : Promise.resolve([])));
+	const outdated = $derived((releases.data ?? []).reduce((n, r) => n + r.outdated, 0));
+	async function rollout(ids: string[] | null) {
+		const what = ids ? plural(ids.length, 'selected agent') : `every online agent (${outdated} out of date)`;
+		const ok = await confirmAction({
+			title: 'Update agents?',
+			message: `Offer the latest signed release to ${what}. Each agent waits for its running jobs, restarts, and rolls back by itself if the new version can't reconnect.`,
+			confirmLabel: 'Update'
+		});
+		if (!ok) return;
+		await attempt(async () => {
 			const r = await api.post<{ offered: number; skipped: number }>('/agent-updates/rollout', { agent_ids: ids });
-			notice = `Update offered to ${r.offered} agent(s); ${r.skipped} skipped (already current, or no release for their platform).`;
-		} catch (e) {
-			notice = (e as Error).message;
-		}
+			toast.success(`Update offered to ${plural(r.offered, 'agent')}; ${r.skipped} skipped (already current, or no release for their platform).`);
+		});
 	}
 
-	$effect(() => {
-		const query = qs({ q, client_id: clientId, online, os });
-		const load = () => api.get<AgentSummary[]>(`/agents${query}`).then((a) => (agents = a));
-		const debounce = setTimeout(load, 150);
-		const t = setInterval(load, 15000);
-		return () => {
-			clearTimeout(debounce);
-			clearInterval(t);
-		};
+	const scoped = $derived(currentClient());
+	const sites = $derived(scoped?.sites ?? []);
+	// A count for every view, under the other filters (client, site, OS, search): one cheap
+	// limit=1 request each, refreshed when agents go online or offline.
+	const viewCounts = resource(async () => {
+		const base = { client_id: clientId(), site_id: param('site'), os: param('os'), q: param('q'), limit: 1 };
+		const keys = Object.keys(views) as View[];
+		const pages = await Promise.all(keys.map((k) => api.get<Page<AgentSummary>>(`/agents${qs({ ...views[k], ...base })}`)));
+		return Object.fromEntries(keys.map((k, i) => [k, `${num(pages[i].total)}${pages[i].total_exact ? '' : '+'}`])) as Record<View, string>;
 	});
-
-	const allSelected = $derived(agents.length > 0 && agents.every((a) => selected.has(a.id)));
-	function toggleAll() {
-		selected = allSelected ? new Set() : new Set(agents.map((a) => a.id));
-	}
-	function toggle(id: string) {
-		const s = new Set(selected);
-		if (s.has(id)) s.delete(id);
-		else s.add(id);
-		selected = s;
-	}
+	liveReload(() => viewCounts.reload(), (e) => e.type === 'agent' && !e.last_metrics, { debounceMs: 1500 });
+	const filtered = $derived(!!(param('q') || param('os') || param('site') || param('health') || view !== 'all'));
 </script>
 
-<div class="mb-4 flex items-center justify-between">
-	<h1 class="text-xl font-semibold">Agents <span class="text-base font-normal text-slate-500">{agents.length}</span></h1>
-	<div class="flex gap-2">
-		{#if can('admin') && outdated > 0}
-			<button class="btn-ghost" onclick={rollout}>{selected.size ? `Update ${selected.size} selected` : `Update ${outdated} outdated`}</button>
-		{/if}
-		{#if can('technician')}
-			<button class="btn-primary" disabled={!selected.size} onclick={() => (running = true)}>Run script on {selected.size || ''} selected</button>
-		{/if}
-	</div>
-</div>
-{#if notice}<p class="mb-3 text-sm text-sky-300">{notice}</p>{/if}
+<PageHeader
+	title="Agents"
+	count={list.data ? list.data.total : null}
+	menu={can('admin') && outdated > 0 ? [{ label: `Update ${outdated} outdated agent${outdated === 1 ? '' : 's'}`, icon: CloudDownload, onSelect: () => rollout(null) }] : undefined}
+>
+	{#snippet actions()}
+		{#if can('technician')}<Button icon={Plus} href={withClient('/clients')}>Enroll</Button>{/if}
+	{/snippet}
+</PageHeader>
 
-<div class="mb-4 flex flex-wrap gap-2">
-	<input class="input max-w-xs" placeholder="Search hostname…" bind:value={q} />
-	<select class="input max-w-48" bind:value={clientId}>
-		<option value="">All clients</option>
-		{#each clients as c (c.id)}<option value={c.id}>{c.name}</option>{/each}
-	</select>
-	<select class="input max-w-36" bind:value={online}>
-		<option value="">Any status</option><option value="true">Online</option><option value="false">Offline</option>
-	</select>
-	<select class="input max-w-36" bind:value={os}>
-		<option value="">Any OS</option><option value="windows">Windows</option><option value="linux">Linux</option><option value="macos">macOS</option>
-	</select>
-</div>
+<Tabs
+	label="View"
+	class="mb-3"
+	value={view}
+	onchange={(v) => setParams({ view: v === 'all' ? null : v, health: null })}
+	items={[
+		{ value: 'all', label: 'All', count: viewCounts.data?.all },
+		{ value: 'online', label: 'Online', count: viewCounts.data?.online },
+		{ value: 'offline', label: 'Offline', count: viewCounts.data?.offline },
+		{ value: 'attention', label: 'Needs attention', count: viewCounts.data?.attention },
+		{ value: 'new', label: 'New', count: viewCounts.data?.new, title: 'Enrolled in the last 7 days' }
+	]}
+/>
 
-<div class="card overflow-x-auto">
-	<table class="table">
-		<thead>
-			<tr>
-				<th class="w-8"><input type="checkbox" checked={allSelected} onchange={toggleAll} aria-label="Select all" /></th>
-				<th>Hostname</th><th>Client / Site</th><th>OS</th><th>Status</th><th class="w-32">CPU</th><th class="w-32">Memory</th><th class="w-32">Disk</th><th>Last seen</th>
-			</tr>
-		</thead>
-		<tbody>
-			{#each agents as a (a.id)}
-				{@const m = a.last_metrics}
-				<tr>
-					<td><input type="checkbox" checked={selected.has(a.id)} onchange={() => toggle(a.id)} aria-label="Select {a.hostname}" /></td>
-					<td><a class="font-medium text-sky-400 hover:underline" href="/agents/{a.id}">{a.hostname}</a></td>
-					<td class="text-slate-400">{a.client_name} <span class="text-slate-600">/</span> {a.site_name}</td>
-					<td><OsBadge os={a.os_family} /> <span class="ml-1 text-xs text-slate-500">{a.os_name}</span></td>
-					<td><Status online={a.online} /></td>
-					<td>{#if m && a.online}<UsageBar value={m.cpu_percent} />{:else}<span class="text-slate-600">–</span>{/if}</td>
-					<td>{#if m}<UsageBar value={pct(m.mem_used, m.mem_total)} />{:else}<span class="text-slate-600">–</span>{/if}</td>
-					<td>{#if m}<UsageBar value={maxDiskPct(m)} />{:else}<span class="text-slate-600">–</span>{/if}</td>
-					<td class="text-xs text-slate-400">{a.online ? 'now' : ago(a.last_seen_at)}</td>
-				</tr>
+{#if list.error && !list.data}
+	<div class="card"><ErrorState error={list.error} onretry={() => list.reload()} /></div>
+{:else}
+	{#snippet hostCell(a: AgentSummary)}
+		<a class="hover:text-accent font-medium whitespace-nowrap" href="/agents/{a.id}">{a.hostname}</a>
+		<!-- Phones: the stacked cell carries client/site and status. -->
+		<div class="text-muted mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs md:hidden">
+			<Status online={a.online} /><span class="truncate">{scoped ? a.site_name : `${a.client_name} › ${a.site_name}`}</span>
+			{#if a.health === 'attention' || a.health === 'unhealthy'}<span class="sm:hidden"><HealthBadge health={a.health} agent={a} /></span>{/if}
+		</div>
+	{/snippet}
+	{#snippet clientCell(a: AgentSummary)}
+		<span class="text-muted inline-flex items-center gap-1 whitespace-nowrap">{#if !scoped}<a class="hover:text-fg" href={withClient('/agents', a.client_id)}>{a.client_name}</a><span class="text-subtle" aria-hidden="true">›</span>{/if}<span>{a.site_name}</span></span>
+	{/snippet}
+	{#snippet osCell(a: AgentSummary)}<OsBadge os={a.os_family} name={a.os_name} muted />{/snippet}
+	{#snippet statusCell(a: AgentSummary)}<Status online={a.online} />{/snippet}
+	{#snippet healthCell(a: AgentSummary)}<HealthBadge health={a.health} agent={a} />{/snippet}
+	{#snippet cpuCell(a: AgentSummary)}{#if a.last_metrics && a.online}<UsageBar bar={false} value={a.last_metrics.cpu_percent} />{:else}<span class="text-muted" aria-label="no data">–</span>{/if}{/snippet}
+	{#snippet memCell(a: AgentSummary)}{#if a.last_metrics}<UsageBar bar={false} value={a.last_metrics.mem_total ? (100 * a.last_metrics.mem_used) / a.last_metrics.mem_total : 0} />{:else}<span class="text-muted" aria-label="no data">–</span>{/if}{/snippet}
+	{#snippet diskCell(a: AgentSummary)}{#if a.last_metrics}<UsageBar bar={false} value={a.disk_max_pct} />{:else}<span class="text-muted" aria-label="no data">–</span>{/if}{/snippet}
+	{#snippet seenCell(a: AgentSummary)}<span class="text-muted whitespace-nowrap">{a.online ? 'now' : ago(a.last_seen_at)}</span>{/snippet}
+	{#snippet versionCell(a: AgentSummary)}<span class="text-muted font-mono text-[13px]">{a.agent_version}</span>{/snippet}
+	{#snippet enrolledCell(a: AgentSummary)}<span class="text-muted">{ago(a.enrolled_at)}</span>{/snippet}
+
+	<DataTable
+		id="agents"
+		caption="Agents"
+		activeFilters={[param('site'), param('os'), param('health')].filter(Boolean).length}
+		rows={list.rows}
+		key={(a) => a.id}
+		loading={list.loading}
+		busy={list.busy}
+		{sort}
+		bind:selected
+		rowHref={(a) => `/agents/${a.id}`}
+		columns={[
+			{ id: 'hostname', label: 'Hostname', sort: 'hostname', cell: hostCell, hideable: false },
+			{ id: 'client', label: scoped ? 'Site' : 'Client / site', sort: 'client', cell: clientCell, from: 'md' },
+			{ id: 'os', label: 'OS', sort: 'os', cell: osCell, from: 'lg' },
+			{ id: 'status', label: 'Status', sort: 'status', cell: statusCell, from: 'md' },
+			{ id: 'health', label: 'Health', sort: 'health', cell: healthCell, from: 'sm' },
+			{ id: 'cpu', label: 'CPU', sort: 'cpu', cell: cpuCell, align: 'right', from: 'xl' },
+			{ id: 'mem', label: 'Memory', sort: 'mem', cell: memCell, align: 'right', from: 'xl' },
+			{ id: 'disk', label: 'Disk', sort: 'disk', cell: diskCell, align: 'right', from: 'lg' },
+			{ id: 'last_seen', label: 'Last seen', sort: 'last_seen', cell: seenCell, align: 'right', from: 'md' },
+			{ id: 'version', label: 'Agent version', sort: 'version', cell: versionCell, defaultHidden: true },
+			{ id: 'enrolled', label: 'Enrolled', sort: 'enrolled', cell: enrolledCell, defaultHidden: true }
+		] satisfies Column<AgentSummary>[]}
+	>
+		{#snippet toolbar()}
+			<Input icon={Search} data-search placeholder="Hostname, IP, user…" aria-label="Search agents" class="min-w-0 flex-1 sm:w-64 sm:flex-none" bind:value={q} />
+		{/snippet}
+		{#snippet filters()}
+			{#if sites.length > 1}
+				<Select
+					aria-label="Site"
+					class="w-full sm:w-auto"
+					value={param('site')}
+					onchange={(e) => setParams({ site: e.currentTarget.value })}
+					options={[{ value: '', label: 'All sites' }, ...sites.map((s) => ({ value: s.id, label: s.name }))]}
+				/>
+			{/if}
+			<Select
+				aria-label="Operating system"
+				class="w-full sm:w-auto"
+				value={param('os')}
+				onchange={(e) => setParams({ os: e.currentTarget.value })}
+				options={[
+					{ value: '', label: 'Any OS' },
+					{ value: 'windows', label: 'Windows' },
+					{ value: 'linux', label: 'Linux' },
+					{ value: 'macos', label: 'macOS' }
+				]}
+			/>
+			{#if param('health')}
+				<Button size="sm" variant="ghost" iconRight={X} onclick={() => setParams({ health: null })}>Health: {param('health').replace(',', ', ')}</Button>
+			{/if}
+		{/snippet}
+		{#snippet bulk(n)}
+			{#if can('technician')}<Button size="sm" variant="primary" icon={Play} onclick={() => (running = true)}>Run script</Button>{/if}
+			{#if can('admin') && outdated > 0}<Button size="sm" icon={CloudDownload} onclick={() => rollout([...selected])}>Update agent{n === 1 ? '' : 's'}</Button>{/if}
+		{/snippet}
+		{#snippet empty()}
+			{#if filtered}
+				<EmptyState title="No agents match" description="Try another view or clear the filters.">
+					{#snippet action()}<Button size="sm" onclick={() => { q = ''; setParams({ q: null, os: null, site: null, health: null, view: null }); }}>Clear filters</Button>{/snippet}
+				</EmptyState>
 			{:else}
-				<tr><td colspan="9" class="py-8 text-center text-slate-500">No agents match.</td></tr>
-			{/each}
-		</tbody>
-	</table>
-</div>
+				<EmptyState title={scoped ? `No agents for ${scoped.name} yet` : 'No agents yet'} description="Create an enrollment token for a site and run the install command on each machine.">
+					{#snippet action()}{#if can('technician')}<Button size="sm" variant="primary" icon={Plus} href={withClient('/clients')}>Enroll agents</Button>{/if}{/snippet}
+				</EmptyState>
+			{/if}
+		{/snippet}
+		{#snippet footer()}
+			{#if list.data}
+				<Pagination
+					shown={list.rows.length}
+					total={list.data.total}
+					exact={list.data.total_exact}
+					hasPrev={!!list.data.prev}
+					hasNext={!!list.data.next}
+					pageSize={list.pageSize}
+					onprev={list.prev}
+					onnext={list.next}
+					onfirst={list.first}
+					onpagesize={list.setPageSize}
+				/>
+			{/if}
+		{/snippet}
+	</DataTable>
+{/if}
 
 {#if running}
-	<RunScript agents={agents.filter((a) => selected.has(a.id))} onclose={() => (running = false)} />
+	<RunScript agents={[...picked.values()]} onclose={() => (running = false)} />
 {/if}

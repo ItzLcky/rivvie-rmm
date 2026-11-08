@@ -3,7 +3,13 @@ export interface User {
 	id: string; email: string; name: string; role: Role; totp_enabled: boolean; mfa_setup_required: boolean;
 	/** null = every client */
 	client_ids: string[] | null;
+	preferences?: import('./prefs.svelte').Prefs;
 }
+
+/** A keyset-paged list response. Pass `next`/`prev` back as `?after=`/`?before=`. */
+export interface Page<T> { items: T[]; next: string | null; prev: string | null; total: number; total_exact: boolean }
+
+export type Health = 'healthy' | 'attention' | 'unhealthy' | 'unknown';
 
 export interface DiskUsage { mount: string; total: number; available: number }
 export interface Metrics {
@@ -17,6 +23,7 @@ export interface AgentSummary {
 	arch: string; agent_version: string; online: boolean; last_seen_at: string | null; enrolled_at: string;
 	site_id: string; site_name: string; client_id: string; client_name: string; last_metrics: Metrics | null;
 	update_state: UpdateState | null; update_version: string | null; update_detail: string | null; update_at: string | null;
+	health: Health; disk_max_pct: number; failed_jobs_24h: number;
 }
 
 export type UpdateState = 'offered' | 'downloading' | 'waiting' | 'applying' | 'completed' | 'rolled_back' | 'failed';
@@ -54,11 +61,26 @@ export interface Job {
 	status: JobStatus; exit_code: number | null; created_by_name: string | null; created_at: string; sent_at: string | null;
 	finished_at: string | null; duration_ms: number | null;
 }
-export interface JobDetail extends Job { body: string; args: string[]; timeout_secs: number; stdout: string; stderr: string }
+export interface JobDetail extends Job {
+	body: string; args: string[]; timeout_secs: number; stdout: string; stderr: string;
+	/** Full output lengths, to pass back as since_stdout/since_stderr for the next chunk. */
+	stdout_len: number; stderr_len: number;
+}
 
+export interface ClientHealth { id: string; name: string; agents: number; online: number; attention: number; unhealthy: number; failed_jobs_24h: number }
 export interface Dashboard {
 	agents_total: number; agents_online: number; clients: number; by_os: Record<string, number>;
-	jobs_24h: Record<string, number>; high_disk: AgentSummary[];
+	health: Partial<Record<Health, number>>; jobs_24h: Partial<Record<JobStatus, number>>;
+	offline: AgentSummary[]; high_disk: AgentSummary[]; failed_jobs: Job[]; client_health: ClientHealth[];
+}
+
+export interface AuditRow { id: number; ts: string; user_name: string | null; action: string; target_type: string | null; target_id: string | null; details: Record<string, unknown> }
+
+export interface SearchResults {
+	agents: { id: string; hostname: string; os_family: string; online: boolean; client_name: string; site_name: string }[];
+	clients: { id: string; name: string }[];
+	sites: { id: string; name: string; client_id: string; client_name: string }[];
+	scripts: { id: string; name: string; interpreter: Interpreter; client_name: string | null }[];
 }
 
 export interface Session { id: string; created_at: string; last_seen_at: string; expires_at: string; user_agent: string | null; current: boolean }

@@ -1,30 +1,101 @@
 <script lang="ts">
+	import { History } from '@lucide/svelte';
 	import { api } from '#lib/api.js';
-	import { datetime } from '#lib/format.js';
+	import { ago, datetime } from '#lib/format.js';
+	import { paged } from '#lib/paged.svelte.js';
+	import { resource } from '#lib/resource.svelte.js';
+	import type { AuditRow } from '#lib/types.js';
+	import { param, qs, setParams } from '#lib/url.svelte.js';
+	import DataTable, { type Column } from '#lib/ui/DataTable.svelte';
+	import EmptyState from '#lib/ui/EmptyState.svelte';
+	import ErrorState from '#lib/ui/ErrorState.svelte';
+	import PageHeader from '#lib/ui/PageHeader.svelte';
+	import Pagination from '#lib/ui/Pagination.svelte';
+	import Select from '#lib/ui/Select.svelte';
 
-	interface Row { id: number; ts: string; user_name: string | null; action: string; target_type: string | null; target_id: string | null; details: Record<string, unknown> }
-	let rows = $state<Row[]>([]);
-	$effect(() => {
-		api.get<Row[]>('/audit').then((r) => (rows = r));
-	});
+	const list = paged<AuditRow>(() => `/audit${qs({ action: param('action'), user_id: param('user') })}`);
+	const users = resource(() => api.get<{ id: string; name: string; email: string }[]>('/users'));
+
+	const groups = [
+		['', 'All actions'],
+		['auth.', 'Sign-ins and accounts'],
+		['user.', 'Users'],
+		['client.', 'Clients'],
+		['site.', 'Sites'],
+		['enrollment_token.', 'Enrollment tokens'],
+		['agent.', 'Agents and updates'],
+		['job.', 'Jobs'],
+		['shell.', 'Terminal sessions'],
+		['script.', 'Scripts'],
+		['settings.', 'Company settings']
+	];
+	const targetHref = (r: AuditRow) =>
+		r.target_id && ({ agent: `/agents/${r.target_id}`, client: `/clients/${r.target_id}`, script: `/scripts/${r.target_id}` } as Record<string, string>)[r.target_type ?? ''];
+	let open = $state<number | null>(null);
 </script>
 
-<h1 class="mb-4 text-xl font-semibold">Audit log</h1>
-<div class="card overflow-x-auto">
-	<table class="table">
-		<thead><tr><th>Time</th><th>User</th><th>Action</th><th>Target</th><th>Details</th></tr></thead>
-		<tbody>
-			{#each rows as r (r.id)}
-				<tr>
-					<td class="text-xs whitespace-nowrap text-slate-400">{datetime(r.ts)}</td>
-					<td>{r.user_name ?? 'system'}</td>
-					<td class="font-mono text-xs">{r.action}</td>
-					<td class="text-xs text-slate-400">
-						{#if r.target_type === 'agent' && r.target_id}<a class="text-sky-400 hover:underline" href="/agents/{r.target_id}">agent</a>{:else}{r.target_type ?? ''}{/if}
-					</td>
-					<td class="font-mono text-xs text-slate-500">{Object.keys(r.details).length ? JSON.stringify(r.details) : ''}</td>
-				</tr>
-			{/each}
-		</tbody>
-	</table>
-</div>
+<PageHeader title="Audit log" count={list.data ? `${list.data.total}${list.data.total_exact ? '' : '+'}` : null} description="Every change made through the dashboard or API, and agent update results." />
+
+{#if list.error && !list.data}
+	<div class="card"><ErrorState error={list.error} onretry={() => list.reload()} /></div>
+{:else}
+	{#snippet timeCell(r: AuditRow)}<time class="text-muted text-xs whitespace-nowrap" datetime={r.ts} title={datetime(r.ts)}>{ago(r.ts)}</time>{/snippet}
+	{#snippet userCell(r: AuditRow)}{r.user_name ?? 'System'}{/snippet}
+	{#snippet actionCell(r: AuditRow)}<code class="text-xs">{r.action}</code>{/snippet}
+	{#snippet targetCell(r: AuditRow)}
+		{@const href = targetHref(r)}
+		{#if href}<a class="text-muted hover:text-fg text-xs hover:underline" {href}>{r.target_type}</a>{:else}<span class="text-muted text-xs">{r.target_type ?? ''}</span>{/if}
+	{/snippet}
+	{#snippet detailsCell(r: AuditRow)}
+		{#if Object.keys(r.details).length}
+			{@const json = JSON.stringify(r.details)}
+			<button class="text-muted hover:text-fg block max-w-md text-left font-mono text-xs {open === r.id ? 'whitespace-pre-wrap break-all' : 'truncate'}" onclick={() => (open = open === r.id ? null : r.id)} aria-expanded={open === r.id}>
+				{open === r.id ? JSON.stringify(r.details, null, 2) : json}
+			</button>
+		{/if}
+	{/snippet}
+
+	<DataTable
+		id="audit"
+		caption="Audit log"
+		rows={list.rows}
+		key={(r) => String(r.id)}
+		loading={list.loading}
+		busy={list.busy}
+		columns={[
+			{ id: 'ts', label: 'When', cell: timeCell, hideable: false },
+			{ id: 'user', label: 'User', cell: userCell },
+			{ id: 'action', label: 'Action', cell: actionCell, hideable: false },
+			{ id: 'target', label: 'Target', cell: targetCell, from: 'sm' },
+			{ id: 'details', label: 'Details', cell: detailsCell, from: 'md' }
+		] satisfies Column<AuditRow>[]}
+	>
+		{#snippet toolbar()}
+			<Select aria-label="Action" class="w-auto" value={param('action')} onchange={(e) => setParams({ action: e.currentTarget.value })} options={groups.map(([value, label]) => ({ value, label }))} />
+			<Select
+				aria-label="User"
+				class="w-auto"
+				value={param('user')}
+				onchange={(e) => setParams({ user: e.currentTarget.value })}
+				options={[{ value: '', label: 'Any user' }, ...(users.data ?? []).map((u) => ({ value: u.id, label: u.name || u.email }))]}
+			/>
+		{/snippet}
+		{#snippet empty()}<EmptyState icon={History} compact title="No entries match" />{/snippet}
+		{#snippet footer()}
+			{#if list.data}
+				<Pagination
+					shown={list.rows.length}
+					total={list.data.total}
+					exact={list.data.total_exact}
+					hasPrev={!!list.data.prev}
+					hasNext={!!list.data.next}
+					pageSize={list.pageSize}
+					onprev={list.prev}
+					onnext={list.next}
+					onfirst={list.first}
+					onpagesize={list.setPageSize}
+				/>
+			{/if}
+		{/snippet}
+	</DataTable>
+{/if}
