@@ -5,11 +5,13 @@ use axum::routing::{delete, get, post};
 
 use crate::state::AppState;
 
+pub mod access;
 mod agents;
 mod auth;
 mod clients;
 mod downloads;
 mod jobs;
+mod packages;
 mod scripts;
 mod settings;
 mod totp;
@@ -24,6 +26,10 @@ pub fn agent_platforms() -> impl Iterator<Item = &'static str> {
 
 pub fn agent_binary_exists(st: &AppState, id: &str) -> bool {
     downloads::platform_path(st, id).is_some()
+}
+
+pub fn agent_binary_path(st: &AppState, id: &str) -> Option<std::path::PathBuf> {
+    downloads::platform_path(st, id)
 }
 
 pub fn router() -> Router<Arc<AppState>> {
@@ -48,10 +54,14 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/enrollment-tokens/{id}", delete(clients::revoke_token))
         .route("/agent-downloads", get(downloads::list))
         .route("/agent-downloads/{id}", get(downloads::download))
+        .route("/agent-packages/{platform}/{file}", get(packages::download))
         .route("/agents", get(agents::list))
         .route("/agents/{id}", get(agents::get).delete(agents::remove))
         .route("/agents/{id}/metrics", get(agents::metrics))
         .route("/agents/{id}/inventory/refresh", post(agents::refresh_inventory))
+        .route("/agents/{id}/update", post(agents::update))
+        .route("/agent-updates", get(agents::releases))
+        .route("/agent-updates/rollout", post(agents::rollout))
         .route("/agents/{id}/jobs", get(jobs::list_for_agent))
         .route("/agents/{id}/shell", get(crate::shell_ws::handler))
         .route("/jobs", get(jobs::list_recent).post(jobs::create))
@@ -61,6 +71,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/users", get(users::list).post(users::create))
         .route("/users/{id}", delete(users::disable))
         .route("/users/{id}/enable", post(users::enable))
+        .route("/users/{id}/access", axum::routing::put(users::update_access))
         .route("/users/{id}/password", post(users::reset_password))
         .route("/users/{id}/totp", delete(users::reset_totp))
         .route("/users/{id}/sessions", get(users::sessions).delete(users::revoke_sessions))

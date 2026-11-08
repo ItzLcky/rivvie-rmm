@@ -68,8 +68,50 @@ impl ShellSession {
 
 impl Drop for ShellSession {
     fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(pid) = self.child.process_id() {
+            kill_session(pid);
+        }
         let _ = self.child.kill();
     }
+}
+
+/// The shell leads its own session (portable-pty calls `setsid`), so everything started
+/// from the terminal, background jobs in other process groups included, shares its
+/// session id. Send SIGHUP, as a closed terminal would, then SIGKILL whatever is left.
+/// Only processes that started a new session themselves (`setsid`, `systemd-run`) escape.
+#[cfg(unix)]
+fn kill_session(leader: u32) {
+    let Ok(leader) = i32::try_from(leader) else { return };
+    // SAFETY: plain syscalls; a negative pid targets the shell's process group.
+    unsafe {
+        libc::kill(-leader, libc::SIGHUP);
+    }
+    let _ = std::thread::Builder::new().name("pty-reaper".into()).spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        for pid in session_members(leader) {
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+        unsafe {
+            libc::kill(-leader, libc::SIGKILL);
+        }
+    });
+}
+
+#[cfg(target_os = "linux")]
+fn session_members(sid: i32) -> Vec<i32> {
+    let Ok(dir) = std::fs::read_dir("/proc") else { return vec![] };
+    dir.filter_map(|e| e.ok()?.file_name().to_str()?.parse::<i32>().ok())
+        .filter(|&pid| pid != sid && unsafe { libc::getsid(pid) } == sid)
+        .collect()
+}
+
+/// No /proc: the process-group kill above is all we can do.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn session_members(_sid: i32) -> Vec<i32> {
+    vec![]
 }
 
 fn size(cols: u16, rows: u16) -> PtySize {

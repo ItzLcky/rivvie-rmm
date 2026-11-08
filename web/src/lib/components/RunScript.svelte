@@ -5,7 +5,7 @@
 	import type { AgentSummary, Interpreter, Script } from '#lib/types.js';
 	import Modal from './Modal.svelte';
 
-	let { agents, onclose }: { agents: Pick<AgentSummary, 'id' | 'hostname' | 'os_family'>[]; onclose: () => void } = $props();
+	let { agents, onclose }: { agents: Pick<AgentSummary, 'id' | 'hostname' | 'os_family' | 'client_id'>[]; onclose: () => void } = $props();
 
 	const windowsOnly = $derived(agents.every((a) => a.os_family === 'windows'));
 	let scripts = $state<Script[]>([]);
@@ -18,7 +18,8 @@
 
 	$effect(() => {
 		interpreter = windowsOnly ? 'powershell' : 'bash';
-		api.get<Script[]>('/scripts').then((s) => (scripts = s));
+		// A client's own script only runs on that client's agents.
+		api.get<Script[]>('/scripts').then((s) => (scripts = s.filter((x) => !x.client_id || agents.every((a) => a.client_id === x.client_id))));
 	});
 
 	const selected = $derived(scripts.find((s) => s.id === scriptId));
@@ -47,7 +48,7 @@
 			<label class="label" for="script">Saved script</label>
 			<select id="script" class="input" bind:value={scriptId}>
 				<option value="">Ad-hoc script…</option>
-				{#each scripts as s (s.id)}<option value={s.id}>{s.name} ({s.interpreter})</option>{/each}
+				{#each scripts as s (s.id)}<option value={s.id}>{s.name} ({s.interpreter}){s.client_name ? ` · ${s.client_name}` : ''}</option>{/each}
 			</select>
 		</div>
 		{#if selected}

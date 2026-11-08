@@ -99,6 +99,9 @@ pub struct User {
     /// 2FA is required for this account but not set up yet: until it is, the session can
     /// only reach the 2FA setup endpoints.
     pub mfa_setup_required: bool,
+    /// The clients this user may see, or `None` for all of them (admins, and accounts with
+    /// `all_clients` set).
+    pub client_ids: Option<Vec<Uuid>>,
     /// The session this request authenticated with.
     #[serde(skip)]
     pub session_id: Uuid,
@@ -113,6 +116,15 @@ impl User {
     pub fn require(&self, min: Role) -> Result<(), ApiError> {
         if self.role() >= min { Ok(()) } else { Err(ApiError::Forbidden) }
     }
+
+    /// Bind this as `$n::uuid[]` in `($n::uuid[] IS NULL OR <client id> = ANY($n))`.
+    pub fn scope(&self) -> Option<&[Uuid]> {
+        self.client_ids.as_deref()
+    }
+
+    pub fn can_see_client(&self, client_id: Uuid) -> bool {
+        self.scope().is_none_or(|ids| ids.contains(&client_id))
+    }
 }
 
 /// SQL select list for [`User`] from a `users u` row, given the placeholder bound to
@@ -122,6 +134,8 @@ macro_rules! user_columns {
         concat!(
             "u.id, u.email, u.name, u.role, u.totp_secret IS NOT NULL AS totp_enabled, ",
             "(u.totp_secret IS NULL AND (u.role = 'admin' OR ", $require_all, ")) AS mfa_setup_required, ",
+            "CASE WHEN u.role = 'admin' OR u.all_clients THEN NULL ",
+            "ELSE ARRAY(SELECT uc.client_id FROM user_clients uc WHERE uc.user_id = u.id) END AS client_ids, ",
             $session_id, " AS session_id"
         )
     };

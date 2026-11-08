@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 use crate::auth::{self, User};
 use crate::error::{ApiError, ApiResult};
+use crate::ratelimit::ClientIp;
 use crate::state::AppState;
 
 #[derive(Deserialize)]
@@ -28,7 +29,21 @@ fn dummy_hash() -> String {
     H.get_or_init(|| auth::hash_password("not-a-real-password").unwrap_or_default()).clone()
 }
 
-pub async fn login(State(st): State<Arc<AppState>>, headers: HeaderMap, Json(body): Json<Login>) -> ApiResult<impl IntoResponse> {
+pub async fn login(
+    State(st): State<Arc<AppState>>,
+    ClientIp(ip): ClientIp,
+    headers: HeaderMap,
+    Json(body): Json<Login>,
+) -> ApiResult<impl IntoResponse> {
+    let ip_key = ip.to_string();
+    let account_key = body.email.trim().to_lowercase();
+    st.limits.login_ip.check(&ip_key).map_err(ApiError::TooManyRequests)?;
+    st.limits.login_account.check(&account_key).map_err(ApiError::TooManyRequests)?;
+    let failed = || {
+        st.limits.login_ip.fail(&ip_key);
+        st.limits.login_account.fail(&account_key);
+    };
+
     let row: Option<(uuid::Uuid, String, bool, Option<Vec<u8>>)> =
         sqlx::query_as("SELECT id, password_hash, disabled, totp_secret FROM users WHERE lower(email) = lower($1)")
             .bind(body.email.trim())
@@ -38,7 +53,8 @@ pub async fn login(State(st): State<Arc<AppState>>, headers: HeaderMap, Json(bod
     let hash = row.as_ref().map(|r| r.1.clone()).unwrap_or_else(dummy_hash);
     let ok = auth::verify_password_async(&body.password, hash).await;
     let Some((user_id, _, disabled, totp_secret)) = row.filter(|_| ok) else {
-        auth::audit(&st.db, None, "auth.login_failed", None, json!({ "email": body.email })).await;
+        failed();
+        auth::audit(&st.db, None, "auth.login_failed", None, json!({ "email": body.email, "ip": ip_key })).await;
         return Err(ApiError::Unauthorized);
     };
     if disabled {
@@ -55,7 +71,8 @@ pub async fn login(State(st): State<Arc<AppState>>, headers: HeaderMap, Json(bod
                     .await;
             }
             None => {
-                auth::audit(&st.db, Some(user_id), "auth.mfa_failed", Some(("user", user_id)), json!({})).await;
+                failed();
+                auth::audit(&st.db, Some(user_id), "auth.mfa_failed", Some(("user", user_id)), json!({ "ip": ip_key })).await;
                 return Err(ApiError::MfaRequired("invalid two-factor code"));
             }
         }
@@ -73,7 +90,7 @@ pub async fn login(State(st): State<Arc<AppState>>, headers: HeaderMap, Json(bod
     .fetch_one(&st.db)
     .await?;
     sqlx::query("UPDATE users SET last_login_at = now() WHERE id = $1").bind(user_id).execute(&st.db).await?;
-    auth::audit(&st.db, Some(user_id), "auth.login", None, json!({})).await;
+    auth::audit(&st.db, Some(user_id), "auth.login", None, json!({ "ip": ip_key })).await;
 
     let user: User = sqlx::query_as(concat!("SELECT ", auth::user_columns!("$3", "$2::uuid"), " FROM users u WHERE u.id = $1"))
         .bind(user_id)

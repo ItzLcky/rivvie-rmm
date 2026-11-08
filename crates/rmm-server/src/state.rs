@@ -10,6 +10,8 @@ pub struct AppState {
     pub cfg: Settings,
     /// Cached `company_settings` row; written through by the settings API.
     pub company: RwLock<Company>,
+    pub limits: crate::ratelimit::Limits,
+    pub releases: crate::updates::Releases,
 }
 
 #[derive(Debug, Clone, Default, sqlx::FromRow)]
@@ -18,11 +20,15 @@ pub struct Company {
     pub session_idle_hours: Option<i32>,
     /// Require 2FA for every user, not just admins.
     pub require_2fa_all: bool,
+    /// Offer the newest signed agent release to agents as they connect.
+    pub auto_update_agents: bool,
 }
 
 impl Company {
+    pub const COLUMNS: &str = "company_name, session_idle_hours, require_2fa_all, auto_update_agents";
+
     pub async fn load(db: &PgPool) -> sqlx::Result<Self> {
-        sqlx::query_as("SELECT company_name, session_idle_hours, require_2fa_all FROM company_settings").fetch_one(db).await
+        sqlx::query_as(sqlx::AssertSqlSafe(format!("SELECT {} FROM company_settings", Self::COLUMNS))).fetch_one(db).await
     }
 }
 
@@ -50,6 +56,8 @@ pub struct Settings {
     /// Sessions unused for this long are rejected (the 7-day absolute lifetime still applies).
     /// Default only: Company settings can override it.
     pub session_idle_hours: u32,
+    /// Peers whose `X-Forwarded-For` is believed (RMM_TRUSTED_PROXIES).
+    pub trusted_proxies: Vec<crate::ratelimit::Cidr>,
 }
 
 impl Settings {

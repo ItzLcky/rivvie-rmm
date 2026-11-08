@@ -21,15 +21,21 @@ pub struct UserRow {
     totp_enabled: bool,
     created_at: DateTime<Utc>,
     last_login_at: Option<DateTime<Utc>>,
+    /// Ignored for admins, who always see every client.
+    all_clients: bool,
+    client_ids: Vec<Uuid>,
 }
 
 pub async fn list(State(st): State<Arc<AppState>>, u: User) -> ApiResult<Json<Vec<UserRow>>> {
     u.require(Role::Admin)?;
     Ok(Json(
-        sqlx::query_as("SELECT id, email, name, role, disabled, totp_secret IS NOT NULL AS totp_enabled, created_at, last_login_at
-               FROM users ORDER BY email")
-            .fetch_all(&st.db)
-            .await?,
+        sqlx::query_as(
+            "SELECT id, email, name, role, disabled, totp_secret IS NOT NULL AS totp_enabled, created_at, last_login_at,
+                    all_clients, ARRAY(SELECT client_id FROM user_clients WHERE user_id = users.id) AS client_ids
+               FROM users ORDER BY email",
+        )
+        .fetch_all(&st.db)
+        .await?,
     ))
 }
 
@@ -39,14 +45,80 @@ pub struct NewUser {
     name: String,
     password: String,
     role: String,
+    #[serde(flatten)]
+    access: Option<Access>,
 }
 
 pub async fn create(State(st): State<Arc<AppState>>, u: User, Json(b): Json<NewUser>) -> ApiResult<Json<serde_json::Value>> {
     u.require(Role::Admin)?;
     let role = Role::parse(&b.role).ok_or_else(|| ApiError::BadRequest("role must be admin, technician or readonly".into()))?;
     let id = create_user(&st.db, &b.email, &b.name, &b.password, role).await?;
-    auth::audit(&st.db, Some(u.id), "user.create", Some(("user", id)), json!({ "email": b.email, "role": b.role })).await;
+    if let Some(access) = &b.access {
+        let mut tx = st.db.begin().await?;
+        set_access(&mut tx, id, access).await?;
+        tx.commit().await?;
+    }
+    auth::audit(
+        &st.db,
+        Some(u.id),
+        "user.create",
+        Some(("user", id)),
+        json!({ "email": b.email, "role": b.role, "all_clients": b.access.as_ref().map(|a| a.all_clients), "clients": b.access.as_ref().map(|a| a.client_ids.len()) }),
+    )
+    .await;
     Ok(Json(json!({ "id": id })))
+}
+
+#[derive(Deserialize)]
+pub struct Access {
+    all_clients: bool,
+    #[serde(default)]
+    client_ids: Vec<Uuid>,
+}
+
+async fn set_access(tx: &mut sqlx::PgConnection, user_id: Uuid, a: &Access) -> ApiResult<()> {
+    let n = sqlx::query("UPDATE users SET all_clients = $2 WHERE id = $1")
+        .bind(user_id)
+        .bind(a.all_clients)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    if n == 0 {
+        return Err(ApiError::NotFound("user"));
+    }
+    sqlx::query("DELETE FROM user_clients WHERE user_id = $1").bind(user_id).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO user_clients (user_id, client_id) SELECT $1, c FROM unnest($2::uuid[]) c ON CONFLICT DO NOTHING")
+        .bind(user_id)
+        .bind(&a.client_ids)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| match e {
+            sqlx::Error::Database(d) if d.is_foreign_key_violation() => ApiError::NotFound("client"),
+            e => e.into(),
+        })?;
+    Ok(())
+}
+
+/// Which clients a non-admin user can see. Takes effect on their next request.
+pub async fn update_access(
+    State(st): State<Arc<AppState>>,
+    u: User,
+    Path(id): Path<Uuid>,
+    Json(b): Json<Access>,
+) -> ApiResult<Json<serde_json::Value>> {
+    u.require(Role::Admin)?;
+    let mut tx = st.db.begin().await?;
+    set_access(&mut tx, id, &b).await?;
+    tx.commit().await?;
+    auth::audit(
+        &st.db,
+        Some(u.id),
+        "user.access_update",
+        Some(("user", id)),
+        json!({ "all_clients": b.all_clients, "client_ids": b.client_ids }),
+    )
+    .await;
+    Ok(Json(json!({ "ok": true })))
 }
 
 pub async fn create_user(db: &sqlx::PgPool, email: &str, name: &str, password: &str, role: Role) -> ApiResult<Uuid> {

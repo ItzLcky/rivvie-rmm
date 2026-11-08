@@ -12,12 +12,19 @@ mod imp {
 
     const UNIT_PATH: &str = "/etc/systemd/system/rmm-agent.service";
     const BIN_PATH: &str = "/usr/local/bin/rmm-agent";
+    /// Where the .deb/.rpm puts it; the package manager owns that copy, so run it in place.
+    const PACKAGED_PATH: &str = "/usr/bin/rmm-agent";
 
     pub fn install(config: &Path) -> Result<()> {
         let exe = std::env::current_exe()?;
-        if exe != Path::new(BIN_PATH) {
-            std::fs::copy(&exe, BIN_PATH).with_context(|| format!("copying agent to {BIN_PATH} (run as root)"))?;
-        }
+        let bin = if exe == Path::new(PACKAGED_PATH) {
+            PACKAGED_PATH
+        } else {
+            if exe != Path::new(BIN_PATH) {
+                std::fs::copy(&exe, BIN_PATH).with_context(|| format!("copying agent to {BIN_PATH} (run as root)"))?;
+            }
+            BIN_PATH
+        };
         // No Nice=/MemoryMax= here: everything the agent spawns (scripts, shells, later
         // patch installs) inherits the unit's cgroup and priority, and a 128M cap OOM-killed
         // ordinary scripts. The agent's own footprint is small without it.
@@ -27,13 +34,16 @@ mod imp {
              After=network-online.target\n\
              Wants=network-online.target\n\n\
              [Service]\n\
-             ExecStart={BIN_PATH} --config {cfg} run\n\
+             ExecStart={bin} --config {cfg} run\n\
              Restart=always\n\
              RestartSec=5\n\n\
              [Install]\n\
              WantedBy=multi-user.target\n",
             cfg = config.display()
         );
+        if let Some(dir) = Path::new(UNIT_PATH).parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
         std::fs::write(UNIT_PATH, unit).with_context(|| format!("writing {UNIT_PATH} (run as root)"))?;
         systemctl(&["daemon-reload"])?;
         systemctl(&["enable", "--now", "rmm-agent.service"])?;
@@ -81,6 +91,39 @@ mod imp {
 
     const NAME: &str = "RmmAgent";
     static CONFIG: OnceLock<std::path::PathBuf> = OnceLock::new();
+    static AS_SERVICE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    pub fn running_as_service() -> bool {
+        AS_SERVICE.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn wait_for(svc: &windows_service::service::Service, want: ServiceState) -> Result<()> {
+        for _ in 0..60 {
+            if svc.query_status()?.current_state == want {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        anyhow::bail!("{NAME} didn't reach {want:?} within 30 s")
+    }
+
+    /// Used by the update watchdog, which runs outside the service.
+    pub fn stop_service() -> Result<()> {
+        let mgr = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
+        let svc = mgr.open_service(NAME, ServiceAccess::STOP | ServiceAccess::QUERY_STATUS)?;
+        if svc.query_status()?.current_state != ServiceState::Stopped {
+            let _ = svc.stop();
+            wait_for(&svc, ServiceState::Stopped)?;
+        }
+        Ok(())
+    }
+
+    pub fn start_service() -> Result<()> {
+        let mgr = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
+        let svc = mgr.open_service(NAME, ServiceAccess::START | ServiceAccess::QUERY_STATUS)?;
+        svc.start::<&str>(&[])?;
+        wait_for(&svc, ServiceState::Running)
+    }
 
     pub fn install(config: &Path) -> Result<()> {
         crate::config::prepare_data_dir()?;
@@ -150,7 +193,8 @@ mod imp {
     }
 
     fn service_main(_args: Vec<OsString>) {
-        let logging = init_file_logging();
+        AS_SERVICE.store(true, std::sync::atomic::Ordering::SeqCst);
+        let logging = init_file_logging("agent.log");
         if let Err(e) = service_body() {
             tracing::error!("service failed: {e:#}");
             if logging.is_err() {
@@ -163,15 +207,15 @@ mod imp {
 
     const LOG_MAX_BYTES: u64 = 10 * 1024 * 1024;
 
-    /// There's no console under the SCM, so log to `logs/agent.log` in the data dir, keeping
-    /// one previous file (`agent.log.1`) once it passes 10 MB at startup.
-    fn init_file_logging() -> Result<()> {
+    /// There's no console under the SCM, so log to `logs/<name>` in the data dir, keeping
+    /// one previous file (`<name>.1`) once it passes 10 MB at startup.
+    pub fn init_file_logging(name: &str) -> Result<()> {
         use tracing_subscriber::EnvFilter;
         let dir = crate::config::prepare_data_dir()?.join("logs");
         std::fs::create_dir_all(&dir)?;
-        let path = dir.join("agent.log");
+        let path = dir.join(name);
         if std::fs::metadata(&path).is_ok_and(|m| m.len() > LOG_MAX_BYTES) {
-            let _ = std::fs::rename(&path, dir.join("agent.log.1"));
+            let _ = std::fs::rename(&path, dir.join(format!("{name}.1")));
         }
         let file = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
         tracing_subscriber::fmt()
@@ -207,8 +251,9 @@ mod imp {
         };
         set(ServiceState::Running, ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN)?;
 
-        let cfg = crate::config::Config::load(CONFIG.get().expect("config path set"))?;
-        crate::runtime()?.block_on(crate::conn::run_forever(cfg, rx));
+        let config_path = CONFIG.get().expect("config path set").clone();
+        let cfg = crate::config::Config::load(&config_path)?;
+        crate::runtime()?.block_on(crate::conn::run_forever(cfg, config_path, rx));
 
         set(ServiceState::Stopped, ServiceControlAccept::empty())?;
         Ok(())
@@ -230,3 +275,18 @@ mod imp {
 }
 
 pub use imp::{install, run_as_service, uninstall};
+#[cfg(windows)]
+pub use imp::{running_as_service, start_service, stop_service};
+
+/// Logging for `update-watchdog`. Under systemd-run stdout goes to the journal
+/// (`journalctl -u 'rmm-agent-update-*'`); on Windows there's no console, so it goes to
+/// `logs\update.log` in the data dir.
+pub fn init_watchdog_logging(_config: &Path) {
+    #[cfg(windows)]
+    if imp::init_file_logging("update.log").is_ok() {
+        return;
+    }
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        .try_init();
+}

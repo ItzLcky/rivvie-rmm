@@ -3,7 +3,7 @@
 	import { api, qs } from '#lib/api.js';
 	import { ago, maxDiskPct, pct } from '#lib/format.js';
 	import { can } from '#lib/session.svelte.js';
-	import type { AgentSummary, Client } from '#lib/types.js';
+	import type { AgentSummary, Client, Release } from '#lib/types.js';
 	import Status from '#lib/components/Status.svelte';
 	import OsBadge from '#lib/components/OsBadge.svelte';
 	import UsageBar from '#lib/components/UsageBar.svelte';
@@ -18,9 +18,26 @@
 	let selected = $state<Set<string>>(new Set());
 	let running = $state(false);
 
+	let releases = $state<Release[]>([]);
+	let notice = $state('');
+	const outdated = $derived(releases.reduce((n, r) => n + r.outdated, 0));
+
 	$effect(() => {
 		api.get<Client[]>('/clients').then((c) => (clients = c));
+		if (can('admin')) api.get<{ releases: Release[] }>('/agent-updates').then((r) => (releases = r.releases)).catch(() => {});
 	});
+
+	async function rollout() {
+		const ids = selected.size ? [...selected] : null;
+		const what = ids ? `${ids.length} selected agents` : `every online agent (${outdated} out of date)`;
+		if (!confirm(`Update ${what} to the latest signed release? Each agent waits for its running jobs, then restarts.`)) return;
+		try {
+			const r = await api.post<{ offered: number; skipped: number }>('/agent-updates/rollout', { agent_ids: ids });
+			notice = `Update offered to ${r.offered} agent(s); ${r.skipped} skipped (already current, or no release for their platform).`;
+		} catch (e) {
+			notice = (e as Error).message;
+		}
+	}
 
 	$effect(() => {
 		const query = qs({ q, client_id: clientId, online, os });
@@ -47,10 +64,16 @@
 
 <div class="mb-4 flex items-center justify-between">
 	<h1 class="text-xl font-semibold">Agents <span class="text-base font-normal text-slate-500">{agents.length}</span></h1>
-	{#if can('technician')}
-		<button class="btn-primary" disabled={!selected.size} onclick={() => (running = true)}>Run script on {selected.size || ''} selected</button>
-	{/if}
+	<div class="flex gap-2">
+		{#if can('admin') && outdated > 0}
+			<button class="btn-ghost" onclick={rollout}>{selected.size ? `Update ${selected.size} selected` : `Update ${outdated} outdated`}</button>
+		{/if}
+		{#if can('technician')}
+			<button class="btn-primary" disabled={!selected.size} onclick={() => (running = true)}>Run script on {selected.size || ''} selected</button>
+		{/if}
+	</div>
 </div>
+{#if notice}<p class="mb-3 text-sm text-sky-300">{notice}</p>{/if}
 
 <div class="mb-4 flex flex-wrap gap-2">
 	<input class="input max-w-xs" placeholder="Search hostname…" bind:value={q} />

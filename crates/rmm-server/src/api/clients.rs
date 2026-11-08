@@ -28,16 +28,21 @@ pub struct ClientOut {
     sites: Vec<SiteRow>,
 }
 
-pub async fn list(State(st): State<Arc<AppState>>, _u: User) -> ApiResult<Json<Vec<ClientOut>>> {
+pub async fn list(State(st): State<Arc<AppState>>, u: User) -> ApiResult<Json<Vec<ClientOut>>> {
     let clients: Vec<(Uuid, String, DateTime<Utc>)> =
-        sqlx::query_as("SELECT id, name, created_at FROM clients ORDER BY name").fetch_all(&st.db).await?;
+        sqlx::query_as("SELECT id, name, created_at FROM clients WHERE ($1::uuid[] IS NULL OR id = ANY($1)) ORDER BY name")
+            .bind(u.scope())
+            .fetch_all(&st.db)
+            .await?;
     let sites: Vec<SiteRow> = sqlx::query_as(
         "SELECT s.id, s.client_id, s.name,
                 count(a.id) AS agent_count,
                 count(a.id) FILTER (WHERE a.online) AS online_count
            FROM sites s LEFT JOIN agents a ON a.site_id = s.id
+          WHERE ($1::uuid[] IS NULL OR s.client_id = ANY($1))
           GROUP BY s.id ORDER BY s.name",
     )
+    .bind(u.scope())
     .fetch_all(&st.db)
     .await?;
     let mut out: Vec<ClientOut> =
@@ -131,6 +136,7 @@ pub struct TokenRow {
 
 pub async fn list_tokens(State(st): State<Arc<AppState>>, u: User, Path(site_id): Path<Uuid>) -> ApiResult<Json<Vec<TokenRow>>> {
     u.require(Role::Technician)?;
+    super::access::site(&st, &u, site_id).await?;
     Ok(Json(
         sqlx::query_as(
             "SELECT id, label, max_uses, uses, expires_at, created_at FROM enrollment_tokens
@@ -147,9 +153,16 @@ pub struct NewToken {
     #[serde(default)]
     label: String,
     max_uses: Option<i32>,
-    /// Defaults to 7 days. 0 = never expires.
+    /// Defaults to 7 days (30 for packages). 0 = never expires (not allowed for packages).
     expires_in_hours: Option<i64>,
+    /// `package`: for baking into .deb/.rpm files, which get copied around, so it must be
+    /// bounded: defaults to 30 days and 50 uses, and refuses "never" or "unlimited".
+    #[serde(default)]
+    purpose: Option<String>,
 }
+
+pub const PACKAGE_TOKEN_HOURS: i64 = 24 * 30;
+pub const PACKAGE_TOKEN_USES: i32 = 50;
 
 pub async fn create_token(
     State(st): State<Arc<AppState>>,
@@ -158,7 +171,22 @@ pub async fn create_token(
     Json(b): Json<NewToken>,
 ) -> ApiResult<Json<serde_json::Value>> {
     u.require(Role::Technician)?;
-    let hours = b.expires_in_hours.unwrap_or(24 * 7);
+    super::access::site(&st, &u, site_id).await?;
+    let package = match b.purpose.as_deref() {
+        None | Some("") => false,
+        Some("package") => true,
+        Some(other) => return Err(ApiError::BadRequest(format!("unknown token purpose {other}"))),
+    };
+    let (hours, max_uses) = if package {
+        let hours = b.expires_in_hours.unwrap_or(PACKAGE_TOKEN_HOURS);
+        let uses = b.max_uses.unwrap_or(PACKAGE_TOKEN_USES);
+        if hours <= 0 || uses <= 0 {
+            return Err(ApiError::BadRequest("package tokens need an expiry and a use limit".into()));
+        }
+        (hours, Some(uses))
+    } else {
+        (b.expires_in_hours.unwrap_or(24 * 7), b.max_uses.filter(|n| *n > 0))
+    };
     let expires_at = (hours > 0).then(|| Utc::now() + Duration::hours(hours));
     let token = auth::random_token();
     let id = Uuid::new_v4();
@@ -170,7 +198,7 @@ pub async fn create_token(
     .bind(site_id)
     .bind(auth::token_hash(&token))
     .bind(b.label.trim())
-    .bind(b.max_uses.filter(|n| *n > 0))
+    .bind(max_uses)
     .bind(expires_at)
     .bind(u.id)
     .execute(&st.db)
@@ -179,7 +207,8 @@ pub async fn create_token(
         sqlx::Error::Database(d) if d.is_foreign_key_violation() => ApiError::NotFound("site"),
         e => e.into(),
     })?;
-    auth::audit(&st.db, Some(u.id), "enrollment_token.create", Some(("site", site_id)), json!({ "token_id": id })).await;
+    auth::audit(&st.db, Some(u.id), "enrollment_token.create", Some(("site", site_id)), json!({ "token_id": id, "package": package }))
+        .await;
 
     let url = &st.cfg.public_url;
     let mut linux = format!("sudo ./rmm-agent enroll --server {url} --token {token} --install");
@@ -198,17 +227,40 @@ pub async fn create_token(
              {windows}"
         );
     }
+    // Bounded tokens can also be baked into Linux packages.
+    let packages = (expires_at.is_some() && max_uses.is_some() && super::agent_binary_exists(&st, "linux-x86_64")).then(|| {
+        let base = format!("{url}/api/agent-packages/linux-x86_64");
+        json!({
+            "deb": format!("{base}/rmm-agent.deb?token={token}"),
+            "rpm": format!("{base}/rmm-agent.rpm?token={token}"),
+            "install_deb": format!("curl -fsSLo /tmp/rmm-agent.deb \"{base}/rmm-agent.deb?token={token}\" && sudo apt-get install -y /tmp/rmm-agent.deb"),
+            "install_rpm": format!("curl -fsSLo /tmp/rmm-agent.rpm \"{base}/rmm-agent.rpm?token={token}\" && sudo dnf install -y /tmp/rmm-agent.rpm"),
+        })
+    });
     Ok(Json(json!({
         "id": id,
         "token": token,
         "expires_at": expires_at,
-        "install": { "linux": linux, "windows": windows }
+        "max_uses": max_uses,
+        "install": { "linux": linux, "windows": windows },
+        "packages": packages,
     })))
 }
 
 pub async fn revoke_token(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uuid>) -> ApiResult<Json<serde_json::Value>> {
     u.require(Role::Technician)?;
-    sqlx::query("DELETE FROM enrollment_tokens WHERE id = $1").bind(id).execute(&st.db).await?;
+    let n = sqlx::query(
+        "DELETE FROM enrollment_tokens t USING sites s
+          WHERE t.id = $1 AND s.id = t.site_id AND ($2::uuid[] IS NULL OR s.client_id = ANY($2))",
+    )
+    .bind(id)
+    .bind(u.scope())
+    .execute(&st.db)
+    .await?
+    .rows_affected();
+    if n == 0 {
+        return Err(ApiError::NotFound("enrollment token"));
+    }
     auth::audit(&st.db, Some(u.id), "enrollment_token.revoke", Some(("enrollment_token", id)), json!({})).await;
     Ok(Json(json!({ "ok": true })))
 }

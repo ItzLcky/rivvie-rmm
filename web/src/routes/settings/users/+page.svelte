@@ -4,24 +4,52 @@
 	import { session } from '#lib/session.svelte.js';
 	import Modal from '#lib/components/Modal.svelte';
 	import Sessions from '#lib/components/Sessions.svelte';
+	import ClientAccess from '#lib/components/ClientAccess.svelte';
+	import type { Client } from '#lib/types.js';
 
-	interface UserRow { id: string; email: string; name: string; role: string; disabled: boolean; totp_enabled: boolean; last_login_at: string | null }
+	interface UserRow {
+		id: string; email: string; name: string; role: string; disabled: boolean; totp_enabled: boolean; last_login_at: string | null;
+		all_clients: boolean; client_ids: string[];
+	}
 	let users = $state<UserRow[]>([]);
+	let clients = $state<Client[]>([]);
 	let adding = $state(false);
-	let form = $state({ email: '', name: '', password: '', role: 'technician' });
+	const blank = () => ({ email: '', name: '', password: '', role: 'technician', all_clients: true, client_ids: [] as string[] });
+	let form = $state(blank());
 	let error = $state('');
 
 	const load = () => api.get<UserRow[]>('/users').then((u) => (users = u));
 	$effect(() => {
 		load();
+		api.get<Client[]>('/clients').then((c) => (clients = c));
 	});
+
+	function access(u: UserRow): string {
+		if (u.role === 'admin' || u.all_clients) return 'All';
+		const names = clients.filter((c) => u.client_ids.includes(c.id)).map((c) => c.name);
+		return names.length === 0 ? 'None' : names.length <= 2 ? names.join(', ') : `${names.length} clients`;
+	}
+
+	let editingAccess = $state<UserRow | null>(null);
+	let accessForm = $state({ all_clients: true, client_ids: [] as string[] });
+	let accessError = $state('');
+	async function saveAccess() {
+		accessError = '';
+		try {
+			await api.put(`/users/${editingAccess!.id}/access`, accessForm);
+			editingAccess = null;
+			await load();
+		} catch (e) {
+			accessError = (e as Error).message;
+		}
+	}
 
 	async function add() {
 		error = '';
 		try {
 			await api.post('/users', form);
 			adding = false;
-			form = { email: '', name: '', password: '', role: 'technician' };
+			form = blank();
 			await load();
 		} catch (e) {
 			error = (e as Error).message;
@@ -73,11 +101,11 @@
 </div>
 <div class="card overflow-x-auto">
 	<table class="table">
-		<thead><tr><th>Name</th><th>Email</th><th>Role</th><th>2FA</th><th>Last login</th><th></th></tr></thead>
+		<thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Clients</th><th>2FA</th><th>Last login</th><th></th></tr></thead>
 		<tbody>
 			{#each users as u (u.id)}
 				<tr>
-					<td class={u.disabled ? 'opacity-50' : ''}>{u.name}</td><td class={u.disabled ? 'opacity-50' : ''}>{u.email}</td><td class="capitalize {u.disabled ? 'opacity-50' : ''}">{u.role}</td><td class="text-xs {u.disabled ? 'opacity-50' : ''}">{#if u.totp_enabled}<span class="text-emerald-400">On</span>{:else if u.role === 'admin'}<span class="text-amber-300">Not set up</span>{:else}<span class="text-slate-500">Off</span>{/if}</td><td class="text-xs text-slate-400 {u.disabled ? 'opacity-50' : ''}">{ago(u.last_login_at)}</td>
+					<td class={u.disabled ? 'opacity-50' : ''}>{u.name}</td><td class={u.disabled ? 'opacity-50' : ''}>{u.email}</td><td class="capitalize {u.disabled ? 'opacity-50' : ''}">{u.role}</td><td class="text-xs {u.disabled ? 'opacity-50' : ''} {access(u) === 'None' ? 'text-amber-300' : 'text-slate-300'}">{access(u)}</td><td class="text-xs {u.disabled ? 'opacity-50' : ''}">{#if u.totp_enabled}<span class="text-emerald-400">On</span>{:else if u.role === 'admin'}<span class="text-amber-300">Not set up</span>{:else}<span class="text-slate-500">Off</span>{/if}</td><td class="text-xs text-slate-400 {u.disabled ? 'opacity-50' : ''}">{ago(u.last_login_at)}</td>
 					<td class="text-right">
 						<div class="flex justify-end gap-1.5">
 							{#if u.id === session.user?.id}
@@ -86,6 +114,7 @@
 								<span class="self-center text-xs text-slate-500">disabled</span>
 								<button class="btn-ghost py-1 text-xs" onclick={() => enable(u)}>Enable</button>
 							{:else}
+								{#if u.role !== 'admin'}<button class="btn-ghost py-1 text-xs" onclick={() => { editingAccess = u; accessForm = { all_clients: u.all_clients, client_ids: [...u.client_ids] }; accessError = ''; }}>Clients</button>{/if}
 								<button class="btn-ghost py-1 text-xs" onclick={() => (viewing = u)}>Sessions</button>
 								<button class="btn-ghost py-1 text-xs" onclick={() => { resetting = u; resetPw = ''; resetError = ''; }}>Reset password</button>
 								{#if u.totp_enabled}<button class="btn-ghost py-1 text-xs" onclick={() => { resetting2fa = u; reset2faError = ''; }}>Reset 2FA</button>{/if}
@@ -113,8 +142,22 @@
 					<option value="readonly">Read-only: view only</option>
 				</select>
 			</div>
+			{#if form.role !== 'admin'}
+				<div><div class="label">Client access</div><ClientAccess {clients} bind:value={form} /></div>
+			{/if}
 			{#if error}<p class="text-sm text-red-400">{error}</p>{/if}
 			<div class="flex justify-end gap-2"><button class="btn-ghost" onclick={() => (adding = false)}>Cancel</button><button class="btn-primary" onclick={add}>Create</button></div>
+		</div>
+	</Modal>
+{/if}
+
+{#if editingAccess}
+	<Modal title="Client access for {editingAccess.email}" onclose={() => (editingAccess = null)}>
+		<div class="space-y-3">
+			<p class="text-sm text-slate-400">They only see agents, sites, jobs and client scripts of these clients. MSP-wide scripts stay visible. Takes effect on their next request.</p>
+			<ClientAccess {clients} bind:value={accessForm} />
+			{#if accessError}<p class="text-sm text-red-400">{accessError}</p>{/if}
+			<div class="flex justify-end gap-2"><button class="btn-ghost" onclick={() => (editingAccess = null)}>Cancel</button><button class="btn-primary" onclick={saveAccess}>Save</button></div>
 		</div>
 	</Modal>
 {/if}

@@ -7,7 +7,12 @@ use sysinfo::{CpuRefreshKind, Disks, MemoryRefreshKind, Networks, ProcessRefresh
 
 use crate::software;
 
-pub const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// `RMM_AGENT_VERSION` at build time overrides the crate version (release builds, tests).
+/// (Empty counts as unset: Docker build args are always defined.)
+pub const AGENT_VERSION: &str = match option_env!("RMM_AGENT_VERSION") {
+    Some(v) if !v.is_empty() => v,
+    _ => env!("CARGO_PKG_VERSION"),
+};
 
 pub struct Collector {
     sys: System,

@@ -15,6 +15,7 @@ use uuid::Uuid;
 use crate::collect::{AGENT_VERSION, Collector, system_info};
 use crate::config::{self, Config};
 use crate::shell::ShellSession;
+use crate::update::Updater;
 use crate::{jobs, shell};
 
 type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
@@ -70,7 +71,9 @@ pub async fn enroll(server_url: &str, token: &str, previous: Option<&Config>) ->
 }
 
 /// Stay connected until `shutdown` flips to true, reconnecting with backoff.
-pub async fn run_forever(cfg: Config, mut shutdown: watch::Receiver<bool>) {
+pub async fn run_forever(cfg: Config, config_path: std::path::PathBuf, mut shutdown: watch::Receiver<bool>) {
+    let tracker = Arc::new(jobs::Tracker::default());
+    let updater = Arc::new(Updater::new(config_path, tracker.clone()));
     let collector = match Collector::new() {
         Ok(c) => Arc::new(Mutex::new(c)),
         Err(e) => {
@@ -82,7 +85,7 @@ pub async fn run_forever(cfg: Config, mut shutdown: watch::Receiver<bool>) {
     loop {
         let started = std::time::Instant::now();
         tokio::select! {
-            res = session(&cfg, collector.clone()) => match res {
+            res = session(&cfg, collector.clone(), tracker.clone(), updater.clone()) => match res {
                 Ok(()) => info!("connection closed"),
                 Err(e) => warn!("connection error: {e:#}"),
             },
@@ -107,7 +110,12 @@ pub async fn run_forever(cfg: Config, mut shutdown: watch::Receiver<bool>) {
     }
 }
 
-async fn session(cfg: &Config, collector: Arc<Mutex<Collector>>) -> Result<()> {
+async fn session(
+    cfg: &Config,
+    collector: Arc<Mutex<Collector>>,
+    tracker: Arc<jobs::Tracker>,
+    updater: Arc<Updater>,
+) -> Result<()> {
     let mut ws = connect(&cfg.ws_url()).await?;
     send(
         &mut ws,
@@ -116,6 +124,7 @@ async fn session(cfg: &Config, collector: Arc<Mutex<Collector>>) -> Result<()> {
             agent_id: cfg.agent_id,
             secret: cfg.secret.clone(),
             agent_version: AGENT_VERSION.to_string(),
+            jobs: tracker.ids().await,
         },
     )
     .await?;
@@ -145,6 +154,9 @@ async fn session(cfg: &Config, collector: Arc<Mutex<Collector>>) -> Result<()> {
         let _ = sink.close().await;
     });
 
+    // Before anything else is queued, so resent job state precedes new output.
+    tracker.attach(tx.clone()).await;
+    updater.attach(tx.clone()).await;
     let heartbeat = tokio::spawn(periodic(tx.clone(), collector.clone(), heartbeat_secs.max(5), false));
     let inventory = tokio::spawn(periodic(tx.clone(), collector.clone(), inventory_secs.max(300), true));
 
@@ -167,15 +179,17 @@ async fn session(cfg: &Config, collector: Arc<Mutex<Collector>>) -> Result<()> {
             Message::Close(_) => break Ok(()),
             _ => continue,
         };
-        handle(msg, &tx, &collector, &mut shells).await;
+        handle(msg, &tx, &collector, &tracker, &updater, &mut shells).await;
     };
 
+    // Running jobs keep going; their output is buffered until the next connection.
+    tracker.detach();
+    updater.detach();
     heartbeat.abort();
     inventory.abort();
     drop(shells);
     drop(tx);
-    // Running jobs hold sender clones, so the writer won't end on its own until they finish,
-    // and a dead socket can stall it mid-send. Give it a moment to flush, then move on.
+    // A dead socket can stall the writer mid-send. Give it a moment to flush, then move on.
     let abort = writer.abort_handle();
     if tokio::time::timeout(Duration::from_secs(5), writer).await.is_err() {
         abort.abort();
@@ -187,6 +201,8 @@ async fn handle(
     msg: ServerMsg,
     tx: &mpsc::Sender<AgentMsg>,
     collector: &Arc<Mutex<Collector>>,
+    tracker: &Arc<jobs::Tracker>,
+    updater: &Arc<Updater>,
     shells: &mut HashMap<Uuid, ShellSession>,
 ) {
     match msg {
@@ -202,8 +218,11 @@ async fn handle(
             });
         }
         ServerMsg::RunScript(job) => {
-            tokio::spawn(jobs::run(job, tx.clone()));
+            tokio::spawn(jobs::run(job, tracker.clone()));
         }
+        ServerMsg::JobAck { job_id } => tracker.ack(job_id).await,
+        ServerMsg::UpdateOffer { version, size, sha256, signature } => updater.offer(version, size, sha256, signature).await,
+        ServerMsg::UpdateChunk { version, offset, data } => updater.chunk(version, offset, data).await,
         ServerMsg::ShellOpen { session_id, cols, rows } => match shell::ShellSession::open(session_id, cols, rows, tx.clone()) {
             Ok(s) => {
                 info!(%session_id, "shell opened");

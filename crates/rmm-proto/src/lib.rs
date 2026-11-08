@@ -8,12 +8,18 @@
 //! Everything is multiplexed over that one connection: metrics, jobs,
 //! interactive shells and (later) patching and remote desktop streams.
 
+pub mod update;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// Bumped on breaking wire changes; the server rejects agents it can't speak to.
 pub const PROTOCOL_VERSION: u32 = 1;
+
+/// Output the agent keeps per job stream so it can resend it after a reconnect. Matches the
+/// server's storage cap, so nothing the server would keep is lost.
+pub const JOB_OUTPUT_BUFFER: usize = 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CodecError {
@@ -56,6 +62,11 @@ pub enum AgentMsg {
         agent_id: Uuid,
         secret: String,
         agent_version: String,
+        /// Jobs this agent still holds (running, or finished but not acknowledged). Any job
+        /// the server thinks was dispatched to it and isn't listed can never report: the
+        /// agent restarted, or the job never arrived. Agents that predate this send nothing.
+        #[serde(default)]
+        jobs: Vec<Uuid>,
     },
     Heartbeat(Metrics),
     Inventory(Inventory),
@@ -70,6 +81,28 @@ pub enum AgentMsg {
         status: JobStatus,
         exit_code: Option<i32>,
         duration_ms: u64,
+    },
+    /// After a reconnect: the job's output so far, replacing whatever the server stored.
+    /// Chunks sent on the old connection may have been lost; live `JobOutput` continues
+    /// after this. Capped by the agent at [`JOB_OUTPUT_BUFFER`] per stream.
+    JobSync {
+        job_id: Uuid,
+        #[serde(with = "serde_bytes")]
+        stdout: Vec<u8>,
+        #[serde(with = "serde_bytes")]
+        stderr: Vec<u8>,
+    },
+    /// Next piece of an offered update: the server answers with [`ServerMsg::UpdateChunk`].
+    UpdateFetch {
+        version: String,
+        offset: u64,
+    },
+    /// Progress of a self-update, for the dashboard.
+    UpdateStatus {
+        version: String,
+        state: UpdateState,
+        #[serde(default)]
+        detail: Option<String>,
     },
     ShellOpened {
         session_id: Uuid,
@@ -142,6 +175,24 @@ pub enum ServerMsg {
     },
     RequestInventory,
     RunScript(ScriptJob),
+    /// The server has stored this job's `JobFinished`; the agent can forget the job.
+    JobAck {
+        job_id: Uuid,
+    },
+    /// Install this version. The agent checks the signature against its built-in key and
+    /// refuses anything that isn't newer than itself.
+    UpdateOffer {
+        version: String,
+        size: u64,
+        sha256: String,
+        signature: String,
+    },
+    UpdateChunk {
+        version: String,
+        offset: u64,
+        #[serde(with = "serde_bytes")]
+        data: Vec<u8>,
+    },
     ShellOpen {
         session_id: Uuid,
         cols: u16,
@@ -163,6 +214,34 @@ pub enum ServerMsg {
     Ping {
         nonce: u64,
     },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateState {
+    Downloading,
+    /// Downloaded and verified; waiting for running jobs to finish before restarting.
+    Waiting,
+    /// Restarting into the new version.
+    Applying,
+    /// The new version is running and connected.
+    Completed,
+    /// The new version didn't connect in time; the previous one was restored.
+    RolledBack,
+    Failed,
+}
+
+impl UpdateState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UpdateState::Downloading => "downloading",
+            UpdateState::Waiting => "waiting",
+            UpdateState::Applying => "applying",
+            UpdateState::Completed => "completed",
+            UpdateState::RolledBack => "rolled_back",
+            UpdateState::Failed => "failed",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -5,6 +5,7 @@ mod jobs;
 mod service;
 mod shell;
 mod software;
+mod update;
 
 use std::path::PathBuf;
 
@@ -13,7 +14,7 @@ use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
-#[command(name = "rmm-agent", version, about = "RMM endpoint agent")]
+#[command(name = "rmm-agent", version = collect::AGENT_VERSION, about = "RMM endpoint agent")]
 struct Cli {
     /// Path to agent.toml (defaults to the platform system location).
     #[arg(long, global = true, env = "RMM_AGENT_CONFIG")]
@@ -27,10 +28,13 @@ enum Cmd {
     /// Register this machine with a server using an enrollment token.
     Enroll {
         /// Server base URL, e.g. https://rmm.example.com
-        #[arg(long)]
-        server: String,
-        #[arg(long, env = "RMM_ENROLL_TOKEN")]
-        token: String,
+        #[arg(long, required_unless_present = "from_file")]
+        server: Option<String>,
+        #[arg(long, env = "RMM_ENROLL_TOKEN", required_unless_present = "from_file")]
+        token: Option<String>,
+        /// Read `server` and `token` from a TOML file instead (what the .deb/.rpm ships).
+        #[arg(long, conflicts_with_all = ["server", "token"])]
+        from_file: Option<PathBuf>,
         /// Also install and start the system service.
         #[arg(long)]
         install: bool,
@@ -50,6 +54,9 @@ enum Cmd {
     /// Entry point used by the Windows Service Control Manager.
     #[command(hide = true)]
     Service,
+    /// Swaps in a downloaded update and rolls back if it doesn't check in (started by the agent).
+    #[command(hide = true)]
+    UpdateWatchdog,
 }
 
 fn main() -> Result<()> {
@@ -61,13 +68,26 @@ fn main() -> Result<()> {
         return service::run_as_service(config_path);
     }
 
+    if let Cmd::UpdateWatchdog = cli.cmd {
+        // No console under systemd-run or a detached Windows process: log to a file too.
+        service::init_watchdog_logging(&config_path);
+        return update::watchdog(&config_path).inspect_err(|e| tracing::error!("update watchdog: {e:#}"));
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
     install_crypto();
 
     match cli.cmd {
-        Cmd::Enroll { server, token, install, insecure } => {
+        Cmd::Enroll { server, token, from_file, install, insecure } => {
+            let (server, token) = match from_file {
+                Some(path) => {
+                    let f = config::EnrollFile::load(&path)?;
+                    (f.server, f.token)
+                }
+                None => (server.unwrap_or_default(), token.unwrap_or_default()),
+            };
             let server = config::normalize_server_url(&server, insecure)?;
             // Re-enrolling: prove ownership of the existing record so the server keeps it.
             // Never hand the old secret to a different server.
@@ -88,7 +108,7 @@ fn main() -> Result<()> {
                     let _ = tokio::signal::ctrl_c().await;
                     let _ = tx.send(true);
                 });
-                conn::run_forever(cfg, rx).await;
+                conn::run_forever(cfg, config_path, rx).await;
             });
             Ok(())
         }
@@ -101,7 +121,7 @@ fn main() -> Result<()> {
             println!("{out}");
             Ok(())
         }
-        Cmd::Service => unreachable!(),
+        Cmd::Service | Cmd::UpdateWatchdog => unreachable!(),
     }
 }
 

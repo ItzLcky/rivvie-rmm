@@ -7,7 +7,10 @@
 
 	interface Token { id: string; label: string; max_uses: number | null; uses: number; expires_at: string | null; created_at: string }
 	interface AgentDownload { id: string; label: string; file_name: string; size: number; sha256: string; url: string }
-	interface NewToken { token: string; expires_at: string | null; install: { linux: string; windows: string } }
+	interface NewToken {
+		token: string; expires_at: string | null; max_uses: number | null; install: { linux: string; windows: string };
+		packages: { deb: string; rpm: string; install_deb: string; install_rpm: string } | null;
+	}
 
 	let clients = $state<Client[]>([]);
 	let newClient = $state('');
@@ -55,14 +58,18 @@
 		downloads ??= await api.get<AgentDownload[]>('/agent-downloads').catch(() => []);
 		tokens = await api.get<Token[]>(`/sites/${site.id}/enrollment-tokens`);
 	}
-	async function createToken() {
+	let tokenError = $state('');
+	async function createToken(purpose: 'package' | null = null) {
 		if (!tokenSite) return;
-		created = await api.post<NewToken>(`/sites/${tokenSite.site.id}/enrollment-tokens`, {
-			label,
-			max_uses: maxUses || null,
-			expires_in_hours: expiresHours
-		});
-		tokens = await api.get<Token[]>(`/sites/${tokenSite.site.id}/enrollment-tokens`);
+		tokenError = '';
+		try {
+			created = await api.post<NewToken>(`/sites/${tokenSite.site.id}/enrollment-tokens`, purpose
+				? { label: label || 'Linux package', purpose, max_uses: maxUses || null, expires_in_hours: expiresHours || null }
+				: { label, max_uses: maxUses || null, expires_in_hours: expiresHours });
+			tokens = await api.get<Token[]>(`/sites/${tokenSite.site.id}/enrollment-tokens`);
+		} catch (e) {
+			tokenError = (e as Error).message;
+		}
 	}
 	async function revoke(t: Token) {
 		await api.del(`/enrollment-tokens/${t.id}`);
@@ -137,6 +144,18 @@
 				<pre class="mb-2 overflow-x-auto rounded bg-slate-950 p-2 font-mono text-xs select-all">{created.install.linux}</pre>
 				<div class="label">Windows (elevated PowerShell)</div>
 				<pre class="overflow-x-auto rounded bg-slate-950 p-2 font-mono text-xs select-all">{created.install.windows}</pre>
+				{#if created.packages}
+					<div class="label mt-3">Linux package (the token is baked in; the package enrolls and starts the agent on install)</div>
+					<div class="mb-2 flex gap-2">
+						<a class="btn-ghost py-1 text-xs" href={created.packages.deb}>Download .deb</a>
+						<a class="btn-ghost py-1 text-xs" href={created.packages.rpm}>Download .rpm</a>
+					</div>
+					<div class="label">Debian / Ubuntu</div>
+					<pre class="mb-2 overflow-x-auto rounded bg-slate-950 p-2 font-mono text-xs select-all">{created.packages.install_deb}</pre>
+					<div class="label">RHEL / Fedora</div>
+					<pre class="overflow-x-auto rounded bg-slate-950 p-2 font-mono text-xs select-all">{created.packages.install_rpm}</pre>
+					<p class="mt-2 text-xs text-slate-400">Anyone with the package can enroll machines into this site until the token expires or runs out of uses{created.max_uses ? ` (${created.max_uses})` : ''}. Push it with your configuration management, and revoke the token when the rollout is done.</p>
+				{/if}
 			</div>
 		{/if}
 		<div class="mb-4 grid grid-cols-3 gap-2">
@@ -149,7 +168,11 @@
 				</select>
 			</div>
 		</div>
-		<button class="btn-primary mb-4" onclick={createToken}>Create enrollment token</button>
+		<div class="mb-4 flex flex-wrap items-center gap-2">
+			<button class="btn-primary" onclick={() => createToken()}>Create enrollment token</button>
+			<button class="btn-ghost" onclick={() => createToken('package')} title="A token limited to 50 uses and 30 days unless set above, plus .deb/.rpm downloads with it baked in">Create Linux package</button>
+		</div>
+		{#if tokenError}<p class="mb-3 text-sm text-red-400">{tokenError}</p>{/if}
 		<table class="table">
 			<thead><tr><th>Label</th><th>Uses</th><th>Expires</th><th></th></tr></thead>
 			<tbody>

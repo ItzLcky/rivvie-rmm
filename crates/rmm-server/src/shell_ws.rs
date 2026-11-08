@@ -43,6 +43,7 @@ pub async fn handler(
 ) -> ApiResult<Response> {
     user.require(Role::Technician)?;
     check_origin(&headers, &st.cfg.public_url)?;
+    crate::api::access::agent(&st, &user, agent_id).await?;
     if !st.hub.is_online(agent_id) {
         return Err(ApiError::Conflict("agent is offline".into()));
     }

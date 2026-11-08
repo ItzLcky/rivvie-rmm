@@ -45,6 +45,20 @@ impl Config {
     }
 }
 
+/// `enroll --from-file`: what the server bakes into .deb/.rpm packages.
+#[derive(Debug, Deserialize)]
+pub struct EnrollFile {
+    pub server: String,
+    pub token: String,
+}
+
+impl EnrollFile {
+    pub fn load(path: &Path) -> Result<Self> {
+        let raw = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        toml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))
+    }
+}
+
 /// Validates the server URL given at enrollment and strips any trailing slash.
 pub fn normalize_server_url(raw: &str, allow_insecure: bool) -> Result<String> {
     let url = raw.trim().trim_end_matches('/');

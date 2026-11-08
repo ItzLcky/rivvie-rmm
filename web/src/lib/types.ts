@@ -1,5 +1,9 @@
 export type Role = 'admin' | 'technician' | 'readonly';
-export interface User { id: string; email: string; name: string; role: Role; totp_enabled: boolean; mfa_setup_required: boolean }
+export interface User {
+	id: string; email: string; name: string; role: Role; totp_enabled: boolean; mfa_setup_required: boolean;
+	/** null = every client */
+	client_ids: string[] | null;
+}
 
 export interface DiskUsage { mount: string; total: number; available: number }
 export interface Metrics {
@@ -12,7 +16,11 @@ export interface AgentSummary {
 	id: string; hostname: string; os_family: 'linux' | 'windows' | 'macos' | 'other'; os_name: string; os_version: string;
 	arch: string; agent_version: string; online: boolean; last_seen_at: string | null; enrolled_at: string;
 	site_id: string; site_name: string; client_id: string; client_name: string; last_metrics: Metrics | null;
+	update_state: UpdateState | null; update_version: string | null; update_detail: string | null; update_at: string | null;
 }
+
+export type UpdateState = 'offered' | 'downloading' | 'waiting' | 'applying' | 'completed' | 'rolled_back' | 'failed';
+export interface Release { platform: string; version: string; sha256: string; size: number; outdated: number }
 
 export interface Software { name: string; version: string; publisher: string | null; source: string }
 export interface Inventory {
@@ -35,6 +43,8 @@ export interface Client { id: string; name: string; created_at: string; sites: S
 export type Interpreter = 'bash' | 'sh' | 'powershell' | 'cmd' | 'python';
 export interface Script {
 	id: string; name: string; description: string; interpreter: Interpreter; body: string; timeout_secs: number;
+	/** null = MSP-wide */
+	client_id: string | null; client_name: string | null;
 	created_at: string; updated_at: string;
 }
 

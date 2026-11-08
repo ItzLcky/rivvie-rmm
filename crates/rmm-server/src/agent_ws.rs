@@ -1,6 +1,7 @@
 //! `/api/agent/ws`: the single endpoint every agent connects to.
 
 use sqlx::AssertSqlSafe;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,7 +12,7 @@ use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use rmm_proto::{
     AgentMsg, Interpreter, Inventory, JobStatus, Metrics, OutputStream, PROTOCOL_VERSION, PreviousCredential, ScriptJob, ServerMsg,
-    SystemInfo,
+    SystemInfo, UpdateState,
 };
 use subtle::ConstantTimeEq;
 use tokio::sync::mpsc;
@@ -20,6 +21,7 @@ use uuid::Uuid;
 
 use crate::auth::{random_token, token_hash};
 use crate::hub::{AgentHandle, ShellEvent};
+use crate::ratelimit::ClientIp;
 use crate::state::AppState;
 
 const MAX_FRAME: usize = 16 * 1024 * 1024;
@@ -27,9 +29,9 @@ const JOB_OUTPUT_CAP: i32 = 1024 * 1024;
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(15);
 const PING_EVERY: Duration = Duration::from_secs(30);
 
-pub async fn handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> Response {
+pub async fn handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>, ClientIp(ip): ClientIp) -> Response {
     ws.max_message_size(MAX_FRAME).on_upgrade(move |socket| async move {
-        if let Err(e) = handle(socket, state).await {
+        if let Err(e) = handle(socket, state, ip).await {
             debug!("agent socket ended: {e:#}");
         }
     })
@@ -40,29 +42,40 @@ async fn send(ws: &mut WebSocket, msg: &ServerMsg) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn handle(mut ws: WebSocket, state: Arc<AppState>) -> anyhow::Result<()> {
+async fn handle(mut ws: WebSocket, state: Arc<AppState>, ip: IpAddr) -> anyhow::Result<()> {
     let first = match tokio::time::timeout(FIRST_FRAME_TIMEOUT, ws.recv()).await {
         Ok(Some(Ok(Message::Binary(b)))) => rmm_proto::decode::<AgentMsg>(&b)?,
         _ => return Ok(()),
     };
-
     match first {
         AgentMsg::Enroll { protocol, token, system, previous } => {
+            // Bad tokens from one address share a budget. Agent auth isn't limited: secrets
+            // are 256-bit, and a few deleted agents retrying behind a site's NAT must not
+            // lock out the healthy ones.
+            let ip_key = ip.to_string();
+            if let Err(wait) = state.limits.enroll_ip.check(&ip_key) {
+                let reason = format!("too many failed enrollments from {ip}; try again in {} seconds", wait.as_secs());
+                send(&mut ws, &ServerMsg::AuthFailed { reason }).await?;
+                return Ok(());
+            }
             let reply = match enroll(&state, protocol, &token, &system, previous.as_ref()).await {
                 Ok((agent_id, secret)) => ServerMsg::Enrolled { agent_id, secret },
-                Err(reason) => ServerMsg::AuthFailed { reason },
+                Err(reason) => {
+                    state.limits.enroll_ip.fail(&ip_key);
+                    ServerMsg::AuthFailed { reason }
+                }
             };
             send(&mut ws, &reply).await?;
             let _ = ws.close().await;
             Ok(())
         }
-        AgentMsg::Auth { protocol, agent_id, secret, agent_version } => {
+        AgentMsg::Auth { protocol, agent_id, secret, agent_version, jobs } => {
             if protocol != PROTOCOL_VERSION {
                 send(&mut ws, &ServerMsg::AuthFailed { reason: format!("unsupported protocol {protocol}") }).await?;
                 return Ok(());
             }
             if !authenticate(&state, agent_id, &secret).await? {
-                warn!(%agent_id, "agent auth failed");
+                warn!(%agent_id, %ip, "agent auth failed");
                 send(&mut ws, &ServerMsg::AuthFailed { reason: "invalid credentials".into() }).await?;
                 return Ok(());
             }
@@ -71,7 +84,7 @@ async fn handle(mut ws: WebSocket, state: Arc<AppState>) -> anyhow::Result<()> {
                 &ServerMsg::AuthOk { heartbeat_secs: state.cfg.heartbeat_secs, inventory_secs: state.cfg.inventory_secs },
             )
             .await?;
-            run_session(ws, state, agent_id, agent_version).await
+            run_session(ws, state, agent_id, agent_version, jobs).await
         }
         _ => Ok(()),
     }
@@ -172,13 +185,19 @@ async fn authenticate(state: &AppState, agent_id: Uuid, secret: &str) -> anyhow:
     Ok(stored.is_some_and(|h| bool::from(h.ct_eq(&token_hash(secret)))))
 }
 
-async fn run_session(ws: WebSocket, state: Arc<AppState>, agent_id: Uuid, agent_version: String) -> anyhow::Result<()> {
+async fn run_session(
+    ws: WebSocket,
+    state: Arc<AppState>,
+    agent_id: Uuid,
+    agent_version: String,
+    held_jobs: Vec<Uuid>,
+) -> anyhow::Result<()> {
     let conn_id = Uuid::new_v4();
     let (tx, mut rx) = mpsc::channel::<ServerMsg>(1024);
-    // Results are reported over the connection a job was sent on, so anything still marked
-    // `sent` from an earlier connection can never finish. Do this before registering: a job
-    // created in between sees the agent offline, stays queued, and is dispatched below.
-    mark_lost(&state.db, agent_id).await?;
+    // The agent resends output and results for the jobs it still holds; anything else marked
+    // `sent` can never finish. Do this before registering: a job created in between sees the
+    // agent offline, stays queued, and is dispatched below.
+    mark_lost(&state.db, agent_id, &held_jobs).await?;
     if let Some(old) = state.hub.register(agent_id, AgentHandle { conn_id, tx: tx.clone() }) {
         debug!(%agent_id, old = %old.conn_id, "replacing stale connection");
     }
@@ -216,10 +235,14 @@ async fn run_session(ws: WebSocket, state: Arc<AppState>, agent_id: Uuid, agent_
     if let Err(e) = dispatch_queued(&state, agent_id, &tx).await {
         warn!(%agent_id, "dispatching queued jobs: {e}");
     }
+    // Replies to this connection only (job acks). Weak, so the writer still ends when the
+    // hub drops the agent (kick) and every other sender is gone.
+    let reply = tx.downgrade();
     drop(tx);
 
     // Idle timeout: 3 missed pings and we consider the agent gone.
     let idle = PING_EVERY * 3;
+    let mut auto_update_checked = false;
     loop {
         let frame = match tokio::time::timeout(idle, stream.next()).await {
             Ok(Some(Ok(f))) => f,
@@ -236,37 +259,49 @@ async fn run_session(ws: WebSocket, state: Arc<AppState>, agent_id: Uuid, agent_
             Message::Close(_) => break,
             _ => continue,
         };
-        if let Err(e) = on_message(&state, agent_id, msg).await {
+        // Auto-update waits for the first heartbeat: the agent reports how its last update
+        // went (e.g. rolled back) before it, so that's already recorded when we decide.
+        let first_heartbeat = !auto_update_checked && matches!(msg, AgentMsg::Heartbeat(_));
+        if let Err(e) = on_message(&state, agent_id, &reply, msg).await {
             warn!(%agent_id, "handling message: {e:#}");
+        }
+        if first_heartbeat {
+            auto_update_checked = true;
+            crate::updates::auto_offer(&state, agent_id).await;
         }
     }
 
     writer.abort();
+    // In-flight jobs stay `sent`: the agent keeps running them and reports on reconnect.
+    // If it never comes back, the housekeeping timeout reaper marks them `lost`.
     if state.hub.unregister(agent_id, conn_id) {
         state.hub.drop_agent_shells(agent_id);
         let _ = sqlx::query("UPDATE agents SET online = false, last_seen_at = now() WHERE id = $1")
             .bind(agent_id)
             .execute(&state.db)
             .await;
-        if let Err(e) = mark_lost(&state.db, agent_id).await {
-            warn!(%agent_id, "marking in-flight jobs lost: {e}");
-        }
         info!(%agent_id, "agent offline");
     }
     Ok(())
 }
 
-/// Dispatched jobs whose connection is gone can't report a result any more.
-pub async fn mark_lost(db: &sqlx::PgPool, agent_id: Uuid) -> sqlx::Result<()> {
-    sqlx::query(
+/// Jobs dispatched to the agent that it doesn't hold any more (it restarted, or the job was
+/// lost in transit with a dying connection) will never report.
+pub async fn mark_lost(db: &sqlx::PgPool, agent_id: Uuid, held: &[Uuid]) -> sqlx::Result<u64> {
+    let n = sqlx::query(
         "UPDATE jobs SET status = 'lost', finished_at = now(),
-                stderr = stderr || E'\\n[rmm] the agent disconnected before reporting a result\\n'
-          WHERE agent_id = $1 AND status = 'sent'",
+                stderr = stderr || E'\\n[rmm] the agent has no record of this job: it restarted, or the job never reached it\\n'
+          WHERE agent_id = $1 AND status = 'sent' AND NOT (id = ANY($2))",
     )
     .bind(agent_id)
+    .bind(held)
     .execute(db)
-    .await?;
-    Ok(())
+    .await?
+    .rows_affected();
+    if n > 0 {
+        info!(%agent_id, jobs = n, "in-flight jobs lost");
+    }
+    Ok(n)
 }
 
 pub async fn dispatch_queued(state: &AppState, agent_id: Uuid, tx: &mpsc::Sender<ServerMsg>) -> anyhow::Result<()> {
@@ -303,7 +338,12 @@ pub fn parse_interpreter(s: &str) -> Option<Interpreter> {
     })
 }
 
-async fn on_message(state: &AppState, agent_id: Uuid, msg: AgentMsg) -> anyhow::Result<()> {
+async fn on_message(
+    state: &AppState,
+    agent_id: Uuid,
+    reply: &mpsc::WeakSender<ServerMsg>,
+    msg: AgentMsg,
+) -> anyhow::Result<()> {
     match msg {
         AgentMsg::Heartbeat(m) => store_metrics(state, agent_id, &m).await?,
         AgentMsg::Inventory(inv) => store_inventory(state, agent_id, &inv).await?,
@@ -338,11 +378,58 @@ async fn on_message(state: &AppState, agent_id: Uuid, msg: AgentMsg) -> anyhow::
             .bind(duration_ms as i64)
             .execute(&state.db)
             .await?;
+            // Stored (or already final from an earlier delivery): the agent can forget it.
+            if let Some(tx) = reply.upgrade() {
+                let _ = tx.send(ServerMsg::JobAck { job_id }).await;
+            }
+        }
+        AgentMsg::JobSync { job_id, stdout, stderr } => {
+            // Replaces what arrived before the reconnect; the agent's copy is a superset.
+            sqlx::query(
+                "UPDATE jobs SET stdout = left($3, $5), stderr = left($4, $5)
+                  WHERE id = $1 AND agent_id = $2 AND status NOT IN ('queued', 'expired')",
+            )
+            .bind(job_id)
+            .bind(agent_id)
+            .bind(String::from_utf8_lossy(&stdout).as_ref())
+            .bind(String::from_utf8_lossy(&stderr).as_ref())
+            .bind(JOB_OUTPUT_CAP)
+            .execute(&state.db)
+            .await?;
         }
         AgentMsg::ShellOpened { session_id } => state.hub.route_shell(agent_id, session_id, ShellEvent::Opened).await,
         AgentMsg::ShellOutput { session_id, data } => state.hub.route_shell(agent_id, session_id, ShellEvent::Output(data)).await,
         AgentMsg::ShellClosed { session_id, reason } => {
             state.hub.route_shell(agent_id, session_id, ShellEvent::Closed(reason)).await
+        }
+        AgentMsg::UpdateFetch { version, offset } => {
+            let chunk = crate::updates::chunk(state, agent_id, &version, offset).await;
+            if let Some(tx) = reply.upgrade() {
+                let _ = tx.send(chunk).await;
+            }
+        }
+        AgentMsg::UpdateStatus { version, state: phase, detail } => {
+            let detail = detail.map(|d| d.chars().take(1000).collect::<String>());
+            sqlx::query(
+                "UPDATE agents SET update_version = $2, update_state = $3, update_detail = $4, update_at = now() WHERE id = $1",
+            )
+            .bind(agent_id)
+            .bind(&version)
+            .bind(phase.as_str())
+            .bind(&detail)
+            .execute(&state.db)
+            .await?;
+            if matches!(phase, UpdateState::Completed | UpdateState::RolledBack | UpdateState::Failed) {
+                info!(%agent_id, %version, state = phase.as_str(), detail = detail.as_deref().unwrap_or(""), "agent update");
+                crate::auth::audit(
+                    &state.db,
+                    None,
+                    &format!("agent.update_{}", phase.as_str()),
+                    Some(("agent", agent_id)),
+                    serde_json::json!({ "version": version, "detail": detail }),
+                )
+                .await;
+            }
         }
         AgentMsg::Pong { .. } => {}
         AgentMsg::Enroll { .. } | AgentMsg::Auth { .. } => {}

@@ -3,9 +3,11 @@ mod api;
 mod auth;
 mod error;
 mod hub;
+mod ratelimit;
 mod shell_ws;
 mod state;
 mod totp;
+mod updates;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -85,6 +87,10 @@ struct ServeArgs {
     /// Admins can override it under Company settings.
     #[arg(long, env = "RMM_SESSION_IDLE_HOURS", default_value_t = 12)]
     session_idle_hours: u32,
+    /// Reverse proxies whose X-Forwarded-For header is trusted for the client IP (rate
+    /// limiting, audit). Comma-separated CIDRs; `private` = loopback + RFC 1918 + ULA.
+    #[arg(long, env = "RMM_TRUSTED_PROXIES", default_value = "")]
+    trusted_proxies: String,
 }
 
 impl Default for ServeArgs {
@@ -101,6 +107,7 @@ impl Default for ServeArgs {
             metrics_retention_days: env("RMM_METRICS_RETENTION_DAYS", "30").parse().unwrap_or(30),
             job_queue_days: env("RMM_JOB_QUEUE_DAYS", "7").parse().unwrap_or(7),
             session_idle_hours: env("RMM_SESSION_IDLE_HOURS", "12").parse().unwrap_or(12),
+            trusted_proxies: env("RMM_TRUSTED_PROXIES", ""),
         }
     }
 }
@@ -152,21 +159,18 @@ async fn main() -> Result<()> {
 async fn serve(db: sqlx::PgPool, args: ServeArgs) -> Result<()> {
     // Nothing is connected yet, whatever the DB says from the last run.
     sqlx::query("UPDATE agents SET online = false WHERE online").execute(&db).await?;
-    // Their connections died with the previous process, so they can never report.
-    sqlx::query(
-        "UPDATE jobs SET status = 'lost', finished_at = now(),
-                stderr = stderr || E'\\n[rmm] the server restarted before the agent reported a result\\n'
-          WHERE status = 'sent'",
-    )
-    .execute(&db)
-    .await?;
+    // Jobs left `sent` by the previous process aren't lost: agents keep running them and
+    // report when they reconnect (and anything they don't hold is marked `lost` then).
     bootstrap_admin(&db).await?;
     let company = state::Company::load(&db).await.context("loading company settings")?;
+    let trusted_proxies = ratelimit::parse_trusted(&args.trusted_proxies).map_err(anyhow::Error::msg)?;
 
     let state = Arc::new(AppState {
         company: company.into(),
         db,
         hub: Default::default(),
+        limits: Default::default(),
+        releases: Default::default(),
         cfg: Settings {
             agent_dir: args.agent_dir.clone(),
             public_url: args.public_url.trim_end_matches('/').to_string(),
@@ -175,6 +179,7 @@ async fn serve(db: sqlx::PgPool, args: ServeArgs) -> Result<()> {
             metrics_retention_days: args.metrics_retention_days,
             job_queue_days: args.job_queue_days,
             session_idle_hours: args.session_idle_hours.max(1),
+            trusted_proxies,
         },
     });
     tokio::spawn(housekeeping(state.clone()));
@@ -202,12 +207,15 @@ async fn serve(db: sqlx::PgPool, args: ServeArgs) -> Result<()> {
 
     let listener = tokio::net::TcpListener::bind(args.bind).await.with_context(|| format!("binding {}", args.bind))?;
     info!("listening on {} (public url {})", args.bind, args.public_url);
-    axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()).await?;
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
     Ok(())
 }
 
-/// Baseline browser hardening for the dashboard. The CSP only restricts framing, plugins and
-/// `<base>`; a script-src policy needs SvelteKit's hash-based CSP, which is a separate change.
+/// Baseline browser hardening for the dashboard. This header CSP covers what a `<meta>` tag
+/// can't (frame-ancestors); script-src and the rest come from the `<meta>` policy SvelteKit
+/// writes into the built pages with hashes of its inline scripts (see web/vite.config.ts).
 fn security_headers(router: Router, https: bool) -> Router {
     use axum::http::{HeaderName, HeaderValue, header};
     use tower_http::set_header::SetResponseHeaderLayer;
@@ -278,6 +286,7 @@ async fn housekeeping(state: Arc<AppState>) {
         ];
         // The rest is bulk deletion; hourly is plenty.
         if runs.is_multiple_of(12) {
+            state.limits.prune();
             results.push(
                 sqlx::query(
                     "DELETE FROM user_sessions

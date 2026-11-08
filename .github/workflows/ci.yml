@@ -17,10 +17,10 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Clippy (agent + proto)
-        run: cargo clippy -p rmm-agent -p rmm-proto --all-targets -- -D warnings
-      - name: Test (agent + proto)
-        run: cargo test -p rmm-agent -p rmm-proto
+      - name: Clippy (agent + proto + sign)
+        run: cargo clippy -p rmm-agent -p rmm-proto -p rmm-sign --all-targets -- -D warnings
+      - name: Test (agent + proto + sign)
+        run: cargo test -p rmm-agent -p rmm-proto -p rmm-sign
       - name: Server (Linux only)
         if: runner.os == 'Linux'
         run: cargo clippy -p rmm-server --all-targets -- -D warnings && cargo test -p rmm-server
@@ -32,6 +32,36 @@ jobs:
           path: |
             target/release/rmm-agent
             target/release/rmm-agent.exe
+
+  # The real server against Postgres, with real agent processes: enrollment reuse/takeover,
+  # jobs across server restarts, lost/expired jobs, headers, per-client access, packages,
+  # rate limits. See crates/rmm-server/tests/e2e.rs.
+  e2e:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env: { POSTGRES_USER: rmm, POSTGRES_PASSWORD: rmm, POSTGRES_DB: rmm }
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U rmm" --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Package tools (to validate the generated .deb/.rpm)
+        run: sudo apt-get install -y --no-install-recommends rpm
+      - run: cargo build -p rmm-agent
+      - name: End-to-end
+        run: cargo test -p rmm-server --test e2e -- --ignored --nocapture
+        env:
+          RMM_E2E_DATABASE_URL: postgres://rmm:rmm@localhost:5432/postgres
+      - name: Server and agent logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-logs
+          path: /tmp/rmm_e2e_*/*.log
 
   web:
     runs-on: ubuntu-latest

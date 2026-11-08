@@ -4,7 +4,7 @@
 	import { api } from '#lib/api.js';
 	import { ago, bytes, datetime, duration, pct } from '#lib/format.js';
 	import { can } from '#lib/session.svelte.js';
-	import type { AgentDetail, Job, MetricPoint } from '#lib/types.js';
+	import type { AgentDetail, Job, MetricPoint, Release } from '#lib/types.js';
 	import Status from '#lib/components/Status.svelte';
 	import OsBadge from '#lib/components/OsBadge.svelte';
 	import UsageBar from '#lib/components/UsageBar.svelte';
@@ -23,6 +23,25 @@
 	let swq = $state('');
 	let running = $state(false);
 	let notice = $state('');
+	let releases = $state<Release[]>([]);
+
+	$effect(() => {
+		if (can('admin')) api.get<{ releases: Release[] }>('/agent-updates').then((r) => (releases = r.releases)).catch(() => {});
+	});
+	const release = $derived(agent ? releases.find((r) => r.platform === `${agent!.os_family}-${agent!.arch}`) : undefined);
+	const updateLabels: Record<string, string> = {
+		offered: 'offered', downloading: 'downloading', waiting: 'waiting for jobs', applying: 'restarting',
+		completed: 'updated', rolled_back: 'rolled back', failed: 'failed'
+	};
+
+	async function update() {
+		try {
+			const r = await api.post<{ version: string }>(`/agents/${id}/update`);
+			notice = `Update to v${r.version} sent. The agent downloads it, waits for running jobs, then restarts.`;
+		} catch (e) {
+			notice = (e as Error).message;
+		}
+	}
 
 	$effect(() => {
 		const load = () => api.get<AgentDetail>(`/agents/${id}`).then((a) => (agent = a));
@@ -73,6 +92,9 @@
 				<button class="btn-ghost" disabled={!agent.online} onclick={() => (tab = 'terminal')}>Terminal</button>
 				<button class="btn-primary" onclick={() => (running = true)}>Run script</button>
 			{/if}
+			{#if can('admin') && release && release.version !== agent.agent_version}
+				<button class="btn-ghost" disabled={!agent.online} onclick={update} title="Signed release {release.sha256.slice(0, 12)}…">Update to v{release.version}</button>
+			{/if}
 			{#if can('admin')}<button class="btn-danger" onclick={remove}>Remove</button>{/if}
 		</div>
 	</div>
@@ -99,7 +121,15 @@
 					<dt class="text-slate-500">Memory</dt><dd>{bytes(inv?.mem_total ?? m?.mem_total)}</dd>
 					<dt class="text-slate-500">Uptime</dt><dd>{m ? duration(m.uptime_secs) : '–'}</dd>
 					<dt class="text-slate-500">Users</dt><dd>{inv?.logged_in_users.join(', ') || '–'}</dd>
-					<dt class="text-slate-500">Agent</dt><dd>v{agent.agent_version}</dd>
+					<dt class="text-slate-500">Agent</dt>
+					<dd>
+						v{agent.agent_version}
+						{#if agent.update_state && agent.update_version && agent.update_version !== agent.agent_version || agent.update_state === 'rolled_back' || agent.update_state === 'failed'}
+							<span class="ml-1 text-xs {agent.update_state === 'failed' || agent.update_state === 'rolled_back' ? 'text-red-400' : 'text-sky-300'}" title={agent.update_detail ?? ''}>
+								→ v{agent.update_version}: {updateLabels[agent.update_state ?? ''] ?? agent.update_state}{agent.update_detail ? ` (${agent.update_detail})` : ''}
+							</span>
+						{/if}
+					</dd>
 					<dt class="text-slate-500">Last seen</dt><dd>{agent.online ? 'now' : ago(agent.last_seen_at)}</dd>
 					<dt class="text-slate-500">Enrolled</dt><dd>{datetime(agent.enrolled_at)}</dd>
 				</dl>

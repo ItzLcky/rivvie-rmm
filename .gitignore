@@ -6,3 +6,4 @@ node_modules
 *.local.toml
 deploy/.env
 /agents
+deploy/backups/

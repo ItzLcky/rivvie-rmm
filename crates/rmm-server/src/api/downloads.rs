@@ -16,6 +16,7 @@ use sha2::{Digest, Sha256};
 
 use crate::auth::{self, User};
 use crate::error::{ApiError, ApiResult};
+use crate::ratelimit::ClientIp;
 use crate::state::AppState;
 
 pub struct Platform {
@@ -70,6 +71,27 @@ pub async fn list(State(st): State<Arc<AppState>>, _u: User) -> ApiResult<Json<V
     Ok(Json(out))
 }
 
+/// Site of a usable enrollment token, for downloads authorized by `?token=`. Checked, not
+/// consumed: a use is only spent when the agent actually enrolls. Bad tokens count against
+/// the same per-IP limit as bad enrollments.
+pub async fn token_site(st: &AppState, ip: std::net::IpAddr, token: &str) -> ApiResult<uuid::Uuid> {
+    let key = ip.to_string();
+    st.limits.enroll_ip.check(&key).map_err(ApiError::TooManyRequests)?;
+    let site: Option<uuid::Uuid> = sqlx::query_scalar(
+        "SELECT site_id FROM enrollment_tokens
+          WHERE token_hash = $1
+            AND (expires_at IS NULL OR expires_at > now())
+            AND (max_uses IS NULL OR uses < max_uses)",
+    )
+    .bind(auth::token_hash(token))
+    .fetch_optional(&st.db)
+    .await?;
+    site.ok_or_else(|| {
+        st.limits.enroll_ip.fail(&key);
+        ApiError::Unauthorized
+    })
+}
+
 #[derive(Deserialize)]
 pub struct TokenQuery {
     token: Option<String>,
@@ -77,25 +99,14 @@ pub struct TokenQuery {
 
 pub async fn download(
     State(st): State<Arc<AppState>>,
+    ClientIp(ip): ClientIp,
     user: Option<User>,
     Path(id): Path<String>,
     Query(q): Query<TokenQuery>,
 ) -> ApiResult<impl IntoResponse> {
     if user.is_none() {
         let token = q.token.ok_or(ApiError::Unauthorized)?;
-        // Checked, not consumed: a use is only spent when the agent actually enrolls.
-        let valid: bool = sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM enrollment_tokens
-                             WHERE token_hash = $1
-                               AND (expires_at IS NULL OR expires_at > now())
-                               AND (max_uses IS NULL OR uses < max_uses))",
-        )
-        .bind(auth::token_hash(&token))
-        .fetch_one(&st.db)
-        .await?;
-        if !valid {
-            return Err(ApiError::Unauthorized);
-        }
+        token_site(&st, ip, &token).await?;
     }
     let platform = PLATFORMS.iter().find(|p| p.id == id).ok_or(ApiError::NotFound("platform"))?;
     let path = platform_path(&st, platform.id).ok_or(ApiError::NotFound("agent binary"))?;
