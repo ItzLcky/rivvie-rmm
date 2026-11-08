@@ -5,6 +5,7 @@ mod error;
 mod hub;
 mod shell_ws;
 mod state;
+mod totp;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -49,6 +50,11 @@ enum Cmd {
         password: String,
         #[arg(long, default_value = "admin")]
         role: String,
+    },
+    /// Remove a user's two-factor auth and sign them out (e.g. the only admin lost their phone).
+    Reset2fa {
+        #[arg(long)]
+        email: String,
     },
 }
 
@@ -123,6 +129,20 @@ async fn main() -> Result<()> {
             let role = auth::Role::parse(&role).context("role must be admin, technician or readonly")?;
             let id = api::create_user_cli(&db, &email, &name, &password, role).await?;
             println!("created user {email} ({id})");
+            Ok(())
+        }
+        Cmd::Reset2fa { email } => {
+            let id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM users WHERE lower(email) = lower($1)")
+                .bind(email.trim())
+                .fetch_optional(&db)
+                .await?
+                .with_context(|| format!("no user with email {email}"))?;
+            let mut tx = db.begin().await?;
+            api::clear_totp(&mut tx, id).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+            sqlx::query("DELETE FROM user_sessions WHERE user_id = $1").bind(id).execute(&mut *tx).await?;
+            tx.commit().await?;
+            auth::audit(&db, None, "user.mfa_reset", Some(("user", id)), serde_json::json!({ "via": "cli" })).await;
+            println!("two-factor auth removed for {email}; they will be asked to set it up again if required");
             Ok(())
         }
         Cmd::Serve(args) => serve(db, args).await,

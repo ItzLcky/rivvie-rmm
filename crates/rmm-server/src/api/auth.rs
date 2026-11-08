@@ -17,6 +17,9 @@ use crate::state::AppState;
 pub struct Login {
     email: String,
     password: String,
+    /// TOTP or recovery code; required once the password checks out for an account with 2FA.
+    #[serde(default)]
+    code: Option<String>,
 }
 
 /// Verified against when the email is unknown so response timing doesn't reveal which accounts exist.
@@ -26,20 +29,36 @@ fn dummy_hash() -> String {
 }
 
 pub async fn login(State(st): State<Arc<AppState>>, headers: HeaderMap, Json(body): Json<Login>) -> ApiResult<impl IntoResponse> {
-    let row: Option<(uuid::Uuid, String, bool)> =
-        sqlx::query_as("SELECT id, password_hash, disabled FROM users WHERE lower(email) = lower($1)")
+    let row: Option<(uuid::Uuid, String, bool, Option<Vec<u8>>)> =
+        sqlx::query_as("SELECT id, password_hash, disabled, totp_secret FROM users WHERE lower(email) = lower($1)")
             .bind(body.email.trim())
             .fetch_optional(&st.db)
             .await?;
 
     let hash = row.as_ref().map(|r| r.1.clone()).unwrap_or_else(dummy_hash);
     let ok = auth::verify_password_async(&body.password, hash).await;
-    let Some((user_id, _, disabled)) = row.filter(|_| ok) else {
+    let Some((user_id, _, disabled, totp_secret)) = row.filter(|_| ok) else {
         auth::audit(&st.db, None, "auth.login_failed", None, json!({ "email": body.email })).await;
         return Err(ApiError::Unauthorized);
     };
     if disabled {
         return Err(ApiError::Unauthorized);
+    }
+    if let Some(secret) = totp_secret {
+        let Some(code) = body.code.as_deref().map(str::trim).filter(|c| !c.is_empty()) else {
+            return Err(ApiError::MfaRequired("two-factor code required"));
+        };
+        match super::totp::check_code(&st.db, user_id, &secret, code).await? {
+            Some(super::totp::Factor::Totp) => {}
+            Some(super::totp::Factor::Recovery { remaining }) => {
+                auth::audit(&st.db, Some(user_id), "auth.recovery_code_used", Some(("user", user_id)), json!({ "remaining": remaining }))
+                    .await;
+            }
+            None => {
+                auth::audit(&st.db, Some(user_id), "auth.mfa_failed", Some(("user", user_id)), json!({})).await;
+                return Err(ApiError::MfaRequired("invalid two-factor code"));
+            }
+        }
     }
 
     let token = auth::random_token();
@@ -56,9 +75,10 @@ pub async fn login(State(st): State<Arc<AppState>>, headers: HeaderMap, Json(bod
     sqlx::query("UPDATE users SET last_login_at = now() WHERE id = $1").bind(user_id).execute(&st.db).await?;
     auth::audit(&st.db, Some(user_id), "auth.login", None, json!({})).await;
 
-    let user: User = sqlx::query_as("SELECT id, email, name, role, $2 AS session_id FROM users WHERE id = $1")
+    let user: User = sqlx::query_as(concat!("SELECT ", auth::user_columns!("$3", "$2::uuid"), " FROM users u WHERE u.id = $1"))
         .bind(user_id)
         .bind(session_id)
+        .bind(st.company().require_2fa_all)
         .fetch_one(&st.db)
         .await?;
     Ok((

@@ -95,6 +95,10 @@ pub struct User {
     pub email: String,
     pub name: String,
     pub role: String,
+    pub totp_enabled: bool,
+    /// 2FA is required for this account but not set up yet: until it is, the session can
+    /// only reach the 2FA setup endpoints.
+    pub mfa_setup_required: bool,
     /// The session this request authenticated with.
     #[serde(skip)]
     pub session_id: Uuid,
@@ -109,6 +113,26 @@ impl User {
     pub fn require(&self, min: Role) -> Result<(), ApiError> {
         if self.role() >= min { Ok(()) } else { Err(ApiError::Forbidden) }
     }
+}
+
+/// SQL select list for [`User`] from a `users u` row, given the placeholder bound to
+/// `require_2fa_all` and the session id expression. Expands to a `&'static str`.
+macro_rules! user_columns {
+    ($require_all:literal, $session_id:literal) => {
+        concat!(
+            "u.id, u.email, u.name, u.role, u.totp_secret IS NOT NULL AS totp_enabled, ",
+            "(u.totp_secret IS NULL AND (u.role = 'admin' OR ", $require_all, ")) AS mfa_setup_required, ",
+            $session_id, " AS session_id"
+        )
+    };
+}
+pub(crate) use user_columns;
+
+/// Whether a session whose account still has to set up 2FA may call this path:
+/// only `me`, `logout` and the `/auth/totp` endpoints.
+fn allowed_before_mfa_setup(path: &str) -> bool {
+    let path = path.strip_prefix("/api").unwrap_or(path);
+    matches!(path, "/auth/me" | "/auth/logout" | "/auth/totp") || path.starts_with("/auth/totp/")
 }
 
 pub fn extract_token(headers: &header::HeaderMap) -> Option<String> {
@@ -131,9 +155,9 @@ impl FromRequestParts<Arc<AppState>> for User {
         let token = extract_token(&parts.headers).ok_or(ApiError::Unauthorized)?;
         // Valid = not past the absolute expiry and used within the idle window. last_seen_at is
         // only rewritten when a minute old, so polling pages don't cost a write per request.
-        sqlx::query_as::<_, User>(
+        let user = sqlx::query_as::<_, User>(concat!(
             "WITH s AS (
-                 SELECT u.id, u.email, u.name, u.role, s.id AS session_id
+                 SELECT ", user_columns!("$3", "s.id"), "
                    FROM user_sessions s JOIN users u ON u.id = s.user_id
                   WHERE s.token_hash = $1 AND s.expires_at > now() AND NOT u.disabled
                     AND s.last_seen_at > now() - make_interval(hours => $2)
@@ -142,12 +166,25 @@ impl FromRequestParts<Arc<AppState>> for User {
                   WHERE id = (SELECT session_id FROM s) AND last_seen_at < now() - interval '1 minute'
              )
              SELECT * FROM s",
-        )
+        ))
         .bind(token_hash(&token))
         .bind(state.session_idle_hours())
+        .bind(state.company().require_2fa_all)
         .fetch_optional(&state.db)
         .await?
-        .ok_or(ApiError::Unauthorized)
+        .ok_or(ApiError::Unauthorized)?;
+        if user.mfa_setup_required {
+            // Nested routers see a stripped URI; OriginalUri has the full path.
+            let path = parts
+                .extensions
+                .get::<axum::extract::OriginalUri>()
+                .map(|u| u.path().to_string())
+                .unwrap_or_else(|| parts.uri.path().to_string());
+            if !allowed_before_mfa_setup(&path) {
+                return Err(ApiError::MfaSetupRequired);
+            }
+        }
+        Ok(user)
     }
 }
 
@@ -205,6 +242,16 @@ mod tests {
         let h = hash_password("correct horse").unwrap();
         assert!(verify_password("correct horse", &h));
         assert!(!verify_password("wrong", &h));
+    }
+
+    #[test]
+    fn mfa_setup_paths() {
+        for p in ["/api/auth/me", "/api/auth/totp", "/api/auth/totp/setup", "/auth/logout"] {
+            assert!(allowed_before_mfa_setup(p), "{p}");
+        }
+        for p in ["/api/agents", "/api/auth/totpx", "/api/auth/password", "/api/users/x/totp", "/api/auth/me/x"] {
+            assert!(!allowed_before_mfa_setup(p), "{p}");
+        }
     }
 
     #[test]

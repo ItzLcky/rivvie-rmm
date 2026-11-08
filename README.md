@@ -41,7 +41,7 @@ docs/           Roadmap and design notes
 - **Transport:** the agent dials out, so endpoints need no inbound ports. Everything is multiplexed over one WebSocket: heartbeats (every 30 s), inventory (every 6 h or on demand), script jobs, and PTY streams. The agent reconnects with jittered exponential backoff, and treats 100 s of silence from the server as a dead connection.
 - **Jobs:** sending a script to an offline agent queues it, and it runs on reconnect (queued jobs expire after `RMM_JOB_QUEUE_DAYS`). Output streams into Postgres (capped at 1 MB per stream). Timeouts kill the whole process tree on Unix. A job whose agent disconnects before reporting is marked `lost`.
 - **Terminal:** xterm.js ↔ server relay ↔ PTY on the agent (bash/zsh on Linux, PowerShell through ConPTY on Windows).
-- **Security:** argon2id passwords; opaque, revocable session tokens in an HttpOnly SameSite=Strict cookie, with an idle timeout and a 7-day cap; users can change their password and review or revoke their sessions, and admins can reset passwords, re-enable users, and revoke anyone's sessions; an Origin check on the terminal socket; three roles (admin / technician / readonly); an audit log covering logins, shells, jobs, enrollment, and deletes.
+- **Security:** argon2id passwords; opaque, revocable session tokens in an HttpOnly SameSite=Strict cookie, with an idle timeout and a 7-day cap; users can change their password and review or revoke their sessions, and admins can reset passwords, re-enable users, and revoke anyone's sessions; TOTP two-factor auth with single-use recovery codes, required for admins and optionally for everyone; an Origin check on the terminal socket; three roles (admin / technician / readonly); an audit log covering logins, shells, jobs, enrollment, and deletes.
 
 ## Development
 
@@ -81,6 +81,13 @@ cp deploy/.env.example deploy/.env      # set RMM_DOMAIN and POSTGRES_PASSWORD
 docker compose -f deploy/docker-compose.yml up -d --build
 docker compose -f deploy/docker-compose.yml exec server \
   sh -c 'RMM_PASSWORD=... rmm-server create-user --email you@example.com --name You'
+```
+
+Admins must set up two-factor auth (any authenticator app) at their first sign-in. If the
+only admin loses their phone and recovery codes, clear it from the server:
+
+```sh
+docker compose -f deploy/docker-compose.yml exec server rmm-server reset2fa --email you@example.com
 ```
 
 Caddy terminates TLS with an automatic certificate. Agents must use `https://` server URLs in

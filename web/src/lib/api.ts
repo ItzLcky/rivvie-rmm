@@ -1,7 +1,7 @@
 import { goto } from '$app/navigation';
 
 export class ApiError extends Error {
-	constructor(public status: number, message: string) {
+	constructor(public status: number, message: string, public data: Record<string, unknown> | null = null) {
 		super(message);
 	}
 }
@@ -17,7 +17,9 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
 		await goto(`/login?next=${encodeURIComponent(location.pathname)}`);
 	}
 	const data = res.headers.get('content-type')?.includes('json') ? await res.json() : null;
-	if (!res.ok) throw new ApiError(res.status, data?.error ?? res.statusText);
+	// The account must set up 2FA before anything else works; the account page handles that.
+	if (res.status === 403 && data?.mfa_setup_required && location.pathname !== '/account') await goto('/account');
+	if (!res.ok) throw new ApiError(res.status, data?.error ?? res.statusText, data);
 	return data as T;
 }
 

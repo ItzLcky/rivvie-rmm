@@ -16,11 +16,13 @@ pub struct AppState {
 pub struct Company {
     pub company_name: String,
     pub session_idle_hours: Option<i32>,
+    /// Require 2FA for every user, not just admins.
+    pub require_2fa_all: bool,
 }
 
 impl Company {
     pub async fn load(db: &PgPool) -> sqlx::Result<Self> {
-        sqlx::query_as("SELECT company_name, session_idle_hours FROM company_settings").fetch_one(db).await
+        sqlx::query_as("SELECT company_name, session_idle_hours, require_2fa_all FROM company_settings").fetch_one(db).await
     }
 }
 

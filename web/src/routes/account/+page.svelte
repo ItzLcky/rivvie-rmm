@@ -2,6 +2,7 @@
 	import { api } from '#lib/api.js';
 	import { session } from '#lib/session.svelte.js';
 	import Sessions from '#lib/components/Sessions.svelte';
+	import TwoFactor from '#lib/components/TwoFactor.svelte';
 
 	let form = $state({ current: '', next: '', confirm: '' });
 	let error = $state('');
@@ -34,6 +35,12 @@
 
 <h1 class="mb-4 text-xl font-semibold">Account</h1>
 <div class="grid max-w-5xl gap-6 lg:grid-cols-2">
+	<section class="card p-4 {session.user?.mfa_setup_required ? 'lg:col-span-2 lg:max-w-xl' : ''}">
+		<h2 class="mb-1 font-semibold">Two-factor authentication</h2>
+		<p class="mb-3 text-xs text-slate-500">A code from an authenticator app on your phone, asked for at every sign-in.</p>
+		<TwoFactor onchange={() => gen++} />
+	</section>
+	{#if !session.user?.mfa_setup_required}
 	<section class="card p-4">
 		<h2 class="mb-1 font-semibold">Change password</h2>
 		<p class="mb-3 text-xs text-slate-500">{session.user?.email} · your other sessions will be signed out</p>
@@ -52,4 +59,5 @@
 		<p class="mb-3 text-xs text-slate-500">Browsers and API clients signed in as you. Sessions end after a period of inactivity or 7 days.</p>
 		{#key gen}<Sessions base="/auth/sessions" />{/key}
 	</section>
+	{/if}
 </div>

@@ -1,5 +1,5 @@
 export type Role = 'admin' | 'technician' | 'readonly';
-export interface User { id: string; email: string; name: string; role: Role }
+export interface User { id: string; email: string; name: string; role: Role; totp_enabled: boolean; mfa_setup_required: boolean }
 
 export interface DiskUsage { mount: string; total: number; available: number }
 export interface Metrics {

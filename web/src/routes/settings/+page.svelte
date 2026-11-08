@@ -1,11 +1,10 @@
 <script lang="ts">
-	import { goto } from '$app/navigation';
 	import { api } from '#lib/api.js';
-	import { can, company, session } from '#lib/session.svelte.js';
+	import { company } from '#lib/session.svelte.js';
 
-	interface Settings { company_name: string; session_idle_hours: number | null; session_idle_hours_default: number }
+	interface Settings { company_name: string; session_idle_hours: number | null; session_idle_hours_default: number; require_2fa_all: boolean }
 
-	let form = $state({ company_name: '', idle: '' });
+	let form = $state({ company_name: '', idle: '', require_2fa_all: false });
 	let defaultIdle = $state(12);
 	let loaded = $state(false);
 	let error = $state('');
@@ -13,18 +12,13 @@
 	let busy = $state(false);
 
 	function apply(s: Settings) {
-		form = { company_name: s.company_name, idle: s.session_idle_hours?.toString() ?? '' };
+		form = { company_name: s.company_name, idle: s.session_idle_hours?.toString() ?? '', require_2fa_all: s.require_2fa_all };
 		defaultIdle = s.session_idle_hours_default;
 		company.name = s.company_name;
 		loaded = true;
 	}
 
 	$effect(() => {
-		if (!session.user) return;
-		if (!can('admin')) {
-			goto('/');
-			return;
-		}
 		api.get<Settings>('/settings').then(apply).catch((e) => (error = (e as Error).message));
 	});
 
@@ -39,7 +33,7 @@
 		}
 		busy = true;
 		try {
-			apply(await api.put<Settings>('/settings', { company_name: form.company_name, session_idle_hours: idle ? Number(idle) : null }));
+			apply(await api.put<Settings>('/settings', { company_name: form.company_name, session_idle_hours: idle ? Number(idle) : null, require_2fa_all: form.require_2fa_all }));
 			done = 'Saved.';
 		} catch (e) {
 			error = (e as Error).message;
@@ -49,7 +43,6 @@
 	}
 </script>
 
-<h1 class="mb-4 text-xl font-semibold">Company settings</h1>
 {#if loaded}
 	<form class="max-w-2xl space-y-6" onsubmit={save}>
 		<section class="card space-y-3 p-4">
@@ -68,6 +61,10 @@
 				<p class="mt-1 text-xs text-slate-500">
 					Sign users out after this long without activity, 1–168 hours. Leave empty to use the server default ({defaultIdle} h, from <code>RMM_SESSION_IDLE_HOURS</code>). Sessions always end after 7 days.
 				</p>
+			</div>
+			<div>
+				<label class="flex items-center gap-2 text-sm"><input type="checkbox" class="accent-sky-500" bind:checked={form.require_2fa_all} /> Require two-factor authentication for all users</label>
+				<p class="mt-1 text-xs text-slate-500">Admins always need it. When on, technicians and read-only users must also set it up at their next sign-in before they can use the dashboard.</p>
 			</div>
 		</section>
 		{#if error}<p class="text-sm text-red-400">{error}</p>{/if}

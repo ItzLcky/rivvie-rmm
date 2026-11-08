@@ -18,6 +18,7 @@ pub struct UserRow {
     name: String,
     role: String,
     disabled: bool,
+    totp_enabled: bool,
     created_at: DateTime<Utc>,
     last_login_at: Option<DateTime<Utc>>,
 }
@@ -25,7 +26,8 @@ pub struct UserRow {
 pub async fn list(State(st): State<Arc<AppState>>, u: User) -> ApiResult<Json<Vec<UserRow>>> {
     u.require(Role::Admin)?;
     Ok(Json(
-        sqlx::query_as("SELECT id, email, name, role, disabled, created_at, last_login_at FROM users ORDER BY email")
+        sqlx::query_as("SELECT id, email, name, role, disabled, totp_secret IS NOT NULL AS totp_enabled, created_at, last_login_at
+               FROM users ORDER BY email")
             .fetch_all(&st.db)
             .await?,
     ))
@@ -124,6 +126,23 @@ pub async fn reset_password(
     sqlx::query("DELETE FROM user_sessions WHERE user_id = $1").bind(id).execute(&mut *tx).await?;
     tx.commit().await?;
     auth::audit(&st.db, Some(u.id), "user.password_reset", Some(("user", id)), json!({})).await;
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// Admin removes someone's 2FA (lost phone) and signs them out everywhere. If 2FA is
+/// required for them, they set it up again on their next sign-in.
+pub async fn reset_totp(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uuid>) -> ApiResult<Json<serde_json::Value>> {
+    u.require(Role::Admin)?;
+    if id == u.id {
+        return Err(ApiError::BadRequest("use Account → Two-factor authentication for your own account".into()));
+    }
+    let mut tx = st.db.begin().await?;
+    if super::totp::clear(&mut tx, id).await? == 0 {
+        return Err(ApiError::NotFound("user"));
+    }
+    sqlx::query("DELETE FROM user_sessions WHERE user_id = $1").bind(id).execute(&mut *tx).await?;
+    tx.commit().await?;
+    auth::audit(&st.db, Some(u.id), "user.mfa_reset", Some(("user", id)), json!({})).await;
     Ok(Json(json!({ "ok": true })))
 }
 

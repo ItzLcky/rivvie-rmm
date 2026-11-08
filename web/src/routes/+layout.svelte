@@ -24,13 +24,17 @@
 			.finally(() => (session.loaded = true));
 	});
 
+	// Admins (or everyone, per Company settings) must set up 2FA before using the dashboard.
+	$effect(() => {
+		if (session.user?.mfa_setup_required && page.url.pathname !== '/account') goto('/account');
+	});
+
 	const nav = $derived([
 		{ href: '/', label: 'Dashboard', show: true },
 		{ href: '/agents', label: 'Agents', show: true },
 		{ href: '/clients', label: 'Clients & Sites', show: true },
 		{ href: '/scripts', label: 'Scripts', show: true },
 		{ href: '/jobs', label: 'Job history', show: true },
-		{ href: '/users', label: 'Users', show: can('admin') },
 		{ href: '/audit', label: 'Audit log', show: can('admin') }
 	]);
 

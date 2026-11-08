@@ -12,8 +12,10 @@ mod downloads;
 mod jobs;
 mod scripts;
 mod settings;
+mod totp;
 mod users;
 
+pub use totp::clear as clear_totp;
 pub use users::create_user as create_user_cli;
 
 pub fn agent_platforms() -> impl Iterator<Item = &'static str> {
@@ -32,6 +34,11 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/auth/password", post(auth::change_password))
         .route("/auth/sessions", get(auth::my_sessions).delete(auth::revoke_other_sessions))
         .route("/auth/sessions/{id}", delete(auth::revoke_my_session))
+        .route("/auth/totp", get(totp::status))
+        .route("/auth/totp/setup", post(totp::setup))
+        .route("/auth/totp/enable", post(totp::enable))
+        .route("/auth/totp/disable", post(totp::disable))
+        .route("/auth/totp/recovery-codes", post(totp::regenerate_recovery))
         .route("/dashboard", get(agents::dashboard))
         .route("/clients", get(clients::list).post(clients::create))
         .route("/clients/{id}", delete(clients::remove))
@@ -55,6 +62,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/users/{id}", delete(users::disable))
         .route("/users/{id}/enable", post(users::enable))
         .route("/users/{id}/password", post(users::reset_password))
+        .route("/users/{id}/totp", delete(users::reset_totp))
         .route("/users/{id}/sessions", get(users::sessions).delete(users::revoke_sessions))
         .route("/users/{id}/sessions/{sid}", delete(users::revoke_session))
         .route("/audit", get(users::audit_log))
