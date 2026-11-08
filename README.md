@@ -41,7 +41,7 @@ docs/           Roadmap and design notes
 - **Transport:** the agent dials out, so endpoints need no inbound ports. Everything is multiplexed over one WebSocket: heartbeats (every 30 s), inventory (every 6 h or on demand), script jobs, and PTY streams. The agent reconnects with jittered exponential backoff, and treats 100 s of silence from the server as a dead connection.
 - **Jobs:** sending a script to an offline agent queues it, and it runs on reconnect (queued jobs expire after `RMM_JOB_QUEUE_DAYS`). Output streams into Postgres (capped at 1 MB per stream). Timeouts kill the whole process tree on Unix. A job whose agent disconnects before reporting is marked `lost`.
 - **Terminal:** xterm.js ↔ server relay ↔ PTY on the agent (bash/zsh on Linux, PowerShell through ConPTY on Windows).
-- **Security:** argon2id passwords; opaque, revocable session tokens in an HttpOnly SameSite=Strict cookie; an Origin check on the terminal socket; three roles (admin / technician / readonly); an audit log covering logins, shells, jobs, enrollment, and deletes.
+- **Security:** argon2id passwords; opaque, revocable session tokens in an HttpOnly SameSite=Strict cookie, with an idle timeout and a 7-day cap; users can change their password and review or revoke their sessions, and admins can reset passwords, re-enable users, and revoke anyone's sessions; an Origin check on the terminal socket; three roles (admin / technician / readonly); an audit log covering logins, shells, jobs, enrollment, and deletes.
 
 ## Development
 
@@ -119,5 +119,6 @@ to SYSTEM and Administrators. Windows service logs go to `C:\ProgramData\RMM\log
 | `RMM_INVENTORY_SECS` | `21600` | Agent inventory interval |
 | `RMM_METRICS_RETENTION_DAYS` | `30` | Metric history kept |
 | `RMM_JOB_QUEUE_DAYS` | `7` | Jobs queued for an offline agent expire after this |
+| `RMM_SESSION_IDLE_HOURS` | `12` | Dashboard sessions unused this long are signed out (sessions last 7 days at most). Admins can override it under Company settings |
 
 See [docs/ROADMAP.md](docs/ROADMAP.md) for what's next: patch management, remote desktop, alerting, and more.

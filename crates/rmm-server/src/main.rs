@@ -75,6 +75,10 @@ struct ServeArgs {
     /// Jobs queued for an offline agent expire after this many days instead of running late.
     #[arg(long, env = "RMM_JOB_QUEUE_DAYS", default_value_t = 7)]
     job_queue_days: u32,
+    /// Dashboard sessions unused for this many hours are signed out (absolute limit: 7 days).
+    /// Admins can override it under Company settings.
+    #[arg(long, env = "RMM_SESSION_IDLE_HOURS", default_value_t = 12)]
+    session_idle_hours: u32,
 }
 
 impl Default for ServeArgs {
@@ -90,6 +94,7 @@ impl Default for ServeArgs {
             inventory_secs: env("RMM_INVENTORY_SECS", "21600").parse().unwrap_or(21600),
             metrics_retention_days: env("RMM_METRICS_RETENTION_DAYS", "30").parse().unwrap_or(30),
             job_queue_days: env("RMM_JOB_QUEUE_DAYS", "7").parse().unwrap_or(7),
+            session_idle_hours: env("RMM_SESSION_IDLE_HOURS", "12").parse().unwrap_or(12),
         }
     }
 }
@@ -136,8 +141,10 @@ async fn serve(db: sqlx::PgPool, args: ServeArgs) -> Result<()> {
     .execute(&db)
     .await?;
     bootstrap_admin(&db).await?;
+    let company = state::Company::load(&db).await.context("loading company settings")?;
 
     let state = Arc::new(AppState {
+        company: company.into(),
         db,
         hub: Default::default(),
         cfg: Settings {
@@ -147,6 +154,7 @@ async fn serve(db: sqlx::PgPool, args: ServeArgs) -> Result<()> {
             inventory_secs: args.inventory_secs,
             metrics_retention_days: args.metrics_retention_days,
             job_queue_days: args.job_queue_days,
+            session_idle_hours: args.session_idle_hours.max(1),
         },
     });
     tokio::spawn(housekeeping(state.clone()));
@@ -250,7 +258,15 @@ async fn housekeeping(state: Arc<AppState>) {
         ];
         // The rest is bulk deletion; hourly is plenty.
         if runs.is_multiple_of(12) {
-            results.push(sqlx::query("DELETE FROM user_sessions WHERE expires_at < now()").execute(db).await);
+            results.push(
+                sqlx::query(
+                    "DELETE FROM user_sessions
+                      WHERE expires_at < now() OR last_seen_at < now() - make_interval(hours => $1)",
+                )
+                .bind(state.session_idle_hours())
+                .execute(db)
+                .await,
+            );
             results.push(
                 sqlx::query("DELETE FROM agent_metrics WHERE ts < now() - make_interval(days => $1)")
                     .bind(state.cfg.metrics_retention_days as i32)

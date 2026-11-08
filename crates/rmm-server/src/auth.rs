@@ -40,6 +40,32 @@ pub fn hash_password(pw: &str) -> anyhow::Result<String> {
         .map_err(|e| anyhow::anyhow!("hashing password: {e}"))
 }
 
+pub const MIN_PASSWORD: usize = 12;
+
+pub fn validate_password(pw: &str) -> Result<(), ApiError> {
+    let n = pw.chars().count();
+    if n < MIN_PASSWORD {
+        // Report the received length: a mangled env var (e.g. `$` expanded by compose) is the usual cause.
+        return Err(ApiError::BadRequest(format!("password must be at least {MIN_PASSWORD} characters (got {n})")));
+    }
+    if n > 1024 {
+        return Err(ApiError::BadRequest("password must be at most 1024 characters".into()));
+    }
+    Ok(())
+}
+
+/// Validate and hash off the async runtime (argon2 is deliberately slow).
+pub async fn hash_password_async(pw: &str) -> Result<String, ApiError> {
+    validate_password(pw)?;
+    let pw = pw.to_string();
+    Ok(tokio::task::spawn_blocking(move || hash_password(&pw)).await.map_err(anyhow::Error::from)??)
+}
+
+pub async fn verify_password_async(pw: &str, hash: String) -> bool {
+    let pw = pw.to_string();
+    tokio::task::spawn_blocking(move || verify_password(&pw, &hash)).await.unwrap_or(false)
+}
+
 pub fn verify_password(pw: &str, hash: &str) -> bool {
     PasswordHash::new(hash).is_ok_and(|h| Argon2::default().verify_password(pw.as_bytes(), &h).is_ok())
 }
@@ -69,6 +95,9 @@ pub struct User {
     pub email: String,
     pub name: String,
     pub role: String,
+    /// The session this request authenticated with.
+    #[serde(skip)]
+    pub session_id: Uuid,
 }
 
 impl User {
@@ -82,13 +111,12 @@ impl User {
     }
 }
 
-fn extract_token(parts: &Parts) -> Option<String> {
-    if let Some(v) = parts.headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok())
+pub fn extract_token(headers: &header::HeaderMap) -> Option<String> {
+    if let Some(v) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok())
         && let Some(t) = v.strip_prefix("Bearer ") {
             return Some(t.trim().to_string());
         }
-    parts
-        .headers
+    headers
         .get_all(header::COOKIE)
         .iter()
         .filter_map(|v| v.to_str().ok())
@@ -100,13 +128,23 @@ impl FromRequestParts<Arc<AppState>> for User {
     type Rejection = ApiError;
 
     async fn from_request_parts(parts: &mut Parts, state: &Arc<AppState>) -> Result<Self, ApiError> {
-        let token = extract_token(parts).ok_or(ApiError::Unauthorized)?;
+        let token = extract_token(&parts.headers).ok_or(ApiError::Unauthorized)?;
+        // Valid = not past the absolute expiry and used within the idle window. last_seen_at is
+        // only rewritten when a minute old, so polling pages don't cost a write per request.
         sqlx::query_as::<_, User>(
-            "SELECT u.id, u.email, u.name, u.role
-               FROM user_sessions s JOIN users u ON u.id = s.user_id
-              WHERE s.token_hash = $1 AND s.expires_at > now() AND NOT u.disabled",
+            "WITH s AS (
+                 SELECT u.id, u.email, u.name, u.role, s.id AS session_id
+                   FROM user_sessions s JOIN users u ON u.id = s.user_id
+                  WHERE s.token_hash = $1 AND s.expires_at > now() AND NOT u.disabled
+                    AND s.last_seen_at > now() - make_interval(hours => $2)
+             ), touch AS (
+                 UPDATE user_sessions SET last_seen_at = now()
+                  WHERE id = (SELECT session_id FROM s) AND last_seen_at < now() - interval '1 minute'
+             )
+             SELECT * FROM s",
         )
         .bind(token_hash(&token))
+        .bind(state.session_idle_hours())
         .fetch_optional(&state.db)
         .await?
         .ok_or(ApiError::Unauthorized)

@@ -1,0 +1,81 @@
+<script lang="ts">
+	import { goto } from '$app/navigation';
+	import { api } from '#lib/api.js';
+	import { can, company, session } from '#lib/session.svelte.js';
+
+	interface Settings { company_name: string; session_idle_hours: number | null; session_idle_hours_default: number }
+
+	let form = $state({ company_name: '', idle: '' });
+	let defaultIdle = $state(12);
+	let loaded = $state(false);
+	let error = $state('');
+	let done = $state('');
+	let busy = $state(false);
+
+	function apply(s: Settings) {
+		form = { company_name: s.company_name, idle: s.session_idle_hours?.toString() ?? '' };
+		defaultIdle = s.session_idle_hours_default;
+		company.name = s.company_name;
+		loaded = true;
+	}
+
+	$effect(() => {
+		if (!session.user) return;
+		if (!can('admin')) {
+			goto('/');
+			return;
+		}
+		api.get<Settings>('/settings').then(apply).catch((e) => (error = (e as Error).message));
+	});
+
+	async function save(e: SubmitEvent) {
+		e.preventDefault();
+		error = '';
+		done = '';
+		const idle = form.idle.trim();
+		if (idle && !/^\d+$/.test(idle)) {
+			error = 'Idle timeout must be a whole number of hours';
+			return;
+		}
+		busy = true;
+		try {
+			apply(await api.put<Settings>('/settings', { company_name: form.company_name, session_idle_hours: idle ? Number(idle) : null }));
+			done = 'Saved.';
+		} catch (e) {
+			error = (e as Error).message;
+		} finally {
+			busy = false;
+		}
+	}
+</script>
+
+<h1 class="mb-4 text-xl font-semibold">Company settings</h1>
+{#if loaded}
+	<form class="max-w-2xl space-y-6" onsubmit={save}>
+		<section class="card space-y-3 p-4">
+			<h2 class="font-semibold">Organisation</h2>
+			<div>
+				<label class="label" for="cn">Company name</label>
+				<input id="cn" class="input" maxlength="100" placeholder="Acme IT" bind:value={form.company_name} />
+				<p class="mt-1 text-xs text-slate-500">Shown in the sidebar, on the sign-in page and in the browser tab.</p>
+			</div>
+		</section>
+		<section class="card space-y-3 p-4">
+			<h2 class="font-semibold">Security</h2>
+			<div>
+				<label class="label" for="idle">Session idle timeout (hours)</label>
+				<input id="idle" class="input max-w-40" inputmode="numeric" placeholder={`${defaultIdle} (server default)`} bind:value={form.idle} />
+				<p class="mt-1 text-xs text-slate-500">
+					Sign users out after this long without activity, 1–168 hours. Leave empty to use the server default ({defaultIdle} h, from <code>RMM_SESSION_IDLE_HOURS</code>). Sessions always end after 7 days.
+				</p>
+			</div>
+		</section>
+		{#if error}<p class="text-sm text-red-400">{error}</p>{/if}
+		<div class="flex items-center justify-end gap-3">
+			{#if done}<span class="text-sm text-emerald-400">{done}</span>{/if}
+			<button class="btn-primary" disabled={busy}>{busy ? 'Saving…' : 'Save'}</button>
+		</div>
+	</form>
+{:else if error}
+	<p class="text-sm text-red-400">{error}</p>
+{/if}

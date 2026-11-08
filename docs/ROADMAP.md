@@ -23,12 +23,13 @@ Done:
 - [x] systemd unit: dropped `MemoryMax=128M`/`Nice=10`, which every script and shell inherited
 - [x] Windows: `C:\ProgramData\RMM` restricted to SYSTEM and Administrators (on enroll and every service start); job scripts written there instead of the shared temp dir
 - [x] Windows: service binary copied to `C:\Program Files\RMM`, SCM restart-on-failure, file logging to `C:\ProgramData\RMM\logs\agent.log`
+- [x] Account management: change password (signs out your other sessions), admin password reset (signs them out everywhere), re-enable users, list and revoke sessions. Sessions now expire after `RMM_SESSION_IDLE_HOURS` (default 12) of inactivity, within the 7-day cap.
+- [x] Company settings page (admins only): company name shown in the sidebar, sign-in page and tab title; session idle timeout override
 
 To do:
 
 - [ ] Integration tests: Postgres in CI, a real agent driven against the server. Start from the manual e2e run: enrollment reuse/takeover, `lost`/`expired` jobs, headers.
 - [ ] Rate-limit `/auth/login` and enrollment. Behind Caddy, key on `X-Forwarded-For` only when it comes from a trusted proxy.
-- [ ] Account management: change password, admin reset, re-enable users, list and revoke sessions; consider an idle timeout shorter than the fixed 7 days
 - [ ] TOTP 2FA for dashboard users; enforce it on admin accounts
 - [ ] Per-client access control for technicians (`user_clients` table) and an optional client-portal role. Touches every query; decide first whether scripts are global or per client.
 - [ ] **Test the Windows agent on real hosts** (Windows 10/11, Server 2019/2022). CI compiles it but nobody has run it. Check the ACL, the Program Files copy, the recovery actions and logging first.

@@ -11,6 +11,7 @@ mod clients;
 mod downloads;
 mod jobs;
 mod scripts;
+mod settings;
 mod users;
 
 pub use users::create_user as create_user_cli;
@@ -28,6 +29,9 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/auth/login", post(auth::login))
         .route("/auth/logout", post(auth::logout))
         .route("/auth/me", get(auth::me))
+        .route("/auth/password", post(auth::change_password))
+        .route("/auth/sessions", get(auth::my_sessions).delete(auth::revoke_other_sessions))
+        .route("/auth/sessions/{id}", delete(auth::revoke_my_session))
         .route("/dashboard", get(agents::dashboard))
         .route("/clients", get(clients::list).post(clients::create))
         .route("/clients/{id}", delete(clients::remove))
@@ -49,5 +53,11 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/scripts/{id}", get(scripts::get).put(scripts::update).delete(scripts::remove))
         .route("/users", get(users::list).post(users::create))
         .route("/users/{id}", delete(users::disable))
+        .route("/users/{id}/enable", post(users::enable))
+        .route("/users/{id}/password", post(users::reset_password))
+        .route("/users/{id}/sessions", get(users::sessions).delete(users::revoke_sessions))
+        .route("/users/{id}/sessions/{sid}", delete(users::revoke_session))
         .route("/audit", get(users::audit_log))
+        .route("/settings", get(settings::get).put(settings::update))
+        .route("/settings/public", get(settings::public))
 }

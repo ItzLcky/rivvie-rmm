@@ -2,7 +2,7 @@
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import { api } from '#lib/api.js';
-	import { session } from '#lib/session.svelte.js';
+	import { brand, session } from '#lib/session.svelte.js';
 	import type { User } from '#lib/types.js';
 	import favicon from '#lib/assets/favicon.svg';
 
@@ -31,7 +31,7 @@
 
 <div class="flex min-h-screen items-center justify-center p-4">
 	<form class="card w-full max-w-sm space-y-4 p-6" onsubmit={submit}>
-		<div class="flex items-center gap-2 text-lg font-semibold"><img src={favicon} alt="" class="size-7" /> Sign in to RMM</div>
+		<div class="flex items-center gap-2 text-lg font-semibold"><img src={favicon} alt="" class="size-7" /> Sign in to {brand()}</div>
 		<div>
 			<label class="label" for="email">Email</label>
 			<input id="email" class="input" type="email" autocomplete="username" required bind:value={email} />

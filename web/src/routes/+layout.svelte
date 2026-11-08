@@ -4,13 +4,15 @@
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import { api } from '#lib/api.js';
-	import { can, session } from '#lib/session.svelte.js';
+	import { brand, can, company, loadCompany, session } from '#lib/session.svelte.js';
 	import type { User } from '#lib/types.js';
 	import type { LayoutProps } from './$types';
 
 	let { children }: LayoutProps = $props();
 
 	const isLogin = $derived(page.url.pathname === '/login');
+
+	$effect(() => loadCompany());
 
 	$effect(() => {
 		if (session.loaded) return;
@@ -45,7 +47,7 @@
 
 <svelte:head>
 	<link rel="icon" href={favicon} />
-	<title>RMM</title>
+	<title>{brand()}</title>
 </svelte:head>
 
 {#if isLogin}
@@ -54,7 +56,8 @@
 	<div class="flex min-h-screen">
 		<aside class="sticky top-0 flex h-screen w-56 shrink-0 flex-col border-r border-slate-800 bg-slate-950">
 			<a href="/" class="flex items-center gap-2 px-4 py-4 font-semibold tracking-tight">
-				<img src={favicon} alt="" class="size-6" /> RMM
+				<img src={favicon} alt="" class="size-6" />
+				<span class="truncate">{company.name || 'RMM'}</span>
 			</a>
 			<nav class="flex-1 space-y-0.5 px-2">
 				{#each nav.filter((n) => n.show) as n (n.href)}
@@ -62,8 +65,13 @@
 				{/each}
 			</nav>
 			<div class="border-t border-slate-800 p-3 text-xs">
-				<div class="truncate text-slate-200">{session.user.name}</div>
-				<div class="truncate text-slate-500">{session.user.email} · {session.user.role}</div>
+				{#if can('admin')}
+					<a href="/settings" class="-mx-1 mb-2 block rounded-md px-1 py-1 text-sm {active('/settings') ? 'bg-slate-800 text-white' : 'text-slate-400 hover:bg-slate-900 hover:text-slate-200'}">Company settings</a>
+				{/if}
+				<a href="/account" class="block rounded-md px-1 py-0.5 -mx-1 hover:bg-slate-900 {active('/account') ? 'bg-slate-800' : ''}">
+					<div class="truncate text-slate-200">{session.user.name}</div>
+					<div class="truncate text-slate-500">{session.user.email} · {session.user.role}</div>
+				</a>
 				<button class="mt-2 text-slate-400 hover:text-slate-100" onclick={logout}>Sign out</button>
 			</div>
 		</aside>

@@ -1,12 +1,13 @@
 use std::sync::Arc;
 
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::{HeaderMap, header};
 use axum::response::{AppendHeaders, IntoResponse};
 use axum::Json;
-use chrono::{Duration, Utc};
-use serde::Deserialize;
+use chrono::{DateTime, Duration, Utc};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
+use uuid::Uuid;
 
 use crate::auth::{self, User};
 use crate::error::{ApiError, ApiResult};
@@ -31,9 +32,8 @@ pub async fn login(State(st): State<Arc<AppState>>, headers: HeaderMap, Json(bod
             .fetch_optional(&st.db)
             .await?;
 
-    let pw = body.password.clone();
     let hash = row.as_ref().map(|r| r.1.clone()).unwrap_or_else(dummy_hash);
-    let ok = tokio::task::spawn_blocking(move || auth::verify_password(&pw, &hash)).await.unwrap_or(false);
+    let ok = auth::verify_password_async(&body.password, hash).await;
     let Some((user_id, _, disabled)) = row.filter(|_| ok) else {
         auth::audit(&st.db, None, "auth.login_failed", None, json!({ "email": body.email })).await;
         return Err(ApiError::Unauthorized);
@@ -44,17 +44,23 @@ pub async fn login(State(st): State<Arc<AppState>>, headers: HeaderMap, Json(bod
 
     let token = auth::random_token();
     let ua = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).map(|s| s.chars().take(200).collect::<String>());
-    sqlx::query("INSERT INTO user_sessions (token_hash, user_id, expires_at, user_agent) VALUES ($1,$2,$3,$4)")
-        .bind(auth::token_hash(&token))
-        .bind(user_id)
-        .bind(Utc::now() + Duration::days(auth::SESSION_DAYS))
-        .bind(ua)
-        .execute(&st.db)
-        .await?;
+    let (session_id,): (Uuid,) = sqlx::query_as(
+        "INSERT INTO user_sessions (token_hash, user_id, expires_at, user_agent) VALUES ($1,$2,$3,$4) RETURNING id",
+    )
+    .bind(auth::token_hash(&token))
+    .bind(user_id)
+    .bind(Utc::now() + Duration::days(auth::SESSION_DAYS))
+    .bind(ua)
+    .fetch_one(&st.db)
+    .await?;
     sqlx::query("UPDATE users SET last_login_at = now() WHERE id = $1").bind(user_id).execute(&st.db).await?;
     auth::audit(&st.db, Some(user_id), "auth.login", None, json!({})).await;
 
-    let user: User = sqlx::query_as("SELECT id, email, name, role FROM users WHERE id = $1").bind(user_id).fetch_one(&st.db).await?;
+    let user: User = sqlx::query_as("SELECT id, email, name, role, $2 AS session_id FROM users WHERE id = $1")
+        .bind(user_id)
+        .bind(session_id)
+        .fetch_one(&st.db)
+        .await?;
     Ok((
         AppendHeaders([(header::SET_COOKIE, auth::session_cookie(&token, st.cfg.secure_cookies()))]),
         // Token is also returned for non-browser API clients.
@@ -63,16 +69,7 @@ pub async fn login(State(st): State<Arc<AppState>>, headers: HeaderMap, Json(bod
 }
 
 pub async fn logout(State(st): State<Arc<AppState>>, headers: HeaderMap) -> ApiResult<impl IntoResponse> {
-    let token = headers
-        .get_all(header::COOKIE)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|v| v.split(';'))
-        .find_map(|kv| kv.trim().strip_prefix(&format!("{}=", auth::COOKIE)).map(str::to_string))
-        .or_else(|| {
-            headers.get(header::AUTHORIZATION)?.to_str().ok()?.strip_prefix("Bearer ").map(|s| s.trim().to_string())
-        });
-    if let Some(t) = token {
+    if let Some(t) = auth::extract_token(&headers) {
         sqlx::query("DELETE FROM user_sessions WHERE token_hash = $1").bind(auth::token_hash(&t)).execute(&st.db).await?;
     }
     Ok((AppendHeaders([(header::SET_COOKIE, auth::clear_cookie())]), Json(json!({ "ok": true }))))
@@ -80,4 +77,98 @@ pub async fn logout(State(st): State<Arc<AppState>>, headers: HeaderMap) -> ApiR
 
 pub async fn me(user: User) -> Json<User> {
     Json(user)
+}
+
+#[derive(Deserialize)]
+pub struct ChangePassword {
+    current_password: String,
+    new_password: String,
+}
+
+/// Change your own password. Every other session of yours is revoked; this one stays.
+pub async fn change_password(
+    State(st): State<Arc<AppState>>,
+    u: User,
+    Json(b): Json<ChangePassword>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let (hash,): (String,) =
+        sqlx::query_as("SELECT password_hash FROM users WHERE id = $1").bind(u.id).fetch_one(&st.db).await?;
+    if !auth::verify_password_async(&b.current_password, hash).await {
+        auth::audit(&st.db, Some(u.id), "auth.password_change_failed", Some(("user", u.id)), json!({})).await;
+        return Err(ApiError::BadRequest("current password is incorrect".into()));
+    }
+    if b.new_password == b.current_password {
+        return Err(ApiError::BadRequest("new password must differ from the current one".into()));
+    }
+    let new_hash = auth::hash_password_async(&b.new_password).await?;
+    let mut tx = st.db.begin().await?;
+    sqlx::query("UPDATE users SET password_hash = $2 WHERE id = $1").bind(u.id).bind(new_hash).execute(&mut *tx).await?;
+    let revoked = sqlx::query("DELETE FROM user_sessions WHERE user_id = $1 AND id <> $2")
+        .bind(u.id)
+        .bind(u.session_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    tx.commit().await?;
+    auth::audit(&st.db, Some(u.id), "auth.password_change", Some(("user", u.id)), json!({ "sessions_revoked": revoked })).await;
+    Ok(Json(json!({ "ok": true, "sessions_revoked": revoked })))
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+pub struct SessionRow {
+    pub id: Uuid,
+    pub created_at: DateTime<Utc>,
+    pub last_seen_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub user_agent: Option<String>,
+    pub current: bool,
+}
+
+/// Live sessions of `user_id`; `current` marks the one making the request.
+pub async fn sessions_for(st: &AppState, user_id: Uuid, current: Uuid) -> ApiResult<Vec<SessionRow>> {
+    Ok(sqlx::query_as(
+        "SELECT id, created_at, last_seen_at, expires_at, user_agent, id = $2 AS current
+           FROM user_sessions
+          WHERE user_id = $1 AND expires_at > now() AND last_seen_at > now() - make_interval(hours => $3)
+          ORDER BY last_seen_at DESC",
+    )
+    .bind(user_id)
+    .bind(current)
+    .bind(st.session_idle_hours())
+    .fetch_all(&st.db)
+    .await?)
+}
+
+pub async fn my_sessions(State(st): State<Arc<AppState>>, u: User) -> ApiResult<Json<Vec<SessionRow>>> {
+    Ok(Json(sessions_for(&st, u.id, u.session_id).await?))
+}
+
+pub async fn revoke_my_session(
+    State(st): State<Arc<AppState>>,
+    u: User,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let n = sqlx::query("DELETE FROM user_sessions WHERE id = $1 AND user_id = $2")
+        .bind(id)
+        .bind(u.id)
+        .execute(&st.db)
+        .await?
+        .rows_affected();
+    if n == 0 {
+        return Err(ApiError::NotFound("session"));
+    }
+    auth::audit(&st.db, Some(u.id), "auth.session_revoke", Some(("user", u.id)), json!({ "session": id })).await;
+    Ok(Json(json!({ "ok": true, "current": id == u.session_id })))
+}
+
+/// Sign out everywhere except here.
+pub async fn revoke_other_sessions(State(st): State<Arc<AppState>>, u: User) -> ApiResult<Json<serde_json::Value>> {
+    let n = sqlx::query("DELETE FROM user_sessions WHERE user_id = $1 AND id <> $2")
+        .bind(u.id)
+        .bind(u.session_id)
+        .execute(&st.db)
+        .await?
+        .rows_affected();
+    auth::audit(&st.db, Some(u.id), "auth.session_revoke_others", Some(("user", u.id)), json!({ "count": n })).await;
+    Ok(Json(json!({ "ok": true, "revoked": n })))
 }

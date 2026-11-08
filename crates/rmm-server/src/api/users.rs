@@ -52,15 +52,7 @@ pub async fn create_user(db: &sqlx::PgPool, email: &str, name: &str, password: &
     if !email.contains('@') {
         return Err(ApiError::BadRequest("invalid email".into()));
     }
-    if password.len() < 12 {
-        // Report the received length: a mangled env var (e.g. `$` expanded by compose) is the usual cause.
-        return Err(ApiError::BadRequest(format!(
-            "password must be at least 12 characters (got {})",
-            password.chars().count()
-        )));
-    }
-    let pw = password.to_string();
-    let hash = tokio::task::spawn_blocking(move || auth::hash_password(&pw)).await.map_err(anyhow::Error::from)??;
+    let hash = auth::hash_password_async(password).await?;
     let role = match role {
         Role::Admin => "admin",
         Role::Technician => "technician",
@@ -88,6 +80,91 @@ pub async fn disable(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uu
     sqlx::query("DELETE FROM user_sessions WHERE user_id = $1").bind(id).execute(&mut *tx).await?;
     tx.commit().await?;
     auth::audit(&st.db, Some(u.id), "user.disable", Some(("user", id)), json!({})).await;
+    Ok(Json(json!({ "ok": true })))
+}
+
+pub async fn enable(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uuid>) -> ApiResult<Json<serde_json::Value>> {
+    u.require(Role::Admin)?;
+    let n = sqlx::query("UPDATE users SET disabled = false WHERE id = $1").bind(id).execute(&st.db).await?.rows_affected();
+    if n == 0 {
+        return Err(ApiError::NotFound("user"));
+    }
+    auth::audit(&st.db, Some(u.id), "user.enable", Some(("user", id)), json!({})).await;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+pub struct ResetPassword {
+    password: String,
+}
+
+/// Admin sets a new password for someone else and signs them out everywhere.
+/// Your own password goes through /auth/password, which asks for the current one.
+pub async fn reset_password(
+    State(st): State<Arc<AppState>>,
+    u: User,
+    Path(id): Path<Uuid>,
+    Json(b): Json<ResetPassword>,
+) -> ApiResult<Json<serde_json::Value>> {
+    u.require(Role::Admin)?;
+    if id == u.id {
+        return Err(ApiError::BadRequest("use Account → Change password for your own account".into()));
+    }
+    let hash = auth::hash_password_async(&b.password).await?;
+    let mut tx = st.db.begin().await?;
+    let n = sqlx::query("UPDATE users SET password_hash = $2 WHERE id = $1")
+        .bind(id)
+        .bind(hash)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    if n == 0 {
+        return Err(ApiError::NotFound("user"));
+    }
+    sqlx::query("DELETE FROM user_sessions WHERE user_id = $1").bind(id).execute(&mut *tx).await?;
+    tx.commit().await?;
+    auth::audit(&st.db, Some(u.id), "user.password_reset", Some(("user", id)), json!({})).await;
+    Ok(Json(json!({ "ok": true })))
+}
+
+pub async fn sessions(
+    State(st): State<Arc<AppState>>,
+    u: User,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<Vec<super::auth::SessionRow>>> {
+    u.require(Role::Admin)?;
+    Ok(Json(super::auth::sessions_for(&st, id, u.session_id).await?))
+}
+
+pub async fn revoke_sessions(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uuid>) -> ApiResult<Json<serde_json::Value>> {
+    u.require(Role::Admin)?;
+    // Your own current session is kept so this can't lock you out mid-click.
+    let n = sqlx::query("DELETE FROM user_sessions WHERE user_id = $1 AND id <> $2")
+        .bind(id)
+        .bind(u.session_id)
+        .execute(&st.db)
+        .await?
+        .rows_affected();
+    auth::audit(&st.db, Some(u.id), "user.sessions_revoke", Some(("user", id)), json!({ "count": n })).await;
+    Ok(Json(json!({ "ok": true, "revoked": n })))
+}
+
+pub async fn revoke_session(
+    State(st): State<Arc<AppState>>,
+    u: User,
+    Path((id, sid)): Path<(Uuid, Uuid)>,
+) -> ApiResult<Json<serde_json::Value>> {
+    u.require(Role::Admin)?;
+    let n = sqlx::query("DELETE FROM user_sessions WHERE id = $1 AND user_id = $2")
+        .bind(sid)
+        .bind(id)
+        .execute(&st.db)
+        .await?
+        .rows_affected();
+    if n == 0 {
+        return Err(ApiError::NotFound("session"));
+    }
+    auth::audit(&st.db, Some(u.id), "user.session_revoke", Some(("user", id)), json!({ "session": sid })).await;
     Ok(Json(json!({ "ok": true })))
 }
 

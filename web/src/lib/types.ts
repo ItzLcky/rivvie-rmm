@@ -50,3 +50,5 @@ export interface Dashboard {
 	agents_total: number; agents_online: number; clients: number; by_os: Record<string, number>;
 	jobs_24h: Record<string, number>; high_disk: AgentSummary[];
 }
+
+export interface Session { id: string; created_at: string; last_seen_at: string; expires_at: string; user_agent: string | null; current: boolean }
