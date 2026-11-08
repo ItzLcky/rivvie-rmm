@@ -62,6 +62,10 @@ struct ServeArgs {
     /// Built dashboard (web/build). Served at / with SPA fallback.
     #[arg(long, env = "RMM_WEB_DIR", default_value = "web/build")]
     web_dir: PathBuf,
+    /// Prebuilt agent binaries (rmm-agent-linux-x86_64, rmm-agent-windows-x86_64.exe)
+    /// offered by the "Enroll agents" dialog.
+    #[arg(long, env = "RMM_AGENT_DIR", default_value = "agents")]
+    agent_dir: PathBuf,
     #[arg(long, env = "RMM_HEARTBEAT_SECS", default_value_t = 30)]
     heartbeat_secs: u32,
     #[arg(long, env = "RMM_INVENTORY_SECS", default_value_t = 6 * 3600)]
@@ -81,6 +85,7 @@ impl Default for ServeArgs {
             bind: env("RMM_BIND", "0.0.0.0:8080").parse().expect("RMM_BIND"),
             public_url: env("RMM_PUBLIC_URL", "http://localhost:8080"),
             web_dir: env("RMM_WEB_DIR", "web/build").into(),
+            agent_dir: env("RMM_AGENT_DIR", "agents").into(),
             heartbeat_secs: env("RMM_HEARTBEAT_SECS", "30").parse().unwrap_or(30),
             inventory_secs: env("RMM_INVENTORY_SECS", "21600").parse().unwrap_or(21600),
             metrics_retention_days: env("RMM_METRICS_RETENTION_DAYS", "30").parse().unwrap_or(30),
@@ -136,6 +141,7 @@ async fn serve(db: sqlx::PgPool, args: ServeArgs) -> Result<()> {
         db,
         hub: Default::default(),
         cfg: Settings {
+            agent_dir: args.agent_dir.clone(),
             public_url: args.public_url.trim_end_matches('/').to_string(),
             heartbeat_secs: args.heartbeat_secs,
             inventory_secs: args.inventory_secs,
@@ -146,6 +152,12 @@ async fn serve(db: sqlx::PgPool, args: ServeArgs) -> Result<()> {
     tokio::spawn(housekeeping(state.clone()));
 
     // adapter-static writes the SPA shell as 200.html; every non-file route falls back to it.
+    let found: Vec<_> = api::agent_platforms().filter(|id| api::agent_binary_exists(&state, id)).collect();
+    if found.is_empty() {
+        warn!("no agent binaries in {}; the dashboard won't offer downloads", args.agent_dir.display());
+    } else {
+        info!("agent downloads: {}", found.join(", "));
+    }
     let index = args.web_dir.join("200.html");
     if !index.exists() {
         warn!("dashboard not found at {} (build it with `npm --prefix web run build`)", args.web_dir.display());

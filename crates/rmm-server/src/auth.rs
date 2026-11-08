@@ -113,6 +113,19 @@ impl FromRequestParts<Arc<AppState>> for User {
     }
 }
 
+/// `Option<User>` in a handler: `None` when not signed in, instead of rejecting the request.
+impl axum::extract::OptionalFromRequestParts<Arc<AppState>> for User {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &Arc<AppState>) -> Result<Option<Self>, ApiError> {
+        match <User as FromRequestParts<Arc<AppState>>>::from_request_parts(parts, state).await {
+            Ok(u) => Ok(Some(u)),
+            Err(ApiError::Unauthorized) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+}
+
 pub fn session_cookie(token: &str, secure: bool) -> String {
     format!(
         "{COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}{}",

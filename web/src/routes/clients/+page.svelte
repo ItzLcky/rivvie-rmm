@@ -1,11 +1,12 @@
 <script lang="ts">
 	import { api } from '#lib/api.js';
-	import { datetime } from '#lib/format.js';
+	import { bytes, datetime } from '#lib/format.js';
 	import { can } from '#lib/session.svelte.js';
 	import type { Client, Site } from '#lib/types.js';
 	import Modal from '#lib/components/Modal.svelte';
 
 	interface Token { id: string; label: string; max_uses: number | null; uses: number; expires_at: string | null; created_at: string }
+	interface AgentDownload { id: string; label: string; file_name: string; size: number; sha256: string; url: string }
 	interface NewToken { token: string; expires_at: string | null; install: { linux: string; windows: string } }
 
 	let clients = $state<Client[]>([]);
@@ -13,6 +14,7 @@
 	let error = $state('');
 	let tokenSite = $state<{ client: Client; site: Site } | null>(null);
 	let tokens = $state<Token[]>([]);
+	let downloads = $state<AgentDownload[] | null>(null);
 	let created = $state<NewToken | null>(null);
 	let label = $state('');
 	let maxUses = $state<number | null>(null);
@@ -50,6 +52,7 @@
 	async function openTokens(client: Client, site: Site) {
 		tokenSite = { client, site };
 		created = null;
+		downloads ??= await api.get<AgentDownload[]>('/agent-downloads').catch(() => []);
 		tokens = await api.get<Token[]>(`/sites/${site.id}/enrollment-tokens`);
 	}
 	async function createToken() {
@@ -108,6 +111,25 @@
 
 {#if tokenSite}
 	<Modal title="Enroll agents into {tokenSite.client.name} / {tokenSite.site.name}" onclose={() => (tokenSite = null)} wide>
+		<div class="mb-4">
+			<div class="label">Download agent</div>
+			{#if downloads === null}
+				<p class="text-sm text-slate-500">Loading…</p>
+			{:else if downloads.length}
+				<div class="flex flex-wrap gap-2">
+					{#each downloads as d (d.id)}
+						<a class="btn-ghost" href={d.url} download={d.file_name} title="SHA-256 {d.sha256}">
+							<svg class="size-4" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true"><path d="M10 3a1 1 0 0 1 1 1v7.59l2.3-2.3a1 1 0 1 1 1.4 1.42l-4 4a1 1 0 0 1-1.4 0l-4-4a1 1 0 1 1 1.4-1.42l2.3 2.3V4a1 1 0 0 1 1-1ZM4 15a1 1 0 0 1 1 1v1h10v-1a1 1 0 1 1 2 0v2a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1v-2a1 1 0 0 1 1-1Z" /></svg>
+							{d.label}
+							<span class="text-xs text-slate-500">{bytes(d.size)}</span>
+						</a>
+					{/each}
+				</div>
+				<p class="mt-1 text-xs text-slate-500">Or create a token below: the install commands download the agent themselves.</p>
+			{:else}
+				<p class="text-sm text-slate-500">This server has no agent binaries. Put them in <code>RMM_AGENT_DIR</code> (the server image includes them).</p>
+			{/if}
+		</div>
 		{#if created}
 			<div class="mb-4 rounded-md border border-emerald-900 bg-emerald-950/30 p-3 text-sm">
 				<p class="mb-2 text-emerald-300">Token created. Copy it now, it won't be shown again.</p>

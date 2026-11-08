@@ -182,14 +182,27 @@ pub async fn create_token(
     auth::audit(&st.db, Some(u.id), "enrollment_token.create", Some(("site", site_id)), json!({ "token_id": id })).await;
 
     let url = &st.cfg.public_url;
+    let mut linux = format!("sudo ./rmm-agent enroll --server {url} --token {token} --install");
+    let mut windows = format!(".\\rmm-agent.exe enroll --server {url} --token {token} --install");
+    // When the server has the binaries, make each command self-contained: fetch, then enroll.
+    // The token authorizes the download without spending a use. It's hex, so no URL escaping.
+    if super::agent_binary_exists(&st, "linux-x86_64") {
+        linux = format!(
+            "curl -fsSLo rmm-agent \"{url}/api/agent-downloads/linux-x86_64?token={token}\" && chmod +x rmm-agent && {linux}"
+        );
+    }
+    if super::agent_binary_exists(&st, "windows-x86_64") {
+        windows = format!(
+            "$ProgressPreference = 'SilentlyContinue'; \
+             Invoke-WebRequest -UseBasicParsing \"{url}/api/agent-downloads/windows-x86_64?token={token}\" -OutFile rmm-agent.exe; \
+             {windows}"
+        );
+    }
     Ok(Json(json!({
         "id": id,
         "token": token,
         "expires_at": expires_at,
-        "install": {
-            "linux": format!("sudo ./rmm-agent enroll --server {url} --token {token} --install"),
-            "windows": format!(".\\rmm-agent.exe enroll --server {url} --token {token} --install"),
-        }
+        "install": { "linux": linux, "windows": windows }
     })))
 }
 

@@ -8,11 +8,20 @@ use crate::state::AppState;
 mod agents;
 mod auth;
 mod clients;
+mod downloads;
 mod jobs;
 mod scripts;
 mod users;
 
 pub use users::create_user as create_user_cli;
+
+pub fn agent_platforms() -> impl Iterator<Item = &'static str> {
+    downloads::PLATFORMS.iter().map(|p| p.id)
+}
+
+pub fn agent_binary_exists(st: &AppState, id: &str) -> bool {
+    downloads::platform_path(st, id).is_some()
+}
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
@@ -26,6 +35,8 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/sites/{id}", delete(clients::remove_site))
         .route("/sites/{id}/enrollment-tokens", get(clients::list_tokens).post(clients::create_token))
         .route("/enrollment-tokens/{id}", delete(clients::revoke_token))
+        .route("/agent-downloads", get(downloads::list))
+        .route("/agent-downloads/{id}", get(downloads::download))
         .route("/agents", get(agents::list))
         .route("/agents/{id}", get(agents::get).delete(agents::remove))
         .route("/agents/{id}/metrics", get(agents::metrics))

@@ -88,6 +88,11 @@ production; the agent verifies certificates against the OS trust store.
 
 **Installing an agent**
 
+In the dashboard, open Clients & Sites → Enroll agents. The dialog has download buttons for the
+agent, and the install commands it generates download the binary themselves (the enrollment
+token authorizes the download), so one pasted command does everything. The server image ships
+a static Linux x86_64 binary and a Windows x64 binary in `RMM_AGENT_DIR`. To install by hand:
+
 ```sh
 # Linux (as root): copies itself to /usr/local/bin and installs a systemd unit
 sudo ./rmm-agent enroll --server https://rmm.example.com --token <TOKEN> --install
@@ -109,6 +114,7 @@ to SYSTEM and Administrators. Windows service logs go to `C:\ProgramData\RMM\log
 | `RMM_BIND` | `0.0.0.0:8080` | Listen address (plain HTTP; put TLS in front) |
 | `RMM_PUBLIC_URL` | `http://localhost:8080` | External URL; used in install commands and to set `Secure` cookies |
 | `RMM_WEB_DIR` | `web/build` | Built dashboard |
+| `RMM_AGENT_DIR` | `agents` (`/srv/agents` in the image) | Agent binaries offered for download: `rmm-agent-linux-x86_64`, `rmm-agent-windows-x86_64.exe` |
 | `RMM_HEARTBEAT_SECS` | `30` | Agent metrics interval |
 | `RMM_INVENTORY_SECS` | `21600` | Agent inventory interval |
 | `RMM_METRICS_RETENTION_DAYS` | `30` | Metric history kept |

@@ -10,6 +10,8 @@ pub struct AppState {
 
 #[derive(Debug, Clone)]
 pub struct Settings {
+    /// Prebuilt agent binaries offered for download.
+    pub agent_dir: std::path::PathBuf,
     /// Public base URL agents and browsers use, e.g. https://rmm.example.com
     pub public_url: String,
     pub heartbeat_secs: u32,
