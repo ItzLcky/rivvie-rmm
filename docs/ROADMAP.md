@@ -150,9 +150,9 @@ Quality:
 ### Later
 
 - [ ] Undo on cheap actions (toasts already support an action button), and optimistic updates for small toggles.
-- [ ] A peek drawer from the agents list, favourites and tags on agents, and agent notes. Tags and notes belong with custom fields in Phase 8.
+- [ ] A peek drawer from the agents list, favourites and tags on agents, and agent notes. Tags and notes belong with custom fields in Phase 9.
 - [ ] Select every row matching a filter, not just the rows on screen, for bulk actions.
-- [ ] Saved views (Phase 8), built on the URL state.
+- [ ] Saved views (Phase 9), built on the URL state.
 - [ ] Configurable dashboard widgets; script version history.
 - [ ] Agent tabs added by later phases: Tickets (7). Phases 4 and 5 added Alerts, Services, Event log and Patches (ten tabs now): move them to a side sub-nav before adding more.
 
@@ -324,7 +324,7 @@ Search uses Postgres full text: a generated `tsvector` over ticket subject, even
   - Deduplicate: while the same alert on the same agent has an open ticket, add an event to it instead of opening a new one.
   - When the alert clears, add a note. Optionally auto-resolve the ticket if nobody has touched it.
   - Flap protection: count the reopens and stop auto-resolving after N.
-- **API and webhooks:** with the public API (Phase 8). Lets monitoring tools and forms outside the RMM create tickets.
+- **API and webhooks:** with the public API (Phase 9). Lets monitoring tools and forms outside the RMM create tickets.
 
 ### Working a ticket
 
@@ -407,12 +407,68 @@ Each milestone should be usable by itself. After step 2, an MSP can already run 
 
 ### Open questions
 
-- **Build vs. integrate.** Many MSPs already use HaloPSA, ConnectWise Manage or Autotask and won't switch. Keep a sync integration (Phase 8) for them alongside the built-in PSA: alerts → their tickets, and agents → their configurations.
+- **Build vs. integrate.** Many MSPs already use HaloPSA, ConnectWise Manage or Autotask and won't switch. Keep a sync integration (Phase 9) for them alongside the built-in PSA: alerts → their tickets, and agents → their configurations.
 - **Multi-currency:** one currency per company is simpler; one per client is what MSPs billing across borders need. Pick one before creating the invoice tables.
 - **Retention:** how long to keep raw email MIME and attachments, and whether closed tickets can be purged per client (GDPR requests from a client's contacts).
 - **Who works the tickets:** if a client's own IT staff (co-managed IT) need to work tickets, they need technician-like access limited to one client. This is the same `user_clients` work from Phase 2.
 
-## Phase 8: Nice to have
+## Phase 8: Endpoint protection (EDR / AV) (planned)
+
+Goal: endpoint protection managed from the same console, so a detection becomes an alert, a ticket and a response action next to the device's live state. MSPs pay per seat for this today, and cyber insurers ask for it.
+
+This is the largest phase on the roadmap. Detection quality decides whether it is any good, and that takes years of tuning against false positives, not just sensor code. The milestones are ordered so each one is useful alone and the riskiest work (blocking, kernel code) comes last.
+
+### Scope decisions
+
+- **Manage the built-in protection first.** Microsoft Defender (Windows), ClamAV (Linux) and XProtect (macOS) already scan files. Reporting their state, triggering scans and turning findings into alerts is the cheapest useful step.
+- **Run beside Defender, not instead of it.** Replacing Defender as the registered antivirus in Windows Security Center needs Microsoft Virus Initiative membership and an ELAM driver, which in practice needs an established product with independent test results. Until then we add telemetry, detection and response on top of Defender.
+- **User mode before kernel mode.** Prefer the platform's supported telemetry APIs (ETW on Windows, eBPF/fanotify/audit on Linux, Endpoint Security on macOS). A custom kernel driver is a last step, only if the gaps prove to matter, because a driver fault can crash every machine it is on.
+- **Not a managed detection service.** Software can't watch the console overnight. We provide the queue, context and response buttons; staffing or an MDR partner is the MSP's call.
+- **No machine-learning classifier early.** It needs a labelled corpus and continual retraining. Start with hashes, signatures, YARA-style rules and behaviour rules.
+
+### Prerequisites
+
+- Windows agent proven on real hosts (Phase 2 to-do).
+- Permission sets from Phase 7: `security.read`, `security.respond` (quarantine, isolate), `security.manage` (policies, exclusions).
+- Signed content pipeline: rule and signature bundles signed like agent releases (`rmm-sign`), verified on the agent, rolled out in stages.
+- Agent job buffer persisted to disk, so response actions survive a restart.
+- Secrets encrypted at rest (Phase 7 vault notes). Telemetry includes command lines, which can contain credentials.
+
+### Architecture
+
+- **Separate sensor process** (`rmm-sensor`), supervised by the agent, so a sensor fault can't take down remote access and it can be switched off per client. Local IPC to the agent, which forwards over the existing socket.
+- **Events stay on the machine by default.** Keep a local, size-limited event store and send only detections and summaries. Pull detailed history on demand during an investigation.
+- **Server side:** `security_detections` (rule, severity, process and file context, state), `security_policies` (per client/site/OS, like alert and patch policies), `security_exclusions`, `quarantine_items`, `content_versions`. Detections feed the health model and open alerts; alerts already open tickets (Phase 7).
+- **Tamper resistance for our own product:** protect the agent's files and service from non-admin users, report when the sensor stops, and alert on it.
+
+### Milestones
+
+1. **Protection status and management.** Read Defender, ClamAV and XProtect state (enabled, signature age, last scan, active threats). Start scans and signature updates from the console. Alert on disabled protection, stale signatures and detections. Show a Security tab per agent and a fleet view.
+2. **File scanning.** On-demand and scheduled scans in the sensor with hash reputation and rule matching against a signed bundle. Quarantine with restore (files moved to a protected store, never deleted outright). Exclusions with an audit trail.
+3. **Telemetry.** Process start, command line, parent chain, module loads, network connections, and file and registry changes of interest, from the supported platform APIs above. Local store and an on-demand query from the console.
+4. **Behaviour detection.** A rule engine over the telemetry (rule format, severity, MITRE ATT&CK tags), with a starter set for common ransomware, credential-theft and persistence behaviour. Every rule ships with test cases and a measured false-positive rate on a clean-fleet baseline; new rules start in audit-only mode.
+5. **Response.** Kill a process tree, quarantine a file, isolate a host from the network while keeping the management channel, collect a triage package, and roll back changes where feasible. All audited and permission-gated, available from alerts and tickets.
+6. **Investigation UI.** Detection detail with a process tree and timeline, search across the fleet, and "have we seen this hash elsewhere".
+7. **Prevention.** Block-on-detect for high-confidence rules only, after enough audit-mode history. Staged rollout (canary clients first) with automatic rollback if a content update raises crash or false-positive counts.
+8. **Later or never:** custom kernel driver, ELAM and MVI registration, a cloud sandbox, threat-intel feed integration, ML classification, application control and device control.
+
+### Testing
+
+- Unit tests per rule against recorded event streams, and a replay harness so rules run in CI.
+- Benign-software corpus run before every content release to catch false positives.
+- Detection coverage checked against a published adversary-emulation test set in an isolated lab, never on customer machines.
+- Performance budget: CPU, memory and disk I/O caps for the sensor, measured on low-end hardware.
+- Content and agent updates tested for safe rollback; a bad rule must be disableable from the server without a new agent build.
+
+### Risks and open questions
+
+- **False positives and outages.** A bad rule or update can quarantine legitimate software fleet-wide. Staged rollout, audit-first and a kill switch are required before any blocking.
+- **Liability and expectations.** Selling protection implies a promise. Marketing and contracts need to say what it does and doesn't cover.
+- **Maintenance cost.** Rule upkeep never ends; decide up front whether to license a signature/threat-intel feed or maintain our own.
+- **Windows first, Linux second, macOS last** matches where MSP fleets are, but macOS needs Apple entitlements and notarisation.
+- **Build vs. integrate.** Some MSPs already standardise on another EDR. Keep an integration path (ingest their detections as alerts) as a parallel option.
+
+## Phase 9: Nice to have
 
 - File browser and transfer (upload/download over the agent socket in chunks)
 - Process list / kill and a services panel
