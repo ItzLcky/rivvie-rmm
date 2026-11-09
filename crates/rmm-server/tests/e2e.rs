@@ -1213,8 +1213,16 @@ async fn monitoring(server: &mut Server, admin: &Api, db: &sqlx::PgPool, dir: &P
     match found {
         Some(a) => {
             assert!(a["details"]["message"].as_str().unwrap().contains(&marker), "{a}");
-            let logs = admin.get(&format!("/agents/{id1}/log-events")).await;
-            assert!(logs[0]["message"].as_str().unwrap().contains(&marker), "{logs}");
+            // The entries are stored just after the alert opens, so give them a moment.
+            let mut logs = json!([]);
+            for _ in 0..20 {
+                logs = admin.get(&format!("/agents/{id1}/log-events")).await;
+                if logs[0]["message"].is_string() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            assert!(logs[0]["message"].as_str().is_some_and(|m| m.contains(&marker)), "{logs}");
             println!("log watcher matched");
         }
         None => println!("no log match (journal not readable by this user?); skipping the log watcher check"),
