@@ -68,6 +68,8 @@ pub struct Settings {
     pub inventory_secs: u32,
     pub metrics_retention_days: u32,
     pub job_queue_days: u32,
+    /// Online agents are asked for a patch scan when their last one is older than this.
+    pub patch_scan_hours: u32,
     /// Sessions unused for this long are rejected (the 7-day absolute lifetime still applies).
     /// Default only: Company settings can override it.
     pub session_idle_hours: u32,

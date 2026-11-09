@@ -2193,6 +2193,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "windows",
  "windows-service",
  "winreg 0.56.0",
 ]

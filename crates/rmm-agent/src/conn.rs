@@ -17,7 +17,7 @@ use crate::config::{self, Config};
 use crate::shell::ShellSession;
 use crate::update::Updater;
 use crate::logwatch::LogWatchers;
-use crate::{jobs, services, shell};
+use crate::{jobs, patch, services, shell};
 
 type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -75,7 +75,8 @@ pub async fn enroll(server_url: &str, token: &str, previous: Option<&Config>) ->
 pub async fn run_forever(cfg: Config, config_path: std::path::PathBuf, mut shutdown: watch::Receiver<bool>) {
     let tracker = Arc::new(jobs::Tracker::default());
     let watchers = Arc::new(LogWatchers::default());
-    let updater = Arc::new(Updater::new(config_path, tracker.clone()));
+    let patches = Arc::new(patch::Manager::new());
+    let updater = Arc::new(Updater::new(config_path, tracker.clone(), patches.clone()));
     let collector = match Collector::new() {
         Ok(c) => Arc::new(Mutex::new(c)),
         Err(e) => {
@@ -87,7 +88,7 @@ pub async fn run_forever(cfg: Config, config_path: std::path::PathBuf, mut shutd
     loop {
         let started = std::time::Instant::now();
         tokio::select! {
-            res = session(&cfg, collector.clone(), tracker.clone(), updater.clone(), watchers.clone()) => match res {
+            res = session(&cfg, collector.clone(), tracker.clone(), updater.clone(), watchers.clone(), patches.clone()) => match res {
                 Ok(()) => info!("connection closed"),
                 Err(e) => warn!("connection error: {e:#}"),
             },
@@ -118,6 +119,7 @@ async fn session(
     tracker: Arc<jobs::Tracker>,
     updater: Arc<Updater>,
     watchers: Arc<LogWatchers>,
+    patches: Arc<patch::Manager>,
 ) -> Result<()> {
     let mut ws = connect(&cfg.ws_url()).await?;
     send(
@@ -128,6 +130,8 @@ async fn session(
             secret: cfg.secret.clone(),
             agent_version: AGENT_VERSION.to_string(),
             jobs: tracker.ids().await,
+            capabilities: vec![rmm_proto::patch::CAPABILITY.to_string()],
+            patch_runs: patches.ids().await,
         },
     )
     .await?;
@@ -160,12 +164,13 @@ async fn session(
     // Before anything else is queued, so resent job state precedes new output.
     tracker.attach(tx.clone()).await;
     updater.attach(tx.clone()).await;
+    patches.attach(tx.clone()).await;
     let heartbeat = tokio::spawn(periodic(tx.clone(), collector.clone(), heartbeat_secs.max(5), false));
     let inventory = tokio::spawn(periodic(tx.clone(), collector.clone(), inventory_secs.max(300), true));
     watchers.attach(tx.clone());
     let (services_refresh, refresh_rx) = mpsc::channel(4);
     let services = tokio::spawn(services::watch(tx.clone(), refresh_rx));
-    let ctx = Ctx { tx: tx.clone(), collector, tracker: tracker.clone(), updater: updater.clone(), watchers: watchers.clone(), services_refresh };
+    let ctx = Ctx { tx: tx.clone(), collector, tracker: tracker.clone(), updater: updater.clone(), watchers: watchers.clone(), patches: patches.clone(), services_refresh };
 
     let mut shells: HashMap<Uuid, ShellSession> = HashMap::new();
     let result = loop {
@@ -195,6 +200,7 @@ async fn session(
     watchers.detach();
     services.abort();
     drop(ctx);
+    patches.detach();
     heartbeat.abort();
     inventory.abort();
     drop(shells);
@@ -214,6 +220,7 @@ struct Ctx {
     tracker: Arc<jobs::Tracker>,
     updater: Arc<Updater>,
     watchers: Arc<LogWatchers>,
+    patches: Arc<patch::Manager>,
     /// Makes the service watcher send its list now.
     services_refresh: mpsc::Sender<()>,
 }
@@ -274,6 +281,13 @@ async fn handle(msg: ServerMsg, ctx: &Ctx, shells: &mut HashMap<Uuid, ShellSessi
             tokio::spawn(services::control(request_id, name, action, tx.clone(), ctx.services_refresh.clone()));
         }
         ServerMsg::Watchers { watchers } => ctx.watchers.set(watchers).await,
+        ServerMsg::PatchScan { request_id } => {
+            tokio::spawn(ctx.patches.clone().scan(Some(request_id)));
+        }
+        ServerMsg::PatchInstall { run_id, ids, reboot_policy } => {
+            tokio::spawn(ctx.patches.clone().install(run_id, ids, reboot_policy));
+        }
+        ServerMsg::PatchAck { run_id } => ctx.patches.ack(run_id).await,
         ServerMsg::Enrolled { .. } | ServerMsg::AuthOk { .. } | ServerMsg::AuthFailed { .. } => {}
     }
 }

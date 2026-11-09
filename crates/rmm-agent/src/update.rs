@@ -39,6 +39,7 @@ pub const PUBKEY: Option<&str> = match option_env!("RMM_UPDATE_PUBKEY") {
 
 pub const CONFIRM_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_IDLE_WAIT: Duration = Duration::from_secs(30 * 60);
+const MAX_PATCH_WAIT: Duration = Duration::from_secs(4 * 3600);
 const MAX_SIZE: u64 = 200 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const UNIT: &str = "rmm-agent.service";
@@ -107,6 +108,7 @@ struct Download {
 pub struct Updater {
     config: PathBuf,
     tracker: std::sync::Arc<crate::jobs::Tracker>,
+    patches: std::sync::Arc<crate::patch::Manager>,
     download: Mutex<Option<Download>>,
     /// Set from the offer until the restart (or a failure), so offers don't pile up.
     busy: AtomicBool,
@@ -114,8 +116,8 @@ pub struct Updater {
 }
 
 impl Updater {
-    pub fn new(config: PathBuf, tracker: std::sync::Arc<crate::jobs::Tracker>) -> Self {
-        Self { config, tracker, download: Mutex::default(), busy: AtomicBool::new(false), link: Mutex::default() }
+    pub fn new(config: PathBuf, tracker: std::sync::Arc<crate::jobs::Tracker>, patches: std::sync::Arc<crate::patch::Manager>) -> Self {
+        Self { config, tracker, patches, download: Mutex::default(), busy: AtomicBool::new(false), link: Mutex::default() }
     }
 
     fn link(&self) -> Option<mpsc::Sender<AgentMsg>> {
@@ -266,10 +268,16 @@ impl Updater {
 
     async fn install(&self, d: Download) {
         let tracker = &self.tracker;
-        if tracker.running().await > 0 {
-            self.status(&d.version, UpdateState::Waiting, Some("waiting for running jobs to finish".into())).await;
-            let started = Instant::now();
-            while tracker.running().await > 0 && started.elapsed() < MAX_IDLE_WAIT {
+        // Jobs get MAX_IDLE_WAIT. A patch install is waited out (up to MAX_PATCH_WAIT):
+        // restarting the service would kill the package manager halfway through.
+        let blocked = |started: Instant| async move {
+            (tracker.running().await > 0 && started.elapsed() < MAX_IDLE_WAIT)
+                || (self.patches.busy().await && started.elapsed() < MAX_PATCH_WAIT)
+        };
+        let started = Instant::now();
+        if blocked(started).await {
+            self.status(&d.version, UpdateState::Waiting, Some("waiting for running jobs and patch installs to finish".into())).await;
+            while blocked(started).await {
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
         }

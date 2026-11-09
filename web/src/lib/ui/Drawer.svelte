@@ -11,11 +11,12 @@
 		title,
 		side = 'left',
 		width = 'w-72',
+		onclose,
 		children
-	}: { open?: boolean; title: string; side?: 'left' | 'right'; width?: string; children: Snippet } = $props();
+	}: { open?: boolean; title: string; side?: 'left' | 'right'; width?: string; onclose?: () => void; children: Snippet } = $props();
 </script>
 
-<Dialog.Root bind:open>
+<Dialog.Root bind:open onOpenChange={(o) => !o && onclose?.()}>
 	<Dialog.Portal>
 		<Dialog.Overlay class="bg-overlay fixed inset-0 z-50" />
 		<Dialog.Content

@@ -23,6 +23,15 @@ const pages: [string, string][] = [
 	['schedules', '/schedules'],
 	['schedule', '/schedules/sc-2'],
 	['notifications', '/settings/notifications'],
+	['agent-patches', '/agents/a-3?tab=patches'],
+	['agent-patches-windows', '/agents/a-1?tab=patches'],
+	['patches', '/patches'],
+	['patches-update', '/patches?update=b3c1d2e4-0001'],
+	['patches-compliance', '/patches?tab=compliance'],
+	['patches-compliance-client', '/patches?tab=compliance&client=c-acme'],
+	['patches-policies', '/patches?tab=policies'],
+	['patches-history', '/patches?tab=history'],
+	['patch-run', '/patches/runs/r-2'],
 	['jobs', '/jobs'],
 	['job', '/jobs/j-1'],
 	['clients', '/clients'],
@@ -40,7 +49,9 @@ const phone: [string, string][] = [
 	['agents', '/agents'],
 	['agent', '/agents/a-3'],
 	['job', '/jobs/j-1'],
-	['alerts', '/alerts']
+	['alerts', '/alerts'],
+	['patches', '/patches'],
+	['agent-patches', '/agents/a-3?tab=patches']
 ];
 
 /** Waits until nothing is loading: no skeletons, fonts in, lazy editors mounted. */
@@ -92,6 +103,15 @@ for (const theme of ['light', 'dark'] as const) {
 			await input.fill('acme');
 			await expect(page.getByRole('option', { name: /acme-dc01/ })).toBeVisible();
 			await expect(page).toHaveScreenshot(`${theme}-palette.png`);
+		});
+
+		test('patch policy editor', async ({ page }) => {
+			await mockApi(page);
+			await page.goto('/patches?tab=policies');
+			await settle(page);
+			await page.getByRole('button', { name: 'Edit' }).nth(1).click();
+			await expect(page.getByRole('dialog', { name: 'Policy for Acme Corp' })).toBeVisible();
+			await expect(page).toHaveScreenshot(`${theme}-patch-policy.png`);
 		});
 
 		test('confirm dialog', async ({ page }) => {

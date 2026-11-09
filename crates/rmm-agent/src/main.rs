@@ -3,6 +3,7 @@ mod config;
 mod conn;
 mod jobs;
 mod logwatch;
+mod patch;
 mod service;
 mod services;
 mod shell;
@@ -53,6 +54,16 @@ enum Cmd {
     Uninstall,
     /// Print collected metrics and inventory as JSON, then exit. Useful for debugging.
     Inspect,
+    /// Scan for OS updates the way the server would, and print them as JSON. With
+    /// `--install`, install those updates (ids from a scan) and print the result.
+    Patches {
+        /// Update ids to install.
+        #[arg(long, num_args = 1..)]
+        install: Vec<String>,
+        /// Skip refreshing package lists.
+        #[arg(long)]
+        no_refresh: bool,
+    },
     /// Entry point used by the Windows Service Control Manager.
     #[command(hide = true)]
     Service,
@@ -123,6 +134,7 @@ fn main() -> Result<()> {
             println!("{out}");
             Ok(())
         }
+        Cmd::Patches { install, no_refresh } => patch::cli(&install, !no_refresh),
         Cmd::Service | Cmd::UpdateWatchdog => unreachable!(),
     }
 }

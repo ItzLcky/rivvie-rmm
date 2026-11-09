@@ -53,6 +53,12 @@ pub enum Event {
         #[serde(skip)]
         client_id: Uuid,
     },
+    /// An agent's patch state changed: a scan, an install's progress or result.
+    Patches {
+        agent_id: Uuid,
+        #[serde(skip)]
+        client_id: Uuid,
+    },
 }
 
 impl Event {
@@ -61,7 +67,8 @@ impl Event {
             Event::Agent { client_id, .. }
             | Event::Job { client_id, .. }
             | Event::Alert { client_id, .. }
-            | Event::Services { client_id, .. } => Some(*client_id),
+            | Event::Services { client_id, .. }
+            | Event::Patches { client_id, .. } => Some(*client_id),
             Event::Jobs => None,
         }
     }

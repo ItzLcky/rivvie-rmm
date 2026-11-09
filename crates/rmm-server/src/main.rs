@@ -7,6 +7,7 @@ mod events;
 mod hub;
 mod notify;
 mod paging;
+mod patches;
 mod ratelimit;
 mod scheduler;
 mod shell_ws;
@@ -98,6 +99,9 @@ struct ServeArgs {
     /// Jobs queued for an offline agent expire after this many days instead of running late.
     #[arg(long, env = "RMM_JOB_QUEUE_DAYS", default_value_t = 7)]
     job_queue_days: u32,
+    /// Online agents scan for OS updates when their last scan is older than this.
+    #[arg(long, env = "RMM_PATCH_SCAN_HOURS", default_value_t = 12)]
+    patch_scan_hours: u32,
     /// Dashboard sessions unused for this many hours are signed out (absolute limit: 7 days).
     /// Admins can override it under Company settings.
     #[arg(long, env = "RMM_SESSION_IDLE_HOURS", default_value_t = 12)]
@@ -124,6 +128,7 @@ impl Default for ServeArgs {
             alert_retention_days: env("RMM_ALERT_RETENTION_DAYS", "180").parse().unwrap_or(180),
             alert_eval_secs: env("RMM_ALERT_EVAL_SECS", "60").parse().unwrap_or(60),
             job_queue_days: env("RMM_JOB_QUEUE_DAYS", "7").parse().unwrap_or(7),
+            patch_scan_hours: env("RMM_PATCH_SCAN_HOURS", "12").parse().unwrap_or(12),
             session_idle_hours: env("RMM_SESSION_IDLE_HOURS", "12").parse().unwrap_or(12),
             trusted_proxies: env("RMM_TRUSTED_PROXIES", ""),
         }
@@ -204,6 +209,7 @@ async fn serve(db: sqlx::PgPool, args: ServeArgs) -> Result<()> {
             inventory_secs: args.inventory_secs,
             metrics_retention_days: args.metrics_retention_days,
             job_queue_days: args.job_queue_days,
+            patch_scan_hours: args.patch_scan_hours.max(1),
             session_idle_hours: args.session_idle_hours.max(1),
             trusted_proxies,
             metrics_raw_days: args.metrics_raw_days.max(1),
@@ -215,6 +221,7 @@ async fn serve(db: sqlx::PgPool, args: ServeArgs) -> Result<()> {
     tokio::spawn(alerts::run(state.clone()));
     tokio::spawn(notify::worker(state.clone()));
     tokio::spawn(scheduler::run(state.clone()));
+    tokio::spawn(patches::scheduler(state.clone()));
 
     // adapter-static writes the SPA shell as 200.html; every non-file route falls back to it.
     let found: Vec<_> = api::agent_platforms().filter(|id| api::agent_binary_exists(&state, id)).collect();
@@ -348,6 +355,9 @@ async fn housekeeping(state: Arc<AppState>) {
                 .execute(db)
                 .await,
             );
+            if let Err(e) = patches::prune(db).await {
+                warn!("housekeeping: pruning patches: {e}");
+            }
             results.push(
                 sqlx::query("DELETE FROM agent_metrics WHERE ts < now() - make_interval(days => $1)")
                     .bind(state.cfg.metrics_raw_days as i32)

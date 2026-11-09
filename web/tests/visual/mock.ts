@@ -216,6 +216,95 @@ function metricHistory(a: Agent) {
 	});
 }
 
+
+// Patch management: a few Windows updates and Linux packages spread over the fleet.
+const updates = [
+	{ update_id: 'b3c1d2e4-0001', title: '2026-06 Cumulative Update for Windows Server 2022 (KB5060526)', kb: 'KB5060526', severity: 'critical', category: 'security', size: 812_000_000, requires_reboot: true, on: ['a-1', 'a-2', 'a-4'], installedOn: [] as string[] },
+	{ update_id: 'openssl', title: 'openssl 3.0.13-0ubuntu3.5', kb: null, severity: null, category: 'security', size: 1_441_784, requires_reboot: false, on: ['a-3', 'a-5', 'a-6'], installedOn: [] },
+	{ update_id: 'b3c1d2e4-0002', title: 'Security Intelligence Update for Microsoft Defender Antivirus (KB2267602)', kb: 'KB2267602', severity: null, category: 'definition', size: 68_000_000, requires_reboot: false, on: ['a-1', 'a-2'], installedOn: ['a-4'] },
+	{ update_id: 'curl', title: 'curl 8.5.0-2ubuntu10.6', kb: null, severity: null, category: 'update', size: 226_334, requires_reboot: false, on: ['a-3', 'a-6'], installedOn: ['a-5'] },
+	{ update_id: 'b3c1d2e4-0003', title: 'Intel - Net - 1.2.3.4', kb: null, severity: null, category: 'driver', size: 4_200_000, requires_reboot: true, on: ['a-2'], installedOn: [] },
+	{ update_id: 'linux-image-6.8.0-60-generic', title: 'linux-generic 6.8.0.60.60', kb: null, severity: null, category: 'security', size: 15_000_000, requires_reboot: true, on: ['a-3'], installedOn: [] }
+];
+const approvalOf = (u: (typeof updates)[number], agentId: string) =>
+	u.category === 'driver' ? 'declined' : u.category === 'update' && agentId !== 'a-6' ? 'pending' : 'approved';
+const stateOf = (u: (typeof updates)[number], agentId: string) => (u.installedOn.includes(agentId) ? 'installed' : u.update_id === 'curl' && agentId === 'a-6' ? 'failed' : 'missing');
+function updateGroups() {
+	return updates.map(({ on, installedOn, ...u }) => {
+		const appr = on.map((a) => approvalOf({ ...u, on, installedOn }, a));
+		return {
+			...u, missing: on.length, installed: installedOn.length, failed: u.update_id === 'curl' ? 1 : 0, installing: 0,
+			approved: appr.filter((x) => x === 'approved').length, pending: appr.filter((x) => x === 'pending').length,
+			declined: appr.filter((x) => x === 'declined').length, first_seen_at: ago(60 * 24 * 3 + u.title.length)
+		};
+	});
+}
+const policyRow = (o: Record<string, unknown>) => ({
+	id: 'p-global', client_id: null, site_id: null, client_name: null, site_name: null, auto_approve_severities: [], auto_approve_categories: ['security', 'critical', 'definition'],
+	deferral_days: 0, auto_install: false, reboot_policy: 'never', updated_by_name: 'Dana Admin', updated_at: ago(60 * 24 * 6), agents: 4, ...o
+});
+const patchPolicies = [
+	policyRow({}),
+	policyRow({ id: 'p-acme', client_id: 'c-acme', client_name: 'Acme Corp', auto_approve_severities: ['critical'], deferral_days: 2, auto_install: true, reboot_policy: 'if_required', agents: 3, updated_at: ago(60 * 26) }),
+	policyRow({ id: 'p-acme-wh', client_id: 'c-acme', site_id: 's-acme-wh', client_name: 'Acme Corp', site_name: 'Warehouse', auto_approve_categories: ['security', 'definition'], auto_install: true, reboot_policy: 'always', agents: 1, updated_at: ago(60 * 5) })
+];
+const windowRow = (s: (typeof sites)[number]) => {
+	const set = s.client_id === 'c-acme';
+	return {
+		site_id: s.id, site_name: s.name, client_id: s.client_id, client_name: clients.find((c) => c.id === s.client_id)!.name,
+		days: set ? (s.id === 's-acme-wh' ? [0] : [6]) : null, start: set ? '02:00' : null, minutes: set ? 180 : null, tz: set ? 'Europe/London' : 'UTC',
+		open_now: !set, next_start: set ? new Date(Date.parse('2026-06-20T01:00:00Z') + (s.id === 's-acme-wh' ? 86_400_000 : 0)).toISOString() : null,
+		agents: agents.filter((a) => a.site_id === s.id).length
+	};
+};
+const runs = [
+	{ id: 'r-1', agent: 'a-3', status: 'sent', stage: 'installing', progress: 'setting up openssl', percent: 64, updates: 2, succeeded: 0, trigger: 'manual', created: 3, finished: null as number | null },
+	{ id: 'r-2', agent: 'a-1', status: 'succeeded', stage: null, progress: null, percent: null, updates: 2, succeeded: 2, trigger: 'policy', created: 60 * 20, finished: 60 * 20 - 34, reboot_required: true, rebooting: true },
+	{ id: 'r-3', agent: 'a-6', status: 'partial', stage: null, progress: null, percent: null, updates: 3, succeeded: 2, trigger: 'policy', created: 60 * 22, finished: 60 * 22 - 4, error: null },
+	{ id: 'r-4', agent: 'a-4', status: 'queued', stage: null, progress: null, percent: null, updates: 1, succeeded: 0, trigger: 'manual', created: 60 * 2, finished: null },
+	{ id: 'r-5', agent: 'a-2', status: 'failed', stage: null, progress: null, percent: null, updates: 1, succeeded: 0, trigger: 'policy', created: 60 * 46, finished: 60 * 46 - 12, error: 'Windows must restart before this update can install' }
+].map((r) => {
+	const a = agents.find((x) => x.id === r.agent)!;
+	return {
+		id: r.id, agent_id: a.id, hostname: a.hostname, client_id: a.client_id, client_name: a.client_name, trigger: r.trigger, created_by_name: r.trigger === 'manual' ? 'Dana Admin' : null,
+		status: r.status, stage: r.stage, progress: r.progress, percent: r.percent, error: (r as { error?: string | null }).error ?? null, updates: r.updates, succeeded: r.succeeded,
+		reboot_policy: r.trigger === 'policy' ? 'if_required' : 'never', reboot_required: (r as { reboot_required?: boolean }).reboot_required ?? false, rebooting: (r as { rebooting?: boolean }).rebooting ?? false,
+		created_at: ago(r.created), sent_at: r.status === 'queued' ? null : ago(r.created), finished_at: r.finished == null ? null : ago(r.finished), duration_ms: r.finished == null ? null : (r.created - r.finished) * 60_000
+	};
+});
+function agentPatches(a: Agent) {
+	const rows = updates.filter((u) => u.on.includes(a.id) || u.installedOn.includes(a.id)).map((u) => ({
+		update_id: u.update_id, title: u.title, kb: u.kb, severity: u.severity, category: u.category, size: u.size, requires_reboot: u.requires_reboot,
+		version: a.os_family === 'linux' ? u.title.split(' ')[1] : null, current_version: a.os_family === 'linux' ? '3.0.13-0ubuntu3.1' : null,
+		state: stateOf(u, a.id), approval: approvalOf(u, a.id), approval_manual: u.category === 'driver', approved_by_name: u.category === 'driver' ? 'Dana Admin' : null,
+		approved_at: ago(600), first_seen_at: ago(60 * 24 * 3), installed_at: u.installedOn.includes(a.id) ? ago(60 * 20) : null,
+		last_error: stateOf(u, a.id) === 'failed' ? 'apt-get failed: E: Could not get lock /var/lib/dpkg/lock-frontend' : null, fail_count: stateOf(u, a.id) === 'failed' ? 1 : 0,
+		deferred_until: a.client_id === 'c-acme' && u.category === 'security' && u.severity !== 'critical' ? ago(-60 * 24) : null
+	}));
+	const site = sites.find((s) => s.id === a.site_id)!;
+	return {
+		status: { supported: a.id !== 'a-7', online: a.online, os_family: a.os_family, provider: a.os_family === 'windows' ? 'wua' : 'apt', all_or_nothing: false,
+			scanned_at: a.id === 'a-7' ? null : ago(95), scan_requested_at: null, scan_error: null, reboot_pending: a.id === 'a-1' },
+		policy: { ...(a.client_id === 'c-acme' ? (a.site_id === 's-acme-wh' ? patchPolicies[2] : patchPolicies[1]) : patchPolicies[0]), source: a.client_id === 'c-acme' ? (a.site_id === 's-acme-wh' ? 'site' : 'client') : 'global' },
+		window: windowRow(site), patches: rows, runs: runs.filter((r) => r.agent_id === a.id)
+	};
+}
+function compliance(clientId: string | null) {
+	const rows = (clientId ? sites.filter((s) => s.client_id === clientId) : clients).map((g) => {
+		const as = agents.filter((a) => (clientId ? a.site_id === g.id : a.client_id === g.id));
+		const scanned = as.filter((a) => a.id !== 'a-7');
+		const missing = (a: Agent) => updates.filter((u) => u.on.includes(a.id) && approvalOf(u, a.id) !== 'declined');
+		return {
+			id: g.id, name: g.name, client_id: clientId, agents: as.length, supported: scanned.length, scanned: scanned.length,
+			compliant: scanned.filter((a) => missing(a).length === 0).length, missing: scanned.reduce((n, a) => n + missing(a).length, 0),
+			agents_missing_security: scanned.filter((a) => missing(a).some((u) => u.category === 'security')).length, failed: as.some((a) => a.id === 'a-6') ? 1 : 0,
+			reboot_pending: as.filter((a) => a.id === 'a-1').length, scan_errors: 0, installed_30d: as.length * 3, oldest_scan: scanned.length ? ago(95) : null
+		};
+	}).sort((x, y) => (x.scanned ? x.compliant / x.scanned : 2) - (y.scanned ? y.compliant / y.scanned : 2));
+	const sum = (k: keyof (typeof rows)[number]) => rows.reduce((n, r) => n + (r[k] as number), 0);
+	return { by: clientId ? 'site' : 'client', rows, totals: Object.fromEntries(['agents', 'supported', 'scanned', 'compliant', 'missing', 'agents_missing_security', 'failed', 'reboot_pending', 'scan_errors', 'installed_30d'].map((k) => [k, sum(k as keyof (typeof rows)[number])])) };
+}
+
 const admin = { id: 'u-1', email: 'dana@northwind.example', name: 'Dana Admin', role: 'admin', totp_enabled: true, mfa_setup_required: false, client_ids: null, preferences: {} };
 
 export async function mockApi(p: Page, opts: { signedIn?: boolean } = {}) {
@@ -246,6 +335,31 @@ export async function mockApi(p: Page, opts: { signedIn?: boolean } = {}) {
 		if ((m = path.match(/^\/agents\/([^/]+)$/))) return json(detail(agents.find((a) => a.id === m![1])!));
 		if ((m = path.match(/^\/agents\/([^/]+)\/metrics$/))) return json(metricHistory(agents.find((a) => a.id === m![1])!));
 		if (path.match(/^\/agents\/[^/]+\/activity$/)) return json([{ id: 1, ts: ago(300), user_name: 'Dana Admin', action: 'agent.update_offer', target_type: 'agent', target_id: 'a-1', details: { version: '0.4.2' } }, { id: 2, ts: ago(290), user_name: null, action: 'agent.update_completed', target_type: 'agent', target_id: 'a-1', details: { version: '0.4.2' } }]);
+		if ((m = path.match(/^\/agents\/([^/]+)\/patches$/))) return json(agentPatches(agents.find((a) => a.id === m![1])!));
+		if (path === '/patches') {
+			let list = updateGroups();
+			if (q.get('client_id')) list = list.filter((u) => updates.find((x) => x.update_id === u.update_id)!.on.some((id) => agents.find((a) => a.id === id)!.client_id === q.get('client_id')));
+			if (q.get('approval')) list = list.filter((u) => (u as unknown as Record<string, number>)[q.get('approval')!] > 0);
+			return json({ items: list, total: list.length, truncated: false });
+		}
+		if (path === '/patches/agents') {
+			const u = updates.find((x) => x.update_id === q.get('update_id'))!;
+			return json([...u.on, ...u.installedOn].map((id) => {
+				const a = agents.find((x) => x.id === id)!;
+				return { agent_id: a.id, hostname: a.hostname, online: a.online, os_family: a.os_family, client_id: a.client_id, client_name: a.client_name, site_name: a.site_name,
+					state: stateOf(u, a.id), approval: approvalOf(u, a.id), approval_manual: u.category === 'driver', approved_by_name: 'Dana Admin', approved_at: ago(600),
+					version: null, current_version: null, first_seen_at: ago(60 * 24 * 3), installed_at: u.installedOn.includes(a.id) ? ago(60 * 20) : null, last_error: null, fail_count: 0 };
+			}));
+		}
+		if (path === '/patches/compliance') return json(compliance(q.get('client_id')));
+		if (path === '/patch-policies') return json(patchPolicies);
+		if (path === '/patch-windows') return json(sites.map(windowRow));
+		if (path === '/patch-runs') return json(runs.filter((r) => (!q.get('agent_id') || r.agent_id === q.get('agent_id')) && (!q.get('status') || q.get('status')!.split(',').flatMap((s) => (s === 'active' ? ['queued', 'sent'] : [s])).includes(r.status))));
+		if ((m = path.match(/^\/patch-runs\/([^/]+)$/))) {
+			const r = runs.find((x) => x.id === m![1])!;
+			const items = updates.filter((u) => u.on.includes(r.agent_id) || u.installedOn.includes(r.agent_id)).slice(0, r.updates).map((u, i) => ({ update_id: u.update_id, title: u.title, kb: u.kb, severity: u.severity, ok: r.status === 'sent' ? null : i < r.succeeded, message: r.status !== 'sent' && i >= r.succeeded ? 'install failed (0x80240022)' : null }));
+			return json({ ...r, items, output: r.status === 'sent' ? '' : 'installing 2 updates through the Windows Update Agent\nb3c1d2e4-0001: installed\nb3c1d2e4-0002: installed\n' });
+		}
 		if (path === '/agent-updates') return json({ releases: [], auto_update: false });
 		if (path === '/agent-downloads') return json([{ id: 'linux-x86_64', label: 'Linux x86_64', file_name: 'rmm-agent', size: 6_400_000, sha256: 'ab'.repeat(32), url: '#' }]);
 		if (path === '/jobs') {

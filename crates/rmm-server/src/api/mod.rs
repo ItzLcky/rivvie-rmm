@@ -15,6 +15,7 @@ mod downloads;
 mod jobs;
 mod packages;
 mod schedules;
+mod patches;
 mod search;
 mod scripts;
 mod services;
@@ -73,6 +74,20 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/agent-updates", get(agents::releases))
         .route("/agent-updates/rollout", post(agents::rollout))
         .route("/agents/{id}/jobs", get(jobs::list_for_agent))
+        .route("/agents/{id}/patches", get(patches::for_agent))
+        .route("/patches", get(patches::list))
+        .route("/patches/agents", get(patches::agents_for_update))
+        .route("/patches/approval", post(patches::approval))
+        .route("/patches/install", post(patches::install))
+        .route("/patches/scan", post(patches::scan))
+        .route("/patches/compliance", get(patches::compliance))
+        .route("/patch-runs", get(patches::runs))
+        .route("/patch-runs/{id}", get(patches::run))
+        .route("/patch-runs/{id}/cancel", post(patches::cancel_run))
+        .route("/patch-policies", get(patches::policies).post(patches::create_policy))
+        .route("/patch-policies/{id}", axum::routing::put(patches::update_policy).delete(patches::delete_policy))
+        .route("/patch-windows", get(patches::windows))
+        .route("/sites/{id}/maintenance-window", axum::routing::put(patches::set_window))
         .route("/agents/{id}/shell", get(crate::shell_ws::handler))
         .route("/jobs", get(jobs::list_recent).post(jobs::create))
         .route("/jobs/{id}", get(jobs::get))

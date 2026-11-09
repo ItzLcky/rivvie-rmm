@@ -1,5 +1,5 @@
 import type { Component } from 'svelte';
-import { BellRing, Building2, CalendarClock, FileCode2, History, LayoutDashboard, ListChecks, Monitor, Settings, ShieldCheck } from '@lucide/svelte';
+import { BellRing, Building2, CalendarClock, FileCode2, History, LayoutDashboard, ListChecks, Monitor, PackageCheck, Settings, ShieldCheck } from '@lucide/svelte';
 import type { Role } from '#lib/types.js';
 
 export interface NavItem {
@@ -20,7 +20,7 @@ export interface NavGroup {
 	items: NavItem[];
 }
 
-/** The sidebar. Later phases add Patches (Automation) and Service desk. */
+/** The sidebar. Later phases add Service desk. */
 export const nav: NavGroup[] = [
 	{ label: 'Overview', items: [{ href: '/', label: 'Dashboard', icon: LayoutDashboard, key: 'd', scoped: true }] },
 	{
@@ -42,7 +42,8 @@ export const nav: NavGroup[] = [
 		items: [
 			{ href: '/scripts', label: 'Scripts', icon: FileCode2, key: 's', scoped: true },
 			{ href: '/schedules', label: 'Schedules', icon: CalendarClock, key: 'h', scoped: true },
-			{ href: '/jobs', label: 'Jobs', icon: ListChecks, key: 'j', scoped: true }
+			{ href: '/jobs', label: 'Jobs', icon: ListChecks, key: 'j', scoped: true },
+			{ href: '/patches', label: 'Patches', icon: PackageCheck, key: 'u', scoped: true }
 		]
 	},
 	{
