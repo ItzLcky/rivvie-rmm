@@ -164,6 +164,7 @@ const page = <T>(items: T[], limit = 1000) => ({ items: items.slice(0, limit), n
 function clientOut(c: (typeof clients)[number]) {
 	return {
 		...c,
+		email_domains: c.id === 'c-acme' ? ['acme.example'] : [],
 		sites: sites.filter((s) => s.client_id === c.id).map((s) => {
 			const as = agents.filter((a) => a.site_id === s.id);
 			return { ...s, agent_count: as.length, online_count: as.filter((a) => a.online).length };
@@ -307,6 +308,84 @@ function compliance(clientId: string | null) {
 	return { by: clientId ? 'site' : 'client', rows, totals: Object.fromEntries(['agents', 'supported', 'scanned', 'compliant', 'missing', 'agents_missing_security', 'failed', 'reboot_pending', 'scan_errors', 'installed_30d'].map((k) => [k, sum(k as keyof (typeof rows)[number])])) };
 }
 
+// --- service desk ---------------------------------------------------------------------------
+const boardStatuses = (b: string) =>
+	[['New', 'new'], ['In progress', 'open'], ['Waiting on client', 'waiting_client'], ['Waiting on vendor', 'waiting_vendor'], ['Resolved', 'resolved'], ['Closed', 'closed']].map(
+		([name, category], position) => ({ id: `${b}-st-${category}`, name, category, position })
+	);
+const boards = [
+	{ id: 'b-desk', name: 'Service Desk', description: 'Requests and incidents from clients.', position: 0, statuses: boardStatuses('b-desk'), open_tickets: 4 },
+	{ id: 'b-alerts', name: 'Alerts', description: 'Tickets opened by alert policies.', position: 1, statuses: boardStatuses('b-alerts'), open_tickets: 1 }
+];
+const ticketTypes = ['Incident', 'Service request', 'Problem', 'Change', 'Alert'].map((name, position) => ({ id: `tt-${position}`, name, position }));
+const contacts = [
+	{ id: 'ct-ann', client_id: 'c-acme', client_name: 'Acme Corp', site_id: 's-acme-hq', site_name: 'Head office', name: 'Ann Lopez', email: 'ann@acme.example', phone: '+1 555 0101', job_title: 'Office manager', notes: '', is_primary: true, portal_enabled: false, open_tickets: 2, created_at: ago(60 * 24 * 100), updated_at: ago(60 * 24 * 100) },
+	{ id: 'ct-raj', client_id: 'c-acme', client_name: 'Acme Corp', site_id: 's-acme-wh', site_name: 'Warehouse', name: 'Raj Patel', email: 'raj@acme.example', phone: '', job_title: 'Warehouse lead', notes: '', is_primary: false, portal_enabled: false, open_tickets: 0, created_at: ago(60 * 24 * 60), updated_at: ago(60 * 24 * 60) }
+];
+type T = Record<string, unknown> & { id: string; client_id: string | null };
+function ticket(i: number, subject: string, clientId: string | null, cat: string, prio: number, extra: Partial<T> = {}): T {
+	const c = clients.find((x) => x.id === clientId);
+	const board = extra.board_id === 'b-alerts' ? boards[1] : boards[0];
+	const st = board.statuses.find((s) => s.category === cat)!;
+	return {
+		id: `t-${i}`, number: 10400 + i, subject, client_id: clientId, client_name: c?.name ?? null, site_id: null, site_name: null, contact_id: null, contact_name: null,
+		contact_email: null, board_id: board.id, board_name: board.name, status_id: st.id, status_name: st.name, status_category: cat, type_id: null, type_name: null,
+		priority: prio, impact: null, urgency: null, source: 'email', assignee_id: null, assignee_name: null, requester_name: '', requester_email: '',
+		created_at: ago(60 * 5 * i), updated_at: ago(17 * i), first_response_at: null, resolved_at: null, closed_at: null, merged_into: null, merged_into_number: null,
+		alert_policy_id: null, alert_reopens: 0, agent_count: 0, ...extra
+	};
+}
+const tickets: T[] = [
+	ticket(1, 'Printer on the second floor prints blank pages', 'c-acme', 'open', 2, { contact_id: 'ct-ann', contact_name: 'Ann Lopez', contact_email: 'ann@acme.example', assignee_id: 'u-1', assignee_name: 'Dana Admin', agent_count: 1, first_response_at: ago(200), type_id: 'tt-0', type_name: 'Incident', impact: 2, urgency: 1 }),
+	ticket(2, 'Disk at or above 95% on acme-fs01', 'c-acme', 'new', 1, { board_id: 'b-alerts', source: 'alert', alert_policy_id: 'p-disk', agent_count: 1, type_id: 'tt-4', type_name: 'Alert' }),
+	ticket(3, 'New starter on Monday: laptop and accounts', 'c-globex', 'waiting_client', 3, { source: 'dashboard', assignee_id: 'u-2', assignee_name: 'Terry Tech', requester_name: 'Gil Bates', requester_email: 'gil@globex.example' }),
+	ticket(4, 'VPN disconnects every hour', null, 'new', 3, { requester_name: 'Sam Doe', requester_email: 'sam@unknown.example' }),
+	ticket(5, 'Renew the SSL certificate for the intranet', 'c-initech', 'open', 4, { source: 'dashboard' }),
+	ticket(6, 'Outlook keeps asking for a password', 'c-acme', 'resolved', 3, { contact_id: 'ct-raj', contact_name: 'Raj Patel', resolved_at: ago(60 * 20) })
+];
+function ticketDetail(t: T) {
+	const a = agents.find((x) => x.id === (t.id === 't-2' ? 'a-2' : 'a-3'))!;
+	const ev = (id: number, kind: string, mins: number, extra: Record<string, unknown>) => ({
+		id, kind, public: false, author_id: null, author_contact_id: null, author_kind: 'system', author_name: 'System', body: '', data: {}, created_at: ago(mins),
+		email_status: null, email_error: null, email_to: null, ...extra
+	});
+	const events = t.id === 't-1'
+		? [
+				ev(1, 'created', 300, { public: true, author_contact_id: 'ct-ann', author_kind: 'contact', author_name: 'Ann Lopez', body: 'Since this morning the printer next to the kitchen prints blank pages. Tried turning it off and on.', data: { source: 'email' } }),
+				ev(2, 'change', 280, { author_id: 'u-1', author_kind: 'user', author_name: 'Dana Admin', data: { field: 'assignee', from: null, to: 'Dana Admin' } }),
+				ev(3, 'job', 250, { author_id: 'u-1', author_kind: 'user', author_name: 'Dana Admin', data: { job_id: 'j-1', hostname: a.hostname, script: 'Restart print spooler', status: 'started' } }),
+				ev(4, 'job', 249, { author_name: a.hostname, body: 'Stopping Print Spooler...\nStarting Print Spooler...\nThe Print Spooler service was started successfully.', data: { job_id: 'j-1', hostname: a.hostname, script: 'Restart print spooler', status: 'succeeded', exit_code: 0 } }),
+				ev(5, 'note', 230, { author_id: 'u-1', author_kind: 'user', author_name: 'Dana Admin', body: 'Spooler restart didn’t help. Toner drum looks worn; ordering a replacement.' }),
+				ev(6, 'reply', 200, { public: true, author_id: 'u-1', author_kind: 'user', author_name: 'Dana Admin', body: 'Hi Ann, a new drum is on its way and should arrive tomorrow. Meanwhile please use the printer in reception.', email_status: 'sent', email_to: ['ann@acme.example'] }),
+				ev(7, 'change', 199, { author_id: 'u-1', author_kind: 'user', author_name: 'Dana Admin', data: { field: 'status', from: 'New', to: 'In progress' } }),
+				ev(8, 'message', 45, { public: true, author_contact_id: 'ct-ann', author_kind: 'contact', author_name: 'Ann Lopez', body: 'Thanks, will do!', data: { from: 'ann@acme.example' } })
+			]
+		: [ev(1, 'created', 60, { author_name: 'Alert', body: `${t.subject}\nSeverity: critical` }), ev(2, 'alert', 60, { author_name: 'Alert', data: { alert_id: 'al-1', state: 'opened' } })];
+	return {
+		...t, events, attachments: t.id === 't-1' ? [{ id: 'at-1', event_id: 1, name: 'test-page.pdf', content_type: 'application/pdf', size: 182_400, uploaded_by_name: null, created_at: ago(300) }] : [],
+		agents: [{ ...a, capabilities: ['patch', 'desktop'], reboot_pending: false, missing_patches: 3, alerts: alerts.filter((x) => x.agent_id === a.id && x.state !== 'resolved').slice(0, 3).map((x) => ({ id: x.id, title: x.title, severity: x.severity, opened_at: x.opened_at })) }],
+		statuses: boards.find((b) => b.id === t.board_id)!.statuses, reply_to: (t.contact_email as string) || (t.requester_email as string) || null
+	};
+}
+const mailboxes = [
+	{ id: 'mb-1', name: 'Support', address: 'support@northwind.example', kind: 'imap', imap_host: 'imap.fastmail.com', imap_port: 993, imap_security: 'tls', imap_username: 'support@northwind.example', has_password: true, imap_folder: 'INBOX', board_id: 'b-desk', board_name: 'Service Desk', auto_reply: true, enabled: true, last_polled_at: ago(1), last_error: null, received_24h: 14, created_at: ago(60 * 24 * 30) },
+	{ id: 'mb-2', name: 'Escalations', address: 'urgent@northwind.example', kind: 'webhook', imap_host: '', imap_port: 993, imap_security: 'tls', imap_username: '', has_password: false, imap_folder: 'INBOX', board_id: 'b-desk', board_name: 'Service Desk', auto_reply: false, enabled: true, last_polled_at: null, last_error: null, received_24h: 1, created_at: ago(60 * 24 * 10) }
+];
+const inboundMail = [
+	{ id: 'e1', mailbox_name: 'Support', from_addr: 'ann@acme.example', subject: 'Re: Printer on the second floor prints blank pages [T-10401]', status: 'received', ignored_reason: null, ticket_id: 't-1', ticket_number: 10401, created_at: ago(45) },
+	{ id: 'e2', mailbox_name: 'Support', from_addr: 'noreply@vendor.example', subject: 'Your weekly newsletter', status: 'ignored', ignored_reason: 'bulk or list mail', ticket_id: null, ticket_number: null, created_at: ago(120) },
+	{ id: 'e3', mailbox_name: 'Support', from_addr: 'sam@unknown.example', subject: 'VPN disconnects every hour', status: 'received', ignored_reason: null, ticket_id: 't-4', ticket_number: 10404, created_at: ago(20 * 4) }
+];
+function ticketList(q: URLSearchParams) {
+	const view = q.get('view') ?? 'open';
+	const done = (t: T) => t.status_category === 'resolved' || t.status_category === 'closed';
+	return tickets.filter(
+		(t) =>
+			(view === 'all' || (view === 'done' ? done(t) : view === 'triage' ? !t.client_id && !done(t) : view === 'mine' ? t.assignee_id === 'u-1' && !done(t) : view === 'unassigned' ? !t.assignee_id && !done(t) : view === 'waiting' ? String(t.status_category).startsWith('waiting') : !done(t))) &&
+			(!q.get('client_id') || t.client_id === q.get('client_id')) && (!q.get('agent_id') || t.agent_count)
+	);
+}
+
 const admin = { id: 'u-1', email: 'dana@northwind.example', name: 'Dana Admin', role: 'admin', totp_enabled: true, mfa_setup_required: false, client_ids: null, preferences: {} };
 
 export async function mockApi(p: Page, opts: { signedIn?: boolean } = {}) {
@@ -402,7 +481,15 @@ export async function mockApi(p: Page, opts: { signedIn?: boolean } = {}) {
 		if ((m = path.match(/^\/schedules\/([^/]+)$/))) return json(schedules.find((x) => x.id === m![1]));
 		if (path.match(/^\/agents\/[^/]+\/services$/)) return json({ services, services_at: ago(3), alerting: ['nginx.service'] });
 		if (path.match(/^\/agents\/[^/]+\/log-events$/)) return json(logEvents);
-		if (path === '/search') return json({ agents: agents.filter((a) => a.hostname.includes(q.get('q') ?? '')).slice(0, 5).map((a) => ({ id: a.id, hostname: a.hostname, os_family: a.os_family, online: a.online, client_name: a.client_name, site_name: a.site_name })), clients: [], sites: [], scripts: [] });
+		if (path === '/tickets/summary') return json({ open: 4, mine: 1, unassigned: 2, triage: 1, waiting: 1 });
+		if (path === '/tickets/meta') return json({ boards, types: ticketTypes, technicians: [{ id: 'u-1', name: 'Dana Admin', email: admin.email, client_ids: null }, { id: 'u-2', name: 'Terry Tech', email: 'terry@northwind.example', client_ids: ['c-acme', 'c-globex'] }] });
+		if (path === '/tickets') return json(page(ticketList(q), Number(q.get('limit') ?? 50)));
+		if ((m = path.match(/^\/tickets\/([^/]+)$/))) return json(ticketDetail(tickets.find((t) => t.id === m![1])!));
+		if (path === '/contacts') return json(contacts.filter((c) => !q.get('client_id') || c.client_id === q.get('client_id')));
+		if (path === '/boards') return json(boards);
+		if (path === '/mailboxes') return json(mailboxes);
+		if (path === '/mailboxes/inbound') return json(inboundMail);
+		if (path === '/search') return json({ agents: agents.filter((a) => a.hostname.includes(q.get('q') ?? '')).slice(0, 5).map((a) => ({ id: a.id, hostname: a.hostname, os_family: a.os_family, online: a.online, client_name: a.client_name, site_name: a.site_name })), clients: [], sites: [], scripts: [], tickets: [] });
 		return json({ error: `no mock for ${path}` }, 404);
 	});
 }

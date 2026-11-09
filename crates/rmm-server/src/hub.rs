@@ -59,6 +59,13 @@ pub enum Event {
         #[serde(skip)]
         client_id: Uuid,
     },
+    /// A ticket was created or changed (fields, timeline).
+    Ticket {
+        id: Uuid,
+        /// `None`: a triage ticket, only for users who see every client.
+        #[serde(skip)]
+        client_id: Option<Uuid>,
+    },
 }
 
 impl Event {
@@ -69,7 +76,17 @@ impl Event {
             | Event::Alert { client_id, .. }
             | Event::Services { client_id, .. }
             | Event::Patches { client_id, .. } => Some(*client_id),
+            Event::Ticket { client_id, .. } => *client_id,
             Event::Jobs => None,
+        }
+    }
+
+    /// Whether `u` may receive this event.
+    pub fn visible_to(&self, u: &crate::auth::User) -> bool {
+        match self {
+            // Clientless tickets are triage: only for users who see everything.
+            Event::Ticket { client_id: None, .. } => u.scope().is_none(),
+            ev => ev.client_id().is_none_or(|c| u.can_see_client(c)),
         }
     }
 }

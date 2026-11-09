@@ -1,5 +1,5 @@
 import type { Component } from 'svelte';
-import { BellRing, Building2, CalendarClock, FileCode2, History, LayoutDashboard, ListChecks, Monitor, PackageCheck, Settings, ShieldCheck } from '@lucide/svelte';
+import { BellRing, Building2, LifeBuoy, CalendarClock, FileCode2, History, LayoutDashboard, ListChecks, Monitor, PackageCheck, Settings, ShieldCheck } from '@lucide/svelte';
 import type { Role } from '#lib/types.js';
 
 export interface NavItem {
@@ -12,17 +12,21 @@ export interface NavItem {
 	key?: string;
 	/** Keeps the client switcher's ?client= when followed. */
 	scoped?: boolean;
-	/** Shows the open alert count. */
-	badge?: 'alerts';
+	/** Shows the open alert count, or unassigned open tickets. */
+	badge?: 'alerts' | 'tickets';
 }
 export interface NavGroup {
 	label: string;
 	items: NavItem[];
 }
 
-/** The sidebar. Later phases add Service desk. */
+/** The sidebar. */
 export const nav: NavGroup[] = [
 	{ label: 'Overview', items: [{ href: '/', label: 'Dashboard', icon: LayoutDashboard, key: 'd', scoped: true }] },
+	{
+		label: 'Service desk',
+		items: [{ href: '/tickets', label: 'Tickets', icon: LifeBuoy, key: 't', scoped: true, badge: 'tickets' }]
+	},
 	{
 		label: 'Devices',
 		items: [

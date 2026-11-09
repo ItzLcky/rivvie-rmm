@@ -9,6 +9,7 @@
 	import { api } from '#lib/api.js';
 	import { connectLive } from '#lib/live.svelte.js';
 	import { trackAlerts } from '#lib/monitoring/alerts.svelte.js';
+	import { trackTickets } from '#lib/servicedesk/tickets.svelte.js';
 	import { loadPrefs } from '#lib/prefs.svelte.js';
 	import { prefs } from '#lib/prefs.svelte.js';
 	import { loadClients, withClient } from '#lib/scope.svelte.js';
@@ -56,6 +57,7 @@
 	});
 
 	trackAlerts(() => !!session.user && !session.user.mfa_setup_required && !bare);
+	trackTickets(() => !!session.user && !session.user.mfa_setup_required && !bare);
 
 	// Admins (or everyone, per Company settings) must set up 2FA before using the dashboard.
 	$effect(() => {

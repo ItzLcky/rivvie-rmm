@@ -25,6 +25,8 @@ use crate::state::AppState;
 pub struct Size {
     cols: Option<u16>,
     rows: Option<u16>,
+    /// Opened from this ticket: start and end are recorded on its timeline.
+    ticket_id: Option<Uuid>,
 }
 
 #[derive(Deserialize)]
@@ -48,7 +50,8 @@ pub async fn handler(
         return Err(ApiError::Conflict("agent is offline".into()));
     }
     let (cols, rows) = (size.cols.unwrap_or(120), size.rows.unwrap_or(32));
-    Ok(ws.on_upgrade(move |socket| run(socket, st, user, agent_id, cols, rows)))
+    let ticket = crate::api::tickets::session_ticket(&st, &user, size.ticket_id, agent_id).await?;
+    Ok(ws.on_upgrade(move |socket| run(socket, st, user, agent_id, cols, rows, ticket)))
 }
 
 /// Cross-site WebSocket hijacking guard (defence in depth on top of SameSite cookies).
@@ -65,14 +68,18 @@ pub(crate) fn check_origin(headers: &HeaderMap, public_url: &str) -> ApiResult<(
     }
 }
 
-async fn run(socket: WebSocket, st: Arc<AppState>, user: User, agent_id: Uuid, cols: u16, rows: u16) {
+async fn run(socket: WebSocket, st: Arc<AppState>, user: User, agent_id: Uuid, cols: u16, rows: u16, ticket: Option<Uuid>) {
     let session_id = Uuid::new_v4();
+    let started = std::time::Instant::now();
     let mut events = st.hub.open_shell(session_id, agent_id);
     auth::audit(&st.db, Some(user.id), "shell.open", Some(("agent", agent_id)), json!({ "session_id": session_id })).await;
 
     if !st.hub.send(agent_id, ServerMsg::ShellOpen { session_id, cols, rows }).await {
         st.hub.close_shell(session_id);
         return;
+    }
+    if let Some(t) = ticket {
+        crate::tickets::session_event(&st, t, user.id, agent_id, "terminal", None).await;
     }
 
     let (mut sink, mut stream) = socket.split();
@@ -116,4 +123,7 @@ async fn run(socket: WebSocket, st: Arc<AppState>, user: User, agent_id: Uuid, c
     st.hub.close_shell(session_id);
     let _ = st.hub.send(agent_id, ServerMsg::ShellClose { session_id }).await;
     auth::audit(&st.db, Some(user.id), "shell.close", Some(("agent", agent_id)), json!({ "session_id": session_id })).await;
+    if let Some(t) = ticket {
+        crate::tickets::session_event(&st, t, user.id, agent_id, "terminal", Some(started.elapsed().as_secs())).await;
+    }
 }

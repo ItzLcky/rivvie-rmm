@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { Command, Dialog } from 'bits-ui';
 	import { goto } from '$app/navigation';
-	import { Building2, Clock, FileCode2, Keyboard, MapPin, Monitor, Moon, Play, Plus, Search, Globe } from '@lucide/svelte';
+	import { Building2, Clock, FileCode2, Keyboard, LifeBuoy, MapPin, Monitor, Moon, Play, Plus, Search, Globe } from '@lucide/svelte';
 	import type { Component } from 'svelte';
 	import { api } from '#lib/api.js';
 	import { cx, interpreterLabel } from '#lib/format.js';
@@ -107,7 +107,7 @@
 					<Search class="text-muted size-4 shrink-0" />
 					<Command.Input
 						bind:value={query}
-						placeholder={mode === 'run' ? 'Run a script on which agent? Type a hostname…' : 'Search agents, clients, sites, scripts, or type a command…'}
+						placeholder={mode === 'run' ? 'Run a script on which agent? Type a hostname…' : 'Search agents, tickets, clients, sites, scripts, or type a command…'}
 						class="placeholder:text-subtle h-12 min-w-0 flex-1 bg-transparent text-sm outline-none"
 					/>
 					{#if mode === 'run'}<button class="text-muted hover:text-fg text-xs" onclick={() => (mode = 'search')}>Back</button>{/if}
@@ -141,6 +141,21 @@
 											<OsIcon os={a.os_family} />
 											<span class="truncate font-medium">{a.hostname}</span>
 											<span class="text-muted ml-auto truncate text-xs">{a.client_name} › {a.site_name}</span>
+										</Command.Item>
+									{/each}
+								</Command.GroupItems>
+							</Command.Group>
+						{/if}
+						{#if mode === 'search' && results?.tickets?.length}
+							<Command.Group>
+								<Command.GroupHeading class={heading}>Tickets</Command.GroupHeading>
+								<Command.GroupItems>
+									{#each results.tickets as t (t.id)}
+										<Command.Item value="ticket-{t.id}" class={item} onSelect={() => go(`/tickets/${t.id}`)}>
+											<LifeBuoy class="text-muted" />
+											<span class="text-muted font-mono text-xs">T-{t.number}</span>
+											<span class="truncate">{t.subject}</span>
+											<span class="text-muted ml-auto truncate text-xs">{t.client_name ?? 'Triage'} · {t.status_name}</span>
 										</Command.Item>
 									{/each}
 								</Command.GroupItems>
@@ -194,7 +209,7 @@
 								</Command.GroupItems>
 							</Command.Group>
 						{/if}
-						{#if q && results && !results.agents.length && !results.clients.length && !results.sites.length && !results.scripts.length && !shownPages.length && !shownActions.length}
+						{#if q && results && !results.agents.length && !results.clients.length && !results.sites.length && !results.scripts.length && !results.tickets?.length && !shownPages.length && !shownActions.length}
 							<p class="text-muted px-3 py-8 text-center text-sm">No matches for “{query.trim()}”{scoped ? ` in ${scoped.name}` : ''}.</p>
 						{:else if q && !results && searching}
 							<p class="text-muted px-3 py-8 text-center text-sm">Searching…</p>

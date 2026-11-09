@@ -412,6 +412,7 @@ async fn on_message(
             .await?;
             if let Some(s) = &status {
                 crate::alerts::job_finished(state, agent_id, job_id, s).await;
+                crate::tickets::job_finished(state, job_id).await;
             }
             job_event(job_id, status, false);
             // Stored (or already final from an earlier delivery): the agent can forget it.

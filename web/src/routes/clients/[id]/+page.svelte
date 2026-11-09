@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
-	import { ExternalLink, MapPin, Pencil, Plus, Trash2, UserPlus } from '@lucide/svelte';
+	import { Contact as ContactIcon, ExternalLink, LifeBuoy, MapPin, Pencil, Plus, Star, Trash2, UserPlus } from '@lucide/svelte';
 	import { api } from '#lib/api.js';
 	import { confirmAction } from '#lib/confirm.svelte.js';
 	import { ago, datetime, num, pct, plural } from '#lib/format.js';
@@ -11,7 +11,7 @@
 	import { loadClients } from '#lib/scope.svelte.js';
 	import { can } from '#lib/session.svelte.js';
 	import { attempt, toast } from '#lib/toast.svelte.js';
-	import type { AgentSummary, Client, Dashboard, Site } from '#lib/types.js';
+	import type { AgentSummary, Client, Contact, Dashboard, Site, Ticket } from '#lib/types.js';
 	import { param, qs, setParams, sortState } from '#lib/url.svelte.js';
 	import Async from '#lib/ui/Async.svelte';
 	import Button from '#lib/ui/Button.svelte';
@@ -32,6 +32,11 @@
 	import HealthBadge from '#lib/components/HealthBadge.svelte';
 	import OsBadge from '#lib/components/OsBadge.svelte';
 	import Status from '#lib/components/Status.svelte';
+	import ContactEditor from '#lib/components/ticket/ContactEditor.svelte';
+	import NewTicket from '#lib/components/ticket/NewTicket.svelte';
+	import TicketTable from '#lib/components/ticket/TicketTable.svelte';
+	import Segmented from '#lib/ui/Segmented.svelte';
+	import Textarea from '#lib/ui/Textarea.svelte';
 
 	const id = $derived(page.params.id!);
 	const tab = $derived(param('tab', 'agents'));
@@ -48,6 +53,37 @@
 
 	const sort = sortState('hostname');
 	const agents = paged<AgentSummary>(() => `/agents${qs({ client_id: id, site_id: param('site'), sort: sort.key, dir: sort.dir })}`);
+
+	// Service desk: tickets and contacts.
+	const ticketSort = sortState('updated', 'desc');
+	const ticketView = $derived(param('tview') === 'all' ? 'all' : 'open');
+	const tickets = paged<Ticket>(() => (tab === 'tickets' ? `/tickets${qs({ client_id: id, view: ticketView, sort: ticketSort.key, dir: ticketSort.dir })}` : `/tickets?limit=1&client_id=${id}`));
+	liveReload(() => tab === 'tickets' && tickets.reload(), (e) => e.type === 'ticket');
+	let ticketing = $state(false);
+	const contacts = resource(() => (tab === 'contacts' ? api.get<Contact[]>(`/contacts?client_id=${id}`) : Promise.resolve([] as Contact[])));
+	let editingContact = $state<Contact | 'new' | null>(null);
+	async function deleteContact(c: Contact) {
+		const ok = await confirmAction({
+			title: `Delete ${c.name}?`,
+			message: c.open_tickets ? `${plural(c.open_tickets, 'open ticket')} keep their history but lose the contact; replies to them stop being emailed.` : 'Their tickets keep their history.',
+			confirmLabel: 'Delete contact',
+			danger: true
+		});
+		if (ok && (await attempt(() => api.del(`/contacts/${c.id}`), `${c.name} deleted.`))) contacts.reload();
+	}
+	let domains = $state('');
+	let domainsBusy = $state(false);
+	$effect(() => {
+		if (client.data) domains = client.data.email_domains.join('\n');
+	});
+	async function saveDomains(c: Client) {
+		domainsBusy = true;
+		const list = domains.split(/[\s,;]+/).map((d) => d.trim()).filter(Boolean);
+		if (await attempt(() => api.put<{ domains: string[] }>(`/clients/${c.id}/email-domains`, { domains: list }).then((r) => (c.email_domains = r.domains)), 'Email domains saved.')) {
+			domains = c.email_domains.join('\n');
+		}
+		domainsBusy = false;
+	}
 
 	let enrolling = $state<Site | null>(null);
 	let naming = $state<{ kind: 'client' | 'site' | 'new-site'; site?: Site; value: string } | null>(null);
@@ -160,6 +196,8 @@
 			items={[
 				{ value: 'agents', label: 'Agents', count: num(total) },
 				{ value: 'sites', label: 'Sites & enrollment', count: c.sites.length },
+				{ value: 'tickets', label: 'Tickets' },
+				{ value: 'contacts', label: 'Contacts' },
 				{ value: 'settings', label: 'Settings', hidden: !can('admin') }
 			]}
 		/>
@@ -255,8 +293,59 @@
 					<EmptyState compact icon={MapPin} title="No sites" description="Agents enroll into a site, so add one first." />
 				{/if}
 			</section>
+		{:else if tab === 'tickets'}
+			<TicketTable id="client-tickets" caption="Tickets of {c.name}" list={tickets} sort={ticketSort} hide={['client']}>
+				{#snippet toolbar()}
+					<Segmented label="Tickets" value={ticketView} onchange={(v) => setParams({ tview: v === 'open' ? null : v })} options={[{ value: 'open', label: 'Open' }, { value: 'all', label: 'All' }]} />
+					{#if can('technician')}<Button size="sm" icon={LifeBuoy} class="ml-auto" onclick={() => (ticketing = true)}>New ticket</Button>{/if}
+				{/snippet}
+				{#snippet empty()}<EmptyState compact title={ticketView === 'open' ? 'No open tickets' : 'No tickets yet'} />{/snippet}
+			</TicketTable>
+		{:else if tab === 'contacts'}
+			<section class="card" aria-label="Contacts">
+				<header class="border-border flex items-center justify-between gap-3 border-b px-4 py-2.5">
+					<div>
+						<h2 class="text-sm font-semibold">Contacts</h2>
+						<p class="text-muted text-xs">People at {c.name}. Mail from their address is filed on their tickets.</p>
+					</div>
+					{#if can('technician')}<Button size="sm" icon={Plus} onclick={() => (editingContact = 'new')}>Add contact</Button>{/if}
+				</header>
+				<Async res={contacts} compact>
+					{#snippet children(list)}
+						{#if list.length}
+							<ul class="divide-border divide-y">
+								{#each list as p (p.id)}
+									<li class="flex flex-wrap items-center gap-x-3 gap-y-1 px-4 py-2.5 text-sm">
+										<div class="min-w-0 flex-1">
+											<div class="font-medium">{p.name}{#if p.is_primary} <Star class="text-warning inline size-3.5 align-[-2px]" aria-label="Primary contact" />{/if}{#if p.job_title}<span class="text-muted font-normal"> · {p.job_title}</span>{/if}</div>
+											<div class="text-muted truncate text-xs">{[p.email, p.phone, p.site_name].filter(Boolean).join(' · ') || 'No contact details'}</div>
+										</div>
+										{#if p.open_tickets}<a class="link text-xs" href="/tickets?client={c.id}&q={encodeURIComponent(p.email || p.name)}">{plural(p.open_tickets, 'open ticket')}</a>{/if}
+										{#if can('technician')}
+											<IconButton icon={Pencil} size="sm" label="Edit {p.name}" onclick={() => (editingContact = p)} />
+											<IconButton icon={Trash2} size="sm" variant="danger-ghost" label="Delete {p.name}" onclick={() => deleteContact(p)} />
+										{/if}
+									</li>
+								{/each}
+							</ul>
+						{:else}
+							<EmptyState compact icon={ContactIcon} title="No contacts yet" description="Add the people who raise tickets, so their mail is filed here and replies reach them." />
+						{/if}
+					{/snippet}
+				</Async>
+			</section>
 		{:else if tab === 'settings' && can('admin')}
 			<div class="max-w-2xl space-y-5">
+				<section class="card space-y-3 p-5" aria-labelledby="domains-heading">
+					<div>
+						<h2 id="domains-heading" class="font-semibold">Email domains</h2>
+						<p class="text-muted text-xs">Mail to a support mailbox from these domains is filed under {c.name}, even when the sender isn't a contact yet. Contacts are never created automatically.</p>
+					</div>
+					<Field label="Domains" id="client-domains" hint="One per line, e.g. example.com.">
+						<Textarea id="client-domains" rows={3} class="font-mono text-xs" bind:value={domains} spellcheck="false" />
+					</Field>
+					<div class="flex justify-end"><Button variant="primary" loading={domainsBusy} disabled={domains === c.email_domains.join('\n')} onclick={() => saveDomains(c)}>Save</Button></div>
+				</section>
 				<section class="card space-y-4 p-5" aria-labelledby="desktop-heading">
 					<h2 id="desktop-heading" class="font-semibold">Remote desktop</h2>
 					<div>
@@ -270,6 +359,10 @@
 		{/if}
 
 		{#if enrolling}<EnrollDialog client={c} site={enrolling} onclose={() => (enrolling = null)} />{/if}
+		{#if ticketing}<NewTicket onclose={() => (ticketing = false)} initial={{ clientId: c.id }} />{/if}
+		{#if editingContact}
+			<ContactEditor contact={editingContact === 'new' ? null : editingContact} clientId={c.id} onclose={() => (editingContact = null)} onsaved={() => contacts.reload()} />
+		{/if}
 		{#if naming}
 			<Modal title={naming.kind === 'client' ? 'Rename client' : naming.kind === 'site' ? `Rename ${naming.site?.name}` : `Add a site to ${c.name}`} onclose={() => (naming = null)} size="sm">
 				<form id="name-form" onsubmit={saveName}>

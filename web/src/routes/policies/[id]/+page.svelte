@@ -24,11 +24,14 @@
 	import Skeleton from '#lib/ui/Skeleton.svelte';
 	import Switch from '#lib/ui/Switch.svelte';
 	import Textarea from '#lib/ui/Textarea.svelte';
+	import { priorities, ticketMeta } from '#lib/servicedesk/tickets.svelte.js';
+	import type { Board, Priority } from '#lib/types.js';
 
 	/** Every field of every kind; only the chosen kind's are sent. Lists are edited as text. */
 	type Draft = {
 		name: string; kind: PolicyKind; severity: Severity; client_id: string | null; site_id: string | null; os_family: string | null;
 		channel_ids: string[]; notify_resolved: boolean; enabled: boolean;
+		ticket_board_id: string | null; ticket_priority: Priority; ticket_auto_resolve: boolean;
 		minutes: number; threshold: number; services: string; auto_only: boolean; exclude: string; script_id: string;
 		min_level: LogLevel; channels: string; sources: string; event_ids: string; pattern: string;
 	};
@@ -43,6 +46,7 @@
 	};
 	const blank = (kind: PolicyKind, client: string | null): Draft => ({
 		name: '', kind, severity: 'warning', client_id: client, site_id: null, os_family: null, channel_ids: [], notify_resolved: true, enabled: true,
+		ticket_board_id: null, ticket_priority: 3, ticket_auto_resolve: true,
 		minutes: 10, threshold: 90, services: '', auto_only: false, exclude: '', script_id: '', min_level: 'error', channels: '', sources: '', event_ids: '', pattern: '',
 		...defaults[kind]
 	});
@@ -54,6 +58,7 @@
 		return {
 			...blank(p.kind, p.client_id),
 			name: p.name, severity: p.severity, site_id: p.site_id, os_family: p.os_family, channel_ids: p.channel_ids, notify_resolved: p.notify_resolved, enabled: p.enabled,
+			ticket_board_id: p.ticket_board_id ?? null, ticket_priority: p.ticket_priority ?? 3, ticket_auto_resolve: p.ticket_auto_resolve ?? true,
 			minutes: Number(q.minutes ?? 10), threshold: Number(q.threshold ?? 90), services: text(q.services), auto_only: !!q.auto_only, exclude: text(q.exclude),
 			script_id: (q.script_id as string) ?? '', min_level: (q.min_level as LogLevel) ?? 'error', channels: text(q.channels).replaceAll('\n', ', '),
 			sources: text(q.sources), event_ids: Array.isArray(q.event_ids) ? q.event_ids.join(', ') : '', pattern: (q.pattern as string) ?? ''
@@ -111,6 +116,10 @@
 	});
 
 	const channels = resource(() => api.get<Channel[]>('/notification-channels'));
+	let boards = $state<Board[] | null>(null);
+	$effect(() => {
+		ticketMeta().then((m) => (boards = m.boards));
+	});
 	const scripts = resource(() => api.get<Script[]>('/scripts'));
 	const scriptItems = $derived(
 		(scripts.data ?? []).filter((s) => !s.client_id || s.client_id === draft?.client_id).map((s) => ({ value: s.id, label: s.name, hint: s.client_name ?? undefined }))
@@ -130,7 +139,8 @@
 		const d = draft;
 		const body = {
 			name: d.name, kind: d.kind, params: params(d), severity: d.severity, client_id: d.client_id, site_id: d.client_id ? d.site_id : null,
-			os_family: d.os_family, channel_ids: d.channel_ids, notify_resolved: d.notify_resolved, enabled: d.enabled
+			os_family: d.os_family, channel_ids: d.channel_ids, notify_resolved: d.notify_resolved, enabled: d.enabled,
+			ticket_board_id: d.ticket_board_id, ticket_priority: d.ticket_priority, ticket_auto_resolve: d.ticket_auto_resolve
 		};
 		busy = true;
 		try {
@@ -306,6 +316,22 @@
 			<div class="border-border border-t pt-3">
 				<Switch bind:checked={draft.enabled}>Policy enabled</Switch>
 				<p class="hint ml-11.5">Disabling closes its open alerts without notifications.</p>
+			</div>
+		</fieldset>
+
+		<fieldset class="card space-y-3 p-4 lg:col-start-2" disabled={!editable}>
+			<legend class="float-left w-full pb-3 text-sm font-semibold">Tickets</legend>
+			<div class="clear-both grid gap-3 sm:grid-cols-2">
+				<Field label="Open a ticket on" id="p-tboard" hint="One ticket per alert per agent; a repeat adds to it instead of opening another.">
+					<Select id="p-tboard" class="w-full" bind:value={draft.ticket_board_id} options={[{ value: null, label: 'Don’t open tickets' }, ...(boards ?? []).map((b) => ({ value: b.id, label: b.name }))]} />
+				</Field>
+				<Field label="Ticket priority" id="p-tprio">
+					<Select id="p-tprio" class="w-full" bind:value={draft.ticket_priority} disabled={!draft.ticket_board_id} options={priorities.map((p) => ({ value: p.value, label: p.label }))} />
+				</Field>
+			</div>
+			<div>
+				<Switch bind:checked={draft.ticket_auto_resolve} disabled={!draft.ticket_board_id}>Resolve the ticket when the alert clears</Switch>
+				<p class="hint ml-11.5">Only while nobody has worked the ticket, and not once the alert has come back three times (flapping needs a person).</p>
 			</div>
 		</fieldset>
 		</div>

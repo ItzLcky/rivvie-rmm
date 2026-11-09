@@ -3,6 +3,7 @@ mod alerts;
 mod desktop_ws;
 mod api;
 mod auth;
+mod email;
 mod error;
 mod events;
 mod hub;
@@ -13,6 +14,8 @@ mod ratelimit;
 mod scheduler;
 mod shell_ws;
 mod state;
+mod storage;
+mod tickets;
 mod totp;
 mod updates;
 
@@ -111,6 +114,15 @@ struct ServeArgs {
     /// limiting, audit). Comma-separated CIDRs; `private` = loopback + RFC 1918 + ULA.
     #[arg(long, env = "RMM_TRUSTED_PROXIES", default_value = "")]
     trusted_proxies: String,
+    /// Ticket attachments and raw email, unless RMM_S3_BUCKET is set.
+    #[arg(long, env = "RMM_STORAGE_DIR", default_value = "data/storage")]
+    storage_dir: PathBuf,
+    #[arg(long, env = "RMM_MAIL_POLL_SECS", default_value_t = 60)]
+    mail_poll_secs: u32,
+    #[arg(long, env = "RMM_TICKET_CLOSE_DAYS", default_value_t = 7)]
+    ticket_close_days: u32,
+    #[arg(long, env = "RMM_EMAIL_RAW_DAYS", default_value_t = 90)]
+    email_raw_days: u32,
 }
 
 impl Default for ServeArgs {
@@ -132,6 +144,10 @@ impl Default for ServeArgs {
             patch_scan_hours: env("RMM_PATCH_SCAN_HOURS", "12").parse().unwrap_or(12),
             session_idle_hours: env("RMM_SESSION_IDLE_HOURS", "12").parse().unwrap_or(12),
             trusted_proxies: env("RMM_TRUSTED_PROXIES", ""),
+            storage_dir: env("RMM_STORAGE_DIR", "data/storage").into(),
+            mail_poll_secs: env("RMM_MAIL_POLL_SECS", "60").parse().unwrap_or(60),
+            ticket_close_days: env("RMM_TICKET_CLOSE_DAYS", "7").parse().unwrap_or(7),
+            email_raw_days: env("RMM_EMAIL_RAW_DAYS", "90").parse().unwrap_or(90),
         }
     }
 }
@@ -189,19 +205,24 @@ async fn serve(db: sqlx::PgPool, args: ServeArgs) -> Result<()> {
     let company = state::Company::load(&db).await.context("loading company settings")?;
     let trusted_proxies = ratelimit::parse_trusted(&args.trusted_proxies).map_err(anyhow::Error::msg)?;
 
+    let http = reqwest::Client::builder()
+        .user_agent(concat!("rmm-server/", env!("CARGO_PKG_VERSION")))
+        .timeout(Duration::from_secs(20))
+        .redirect(reqwest::redirect::Policy::limited(3))
+        .build()
+        .context("building HTTP client")?;
+    let storage = storage::Storage::from_env(args.storage_dir.clone(), http.clone())?;
+    info!("file storage: {}", storage.describe());
+
     let state = Arc::new(AppState {
+        storage,
         company: company.into(),
         db,
         hub: Default::default(),
         limits: Default::default(),
         releases: Default::default(),
         started_at: chrono::Utc::now(),
-        http: reqwest::Client::builder()
-            .user_agent(concat!("rmm-server/", env!("CARGO_PKG_VERSION")))
-            .timeout(Duration::from_secs(20))
-            .redirect(reqwest::redirect::Policy::limited(3))
-            .build()
-            .context("building HTTP client")?,
+        http,
         notify_wake: Default::default(),
         cfg: Settings {
             agent_dir: args.agent_dir.clone(),
@@ -216,6 +237,8 @@ async fn serve(db: sqlx::PgPool, args: ServeArgs) -> Result<()> {
             metrics_raw_days: args.metrics_raw_days.max(1),
             alert_retention_days: args.alert_retention_days.max(1),
             alert_eval_secs: args.alert_eval_secs,
+            ticket_close_days: args.ticket_close_days.max(1),
+            email_raw_days: args.email_raw_days.max(1),
         },
     });
     tokio::spawn(housekeeping(state.clone()));
@@ -223,6 +246,7 @@ async fn serve(db: sqlx::PgPool, args: ServeArgs) -> Result<()> {
     tokio::spawn(notify::worker(state.clone()));
     tokio::spawn(scheduler::run(state.clone()));
     tokio::spawn(patches::scheduler(state.clone()));
+    tokio::spawn(email::poll_loop(state.clone(), args.mail_poll_secs));
 
     // adapter-static writes the SPA shell as 200.html; every non-file route falls back to it.
     let found: Vec<_> = api::agent_platforms().filter(|id| api::agent_binary_exists(&state, id)).collect();
@@ -394,6 +418,14 @@ async fn housekeeping(state: Arc<AppState>) {
                     .execute(db)
                     .await,
             );
+            match tickets::auto_close(&state, state.cfg.ticket_close_days).await {
+                Ok(n) if n > 0 => info!(tickets = n, "closed resolved tickets"),
+                Ok(_) => {}
+                Err(e) => warn!("housekeeping: closing resolved tickets: {e}"),
+            }
+            if let Err(e) = prune_raw_email(&state).await {
+                warn!("housekeeping: pruning raw email: {e:#}");
+            }
         }
         runs += 1;
         for e in results.iter().filter_map(|r| r.as_ref().err()) {
@@ -401,6 +433,23 @@ async fn housekeeping(state: Arc<AppState>) {
         }
         tracing::debug!(online = state.hub.online_count(), "housekeeping done");
     }
+}
+
+/// Raw MIME is kept for RMM_EMAIL_RAW_DAYS; the parsed text stays on the ticket. The row
+/// stays too (threading looks up its Message-ID).
+async fn prune_raw_email(state: &AppState) -> Result<()> {
+    let old: Vec<(uuid::Uuid, String)> = sqlx::query_as(
+        "SELECT id, raw_key FROM email_messages
+          WHERE raw_key IS NOT NULL AND created_at < now() - make_interval(days => $1) LIMIT 1000",
+    )
+    .bind(state.cfg.email_raw_days as i32)
+    .fetch_all(&state.db)
+    .await?;
+    for (id, key) in old {
+        state.storage.delete(&key).await?;
+        sqlx::query("UPDATE email_messages SET raw_key = NULL WHERE id = $1").bind(id).execute(&state.db).await?;
+    }
+    Ok(())
 }
 
 async fn shutdown_signal() {

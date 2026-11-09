@@ -45,7 +45,15 @@ const pages: [string, string][] = [
 	['audit', '/audit'],
 	['settings', '/settings'],
 	['users', '/settings/users'],
-	['account', '/account']
+	['account', '/account'],
+	['tickets', '/tickets'],
+	['tickets-triage', '/tickets?view=triage'],
+	['ticket', '/tickets/t-1'],
+	['ticket-alert', '/tickets/t-2'],
+	['client-tickets', '/clients/c-acme?tab=tickets'],
+	['client-contacts', '/clients/c-acme?tab=contacts'],
+	['agent-tickets', '/agents/a-3?tab=tickets'],
+	['service-desk', '/settings/service-desk']
 ];
 const phone: [string, string][] = [
 	['dashboard', '/'],
@@ -54,7 +62,9 @@ const phone: [string, string][] = [
 	['job', '/jobs/j-1'],
 	['alerts', '/alerts'],
 	['patches', '/patches'],
-	['agent-patches', '/agents/a-3?tab=patches']
+	['agent-patches', '/agents/a-3?tab=patches'],
+	['tickets', '/tickets'],
+	['ticket', '/tickets/t-1']
 ];
 
 const jpeg = readFileSync(new URL('./fixtures/desktop.jpg', import.meta.url));
@@ -122,7 +132,7 @@ for (const theme of ['light', 'dark'] as const) {
 			await page.goto('/agents');
 			await settle(page);
 			await page.keyboard.press('Control+k');
-			const input = page.getByPlaceholder(/Search agents, clients, sites/);
+			const input = page.getByPlaceholder(/Search agents, tickets, clients, sites/);
 			await expect(input).toBeFocused();
 			await input.fill('acme');
 			await expect(page.getByRole('option', { name: /acme-dc01/ })).toBeVisible();

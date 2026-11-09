@@ -92,7 +92,7 @@ pub async fn enqueue(st: &AppState, alert_id: Uuid, event: &str, channels: &[Uui
     }
 }
 
-fn backoff(attempts: i32) -> chrono::Duration {
+pub(crate) fn backoff(attempts: i32) -> chrono::Duration {
     chrono::Duration::minutes(match attempts {
         1 => 1,
         2 => 5,
@@ -103,11 +103,24 @@ fn backoff(attempts: i32) -> chrono::Duration {
 
 pub async fn worker(st: Arc<AppState>) {
     loop {
-        match drain(&st).await {
+        let full = match drain(&st).await {
             // A full batch: there may be more due right away.
-            Ok(n) if n as i64 == BATCH => continue,
-            Ok(_) => {}
-            Err(e) => warn!("notification worker: {e}"),
+            Ok(n) => n as i64 == BATCH,
+            Err(e) => {
+                warn!("notification worker: {e}");
+                false
+            }
+        };
+        // Ticket email shares the worker (and the mail server).
+        let full_mail = match crate::email::drain_outbox(&st).await {
+            Ok(n) => n >= 20,
+            Err(e) => {
+                warn!("email outbox: {e:#}");
+                false
+            }
+        };
+        if full || full_mail {
+            continue;
         }
         tokio::select! {
             _ = st.notify_wake.notified() => {}
@@ -383,10 +396,12 @@ fn teams_body(m: &Message) -> Value {
     })
 }
 
-async fn send_email(st: &AppState, to: &[String], m: &Message) -> Result<(), String> {
-    use lettre::message::header::ContentType;
+/// An SMTP transport for the company mail server, and the configured sender.
+pub(crate) fn mailer(
+    st: &AppState,
+) -> Result<(lettre::AsyncSmtpTransport<lettre::Tokio1Executor>, lettre::message::Mailbox), String> {
     use lettre::transport::smtp::authentication::Credentials;
-    use lettre::{AsyncSmtpTransport, AsyncTransport, Tokio1Executor};
+    use lettre::{AsyncSmtpTransport, Tokio1Executor};
 
     let c = st.company();
     if c.smtp_host.trim().is_empty() || c.smtp_from.trim().is_empty() {
@@ -402,8 +417,15 @@ async fn send_email(st: &AppState, to: &[String], m: &Message) -> Result<(), Str
     if !c.smtp_username.is_empty() {
         builder = builder.credentials(Credentials::new(c.smtp_username.clone(), c.smtp_password.clone()));
     }
-    let mailer = builder.build();
     let from = c.smtp_from.trim().parse().map_err(|_| format!("sender address {:?} is invalid", c.smtp_from))?;
+    Ok((builder.build(), from))
+}
+
+async fn send_email(st: &AppState, to: &[String], m: &Message) -> Result<(), String> {
+    use lettre::AsyncTransport;
+    use lettre::message::header::ContentType;
+
+    let (mailer, from) = mailer(st)?;
     let mut email = lettre::Message::builder().from(from).subject(&m.subject);
     for t in to {
         email = email.to(t.parse().map_err(|_| format!("{t} is not an email address"))?);

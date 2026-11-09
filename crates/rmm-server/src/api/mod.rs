@@ -18,8 +18,10 @@ mod schedules;
 mod patches;
 mod search;
 mod scripts;
+mod servicedesk;
 mod services;
 mod settings;
+pub(crate) mod tickets;
 mod totp;
 pub(crate) mod users;
 
@@ -127,4 +129,27 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/agents/{id}/services/refresh", post(services::refresh))
         .route("/agents/{id}/services/control", post(services::control))
         .route("/agents/{id}/log-events", get(services::log_events))
+        .route("/tickets", get(tickets::list).post(tickets::create))
+        .route("/tickets/summary", get(tickets::summary))
+        .route("/tickets/meta", get(tickets::meta))
+        .route("/tickets/bulk", post(tickets::bulk))
+        .route("/tickets/{id}", get(tickets::get).patch(tickets::update))
+        .route("/tickets/{id}/events", post(tickets::add_event))
+        .route("/tickets/{id}/attachments", post(tickets::upload))
+        .route("/tickets/{id}/attachments/{aid}", get(tickets::download))
+        .route("/tickets/{id}/agents", post(tickets::link_agent))
+        .route("/tickets/{id}/agents/{agent_id}", delete(tickets::unlink_agent))
+        .route("/tickets/{id}/merge", post(tickets::merge))
+        .route("/contacts", get(servicedesk::list_contacts).post(servicedesk::create_contact))
+        .route("/contacts/{id}", get(servicedesk::get_contact).put(servicedesk::update_contact).delete(servicedesk::remove_contact))
+        .route("/clients/{id}/email-domains", axum::routing::put(servicedesk::update_email_domains))
+        .route("/boards", get(servicedesk::list_boards).post(servicedesk::create_board))
+        .route("/boards/{id}", axum::routing::put(servicedesk::update_board).delete(servicedesk::remove_board))
+        .route("/ticket-types", axum::routing::put(servicedesk::save_types))
+        .route("/mailboxes", get(servicedesk::list_mailboxes).post(servicedesk::create_mailbox))
+        .route("/mailboxes/inbound", get(servicedesk::inbound_log))
+        .route("/mailboxes/{id}", axum::routing::put(servicedesk::update_mailbox).delete(servicedesk::remove_mailbox))
+        .route("/mailboxes/{id}/poll", post(servicedesk::poll_mailbox))
+        .route("/mailboxes/{id}/rotate-token", post(servicedesk::rotate_mailbox_token))
+        .route("/inbound/email/{token}", post(servicedesk::inbound))
 }

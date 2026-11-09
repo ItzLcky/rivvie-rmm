@@ -7,3 +7,4 @@ node_modules
 deploy/.env
 /agents
 deploy/backups/
+/data/

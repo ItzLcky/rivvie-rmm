@@ -10,7 +10,8 @@
 	import IconButton from '#lib/ui/IconButton.svelte';
 
 	/** The browser terminal. Loaded only when its tab opens (xterm.js is large). */
-	let { agentId, hostname }: { agentId: string; hostname: string } = $props();
+	/** `ticketId`: opened from a ticket, which records the session on its timeline. */
+	let { agentId, hostname, ticketId }: { agentId: string; hostname: string; ticketId?: string } = $props();
 
 	let el: HTMLDivElement;
 	let status = $state<'connecting' | 'open' | 'closed'>('connecting');
@@ -45,7 +46,7 @@
 		fit.fit();
 
 		const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-		ws = new WebSocket(`${proto}://${location.host}/api/agents/${agentId}/shell?cols=${term.cols}&rows=${term.rows}`);
+		ws = new WebSocket(`${proto}://${location.host}/api/agents/${agentId}/shell?cols=${term.cols}&rows=${term.rows}${ticketId ? `&ticket_id=${ticketId}` : ''}`);
 		ws.binaryType = 'arraybuffer';
 		const enc = new TextEncoder();
 

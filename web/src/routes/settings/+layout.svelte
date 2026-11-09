@@ -22,7 +22,8 @@
 	items={[
 		{ value: '/settings', label: 'General' },
 		{ value: '/settings/users', label: 'Users' },
-		{ value: '/settings/notifications', label: 'Notifications' }
+		{ value: '/settings/notifications', label: 'Notifications' },
+		{ value: '/settings/service-desk', label: 'Service desk' }
 	]}
 />
 {#if session.user && can('admin')}

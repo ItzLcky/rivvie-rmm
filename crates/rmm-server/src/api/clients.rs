@@ -27,13 +27,16 @@ pub struct ClientOut {
     created_at: DateTime<Utc>,
     /// Ask the person at the machine before a remote desktop session starts.
     desktop_consent: bool,
+    /// Mail from these domains is filed under the client.
+    email_domains: Vec<String>,
     sites: Vec<SiteRow>,
 }
 
 /// Clients (all visible ones, or just `only`) with their sites and agent counts.
 async fn load(st: &AppState, u: &User, only: Option<Uuid>) -> ApiResult<Vec<ClientOut>> {
-    let clients: Vec<(Uuid, String, DateTime<Utc>, bool)> = sqlx::query_as(
-        "SELECT id, name, created_at, desktop_consent FROM clients
+    #[allow(clippy::type_complexity)]
+    let clients: Vec<(Uuid, String, DateTime<Utc>, bool, Vec<String>)> = sqlx::query_as(
+        "SELECT id, name, created_at, desktop_consent, email_domains FROM clients
           WHERE ($1::uuid[] IS NULL OR id = ANY($1)) AND ($2::uuid IS NULL OR id = $2) ORDER BY lower(name)",
     )
     .bind(u.scope())
@@ -53,7 +56,10 @@ async fn load(st: &AppState, u: &User, only: Option<Uuid>) -> ApiResult<Vec<Clie
     .fetch_all(&st.db)
     .await?;
     let mut out: Vec<ClientOut> =
-        clients.into_iter().map(|(id, name, created_at, desktop_consent)| ClientOut { id, name, created_at, desktop_consent, sites: vec![] }).collect();
+        clients
+        .into_iter()
+        .map(|(id, name, created_at, desktop_consent, email_domains)| ClientOut { id, name, created_at, desktop_consent, email_domains, sites: vec![] })
+        .collect();
     for s in sites {
         if let Some(c) = out.iter_mut().find(|c| c.id == s.client_id) {
             c.sites.push(s);

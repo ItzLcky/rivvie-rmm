@@ -18,6 +18,8 @@ pub struct AppState {
     pub http: reqwest::Client,
     /// Wakes the notification worker when something is queued.
     pub notify_wake: tokio::sync::Notify,
+    /// Ticket attachments and raw email.
+    pub storage: crate::storage::Storage,
 }
 
 #[derive(Debug, Clone, Default, sqlx::FromRow)]
@@ -81,6 +83,10 @@ pub struct Settings {
     pub alert_retention_days: u32,
     /// How often polled alert policies (offline, CPU, memory, disk) are checked.
     pub alert_eval_secs: u32,
+    /// Resolved tickets move to Closed after this many days.
+    pub ticket_close_days: u32,
+    /// Raw inbound email (MIME) is deleted from storage after this many days.
+    pub email_raw_days: u32,
 }
 
 impl Settings {

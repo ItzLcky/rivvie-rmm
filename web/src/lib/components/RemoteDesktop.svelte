@@ -53,7 +53,8 @@
 	import Textarea from '#lib/ui/Textarea.svelte';
 
 	/** The remote desktop viewer. Loaded only when its tab opens. */
-	let { agentId, hostname }: { agentId: string; hostname: string } = $props();
+	/** `ticketId`: opened from a ticket, which records the session on its timeline. */
+	let { agentId, hostname, ticketId }: { agentId: string; hostname: string; ticketId?: string } = $props();
 
 	let container: HTMLDivElement;
 	let canvas: HTMLCanvasElement;
@@ -107,7 +108,7 @@
 		buttons.clear();
 
 		const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-		const sock = new WebSocket(`${proto}://${location.host}/api/agents/${agentId}/desktop?quality=${quality}&monitor=${monitor}`);
+		const sock = new WebSocket(`${proto}://${location.host}/api/agents/${agentId}/desktop?quality=${quality}&monitor=${monitor}${ticketId ? `&ticket_id=${ticketId}` : ''}`);
 		ws = sock;
 		sock.binaryType = 'arraybuffer';
 		sock.onmessage = (e) => {

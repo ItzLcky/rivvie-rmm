@@ -8,6 +8,7 @@
 	import { can, company } from '#lib/session.svelte.js';
 	import Tooltip from '#lib/ui/Tooltip.svelte';
 	import { alertCounts } from '#lib/monitoring/alerts.svelte.js';
+	import { ticketCounts } from '#lib/servicedesk/tickets.svelte.js';
 	import { isActive, nav } from './nav';
 
 	/** `collapsed` shows icons only; the mobile drawer always renders it expanded. */
@@ -50,12 +51,17 @@
 									>
 										<span class="relative flex">
 											<item.icon />
-											{#if collapsed && item.badge && openAlerts}<span class={cx('ring-raised absolute -top-0.5 -right-0.5 size-2 rounded-full ring-2', alertCounts.critical ? 'bg-danger' : 'bg-warning')} aria-hidden="true"></span>{/if}
+											{#if collapsed && item.badge === 'alerts' && openAlerts}<span class={cx('ring-raised absolute -top-0.5 -right-0.5 size-2 rounded-full ring-2', alertCounts.critical ? 'bg-danger' : 'bg-warning')} aria-hidden="true"></span>{/if}
+											{#if collapsed && item.badge === 'tickets' && ticketCounts.unassigned}<span class="ring-raised bg-accent absolute -top-0.5 -right-0.5 size-2 rounded-full ring-2" aria-hidden="true"></span>{/if}
 										</span>
 										{#if !collapsed}<span class="truncate">{item.label}</span>{/if}
-										{#if item.badge && openAlerts}
+										{#if item.badge === 'alerts' && openAlerts}
 											<span class={cx('tabular ml-auto rounded-full px-1.5 text-[11px] leading-[18px] font-semibold', collapsed && 'sr-only', alertCounts.critical ? 'bg-danger-soft text-danger' : 'bg-warning-soft text-warning')}>
 												{openAlerts > 999 ? '999+' : openAlerts}<span class="sr-only"> open</span>
+											</span>
+										{:else if item.badge === 'tickets' && ticketCounts.unassigned}
+											<span class={cx('tabular bg-accent-soft text-accent ml-auto rounded-full px-1.5 text-[11px] leading-[18px] font-semibold', collapsed && 'sr-only')}>
+												{ticketCounts.unassigned > 999 ? '999+' : ticketCounts.unassigned}<span class="sr-only"> unassigned</span>
 											</span>
 										{/if}
 									</a>

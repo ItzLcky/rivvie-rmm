@@ -78,6 +78,7 @@
 				<dl class="dl">
 					<dt>Policy</dt><dd>{#if a.policy_id}<a class="link" href="/policies/{a.policy_id}">{a.policy_name}</a>{:else}<span class="text-muted">Deleted</span>{/if}</dd>
 					<dt>Type</dt><dd>{kindLabels[a.kind]}</dd>
+					{#if a.ticket}<dt>Ticket</dt><dd><a class="link" href="/tickets/{a.ticket.id}">T-{a.ticket.number}</a></dd>{/if}
 					<dt>Opened</dt><dd>{datetime(a.opened_at)} <span class="text-muted text-xs">({ago(a.opened_at)})</span></dd>
 					<dt>Last seen</dt><dd>{datetime(a.last_seen_at)}</dd>
 					{#if a.occurrences > 1}<dt>Occurrences</dt><dd class="tabular">{num(a.occurrences)}</dd>{/if}

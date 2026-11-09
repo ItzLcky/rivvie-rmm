@@ -224,6 +224,12 @@ async fn announce(st: &AppState, ids: &[Uuid], event: &'static str, channels: &[
         if notify {
             crate::notify::enqueue(st, id, event, channels).await;
         }
+        // Tickets follow the alert even when notifications are off.
+        if event == "opened" {
+            crate::tickets::alert_opened(st, id).await;
+        } else {
+            crate::tickets::alert_resolved(st, id).await;
+        }
     }
     if notify && !channels.is_empty() {
         st.notify_wake.notify_one();

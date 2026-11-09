@@ -51,6 +51,8 @@ export interface Client {
 	id: string; name: string; created_at: string; sites: Site[];
 	/** Ask the person at the machine before a remote desktop session starts. */
 	desktop_consent: boolean;
+	/** Mail from these domains is filed under this client. */
+	email_domains: string[];
 }
 
 export type Interpreter = 'bash' | 'sh' | 'powershell' | 'cmd' | 'python';
@@ -88,6 +90,7 @@ export interface SearchResults {
 	clients: { id: string; name: string }[];
 	sites: { id: string; name: string; client_id: string; client_name: string }[];
 	scripts: { id: string; name: string; interpreter: Interpreter; client_name: string | null }[];
+	tickets: { id: string; number: number; subject: string; client_name: string | null; status_name: string }[];
 }
 
 export interface Session { id: string; created_at: string; last_seen_at: string; expires_at: string; user_agent: string | null; current: boolean }
@@ -113,12 +116,14 @@ export interface LogEvent {
 	id: number; ts: string; received_at?: string; level: LogLevel; source: string; event_id: number | null; message: string;
 	policy_id?: string | null; policy_name: string | null; alert_id?: string | null;
 }
-export interface AlertDetail extends Alert { notifications: Delivery[]; log_events: LogEvent[] }
+export interface AlertDetail extends Alert { notifications: Delivery[]; log_events: LogEvent[]; ticket: { id: string; number: number } | null }
 
 export interface Policy {
 	id: string; name: string; kind: PolicyKind; params: Record<string, unknown>; severity: Severity;
 	client_id: string | null; client_name: string | null; site_id: string | null; site_name: string | null; os_family: 'linux' | 'windows' | 'macos' | null;
 	channel_ids: string[]; notify_resolved: boolean; enabled: boolean; open_alerts: number; created_at: string; updated_at: string;
+	/** Open tickets for its alerts on this board (null = no tickets). */
+	ticket_board_id: string | null; ticket_priority: Priority; ticket_auto_resolve: boolean;
 }
 
 export type ChannelKind = 'email' | 'webhook' | 'slack' | 'teams';
@@ -203,4 +208,60 @@ export interface Compliance {
 	by: 'client' | 'site';
 	totals: Omit<ComplianceRow, 'id' | 'name' | 'client_id' | 'oldest_scan'>;
 	rows: ComplianceRow[];
+}
+
+// --- Service desk ------------------------------------------------------------------------------
+
+export type Priority = 1 | 2 | 3 | 4;
+export type StatusCategory = 'new' | 'open' | 'waiting_client' | 'waiting_vendor' | 'resolved' | 'closed';
+export type TicketSource = 'dashboard' | 'email' | 'alert' | 'portal' | 'api';
+export interface BoardStatus { id: string; name: string; category: StatusCategory; position: number }
+export interface Board { id: string; name: string; description: string; position: number; statuses: BoardStatus[]; open_tickets: number }
+export interface TicketType { id: string; name: string; position: number }
+export interface Technician { id: string; name: string; email: string; client_ids: string[] | null }
+export interface TicketMeta { boards: Board[]; types: TicketType[]; technicians: Technician[] }
+
+export interface Ticket {
+	id: string; number: number; subject: string; client_id: string | null; client_name: string | null; site_id: string | null; site_name: string | null;
+	contact_id: string | null; contact_name: string | null; contact_email: string | null; board_id: string; board_name: string;
+	status_id: string; status_name: string; status_category: StatusCategory; type_id: string | null; type_name: string | null;
+	priority: Priority; impact: 1 | 2 | 3 | null; urgency: 1 | 2 | 3 | null; source: TicketSource; assignee_id: string | null; assignee_name: string | null;
+	requester_name: string; requester_email: string; created_at: string; updated_at: string; first_response_at: string | null;
+	resolved_at: string | null; closed_at: string | null; merged_into: string | null; merged_into_number: number | null;
+	alert_policy_id: string | null; alert_reopens: number; agent_count: number;
+}
+export type TicketEventKind = 'created' | 'reply' | 'message' | 'note' | 'change' | 'alert' | 'job' | 'session' | 'merge' | 'agent';
+export interface TicketEvent {
+	id: number; kind: TicketEventKind; public: boolean; author_id: string | null; author_contact_id: string | null;
+	author_kind: 'user' | 'contact' | 'system'; author_name: string; body: string; data: Record<string, unknown>; created_at: string;
+	email_status: 'pending' | 'sent' | 'failed' | null; email_error: string | null; email_to: string[] | null;
+}
+export interface TicketAttachment { id: string; event_id: number | null; name: string; content_type: string; size: number; uploaded_by_name: string | null; created_at: string }
+export interface TicketAgent extends AgentSummary {
+	capabilities: string[]; reboot_pending: boolean; missing_patches: number;
+	alerts: { id: string; title: string; severity: Severity; opened_at: string }[];
+}
+export interface TicketDetail extends Ticket {
+	events: TicketEvent[]; attachments: TicketAttachment[]; agents: TicketAgent[]; statuses: BoardStatus[];
+	/** Where a public reply is emailed, if anywhere. */
+	reply_to: string | null;
+}
+export interface TicketSummary { open: number; mine: number; unassigned: number; triage: number; waiting: number }
+
+export interface Contact {
+	id: string; client_id: string; client_name: string; site_id: string | null; site_name: string | null; name: string; email: string;
+	phone: string; job_title: string; notes: string; is_primary: boolean; portal_enabled: boolean; open_tickets: number;
+	created_at: string; updated_at: string;
+}
+
+export interface Mailbox {
+	id: string; name: string; address: string; kind: 'imap' | 'webhook'; imap_host: string; imap_port: number; imap_security: 'tls' | 'none';
+	imap_username: string; has_password: boolean; imap_folder: string; board_id: string; board_name: string; auto_reply: boolean;
+	enabled: boolean; last_polled_at: string | null; last_error: string | null; received_24h: number; created_at: string;
+	/** Only right after creating a webhook mailbox (or rotating its token). */
+	webhook_url?: string;
+}
+export interface InboundMail {
+	id: string; mailbox_name: string | null; from_addr: string; subject: string; status: 'received' | 'ignored';
+	ignored_reason: string | null; ticket_id: string | null; ticket_number: number | null; created_at: string;
 }

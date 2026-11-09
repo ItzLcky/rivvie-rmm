@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
-	import { CloudDownload, Copy, MonitorUp, Play, RefreshCw, Search, SquareTerminal, Trash2 } from '@lucide/svelte';
+	import { CloudDownload, Copy, LifeBuoy, MonitorUp, Play, RefreshCw, Search, SquareTerminal, Trash2 } from '@lucide/svelte';
 	import { api } from '#lib/api.js';
 	import { confirmAction } from '#lib/confirm.svelte.js';
 	import { ago, bytes, datetime, duration, ms, num, pct } from '#lib/format.js';
@@ -34,6 +34,11 @@
 	import AgentAlerts from '#lib/components/agent/AgentAlerts.svelte';
 	import AgentLogs from '#lib/components/agent/AgentLogs.svelte';
 	import AgentServices from '#lib/components/agent/AgentServices.svelte';
+	import NewTicket from '#lib/components/ticket/NewTicket.svelte';
+	import TicketTable from '#lib/components/ticket/TicketTable.svelte';
+	import { paged } from '#lib/paged.svelte.js';
+	import { qs, sortState } from '#lib/url.svelte.js';
+	import type { Ticket } from '#lib/types.js';
 
 	const id = $derived(page.params.id!);
 	const tab = $derived(param('tab', 'overview'));
@@ -72,6 +77,14 @@
 	};
 
 	let running = $state(false);
+	let ticketing = $state(false);
+	/** Terminal or desktop opened from a ticket: the session is recorded there. */
+	const fromTicket = $derived(param('ticket'));
+
+	const ticketSort = sortState('updated', 'desc');
+	const ticketView = $derived(param('tview') === 'all' ? 'all' : 'open');
+	const tickets = paged<Ticket>(() => (tab === 'tickets' ? `/tickets${qs({ agent_id: id, view: ticketView, sort: ticketSort.key, dir: ticketSort.dir })}` : '/tickets?limit=1&view=open&agent_id=' + id));
+	liveReload(() => tab === 'tickets' && tickets.reload(), (e) => e.type === 'ticket');
 
 	async function update() {
 		await attempt(async () => {
@@ -172,6 +185,7 @@
 			title={a.hostname}
 			crumbs={[{ label: 'Clients', href: '/clients' }, { label: a.client_name, href: `/clients/${a.client_id}` }, { label: a.site_name, href: `/agents?client=${a.client_id}&site=${a.site_id}` }, { label: a.hostname }]}
 			menu={[
+				...(can('technician') ? [{ label: 'New ticket for this agent', icon: LifeBuoy, onSelect: () => (ticketing = true) }] : []),
 				...(can('technician') ? [{ label: 'Refresh inventory', icon: RefreshCw, onSelect: refreshInventory, disabled: !a.online }] : []),
 				...(can('admin') && release && release.version !== a.agent_version ? [{ label: `Update agent to v${release.version}`, icon: CloudDownload, onSelect: update, disabled: !a.online }] : []),
 				{ label: 'Copy agent ID', icon: Copy, onSelect: () => navigator.clipboard?.writeText(a.id).then(() => toast.success('Agent ID copied.')) },
@@ -203,6 +217,7 @@
 				{ value: 'inventory', label: 'Hardware & network' },
 				{ value: 'software', label: 'Software', count: inv ? num(inv.software.length) : undefined },
 				{ value: 'alerts', label: 'Alerts', count: a.open_alerts ? num(a.open_alerts) : undefined },
+				{ value: 'tickets', label: 'Tickets' },
 				{ value: 'services', label: 'Services' },
 				{ value: 'logs', label: 'Event log' },
 				{ value: 'patches', label: 'Patches' },
@@ -399,6 +414,14 @@
 			</DataTable>
 		{:else if tab === 'alerts'}
 			<AgentAlerts agentId={a.id} />
+		{:else if tab === 'tickets'}
+			<TicketTable id="agent-tickets" caption="Tickets about {a.hostname}" list={tickets} sort={ticketSort} hide={['client']}>
+				{#snippet toolbar()}
+					<Segmented label="Tickets" value={ticketView} onchange={(v) => setParams({ tview: v === 'open' ? null : v })} options={[{ value: 'open', label: 'Open' }, { value: 'all', label: 'All' }]} />
+					{#if can('technician')}<Button size="sm" icon={LifeBuoy} class="ml-auto" onclick={() => (ticketing = true)}>New ticket</Button>{/if}
+				{/snippet}
+				{#snippet empty()}<EmptyState compact title={ticketView === 'open' ? 'No open tickets about this agent' : 'No tickets about this agent'} description="Tickets list the agents they're about; alert tickets link theirs automatically." />{/snippet}
+			</TicketTable>
 		{:else if tab === 'services'}
 			<AgentServices agentId={a.id} online={a.online} hostname={a.hostname} />
 		{:else if tab === 'logs'}
@@ -423,16 +446,18 @@
 				</Async>
 			</section>
 		{:else if tab === 'terminal'}
+			{#if fromTicket}<p class="text-muted mb-2 text-xs">Opened from a <a class="link" href="/tickets/{fromTicket}">ticket</a>: the session's start and end are added to it.</p>{/if}
 			{#if !a.online}
 				<div class="card"><EmptyState title="The agent is offline" description="The terminal opens once the agent reconnects." /></div>
 			{:else if terminal}
 				{#await terminal}
 					<div class="card flex h-64 items-center justify-center"><Spinner label="Loading terminal" /></div>
 				{:then T}
-					<T.default agentId={a.id} hostname={a.hostname} />
+					<T.default agentId={a.id} hostname={a.hostname} ticketId={fromTicket || undefined} />
 				{/await}
 			{/if}
 		{:else if tab === 'desktop'}
+			{#if fromTicket}<p class="text-muted mb-2 text-xs">Opened from a <a class="link" href="/tickets/{fromTicket}">ticket</a>: the session's start and end are added to it.</p>{/if}
 			{#if !a.capabilities?.includes('desktop')}
 				<div class="card">
 					<EmptyState icon={MonitorUp} title="Remote desktop needs a newer agent" description="This agent's version (v{a.agent_version}) can't share its screen. Update the agent, then reopen this tab." />
@@ -443,11 +468,12 @@
 				{#await desktop}
 					<div class="card flex h-64 items-center justify-center"><Spinner label="Loading remote desktop" /></div>
 				{:then D}
-					{#key a.id}<D.default agentId={a.id} hostname={a.hostname} />{/key}
+					{#key a.id}<D.default agentId={a.id} hostname={a.hostname} ticketId={fromTicket || undefined} />{/key}
 				{/await}
 			{/if}
 		{/if}
 
 		{#if running}<RunScript agents={[a]} onclose={() => (running = false)} />{/if}
+		{#if ticketing}<NewTicket onclose={() => (ticketing = false)} initial={{ clientId: a.client_id, agents: [a] }} />{/if}
 	{/snippet}
 </Async>

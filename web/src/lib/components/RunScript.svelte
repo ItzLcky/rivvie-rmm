@@ -16,12 +16,15 @@
 	let {
 		agents,
 		onclose,
-		initial
+		initial,
+		ticketId
 	}: {
 		agents: Pick<AgentSummary, 'id' | 'hostname' | 'os_family' | 'client_id'>[];
 		onclose: () => void;
 		/** Prefill (e.g. from a script page's "Run"). */
 		initial?: { scriptId?: string };
+		/** Run from this ticket: the result goes on its timeline, and we stay on the ticket. */
+		ticketId?: string;
 	} = $props();
 
 	const windowsOnly = $derived(agents.every((a) => a.os_family === 'windows'));
@@ -55,11 +58,16 @@
 		busy = true;
 		try {
 			const ids = agents.map((a) => a.id);
-			const payload = selected
-				? { agent_ids: ids, script_id: selected.id, args: argList }
-				: { agent_ids: ids, interpreter, body, args: argList, timeout_secs: timeout };
+			const payload = {
+				...(selected ? { agent_ids: ids, script_id: selected.id, args: argList } : { agent_ids: ids, interpreter, body, args: argList, timeout_secs: timeout }),
+				ticket_id: ticketId ?? null
+			};
 			const res = await api.post<{ jobs: { job_id: string; status: string }[]; skipped: string[] }>('/jobs', payload);
 			onclose();
+			if (ticketId) {
+				toast.success('Started. The result will be added to the ticket.');
+				return;
+			}
 			const queued = res.jobs.filter((j) => j.status === 'queued').length;
 			toast.success(
 				`Started on ${plural(res.jobs.length, 'agent')}${queued ? ` (${queued} offline, queued)` : ''}${res.skipped.length ? `; ${res.skipped.length} skipped` : ''}.`

@@ -24,6 +24,8 @@ services:
       # Caddy reaches the server over the compose network; believe its X-Forwarded-For.
       RMM_TRUSTED_PROXIES: private
       RUST_LOG: info
+    # Ticket attachments and raw email. Back this up along with the database dumps.
+    volumes: [files:/srv/data]
 
   # Nightly pg_dump (custom format), pruned after BACKUP_KEEP_DAYS. Dumps hold password
   # hashes, 2FA secrets and agent credential hashes, so they're written mode 0600.
@@ -73,3 +75,4 @@ services:
 volumes:
   pgdata:
   caddy:
+  files:

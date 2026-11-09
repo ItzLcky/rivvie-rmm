@@ -35,6 +35,9 @@ services:
       RUST_LOG: ${RUST_LOG:-info}
     ports:
       - "${RMM_PORT:-8080}:8080"
+    # Ticket attachments and raw email. Back this up along with the database dumps.
+    volumes:
+      - rmm-files:/srv/data
 
   # Nightly pg_dump (custom format), pruned after BACKUP_KEEP_DAYS. Dumps hold password
   # hashes, 2FA secrets and agent credential hashes, so they're written mode 0600.
@@ -73,3 +76,4 @@ services:
 volumes:
   rmm-pgdata:
   rmm-backups:
+  rmm-files:

@@ -44,7 +44,10 @@ RUN adduser -D -H rmm
 COPY --from=server /src/target/release/rmm-server /usr/local/bin/rmm-server
 COPY --from=web /web/build /srv/web
 COPY --from=agents /out /srv/agents
-ENV RMM_WEB_DIR=/srv/web RMM_AGENT_DIR=/srv/agents RMM_BIND=0.0.0.0:8080
+# Ticket attachments and raw email (unless RMM_S3_BUCKET is set). Mount a volume here; owned
+# by rmm so a fresh named volume inherits that.
+RUN mkdir -p /srv/data/storage && chown -R rmm /srv/data
+ENV RMM_WEB_DIR=/srv/web RMM_AGENT_DIR=/srv/agents RMM_STORAGE_DIR=/srv/data/storage RMM_BIND=0.0.0.0:8080
 USER rmm
 EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=3s --start-period=20s CMD wget -qO- http://127.0.0.1:8080/healthz || exit 1

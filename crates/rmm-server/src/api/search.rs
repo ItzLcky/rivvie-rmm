@@ -1,4 +1,4 @@
-//! `/search?q=`: the command palette's lookup across agents, clients, sites and scripts.
+//! `/search?q=`: the command palette's lookup across agents, clients, sites, scripts and tickets.
 //! Every result is limited to the clients the user can see.
 
 use std::sync::Arc;
@@ -54,12 +54,22 @@ pub struct ScriptHit {
     client_name: Option<String>,
 }
 
+#[derive(Serialize, sqlx::FromRow)]
+pub struct TicketHit {
+    id: Uuid,
+    number: i64,
+    subject: String,
+    client_name: Option<String>,
+    status_name: String,
+}
+
 #[derive(Serialize, Default)]
 pub struct Results {
     agents: Vec<AgentHit>,
     clients: Vec<ClientHit>,
     sites: Vec<SiteHit>,
     scripts: Vec<ScriptHit>,
+    tickets: Vec<TicketHit>,
 }
 
 pub async fn search(State(st): State<Arc<AppState>>, u: User, Query(q): Query<SearchQuery>) -> ApiResult<Json<Results>> {
@@ -110,5 +120,19 @@ pub async fn search(State(st): State<Arc<AppState>>, u: User, Query(q): Query<Se
     .bind(&scope)
     .fetch_all(&st.db)
     .await?;
-    Ok(Json(Results { agents, clients, sites, scripts }))
+    // Tickets by number (T-10423), else subject and timeline text; open ones first.
+    let number: Option<i64> = text.trim_start_matches(['T', 't']).trim_start_matches('-').parse().ok();
+    let tickets = sqlx::query_as(AssertSqlSafe(format!(
+        "SELECT t.id, t.number, t.subject, c.name AS client_name, bs.name AS status_name
+           FROM tickets t JOIN board_statuses bs ON bs.id = t.status_id LEFT JOIN clients c ON c.id = t.client_id
+          WHERE ($2::uuid[] IS NULL OR t.client_id = ANY($2))
+            AND (t.number = $3 OR t.subject ILIKE '%' || $1 || '%' OR t.search @@ websearch_to_tsquery('simple', $1))
+          ORDER BY t.number = $3 DESC NULLS LAST, bs.category IN ('resolved', 'closed'), t.updated_at DESC LIMIT {PER_KIND}"
+    )))
+    .bind(&text)
+    .bind(&scope)
+    .bind(number)
+    .fetch_all(&st.db)
+    .await?;
+    Ok(Json(Results { agents, clients, sites, scripts, tickets }))
 }

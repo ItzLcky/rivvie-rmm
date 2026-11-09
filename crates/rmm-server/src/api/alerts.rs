@@ -179,6 +179,8 @@ pub struct AlertDetail {
     alert: AlertRow,
     notifications: Vec<Delivery>,
     log_events: Vec<LogEventRow>,
+    /// The ticket its policy opened for it, if any.
+    ticket: Option<Value>,
 }
 
 pub async fn get(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uuid>) -> ApiResult<Json<AlertDetail>> {
@@ -199,7 +201,16 @@ pub async fn get(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uuid>)
     .bind(id)
     .fetch_all(&st.db)
     .await?;
-    Ok(Json(AlertDetail { alert, notifications, log_events }))
+    let ticket: Option<Value> = sqlx::query_scalar(
+        "SELECT jsonb_build_object('id', t.id, 'number', t.number) FROM alerts al JOIN tickets t
+             ON t.alert_policy_id = al.policy_id AND t.alert_agent_id = al.agent_id AND t.alert_key = al.key
+          WHERE al.id = $1 AND t.created_at <= coalesce(al.resolved_at, now()) + interval '1 minute'
+          ORDER BY t.created_at DESC LIMIT 1",
+    )
+    .bind(id)
+    .fetch_optional(&st.db)
+    .await?;
+    Ok(Json(AlertDetail { alert, notifications, log_events, ticket }))
 }
 
 #[derive(Deserialize)]
@@ -239,6 +250,9 @@ async fn act(st: &AppState, u: &User, ids: &[Uuid], action: &str) -> ApiResult<u
     let mut woke = false;
     for (id, agent_id, client_id, policy_id) in &rows {
         st.hub.publish(Event::Alert { id: *id, agent_id: *agent_id, client_id: *client_id, state: state.into() });
+        if action == "resolve" {
+            crate::tickets::alert_resolved(st, *id).await;
+        }
         if action == "resolve"
             && let Some(pid) = policy_id
         {
@@ -331,13 +345,19 @@ pub struct PolicyRow {
     channel_ids: Vec<Uuid>,
     notify_resolved: bool,
     enabled: bool,
+    /// Open tickets on this board for its alerts (None = no tickets).
+    ticket_board_id: Option<Uuid>,
+    ticket_priority: i16,
+    /// Resolve the ticket when the alert clears, if nobody has worked it.
+    ticket_auto_resolve: bool,
     open_alerts: i64,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
 
 const POLICY_SELECT: &str = "SELECT p.id, p.name, p.kind, p.params, p.severity, p.client_id, c.name AS client_name, p.site_id,
-       si.name AS site_name, p.os_family, p.channel_ids, p.notify_resolved, p.enabled,
+       si.name AS site_name, p.os_family, p.channel_ids, p.notify_resolved, p.enabled, p.ticket_board_id, p.ticket_priority,
+       p.ticket_auto_resolve,
        (SELECT count(*) FROM alerts al WHERE al.policy_id = p.id AND al.resolved_at IS NULL) AS open_alerts,
        p.created_at, p.updated_at
   FROM alert_policies p LEFT JOIN clients c ON c.id = p.client_id LEFT JOIN sites si ON si.id = p.site_id";
@@ -382,6 +402,15 @@ pub struct PolicyIn {
     notify_resolved: bool,
     #[serde(default = "yes")]
     enabled: bool,
+    ticket_board_id: Option<Uuid>,
+    #[serde(default = "p3")]
+    ticket_priority: i16,
+    #[serde(default)]
+    ticket_auto_resolve: bool,
+}
+
+fn p3() -> i16 {
+    3
 }
 
 fn yes() -> bool {
@@ -423,6 +452,15 @@ impl PolicyIn {
         let rule = Rule::parse(&self.kind, &params).map_err(ApiError::BadRequest)?;
         rule.validate().map_err(ApiError::BadRequest)?;
         check_target(st, u, self.client_id, self.site_id, self.os_family.as_deref()).await?;
+        if !(1..=4).contains(&self.ticket_priority) {
+            return Err(ApiError::BadRequest("ticket priority must be 1-4".into()));
+        }
+        if let Some(b) = self.ticket_board_id {
+            let exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM boards WHERE id = $1)").bind(b).fetch_one(&st.db).await?;
+            if !exists {
+                return Err(ApiError::NotFound("board"));
+            }
+        }
         if self.channel_ids.len() > 20 {
             return Err(ApiError::BadRequest("at most 20 channels".into()));
         }
@@ -465,8 +503,9 @@ pub async fn create_policy(State(st): State<Arc<AppState>>, u: User, Json(b): Js
     let rule = b.validate(&st, &u).await?;
     let id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO alert_policies (id, name, kind, params, severity, client_id, site_id, os_family, channel_ids, notify_resolved, enabled, created_by)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+        "INSERT INTO alert_policies (id, name, kind, params, severity, client_id, site_id, os_family, channel_ids, notify_resolved, enabled, created_by,
+                                     ticket_board_id, ticket_priority, ticket_auto_resolve)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
     )
     .bind(id)
     .bind(b.name.trim())
@@ -480,6 +519,9 @@ pub async fn create_policy(State(st): State<Arc<AppState>>, u: User, Json(b): Js
     .bind(b.notify_resolved)
     .bind(b.enabled)
     .bind(u.id)
+    .bind(b.ticket_board_id)
+    .bind(b.ticket_priority)
+    .bind(b.ticket_auto_resolve)
     .execute(&st.db)
     .await?;
     auth::audit(&st.db, Some(u.id), "policy.create", Some(("policy", id)), json!({ "name": b.name.trim(), "kind": rule.kind() })).await;
@@ -503,7 +545,8 @@ pub async fn update_policy(
     }
     sqlx::query(
         "UPDATE alert_policies SET name = $2, params = $3, severity = $4, client_id = $5, site_id = $6, os_family = $7,
-                channel_ids = $8, notify_resolved = $9, enabled = $10, updated_at = now()
+                channel_ids = $8, notify_resolved = $9, enabled = $10, ticket_board_id = $11, ticket_priority = $12,
+                ticket_auto_resolve = $13, updated_at = now()
           WHERE id = $1",
     )
     .bind(id)
@@ -516,6 +559,9 @@ pub async fn update_policy(
     .bind(dedup(&b.channel_ids))
     .bind(b.notify_resolved)
     .bind(b.enabled)
+    .bind(b.ticket_board_id)
+    .bind(b.ticket_priority)
+    .bind(b.ticket_auto_resolve)
     .execute(&st.db)
     .await?;
     // Open alerts take the new severity.

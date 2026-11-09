@@ -142,6 +142,9 @@ docker compose -f deploy/docker-compose.yml exec -T db \
 docker compose -f deploy/docker-compose.yml start server
 ```
 
+Ticket attachments and raw inbound email aren't in the database: they're files in the `files`
+volume (`rmm-files` in the Arcane stack), or in your S3 bucket. Back that up too.
+
 **Installing an agent**
 
 In the dashboard, open Clients & Sites → Enroll agents. The dialog has download buttons for the
@@ -186,6 +189,11 @@ to SYSTEM and Administrators. Windows service logs go to `C:\ProgramData\RMM\log
 | `RMM_JOB_QUEUE_DAYS` | `7` | Jobs (and patch installs) queued for an offline agent expire after this |
 | `RMM_PATCH_SCAN_HOURS` | `12` | Online agents scan for OS updates when their last scan is older than this |
 | `RMM_SESSION_IDLE_HOURS` | `12` | Dashboard sessions unused this long are signed out (sessions last 7 days at most). Admins can override it under Company settings |
+| `RMM_STORAGE_DIR` | `data/storage` (`/srv/data/storage` in the image) | Ticket attachments and raw inbound email, unless `RMM_S3_BUCKET` is set |
+| `RMM_S3_BUCKET` | empty | Store those files in an S3-compatible bucket instead. With `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `RMM_S3_REGION` (default `us-east-1`), and `RMM_S3_ENDPOINT` for MinIO and other non-AWS stores (path-style URLs then; `RMM_S3_PATH_STYLE` overrides) |
+| `RMM_MAIL_POLL_SECS` | `60` | How often IMAP support mailboxes are checked |
+| `RMM_TICKET_CLOSE_DAYS` | `7` | Resolved tickets move to Closed after this |
+| `RMM_EMAIL_RAW_DAYS` | `90` | Raw MIME of inbound mail is deleted after this (the ticket keeps the text and attachments) |
 | `RMM_TRUSTED_PROXIES` | empty | Reverse proxies whose `X-Forwarded-For` gives the client IP (for rate limiting and the audit log): comma-separated addresses/CIDRs, or `private` for loopback + RFC 1918 + IPv6 ULA. The bundled compose stack sets `private` for Caddy |
 
 ## Monitoring and alerts
@@ -301,6 +309,42 @@ security tags either: include **Updates** in the policy for Arch machines). On A
 macOS updates that need a restart may need a signed-in user to approve them. The Windows provider
 is compile-checked only so far, like the rest of the Windows agent.
 
+## Service desk (tickets)
+
+**Tickets** (Service desk → Tickets) live on **boards** (queues such as Service Desk and Alerts), each
+with its own statuses. Every status belongs to a category (New, Open, Waiting on client, Waiting on
+vendor, Resolved, Closed), which drives the views, reopening and auto-closing. Boards, ticket types
+and support mailboxes are under Company settings → Service desk.
+
+- **Timeline:** public replies (emailed to the contact), internal notes, every field change, alert
+  events, script results and remote sessions, in one append-only history. Attachments are stored
+  in `RMM_STORAGE_DIR` or S3; images preview inline, everything else downloads.
+- **The RMM link:** a ticket lists the agents it's about with their live state (online, CPU,
+  memory, disk, open alerts, missing updates). From there a technician runs a script (the output
+  lands on the timeline as an internal note) or opens a terminal or remote desktop (start and end,
+  with the duration, are recorded).
+- **Alerts open tickets:** an alert policy can file tickets on a board with a priority. A repeat of
+  the same alert on the same agent adds to its open ticket; a return after it was resolved reopens
+  it. Optionally the ticket resolves itself when the alert clears, unless a person has worked it
+  or the alert has come back three times.
+- **Email:** support mailboxes receive mail over IMAP (polled every minute, messages marked read)
+  or a provider webhook (`POST /api/inbound/email/<secret>`: raw MIME, Postmark JSON with the raw
+  email, or a Mailgun `mime` route). Replies thread by the `[T-10423]` subject tag, then by
+  `In-Reply-To`/`References`; quoted history is stripped. Senders are matched to contacts by
+  address, then to clients by their email domains; unknown senders land in **Triage** (visible only
+  to users who see every client). Auto-replies, bulk and list mail, bounces and mail from our own
+  addresses are recorded and ignored, and acknowledgements are limited to three per sender per
+  hour, so two systems can't reply to each other forever. Outgoing mail uses the SMTP server under
+  Notifications, with Reply-To set to the mailbox.
+- **Contacts** belong to a client (Clients → a client → Contacts). They're never created from mail
+  automatically.
+- Search covers ticket numbers, subjects, every timeline entry and contact names (Postgres full
+  text), in the Tickets list and the command palette. Bulk actions: assign, status, priority; and
+  merge duplicates from a ticket's menu.
+
+Not yet: Microsoft 365 mailboxes (they need OAuth or Graph; forward their mail to a webhook mailbox
+meanwhile), SLAs, time tracking and billing, and the client portal. See the roadmap.
+
 ## Remote desktop
 
 Open an agent and choose **Remote desktop** (technicians and admins). The agent starts a helper
@@ -329,4 +373,4 @@ sign-in screen), there's no clipboard sync or session recording, and the Windows
 compile-checked only, like the rest of the Windows agent. `RMM_DESKTOP_FAKE=<file>` makes the
 agent serve a synthetic screen and log input to `<file>`, for testing without a display.
 
-See [docs/ROADMAP.md](docs/ROADMAP.md) for what's next: PSA and more.
+See [docs/ROADMAP.md](docs/ROADMAP.md) for what's next: the rest of the PSA and more.

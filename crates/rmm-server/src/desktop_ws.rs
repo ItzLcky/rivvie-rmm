@@ -44,6 +44,8 @@ pub struct Params {
     monitor: u32,
     #[serde(default)]
     quality: Quality,
+    /// Opened from this ticket: start and end are recorded on its timeline.
+    ticket_id: Option<Uuid>,
 }
 
 #[derive(Deserialize)]
@@ -85,7 +87,8 @@ pub async fn handler(
         timeout_secs: CONSENT_TIMEOUT_SECS,
     });
     let settings = Settings { monitor: p.monitor, quality: p.quality };
-    Ok(ws.on_upgrade(move |socket| run(socket, st, user, agent_id, settings, consent)))
+    let ticket = crate::api::tickets::session_ticket(&st, &user, p.ticket_id, agent_id).await?;
+    Ok(ws.on_upgrade(move |socket| run(socket, st, user, agent_id, settings, consent, ticket)))
 }
 
 /// The browser's binary frame layout (see the module docs).
@@ -112,8 +115,19 @@ pub(crate) fn encode_frame(f: &Frame) -> Vec<u8> {
     out
 }
 
-async fn run(socket: WebSocket, st: Arc<AppState>, user: User, agent_id: Uuid, settings: Settings, consent: Option<Consent>) {
+async fn run(
+    socket: WebSocket,
+    st: Arc<AppState>,
+    user: User,
+    agent_id: Uuid,
+    settings: Settings,
+    consent: Option<Consent>,
+    ticket: Option<Uuid>,
+) {
     let session_id = Uuid::new_v4();
+    if let Some(t) = ticket {
+        crate::tickets::session_event(&st, t, user.id, agent_id, "desktop", None).await;
+    }
     let started = Instant::now();
     let mut events = st.hub.open_desktop(session_id, agent_id);
     let asked = consent.is_some();
@@ -198,6 +212,9 @@ async fn run(socket: WebSocket, st: Arc<AppState>, user: User, agent_id: Uuid, s
         json!({ "session_id": session_id, "duration_secs": started.elapsed().as_secs(), "reason": reason }),
     )
     .await;
+    if let Some(t) = ticket {
+        crate::tickets::session_event(&st, t, user.id, agent_id, "desktop", Some(started.elapsed().as_secs())).await;
+    }
 }
 
 #[cfg(test)]

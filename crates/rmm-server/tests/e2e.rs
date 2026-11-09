@@ -12,6 +12,11 @@
 //! run creates and drops its own `rmm_e2e_<random>` database. The agent binary defaults to
 //! the one next to the server binary (`target/debug/rmm-agent`); set `RMM_E2E_AGENT_BIN`
 //! to use another. Linux only: the agent runs bash jobs.
+//!
+//! Optional: `RMM_E2E_IMAP=host:imap_port:smtp_port` of a GreenMail container (user
+//! `imap@local.test`, password `secret`) also tests IMAP polling:
+//! `docker run -d -p 33143:3143 -p 33025:3025 -e GREENMAIL_OPTS='-Dgreenmail.setup.test.all -Dgreenmail.hostname=0.0.0.0
+//! -Dgreenmail.users=imap:secret@local.test -Dgreenmail.users.login=email' greenmail/standalone:2.1.3`
 
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -47,6 +52,7 @@ impl Server {
             .env("RMM_PUBLIC_URL", format!("http://127.0.0.1:{port}"))
             .env("RMM_WEB_DIR", dir.join("web"))
             .env("RMM_AGENT_DIR", dir.join("agents"))
+            .env("RMM_STORAGE_DIR", dir.join("storage"))
             .env("RMM_HEARTBEAT_SECS", "5")
             .env("RMM_ALERT_EVAL_SECS", "2")
             .env("RMM_TRUSTED_PROXIES", "127.0.0.1")
@@ -783,6 +789,7 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
     assert!(a["agent_version"] != "99.0.0");
 
     desktop(&url, &admin, dir, &id1).await;
+    tickets(&url, &admin, &id1, a_id, b_id).await;
     monitoring(server, &admin, db, dir, &id1, &id3, a_id).await;
 
     // --- rate limits ------------------------------------------------------------------------------
@@ -1276,4 +1283,362 @@ async fn monitoring(server: &mut Server, admin: &Api, db: &sqlx::PgPool, dir: &P
     let week = admin.get(&format!("/agents/{id1}/metrics?hours=168")).await;
     assert!(!week.as_array().unwrap().is_empty(), "long ranges read the rollups");
     let _ = (dir, id3);
+}
+
+/// Messages received by [`smtp_sink`]: (envelope recipients, raw DATA).
+type Mail = std::sync::Arc<std::sync::Mutex<Vec<(Vec<String>, String)>>>;
+
+/// A minimal SMTP server that accepts everything (no TLS, no auth).
+async fn smtp_sink() -> (u16, Mail) {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let mail: Mail = Default::default();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let store = mail.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((sock, _)) = listener.accept().await else { return };
+            let store = store.clone();
+            tokio::spawn(async move {
+                let (r, mut w) = sock.into_split();
+                let mut lines = BufReader::new(r).lines();
+                let _ = w.write_all(b"220 sink ESMTP\r\n").await;
+                let mut rcpt = vec![];
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let upper = line.to_ascii_uppercase();
+                    let reply: &[u8] = if upper.starts_with("EHLO") || upper.starts_with("HELO") {
+                        b"250 sink\r\n"
+                    } else if upper.starts_with("RCPT TO:") {
+                        rcpt.push(line[8..].trim().trim_matches(['<', '>']).to_string());
+                        b"250 ok\r\n"
+                    } else if upper.starts_with("DATA") {
+                        let _ = w.write_all(b"354 go\r\n").await;
+                        let mut data = String::new();
+                        while let Ok(Some(l)) = lines.next_line().await {
+                            if l == "." {
+                                break;
+                            }
+                            data.push_str(l.strip_prefix('.').filter(|_| l.starts_with("..")).unwrap_or(&l));
+                            data.push_str("\r\n");
+                        }
+                        store.lock().unwrap().push((std::mem::take(&mut rcpt), data));
+                        b"250 queued\r\n"
+                    } else if upper.starts_with("QUIT") {
+                        let _ = w.write_all(b"221 bye\r\n").await;
+                        break;
+                    } else {
+                        b"250 ok\r\n"
+                    };
+                    if w.write_all(reply).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    (port, mail)
+}
+
+async fn wait_mail(mail: &Mail, what: &str, pred: impl Fn(&[String], &str) -> bool) -> String {
+    eventually(30, what, || async { mail.lock().unwrap().iter().find(|(to, data)| pred(to, data)).map(|(_, d)| d.clone()) }).await
+}
+
+fn header<'a>(raw: &'a str, name: &str) -> Option<&'a str> {
+    let prefix = format!("{}:", name.to_ascii_lowercase());
+    raw.lines().take_while(|l| !l.is_empty()).find(|l| l.to_ascii_lowercase().starts_with(&prefix)).map(|l| l[prefix.len()..].trim())
+}
+
+async fn inbound(http: &reqwest::Client, url: &str, raw: String) -> Value {
+    let res = http.post(url).header("content-type", "message/rfc822").body(raw).send().await.unwrap();
+    let status = res.status();
+    let v: Value = res.json().await.unwrap_or(Value::Null);
+    assert!(status.is_success(), "inbound: {status} {v}");
+    v
+}
+
+fn events_of(t: &Value, kind: &str) -> Vec<Value> {
+    t["events"].as_array().unwrap().iter().filter(|e| e["kind"] == kind).cloned().collect()
+}
+
+async fn tickets(url: &str, admin: &Api, id1: &str, a_id: &str, b_id: &str) {
+    let http = reqwest::Client::new();
+    let (smtp_port, mail) = smtp_sink().await;
+    admin
+        .call(
+            reqwest::Method::PUT,
+            "/settings/smtp",
+            Some(json!({ "host": "127.0.0.1", "port": smtp_port, "security": "none", "from": "Help Desk <help@msp.example>" })),
+        )
+        .await;
+
+    // --- setup: boards, a contact, the client's domain, a webhook mailbox ----------------------
+    let meta = admin.get("/tickets/meta").await;
+    let boards = meta["boards"].as_array().unwrap();
+    let desk = boards.iter().find(|b| b["name"] == "Service Desk").unwrap().clone();
+    let alerts_board = boards.iter().find(|b| b["name"] == "Alerts").unwrap()["id"].as_str().unwrap().to_string();
+    let status = |cat: &str| desk["statuses"].as_array().unwrap().iter().find(|s| s["category"] == cat).unwrap()["id"].as_str().unwrap().to_string();
+    let (s, v) = admin
+        .call(reqwest::Method::PUT, &format!("/boards/{}", desk["id"].as_str().unwrap()), Some(json!({ "name": "Service Desk", "statuses": [{ "name": "New", "category": "new" }] })))
+        .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "a board needs resolved and closed statuses: {v}");
+    let ann = admin
+        .post("/contacts", json!({ "client_id": a_id, "name": "Ann Example", "email": "Ann@Client-A.example", "is_primary": true }))
+        .await;
+    assert_eq!(ann["email"], "ann@client-a.example");
+    let (s, _) = admin.call(reqwest::Method::POST, "/contacts", Some(json!({ "client_id": a_id, "name": "Dup", "email": "ann@client-a.example" }))).await;
+    assert_eq!(s, StatusCode::CONFLICT);
+    admin.call(reqwest::Method::PUT, &format!("/clients/{a_id}/email-domains"), Some(json!({ "domains": ["@Client-A.example"] }))).await;
+    let (s, _) = admin.call(reqwest::Method::PUT, &format!("/clients/{b_id}/email-domains"), Some(json!({ "domains": ["client-a.example"] }))).await;
+    assert_eq!(s, StatusCode::CONFLICT, "a domain belongs to one client");
+    let mb = admin
+        .post("/mailboxes", json!({ "name": "Support", "address": "support@msp.example", "kind": "webhook", "board_id": desk["id"], "auto_reply": true }))
+        .await;
+    let hook = mb["webhook_url"].as_str().unwrap().to_string();
+    assert!(admin.get("/mailboxes").await[0].get("webhook_url").is_none(), "the URL is shown once");
+
+    // --- a ticket from the dashboard, linked to an agent ---------------------------------------------
+    let t = admin
+        .post(
+            "/tickets",
+            json!({ "subject": "  Printer   offline ", "description": "The office printer stopped working.", "client_id": a_id,
+                    "contact_id": ann["id"], "impact": 1, "urgency": 2, "agent_ids": [id1] }),
+        )
+        .await;
+    assert_eq!((t["subject"].as_str(), t["priority"].as_i64(), t["status_category"].as_str()), (Some("Printer offline"), Some(2), Some("new")), "{t}");
+    assert!(t["number"].as_i64() >= Some(10001));
+    let (tid, number) = (t["id"].as_str().unwrap().to_string(), t["number"].as_i64().unwrap());
+    let (s, _) = admin.call(reqwest::Method::POST, "/tickets", Some(json!({ "subject": "x", "client_id": b_id, "agent_ids": [id1] }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "agents must belong to the ticket's client");
+
+    // Detail: the agent's live state rides along.
+    let d = admin.get(&format!("/tickets/{tid}")).await;
+    assert_eq!(d["agents"][0]["id"], id1);
+    assert!(d["agents"][0]["online"].is_boolean() && d["agents"][0]["alerts"].is_array(), "{}", d["agents"]);
+    assert_eq!(d["reply_to"], "ann@client-a.example");
+
+    // --- a public reply is emailed with the ticket tag; notes aren't -------------------------------
+    admin.post(&format!("/tickets/{tid}/events"), json!({ "kind": "note", "body": "Checked the spooler." })).await;
+    let r = admin
+        .post(&format!("/tickets/{tid}/events"), json!({ "kind": "reply", "body": "Could you power-cycle it?", "status_id": status("waiting_client") }))
+        .await;
+    assert_eq!(r["emailed"], true);
+    let sent = wait_mail(&mail, "the reply email", |to, _| to == ["ann@client-a.example"]).await;
+    assert!(header(&sent, "Subject").unwrap().contains(&format!("[T-{number}]")), "{sent}");
+    assert!(header(&sent, "Reply-To").unwrap().contains("support@msp.example"), "{sent}");
+    let our_id = header(&sent, "Message-ID").unwrap().trim_matches(['<', '>']).to_string();
+    assert!(sent.contains("power-cycle"));
+    assert_eq!(mail.lock().unwrap().len(), 1, "internal notes are never emailed");
+    let d = admin.get(&format!("/tickets/{tid}")).await;
+    assert_eq!(d["status_category"], "waiting_client");
+    assert!(d["first_response_at"].is_string());
+    let (api, t2) = (admin, tid.as_str());
+    eventually(20, "the reply to show as sent", move || async move {
+        let d = api.get(&format!("/tickets/{t2}")).await;
+        (events_of(&d, "reply")[0]["email_status"] == "sent").then_some(())
+    })
+    .await;
+
+    // --- the client answers without the tag: threaded by In-Reply-To, back to work ---------------------
+    let answer = format!(
+        "From: Ann Example <ann@client-a.example>\r\nTo: support@msp.example\r\nSubject: Re: Printer offline\r\n\
+         Message-ID: <answer-1@client-a.example>\r\nIn-Reply-To: <{our_id}>\r\nReferences: <{our_id}>\r\n\
+         Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain\r\n\r\nDid that, it prints now.\r\n\r\n\
+         On Mon, 9 Nov 2026, Help Desk <help@msp.example> wrote:\r\n> Could you power-cycle it?\r\n\r\n--b\r\n\
+         Content-Type: text/plain; name=\"log.txt\"\r\nContent-Disposition: attachment; filename=\"log.txt\"\r\n\r\nprinter log\r\n--b--\r\n"
+    );
+    let v = inbound(&http, &hook, answer.clone()).await;
+    assert_eq!((v["result"].as_str(), v["ticket_id"].as_str()), (Some("threaded"), Some(tid.as_str())), "{v}");
+    assert_eq!(inbound(&http, &hook, answer).await["result"], "duplicate");
+    let d = admin.get(&format!("/tickets/{tid}")).await;
+    let msg = events_of(&d, "message");
+    assert_eq!(msg[0]["body"], "Did that, it prints now.", "quoted text is stripped");
+    assert_eq!((msg[0]["author_kind"].as_str(), msg[0]["author_name"].as_str()), (Some("contact"), Some("Ann Example")));
+    assert_eq!(d["status_category"], "open", "a reply while waiting on the client reopens the work");
+    let att = d["attachments"].as_array().unwrap().iter().find(|a| a["name"] == "log.txt").unwrap().clone();
+    let res = admin.http.get(format!("{}/tickets/{tid}/attachments/{}", admin.base, att["id"].as_str().unwrap())).send().await.unwrap();
+    assert_eq!(res.headers()["content-type"], "application/octet-stream", "non-images always download");
+    assert!(res.headers()["content-disposition"].to_str().unwrap().starts_with("attachment"));
+    assert!(res.text().await.unwrap().contains("printer log"));
+
+    // --- new mail: a domain match, a stranger (triage), robots ------------------------------------------
+    let new_mail = |from: &str, id: &str, extra: &str, body: &str| {
+        format!("From: {from}\r\nTo: support@msp.example\r\nSubject: Need help with VPN\r\nMessage-ID: <{id}>\r\n{extra}\r\n{body}\r\n")
+    };
+    let v = inbound(&http, &hook, new_mail("Bob <bob@client-a.example>", "n1@x", "", "zebrafish VPN drops every hour")).await;
+    assert_eq!(v["result"], "created");
+    let bob_ticket = admin.get(&format!("/tickets/{}", v["ticket_id"].as_str().unwrap())).await;
+    assert_eq!((bob_ticket["client_id"].as_str(), bob_ticket["contact_id"].as_str()), (Some(a_id), None), "filed by domain, no contact created");
+    assert_eq!(bob_ticket["requester_email"], "bob@client-a.example");
+    wait_mail(&mail, "the acknowledgement", |to, data| to == ["bob@client-a.example"] && header(data, "Auto-Submitted") == Some("auto-replied")).await;
+    let v = inbound(&http, &hook, new_mail("stranger@nowhere.example", "n2@x", "", "who are you")).await;
+    let triage_id = v["ticket_id"].as_str().unwrap().to_string();
+    assert!(admin.get(&format!("/tickets/{triage_id}")).await["client_id"].is_null());
+    for (extra, why) in [("Auto-Submitted: auto-replied\r\n", "auto-submitted"), ("Precedence: bulk\r\n", "bulk or list mail")] {
+        let v = inbound(&http, &hook, new_mail("ooo@client-a.example", &format!("{why}@x"), extra, "I'm away")).await;
+        assert_eq!((v["result"].as_str(), v["reason"].as_str()), (Some("ignored"), Some(why)));
+    }
+    let v = inbound(&http, &hook, new_mail("support@msp.example", "loop@x", "", "echo")).await;
+    assert_eq!(v["result"], "ignored", "mail from our own mailbox is never filed");
+    let (s, _) = admin.call(reqwest::Method::GET, "/mailboxes/inbound", None).await;
+    assert!(s.is_success());
+    let res = http.post(format!("{url}/api/inbound/email/not-a-token")).body("x").send().await.unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+    // --- search, views, scoping ---------------------------------------------------------------------------
+    let hits = admin.get("/tickets?q=zebrafish").await;
+    assert_eq!(hits["items"][0]["id"], bob_ticket["id"], "event text is searchable: {hits}");
+    assert_eq!(admin.get(&format!("/tickets?q=T-{number}")).await["items"][0]["id"], tid.as_str());
+    assert_eq!(admin.get(&format!("/tickets?view=all&agent_id={id1}")).await["total"], 1);
+    assert_eq!(admin.get("/tickets?view=triage").await["items"][0]["id"], triage_id.as_str());
+    let desk_user = admin
+        .post("/users", json!({ "email": "scoped-desk@e2e.test", "name": "Scoped Desk", "password": "desk-password-123", "role": "technician", "all_clients": false, "client_ids": [b_id] }))
+        .await;
+    let desk_api = Api::new(url);
+    desk_api.post("/auth/login", json!({ "email": "scoped-desk@e2e.test", "password": "desk-password-123" })).await;
+    assert_eq!(desk_api.get("/tickets?view=all").await["total"], 0, "other clients' and triage tickets are hidden");
+    for path in [format!("/tickets/{tid}"), format!("/tickets/{triage_id}")] {
+        let (s, _) = desk_api.call(reqwest::Method::GET, &path, None).await;
+        assert_eq!(s, StatusCode::NOT_FOUND, "{path}");
+    }
+    let (s, _) = desk_api.call(reqwest::Method::POST, "/tickets", Some(json!({ "subject": "x" }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "scoped users can't open triage tickets");
+    let (s, v) = admin.call(reqwest::Method::PATCH, &format!("/tickets/{tid}"), Some(json!({ "assignee_id": desk_user["id"] }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "the assignee must see the client: {v}");
+
+    // --- changes are recorded; bulk; merge ---------------------------------------------------------------
+    let me = admin.get("/auth/me").await["id"].as_str().unwrap().to_string();
+    let p = admin.call(reqwest::Method::PATCH, &format!("/tickets/{tid}"), Some(json!({ "priority": 1, "assignee_id": me, "subject": "Printer offline (2nd floor)" }))).await;
+    assert!(p.0.is_success(), "{}", p.1);
+    assert_eq!(p.1["assignee_id"], me.as_str());
+    let d = admin.get(&format!("/tickets/{tid}")).await;
+    let fields: Vec<String> = events_of(&d, "change").iter().map(|e| e["data"]["field"].as_str().unwrap().to_string()).collect();
+    for f in ["status", "subject", "priority", "assignee"] {
+        assert!(events_of(&d, "change").iter().any(|e| e["data"]["field"] == f), "{f} change recorded: {fields:?}");
+    }
+    assert_eq!(admin.get("/tickets?view=mine").await["items"][0]["id"], tid.as_str());
+    let b = admin.post("/tickets/bulk", json!({ "ids": [bob_ticket["id"]], "status_category": "open", "priority": 4 })).await;
+    assert_eq!(b["changed"], 1);
+    let m = admin.post(&format!("/tickets/{triage_id}/merge"), json!({ "into": bob_ticket["id"] })).await;
+    assert!(m["id"] == bob_ticket["id"]);
+    let merged = admin.get(&format!("/tickets/{triage_id}")).await;
+    assert_eq!((merged["status_category"].as_str(), merged["merged_into"].as_str()), (Some("closed"), bob_ticket["id"].as_str()));
+    let target = admin.get(&format!("/tickets/{}", bob_ticket["id"].as_str().unwrap())).await;
+    assert!(events_of(&target, "message").is_empty() && events_of(&target, "created").len() == 2, "the duplicate's timeline moved over");
+
+    // --- uploads and a reply with an attachment ------------------------------------------------------------
+    let form = reqwest::multipart::Form::new().part("file", reqwest::multipart::Part::bytes(b"\x89PNG fake".to_vec()).file_name("shot.png").mime_str("image/png").unwrap());
+    let up: Value = admin.http.post(format!("{}/tickets/{tid}/attachments", admin.base)).multipart(form).send().await.unwrap().json().await.unwrap();
+    let up_id = up[0]["id"].as_str().unwrap().to_string();
+    admin.post(&format!("/tickets/{tid}/events"), json!({ "kind": "reply", "body": "Screenshot attached.", "attachment_ids": [up_id] })).await;
+    let sent = wait_mail(&mail, "the reply with an attachment", |_, d| d.contains("Screenshot attached")).await;
+    assert!(sent.contains("shot.png"), "the attachment is emailed too");
+    assert!(header(&sent, "In-Reply-To").unwrap().contains("answer-1@client-a.example"), "threads onto the client's last message");
+    let res = admin.http.get(format!("{}/tickets/{tid}/attachments/{up_id}?inline=1", admin.base)).send().await.unwrap();
+    assert_eq!(res.headers()["content-type"], "image/png");
+    let (s, _) = admin.call(reqwest::Method::POST, &format!("/tickets/{tid}/events"), Some(json!({ "kind": "note", "body": "x", "attachment_ids": [up_id] }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "an attachment belongs to one event");
+
+    // --- a script run from the ticket reports back ----------------------------------------------------------
+    let j = admin.post("/jobs", json!({ "agent_ids": [id1], "interpreter": "bash", "body": "echo spooler restarted", "timeout_secs": 30, "ticket_id": tid })).await;
+    admin.wait_job(j["jobs"][0]["job_id"].as_str().unwrap(), 30).await;
+    let (api, t2) = (admin, tid.as_str());
+    let job_ev = eventually(20, "the job result on the timeline", move || async move {
+        let d = api.get(&format!("/tickets/{t2}")).await;
+        events_of(&d, "job").into_iter().find(|e| e["data"]["status"] == "succeeded")
+    })
+    .await;
+    assert!(job_ev["body"].as_str().unwrap().contains("spooler restarted"), "{job_ev}");
+    let b_ticket = admin.post("/tickets", json!({ "subject": "Client B issue", "client_id": b_id })).await;
+    let (s, _) = admin
+        .call(reqwest::Method::POST, "/jobs", Some(json!({ "agent_ids": [id1], "interpreter": "bash", "body": "true", "ticket_id": b_ticket["id"] })))
+        .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "the agent must belong to the ticket's client");
+
+    // --- an alert policy files a ticket, resolves it, reopens it ---------------------------------------------
+    let pol = admin
+        .post(
+            "/alert-policies",
+            json!({ "name": "Ticket on failure", "kind": "job_failed", "params": {}, "severity": "warning", "client_id": a_id,
+                    "ticket_board_id": alerts_board, "ticket_priority": 2, "ticket_auto_resolve": true }),
+        )
+        .await;
+    assert_eq!(pol["ticket_board_id"], alerts_board.as_str());
+    let fail = admin.run_script(id1, "exit 3", 30).await;
+    admin.wait_job(&fail, 30).await;
+    let pid = pol["id"].as_str().unwrap().to_string();
+    let (api, p) = (admin, pid.as_str());
+    let at = eventually(20, "the alert ticket", move || async move {
+        let l = api.get("/tickets?view=all&sort=created&dir=desc").await;
+        l["items"].as_array().unwrap().iter().find(|t| t["alert_policy_id"] == p).cloned()
+    })
+    .await;
+    assert_eq!((at["board_id"].as_str(), at["priority"].as_i64(), at["source"].as_str()), (Some(alerts_board.as_str()), Some(2), Some("alert")));
+    assert_eq!(at["agent_count"], 1);
+    let at_id = at["id"].as_str().unwrap().to_string();
+    let ok = admin.run_script(id1, "true", 30).await;
+    admin.wait_job(&ok, 30).await;
+    let (api, a2) = (admin, at_id.as_str());
+    eventually(20, "the alert ticket to resolve itself", move || async move {
+        (api.get(&format!("/tickets/{a2}")).await["status_category"] == "resolved").then_some(())
+    })
+    .await;
+    let fail = admin.run_script(id1, "exit 3", 30).await;
+    admin.wait_job(&fail, 30).await;
+    let (api, a2) = (admin, at_id.as_str());
+    let back = eventually(20, "the same ticket to reopen", move || async move {
+        let t = api.get(&format!("/tickets/{a2}")).await;
+        (t["status_category"] == "open").then_some(t)
+    })
+    .await;
+    assert_eq!(back["alert_reopens"], 1, "{back}");
+    let n_alert_tickets = admin.get("/tickets?view=all").await["items"].as_array().unwrap().iter().filter(|t| t["alert_policy_id"] == pid.as_str()).count();
+    assert_eq!(n_alert_tickets, 1, "deduplicated onto one ticket");
+    // A person working it stops automation from resolving it.
+    admin.post(&format!("/tickets/{at_id}/events"), json!({ "kind": "note", "body": "Looking into it." })).await;
+    let ok = admin.run_script(id1, "true", 30).await;
+    admin.wait_job(&ok, 30).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let t = admin.get(&format!("/tickets/{at_id}")).await;
+    assert_eq!(t["status_category"], "open", "touched tickets aren't auto-resolved");
+    assert!(events_of(&t, "alert").iter().any(|e| e["data"]["state"] == "resolved"), "the clear is still noted");
+    admin.call(reqwest::Method::DELETE, &format!("/alert-policies/{pid}"), None).await;
+    // --- IMAP (optional): RMM_E2E_IMAP=host:imap_port:smtp_port of a GreenMail container -----------
+    if let Ok(spec) = std::env::var("RMM_E2E_IMAP") {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let parts: Vec<&str> = spec.split(':').collect();
+        let (host, imap_port, smtp) = (parts[0], parts[1].parse::<u16>().unwrap(), parts[2]);
+        // Deliver one message over SMTP.
+        let sock = tokio::net::TcpStream::connect(format!("{host}:{smtp}")).await.unwrap();
+        let (r, mut w) = sock.into_split();
+        let mut lines = BufReader::new(r).lines();
+        lines.next_line().await.unwrap();
+        for cmd in ["EHLO e2e", "MAIL FROM:<ann@client-a.example>", "RCPT TO:<imap@local.test>", "DATA"] {
+            w.write_all(format!("{cmd}\r\n").as_bytes()).await.unwrap();
+            loop {
+                let l = lines.next_line().await.unwrap().unwrap();
+                if l.as_bytes().get(3) != Some(&b'-') {
+                    break;
+                }
+            }
+        }
+        let msg = format!("From: Ann Example <ann@client-a.example>\r\nTo: imap@local.test\r\nSubject: Re: Printer [T-{number}]\r\nMessage-ID: <imap-1@client-a.example>\r\n\r\nSent over IMAP.\r\n.\r\nQUIT\r\n");
+        w.write_all(msg.as_bytes()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let mb = admin
+            .post(
+                "/mailboxes",
+                json!({ "name": "IMAP", "address": "imap@local.test", "kind": "imap", "imap_host": host, "imap_port": imap_port,
+                        "imap_security": "none", "imap_username": "imap@local.test", "imap_password": "secret", "board_id": desk["id"] }),
+            )
+            .await;
+        let r = admin.post(&format!("/mailboxes/{}/poll", mb["id"].as_str().unwrap()), json!({})).await;
+        assert_eq!((r["ok"].as_bool(), r["filed"].as_i64()), (Some(true), Some(1)), "{r}");
+        let d = admin.get(&format!("/tickets/{tid}")).await;
+        assert!(events_of(&d, "message").iter().any(|e| e["body"] == "Sent over IMAP."), "IMAP mail threaded onto the ticket");
+        let r = admin.post(&format!("/mailboxes/{}/poll", mb["id"].as_str().unwrap()), json!({})).await;
+        assert_eq!(r["filed"], 0, "marked seen, not filed twice");
+        println!("IMAP polling filed the message");
+    }
+    let summary = admin.get("/tickets/summary").await;
+    assert!(summary["open"].as_i64() >= Some(2) && summary["mine"].as_i64() >= Some(1), "{summary}");
 }

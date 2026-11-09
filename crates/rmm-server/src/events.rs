@@ -57,6 +57,7 @@ enum Key {
     Alert(Uuid),
     Services(Uuid),
     Patches(Uuid),
+    Ticket(Uuid),
 }
 
 fn key(ev: &Event) -> Key {
@@ -67,6 +68,7 @@ fn key(ev: &Event) -> Key {
         Event::Alert { id, .. } => Key::Alert(*id),
         Event::Services { agent_id, .. } => Key::Services(*agent_id),
         Event::Patches { agent_id, .. } => Key::Patches(*agent_id),
+        Event::Ticket { id, .. } => Key::Ticket(*id),
     }
 }
 
@@ -96,7 +98,7 @@ async fn pump(st: Arc<AppState>, mut user: User, token: String, mut events: broa
         tokio::select! {
             ev = events.recv() => match ev {
                 Ok(ev) => {
-                    if ev.client_id().is_some_and(|c| !user.can_see_client(c)) {
+                    if !ev.visible_to(&user) {
                         continue;
                     }
                     let k = key(&ev);

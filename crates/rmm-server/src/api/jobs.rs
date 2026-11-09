@@ -210,6 +210,9 @@ pub struct NewJob {
     #[serde(default)]
     args: Vec<String>,
     timeout_secs: Option<i32>,
+    /// Run from this ticket: the result is added to its timeline. The agents must belong to
+    /// the ticket's client.
+    ticket_id: Option<Uuid>,
 }
 
 pub async fn create(State(st): State<Arc<AppState>>, u: User, Json(b): Json<NewJob>) -> ApiResult<Json<serde_json::Value>> {
@@ -238,6 +241,19 @@ pub async fn create(State(st): State<Arc<AppState>>, u: User, Json(b): Json<NewJ
         ),
     };
     let interpreter = parse_interpreter(&interp).ok_or_else(|| ApiError::BadRequest(format!("unknown interpreter {interp}")))?;
+    let ticket_client = match b.ticket_id {
+        Some(t) => {
+            let c = super::tickets::visible(&st, &u, t).await?;
+            Some(c.ok_or_else(|| ApiError::BadRequest("set the ticket's client before running scripts from it".into()))?)
+        }
+        None => None,
+    };
+    if let (Some(sc), Some(tc)) = (script_client, ticket_client)
+        && sc != tc
+    {
+        return Err(ApiError::BadRequest("that script belongs to another client".into()));
+    }
+    let required_client = script_client.or(ticket_client);
     let timeout = b.timeout_secs.unwrap_or(default_timeout).clamp(1, 86400);
     let args = serde_json::to_value(&b.args).unwrap_or_default();
 
@@ -248,8 +264,8 @@ pub async fn create(State(st): State<Arc<AppState>>, u: User, Json(b): Json<NewJ
         // Agents that don't exist, that the user can't see, or that belong to a different
         // client than the script are skipped and reported back.
         let client_id: Option<Uuid> = sqlx::query_scalar(
-            "INSERT INTO jobs (id, agent_id, script_id, interpreter, body, args, timeout_secs, created_by)
-             SELECT $1, $2, $3, $4, $5, $6, $7, $8
+            "INSERT INTO jobs (id, agent_id, script_id, interpreter, body, args, timeout_secs, created_by, ticket_id)
+             SELECT $1, $2, $3, $4, $5, $6, $7, $8, $11
                FROM agents a JOIN sites s ON s.id = a.site_id
               WHERE a.id = $2 AND ($9::uuid[] IS NULL OR s.client_id = ANY($9))
                 AND ($10::uuid IS NULL OR s.client_id = $10)
@@ -264,7 +280,8 @@ pub async fn create(State(st): State<Arc<AppState>>, u: User, Json(b): Json<NewJ
         .bind(timeout)
         .bind(u.id)
         .bind(u.scope())
-        .bind(script_client)
+        .bind(required_client)
+        .bind(b.ticket_id)
         .fetch_optional(&st.db)
         .await?;
         let Some(client_id) = client_id else {
@@ -275,10 +292,13 @@ pub async fn create(State(st): State<Arc<AppState>>, u: User, Json(b): Json<NewJ
         let job = ScriptJob { job_id, interpreter, script: body.clone(), args: b.args.clone(), timeout_secs: timeout as u32 };
         let status = deliver(&st, *agent_id, client_id, job).await?;
         jobs.push(json!({ "job_id": job_id, "agent_id": agent_id, "status": status }));
+        if let Some(t) = b.ticket_id {
+            super::tickets::job_started(&st, &u, t, job_id, *agent_id, b.script_id).await?;
+        }
     }
     if jobs.is_empty() {
         return Err(ApiError::BadRequest(
-            "none of the selected agents can run this: they don't exist, or belong to a different client than the script".into(),
+            "none of the selected agents can run this: they don't exist, or belong to a different client than the script or ticket".into(),
         ));
     }
 

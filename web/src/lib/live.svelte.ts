@@ -13,7 +13,8 @@ export type LiveEvent =
 	| { type: 'jobs' }
 	| { type: 'alert'; id: string; agent_id: string; state: 'open' | 'acknowledged' | 'resolved' }
 	| { type: 'services'; agent_id: string }
-	| { type: 'patches'; agent_id: string };
+	| { type: 'patches'; agent_id: string }
+	| { type: 'ticket'; id: string };
 
 export const live = $state<{ status: 'connecting' | 'live' | 'offline' }>({ status: 'connecting' });
 

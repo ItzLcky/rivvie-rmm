@@ -241,7 +241,42 @@ To do:
 - [ ] Remote cursor shape (XFixes / `GetCursorInfo`); today the local cursor is shown and the remote position is marked.
 - [ ] Session recording to object storage; an on-screen "you are being watched" indicator; view-only sessions for the readonly role.
 
-## Phase 7: PSA (professional services automation)
+## Phase 7: PSA (professional services automation) (milestones 1-2 done)
+
+### Progress
+
+Done (milestones 1 and 2 of the build order below, so an MSP can run its service desk here and bill elsewhere):
+
+- [x] Contacts per client; client email domains
+- [x] Boards with ordered statuses mapped to categories; ticket types; P1-P4 from impact × urgency (or set directly)
+- [x] Tickets with `T-10001` numbers, an append-only timeline (replies, notes, field changes, alerts, script results, sessions, merges), assignment, attachments, bulk status/priority/assignee, merge
+- [x] Full-text search (trigger-maintained `tsvector` over subject, timeline and contact) in the list and the command palette
+- [x] Linked agents with their live state on the ticket; run a script, open a terminal or remote desktop from it (results and sessions recorded on the timeline)
+- [x] Object storage: local directory by default, S3/MinIO with a small SigV4 client (`RMM_S3_*`)
+- [x] Outbound email: public replies (with attachments) threaded by Message-ID/References and the `[T-n]` tag; assignment notices; acknowledgements
+- [x] Inbound email: IMAP polling and a provider webhook (raw MIME, Postmark, Mailgun); threading by tag then In-Reply-To/References; quote stripping; sender → contact → client domain → triage; loop protection (Auto-Submitted, Precedence, X-Autoreply, DSNs, our own addresses, per-sender acknowledgement limit); raw MIME kept for `RMM_EMAIL_RAW_DAYS`
+- [x] Alert → ticket per policy (board, priority), deduplicated per alert/agent, notes on clear, auto-resolve if untouched, reopen on return, stop auto-resolving after 3 reopens
+- [x] Resolved tickets close after `RMM_TICKET_CLOSE_DAYS`
+
+Left over from milestones 1-2:
+
+- [ ] Microsoft Graph mailboxes (subscriptions) or IMAP with XOAUTH2. Basic-auth IMAP is off in Microsoft 365, so M365 tenants currently have to forward to a webhook mailbox
+- [ ] Teams for assignment (only users today), split a reply into a new ticket, canned responses and macros, CSAT survey
+- [ ] Per-board notification of new tickets through the notification channels
+- [ ] Attachments over 8 MB (the global request body limit)
+
+### Review notes (2026-11)
+
+Decisions and corrections made while building milestones 1-2:
+
+- **Permissions model:** not needed until time and billing (rates must be hidden from some technicians). Tickets use the existing roles: read-only users read, technicians work tickets, admins configure boards and mailboxes. Do the permission sets before milestone 5, not before milestone 1.
+- **Object storage:** a hard MinIO dependency is heavy for small installs. Local directory is the default; S3 is opt-in. Session recordings (Phase 6) can use the same `Storage`.
+- **Priorities:** a `priorities` table added nothing; priority is 1-4 on the ticket with impact × urgency (1-3 each) computed in code. SLA targets will key on the number.
+- **Search:** a generated `tsvector` column can't read other tables (timeline, contact), so triggers maintain it.
+- **Triage:** unknown senders' tickets have no client. The existing scope filter (`client_id = ANY(scope)`) already hides them from scoped users, so triage needs no extra access rules.
+- **Alert dedupe:** keyed on the alert's (policy, agent, key), not the alert row, so a flapping check reopens one ticket instead of opening many. "Untouched" is `touched_at IS NULL`, set by any person's action.
+- **Email identity:** contacts are matched on `From`, never `Reply-To` (anyone can set that). An address used by two clients' contacts goes to triage rather than guessing.
+- **Open questions answered:** multi-currency: store a currency per client (company default), decide before the invoice tables. Retention: raw MIME is pruned after `RMM_EMAIL_RAW_DAYS`; per-client purge of closed tickets (GDPR) is still open. Co-managed IT: works today through `user_clients` (a technician limited to one client sees only its tickets).
 
 The goal is a built-in PSA, so an MSP can run its service desk, contracts and billing in the same product as the RMM. The selling point is the link between the two: alerts open tickets, tickets show the device's live state, and invoices count the enrolled agents. A ticket tracker sitting next to the RMM wouldn't offer that.
 
