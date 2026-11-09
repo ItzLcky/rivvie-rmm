@@ -38,12 +38,18 @@ pub enum Event {
     },
     /// Many jobs changed at once (the housekeeping sweep): refetch job lists.
     Jobs,
+    /// An agent's patch state changed: a scan, an install's progress or result.
+    Patches {
+        agent_id: Uuid,
+        #[serde(skip)]
+        client_id: Uuid,
+    },
 }
 
 impl Event {
     pub fn client_id(&self) -> Option<Uuid> {
         match self {
-            Event::Agent { client_id, .. } | Event::Job { client_id, .. } => Some(*client_id),
+            Event::Agent { client_id, .. } | Event::Job { client_id, .. } | Event::Patches { client_id, .. } => Some(*client_id),
             Event::Jobs => None,
         }
     }

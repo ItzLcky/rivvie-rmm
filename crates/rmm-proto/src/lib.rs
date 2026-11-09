@@ -8,6 +8,7 @@
 //! Everything is multiplexed over that one connection: metrics, jobs,
 //! interactive shells and (later) patching and remote desktop streams.
 
+pub mod patch;
 pub mod update;
 
 use chrono::{DateTime, Utc};
@@ -67,6 +68,13 @@ pub enum AgentMsg {
         /// agent restarted, or the job never arrived. Agents that predate this send nothing.
         #[serde(default)]
         jobs: Vec<Uuid>,
+        /// Optional features this build supports ([`patch::CAPABILITY`]...). The server
+        /// doesn't send messages for a feature the agent didn't list.
+        #[serde(default)]
+        capabilities: Vec<String>,
+        /// Patch installs still running or awaiting [`ServerMsg::PatchAck`], like `jobs`.
+        #[serde(default)]
+        patch_runs: Vec<Uuid>,
     },
     Heartbeat(Metrics),
     Inventory(Inventory),
@@ -119,6 +127,34 @@ pub enum AgentMsg {
     Pong {
         nonce: u64,
     },
+    /// Answer to [`ServerMsg::PatchScan`], and sent unasked after every install.
+    PatchScanResult {
+        /// The scan request this answers; `None` for the rescan after an install.
+        #[serde(default)]
+        request_id: Option<Uuid>,
+        /// Which provider scanned: `wua`, `pswindowsupdate`, `apt`, `dnf`, `pacman`, `softwareupdate`.
+        provider: String,
+        /// The provider can only install everything at once (pacman).
+        #[serde(default)]
+        all_or_nothing: bool,
+        /// The scan failed; `updates` is then empty and means nothing.
+        #[serde(default)]
+        error: Option<String>,
+        updates: Vec<patch::PatchUpdate>,
+        /// A reboot is pending from an earlier install.
+        #[serde(default)]
+        reboot_pending: bool,
+    },
+    PatchProgress {
+        run_id: Uuid,
+        stage: patch::PatchStage,
+        #[serde(default)]
+        message: Option<String>,
+        /// Overall percentage, when the provider knows it.
+        #[serde(default)]
+        percent: Option<u8>,
+    },
+    PatchResult(patch::PatchOutcome),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -213,6 +249,21 @@ pub enum ServerMsg {
     },
     Ping {
         nonce: u64,
+    },
+    /// Look for available updates; answered with [`AgentMsg::PatchScanResult`].
+    PatchScan {
+        request_id: Uuid,
+    },
+    /// Install these updates (ids from a scan). Answered with progress, then
+    /// [`AgentMsg::PatchResult`].
+    PatchInstall {
+        run_id: Uuid,
+        ids: Vec<String>,
+        reboot_policy: patch::RebootPolicy,
+    },
+    /// The server has stored this install's result; the agent can forget it.
+    PatchAck {
+        run_id: Uuid,
     },
 }
 
@@ -409,6 +460,41 @@ mod tests {
         });
         let buf = encode(&msg).unwrap();
         assert!(matches!(decode::<ServerMsg>(&buf).unwrap(), ServerMsg::RunScript(_)));
+    }
+
+    #[test]
+    fn old_auth_has_no_capabilities_and_patch_messages_roundtrip() {
+        #[derive(Serialize)]
+        #[serde(tag = "t", rename_all = "snake_case")]
+        enum Old {
+            Auth { protocol: u32, agent_id: Uuid, secret: String, agent_version: String },
+        }
+        let buf = encode(&Old::Auth { protocol: 1, agent_id: Uuid::nil(), secret: "s".into(), agent_version: "0.1.0".into() }).unwrap();
+        match decode::<AgentMsg>(&buf).unwrap() {
+            AgentMsg::Auth { capabilities, patch_runs, jobs, .. } => assert!(capabilities.is_empty() && patch_runs.is_empty() && jobs.is_empty()),
+            other => panic!("unexpected {other:?}"),
+        }
+        let run_id = Uuid::new_v4();
+        let msg = ServerMsg::PatchInstall { run_id, ids: vec!["openssl".into()], reboot_policy: patch::RebootPolicy::IfRequired };
+        match decode::<ServerMsg>(&encode(&msg).unwrap()).unwrap() {
+            ServerMsg::PatchInstall { run_id: r, ids, reboot_policy } => {
+                assert_eq!((r, ids.as_slice(), reboot_policy), (run_id, &["openssl".to_string()][..], patch::RebootPolicy::IfRequired))
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        let out = patch::PatchOutcome {
+            run_id,
+            results: vec![patch::PatchItemResult { id: "openssl".into(), ok: true, message: None }],
+            error: None,
+            reboot_required: true,
+            rebooting: false,
+            output: "done".into(),
+            duration_ms: 5,
+        };
+        match decode::<AgentMsg>(&encode(&AgentMsg::PatchResult(out.clone())).unwrap()).unwrap() {
+            AgentMsg::PatchResult(o) => assert_eq!(o, out),
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     /// Agents built before `previous` existed must still be able to enroll.

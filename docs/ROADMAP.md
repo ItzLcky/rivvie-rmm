@@ -154,7 +154,7 @@ Quality:
 - [ ] Select every row matching a filter, not just the rows on screen, for bulk actions.
 - [ ] Saved views (Phase 8), built on the URL state.
 - [ ] Configurable dashboard widgets; script version history.
-- [ ] Agent tabs added by later phases: Patches (5), Alerts (4), Tickets (7). Move tabs to a side sub-nav once there are more than about eight.
+- [ ] Agent tabs added by later phases: Alerts (4), Tickets (7) (Patches is done). Move tabs to a side sub-nav once there are more than about eight.
 
 ## Phase 4: Monitoring and alerting
 
@@ -165,21 +165,33 @@ Quality:
 - [ ] Scheduled scripts (cron-style) per client or site, with output retention
 - [ ] Move `agent_metrics` to TimescaleDB, or add hourly rollups, once fleets reach thousands of agents
 
-## Phase 5: Patch management
+## Phase 5: Patch management (done)
 
-Agent side, behind a `PatchProvider` trait:
+Built as planned, behind a `PatchProvider` trait in `crates/rmm-agent/src/patch/`:
 
 | OS | Scan | Install |
 |---|---|---|
-| Windows | `IUpdateSearcher` via the Windows Update Agent COM API (`windows` crate); fall back to `PSWindowsUpdate` | `IUpdateInstaller`; reboot handling via `IUpdateInstaller::RebootRequiredBeforeInstallation` |
-| Debian/Ubuntu | `apt-get -s upgrade` / `apt list --upgradable` (after `apt-get update`) | `apt-get -y install --only-upgrade <pkgs>` with `DEBIAN_FRONTEND=noninteractive` |
-| RHEL/Fedora | `dnf check-update --refresh` / `dnf updateinfo list --sec` | `dnf -y upgrade <pkgs>` |
+| Windows | `IUpdateSearcher` via the Windows Update Agent COM API (`windows` crate); falls back to `PSWindowsUpdate` when the API can't be reached | `IUpdateDownloader` + `IUpdateInstaller`; reports instead of installing when `RebootRequiredBeforeInstallation` |
+| Debian/Ubuntu | `apt-get update`, then `apt-get -s dist-upgrade` (stable output, unlike `apt list`); `*-security` suites are security | `apt-get -y install --only-upgrade <pkgs>` with `DEBIAN_FRONTEND=noninteractive`, `--force-confold` |
+| RHEL/Fedora | `dnf check-update --refresh` + `dnf updateinfo list --updates` (dnf4 and dnf5 output); `yum` on older systems | `dnf -y upgrade <name.arch…>` |
 | Arch | `checkupdates` | `pacman -Syu --noconfirm` (all-or-nothing) |
-| macOS | `softwareupdate -l` | `softwareupdate -i` |
+| macOS | `softwareupdate -l` | `softwareupdate -i`, one at a time |
 
-Protocol: `ServerMsg::PatchScan`, `PatchInstall { ids, reboot_policy }` → `AgentMsg::PatchScanResult { updates: [{ id, title, kb, severity, size, requires_reboot }] }`, `PatchProgress`, `PatchResult`.
+Done:
 
-Server: `patches` table (per agent and update), patch policies (auto-approve by severity/category, deferral days, maintenance window per site, reboot policy), approval UI, compliance dashboard (% patched per client).
+- [x] Protocol: `ServerMsg::PatchScan`, `PatchInstall { run_id, ids, reboot_policy }`, `PatchAck`; `AgentMsg::PatchScanResult { updates: [{ id, title, kb, severity, category, size, requires_reboot, version, current_version }], reboot_pending, all_or_nothing, error }`, `PatchProgress`, `PatchResult`. Agents list `capabilities` (`patch`) and their unacknowledged installs (`patch_runs`) in `Auth`, so the server never sends patch messages to older agents and knows which installs are still alive.
+- [x] Agent: one scan or install at a time; results are kept and resent after reconnects until acknowledged; a rescan after every install (also gives per-update results for package managers that don't report them); reboot handling (`shutdown -r +1`, `shutdown /r /t 60`); the self-updater waits up to 4 hours for an install to finish. `rmm-agent patches [--install ID…]` for debugging.
+- [x] Server: `patches` (per agent and update: state, approval, first seen, failures), `patch_runs` (installs with progress, results and output), `patch_policies` (auto-approve by severity/category, deferral days, automatic install, reboot policy; MSP-wide, per client, per site) and maintenance windows per site (days, start, length, time zone; computed in Postgres). A scheduler asks stale agents to scan, starts automatic installs inside windows, retries failures up to three times and gives up on installs that never report.
+- [x] Dashboard: Patches page (updates across the fleet with filters and bulk approve/decline, per-update agent drawer with install now; compliance by client and site; policies and maintenance windows; install history), an install page with per-update results and output, and a Patches tab on agents. Live over the SSE stream.
+- [x] Tests: provider parsers against real output, the agent manager with a fake provider, and an end-to-end run (`crates/rmm-server/tests/e2e.rs`) through scan, policy approval, manual approval and decline, install, rescan, compliance, client policies, maintenance windows and an automatic install. The apt and dnf5 providers were also run for real in Debian 12 and Fedora 41 containers, and the pacman scan on Arch.
+
+To do:
+
+- [ ] **Run the Windows provider on real hosts** (with the rest of the Windows agent, Phase 2). It compiles, but nobody has scanned or installed with it yet.
+- [ ] Health and alerts: count missing critical updates and pending restarts in agent health, and alert on failed installs (with Phase 4's alert policies).
+- [ ] Approval rules that apply to agents that report an update later (today an approval covers the agents that already report it, plus whatever the policy approves).
+- [ ] Run package managers in their own systemd scope, so restarting the agent mid-install doesn't kill dpkg.
+- [ ] Arch security data (`arch-audit`), Ubuntu Pro/ESM, Windows feature-update targeting, and third-party application patching (winget, Chocolatey).
 
 ## Phase 6: Remote desktop
 

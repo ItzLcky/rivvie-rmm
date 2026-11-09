@@ -44,6 +44,7 @@ docs/           Roadmap and design notes
 - **Jobs:** sending a script to an offline agent queues it, and it runs on reconnect (queued jobs expire after `RMM_JOB_QUEUE_DAYS`). Output streams into Postgres (capped at 1 MB per stream). Jobs outlive the connection: the agent keeps a copy of each job's output and its result, and resends them after a reconnect or server restart until the server acknowledges them. A job is only marked `lost` when the agent comes back without it (the agent itself restarted) or never comes back. Timeouts kill the whole process tree on Unix, and closing a terminal kills everything started from it.
 - **Terminal:** xterm.js ↔ server relay ↔ PTY on the agent (bash/zsh on Linux, PowerShell through ConPTY on Windows).
 - **Per-client access:** admins see every client. Technicians and read-only users see every client by default, or only the clients an admin picks under Company settings → Users. Everything they can reach (agents, sites, tokens, jobs, terminal, dashboard counts) is scoped to those clients, and anything outside them reads as "not found". Scripts are MSP-wide (admins edit them; they run anywhere) or belong to one client (its technicians edit them; they only run on its agents).
+- **Patch management:** agents scan for OS updates (Windows Update Agent, apt, dnf/yum, pacman, softwareupdate) when they connect and every `RMM_PATCH_SCAN_HOURS`. Patch policies approve updates by category or severity and can install them during each site's maintenance window, with a reboot policy. Technicians approve, decline and install from the Patches page or an agent's Patches tab, and the Compliance tab shows how many agents per client are fully patched. See [Patch management](#patch-management).
 - **Self-update:** agents install new versions signed with an offline ed25519 key whose public half is compiled into the agent, and roll themselves back if the new version can't reconnect. See [Agent updates](#agent-updates).
 - **Security:** argon2id passwords; opaque, revocable session tokens in an HttpOnly SameSite=Strict cookie, with an idle timeout and a 7-day cap; users can change their password and review or revoke their sessions, and admins can reset passwords, re-enable users, and revoke anyone's sessions; TOTP two-factor auth with single-use recovery codes, required for admins and optionally for everyone; an Origin check on the terminal socket; three roles (admin / technician / readonly); an audit log covering logins, shells, jobs, enrollment, and deletes. Failed sign-ins are rate-limited per client IP and per account, and bad enrollment tokens per IP (see `RMM_TRUSTED_PROXIES`). The dashboard ships a hash-based script CSP, so no inline or third-party script runs.
 
@@ -177,7 +178,8 @@ to SYSTEM and Administrators. Windows service logs go to `C:\ProgramData\RMM\log
 | `RMM_HEARTBEAT_SECS` | `30` | Agent metrics interval |
 | `RMM_INVENTORY_SECS` | `21600` | Agent inventory interval |
 | `RMM_METRICS_RETENTION_DAYS` | `30` | Metric history kept |
-| `RMM_JOB_QUEUE_DAYS` | `7` | Jobs queued for an offline agent expire after this |
+| `RMM_JOB_QUEUE_DAYS` | `7` | Jobs (and patch installs) queued for an offline agent expire after this |
+| `RMM_PATCH_SCAN_HOURS` | `12` | Online agents scan for OS updates when their last scan is older than this |
 | `RMM_SESSION_IDLE_HOURS` | `12` | Dashboard sessions unused this long are signed out (sessions last 7 days at most). Admins can override it under Company settings |
 | `RMM_TRUSTED_PROXIES` | empty | Reverse proxies whose `X-Forwarded-For` gives the client IP (for rate limiting and the audit log): comma-separated addresses/CIDRs, or `private` for loopback + RFC 1918 + IPv6 ULA. The bundled compose stack sets `private` for Caddy |
 
@@ -211,4 +213,41 @@ on Windows.
 Updates need the agent running as a service (systemd or the Windows service). Agents installed
 from a `.deb`/`.rpm` update in place, and a later package upgrade replaces the binary again.
 
-See [docs/ROADMAP.md](docs/ROADMAP.md) for what's next: patch management, remote desktop, alerting, and more.
+## Patch management
+
+Each agent scans with its OS's own update mechanism:
+
+| OS | Scan | Install |
+|---|---|---|
+| Windows | Windows Update Agent API (`IUpdateSearcher`, software and drivers); PSWindowsUpdate if the API can't be reached | `IUpdateDownloader` + `IUpdateInstaller`. If Windows needs a restart before it can install (`RebootRequiredBeforeInstallation`), the install reports that instead of trying |
+| Debian, Ubuntu | `apt-get update`, then `apt-get -s dist-upgrade`. Updates from a `*-security` suite count as security | `apt-get install --only-upgrade`, non-interactive, keeping existing config files |
+| RHEL, Fedora | `dnf check-update --refresh` (or `yum`), with `dnf updateinfo` for advisories, severity and security | `dnf -y upgrade <name.arch…>` |
+| Arch | `checkupdates` (install `pacman-contrib`) | `pacman -Syu`: always everything, because Arch doesn't support partial upgrades |
+| macOS | `softwareupdate -l` | `softwareupdate -i`, one update at a time |
+
+`rmm-agent patches` runs a scan in the foreground and prints what the server would get, and
+`rmm-agent patches --install ID…` installs. Both are useful for debugging a machine.
+
+**Approval.** The patch policy that applies to an agent approves updates by category (security,
+critical, definitions, rollups, updates, drivers, feature updates) or by vendor severity
+(critical, important, moderate, low; only Windows and RHEL/Fedora rate updates). There is one
+MSP-wide policy, which by default approves security, critical and definition updates and installs
+nothing on its own. Clients and sites can have their own, and the most specific one applies,
+whole. A person's approve or decline overrides the policy for that update on that agent until
+someone resets it. Declined updates don't count against compliance.
+
+**Installing.** With **Install automatically** on, the server starts installs for approved
+updates (after the policy's deferral, counted from when the update was first seen) while the
+site's maintenance window is open. A site without a window installs whenever updates are
+eligible. Installing by hand from the dashboard starts right away, ignoring windows and
+deferrals. The reboot policy (never, if required, always) decides whether the agent restarts the
+machine afterwards, with a one-minute warning. Failed updates are retried automatically up to
+three times. Agents report results after reconnects, like job results. After every install the
+agent rescans, so the dashboard shows what is really installed.
+
+Limits: Debian/Ubuntu/Arch don't publish severities, so approve those by category (Arch has no
+security tags either: include **Updates** in the policy for Arch machines). On Apple silicon,
+macOS updates that need a restart may need a signed-in user to approve them. The Windows provider
+is compile-checked only so far, like the rest of the Windows agent.
+
+See [docs/ROADMAP.md](docs/ROADMAP.md) for what's next: alerting, remote desktop, PSA and more.

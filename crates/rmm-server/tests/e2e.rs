@@ -107,6 +107,8 @@ impl Agent {
                 .arg(&self.config)
                 .arg("run")
                 .env("RUST_LOG", "info")
+                // Debug agents read updates from this file instead of the real package manager.
+                .env("RMM_PATCH_FAKE", log_dir.join(format!("{name}-patches.json")))
                 .stdout(log.try_clone().unwrap())
                 .stderr(log)
                 .spawn()
@@ -544,6 +546,172 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
     let j = admin.post("/jobs", json!({ "agent_ids": [id1], "script_id": global["id"] })).await;
     let j = admin.wait_job(j["jobs"][0]["job_id"].as_str().unwrap(), 30).await;
     assert_eq!(j["stdout"], "global\n");
+
+    // --- patch management ---------------------------------------------------------------------
+    let upd = |id: &str, category: &str, severity: Option<&str>, reboot: bool| {
+        json!({ "id": id, "title": format!("Update {id}"), "kb": format!("KB{}", id.len()), "severity": severity,
+                "category": category, "size": 1000, "requires_reboot": reboot })
+    };
+    std::fs::write(
+        dir.join("a1-patches.json"),
+        json!({ "updates": [upd("sec-1", "security", Some("critical"), true), upd("upd-1", "update", None, false),
+                            upd("drv-1", "driver", None, false)], "fail": [] })
+        .to_string(),
+    )
+    .unwrap();
+    admin.post("/patches/scan", json!({ "agent_ids": [id1] })).await;
+    let (api, id) = (&admin, id1.as_str());
+    let p = eventually(30, "the patch scan", move || async move {
+        let p = api.get(&format!("/agents/{id}/patches")).await;
+        (p["patches"].as_array().unwrap().len() == 3).then_some(p)
+    })
+    .await;
+    assert_eq!(p["status"]["supported"], true, "{p}");
+    assert_eq!(p["status"]["provider"], "fake");
+    assert_eq!(p["policy"]["source"], "global");
+    assert_eq!(p["window"]["open_now"], true, "no window: any time");
+    let approval = |p: &Value, id: &str| {
+        let row = p["patches"].as_array().unwrap().iter().find(|r| r["update_id"] == id).unwrap().clone();
+        (row["approval"].as_str().unwrap().to_string(), row["state"].as_str().unwrap().to_string(), row["approval_manual"].as_bool().unwrap())
+    };
+    assert_eq!(p["patches"][0]["update_id"], "sec-1", "most severe first");
+    assert_eq!(approval(&p, "sec-1"), ("approved".into(), "missing".into(), false), "the default policy approves security updates");
+    assert_eq!(approval(&p, "upd-1").0, "pending");
+
+    admin.post("/patches/approval", json!({ "decision": "approved", "update_ids": ["upd-1"], "agent_ids": [id1] })).await;
+    admin.post("/patches/approval", json!({ "decision": "declined", "update_ids": ["drv-1"], "client_id": a_id })).await;
+    let groups = admin.get("/patches").await;
+    assert_eq!(groups["total"], 3, "{groups}");
+    let declined = admin.get("/patches?approval=declined").await;
+    assert_eq!(declined["items"][0]["update_id"], "drv-1");
+    assert_eq!(declined["total"], 1);
+    let on = admin.get("/patches/agents?update_id=sec-1").await;
+    assert_eq!(on[0]["agent_id"], id1.as_str());
+    let c = admin.get("/patches/compliance").await;
+    let row_a = c["rows"].as_array().unwrap().iter().find(|r| r["id"] == a_id).unwrap().clone();
+    assert_eq!((row_a["scanned"].as_i64(), row_a["compliant"].as_i64(), row_a["agents_missing_security"].as_i64()), (Some(1), Some(0), Some(1)), "{row_a}");
+
+    // Scoped: client B's technician sees none of it.
+    assert_eq!(tech.get("/patches").await["total"], 0);
+    let (s, _) = tech.call(reqwest::Method::GET, &format!("/agents/{id1}/patches"), None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    let (s, _) = tech.call(reqwest::Method::POST, "/patches/approval", Some(json!({ "decision": "approved", "update_ids": ["drv-1"], "client_id": a_id }))).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    let r = tech.post("/patches/approval", json!({ "decision": "approved", "update_ids": ["drv-1"] })).await;
+    assert_eq!(r["changed"], 0, "no rows outside their clients");
+    let (s, _) = tech.call(reqwest::Method::PUT, "/patch-policies/00000000-0000-4000-8000-000000000001", Some(json!({ "reboot_policy": "always" }))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "the MSP-wide policy is admin-only");
+
+    // Install everything approved: sec-1 and upd-1 (drv-1 is declined).
+    let r = admin.post("/patches/install", json!({ "agent_ids": [id1], "reboot_policy": "never" })).await;
+    let run_id = r["runs"][0]["run_id"].as_str().unwrap().to_string();
+    assert_eq!(r["runs"][0]["updates"], 2, "{r}");
+    let (api, rid) = (&admin, run_id.as_str());
+    let run = eventually(30, "the install to finish", move || async move {
+        let r = api.get(&format!("/patch-runs/{rid}")).await;
+        (r["status"] != "sent" && r["status"] != "queued").then_some(r)
+    })
+    .await;
+    assert_eq!(run["status"], "succeeded", "{run}");
+    assert_eq!(run["succeeded"], 2);
+    assert_eq!(run["reboot_required"], true, "sec-1 needs a reboot");
+    assert!(run["output"].as_str().unwrap().contains("sec-1: installed"), "{run}");
+    assert_eq!(run["items"].as_array().unwrap().len(), 2);
+    let (api, id) = (&admin, id1.as_str());
+    let p = eventually(30, "the post-install rescan", move || async move {
+        let p = api.get(&format!("/agents/{id}/patches")).await;
+        (p["patches"].as_array().unwrap().iter().filter(|r| r["state"] == "installed").count() == 2).then_some(p)
+    })
+    .await;
+    assert_eq!(p["status"]["reboot_pending"], true);
+    assert_eq!(approval(&p, "drv-1"), ("declined".into(), "missing".into(), true));
+    let c = admin.get(&format!("/patches/compliance?client_id={a_id}")).await;
+    assert_eq!(c["by"], "site");
+    assert_eq!((c["totals"]["compliant"].as_i64(), c["totals"]["installed_30d"].as_i64()), (Some(1), Some(2)), "declined updates don't count: {c}");
+
+    // Policies: a client policy that approves drivers overrides the MSP-wide one; resetting
+    // the manual decline hands drv-1 back to it.
+    let pol = admin
+        .post("/patch-policies", json!({ "client_id": a_id, "auto_approve_categories": ["security", "driver"], "reboot_policy": "if_required" }))
+        .await;
+    let (s, _) = admin.call(reqwest::Method::POST, "/patch-policies", Some(json!({ "client_id": a_id, "reboot_policy": "never" }))).await;
+    assert_eq!(s, StatusCode::CONFLICT, "one policy per client");
+    admin.post("/patches/approval", json!({ "decision": "pending", "update_ids": ["drv-1"], "agent_ids": [id1] })).await;
+    let p = admin.get(&format!("/agents/{id1}/patches")).await;
+    assert_eq!(p["policy"]["source"], "client");
+    assert_eq!(approval(&p, "drv-1"), ("approved".into(), "missing".into(), false));
+    let pid = pol["id"].as_str().unwrap();
+    let (s, _) = admin.call(reqwest::Method::DELETE, &format!("/patch-policies/{pid}"), None).await;
+    assert!(s.is_success());
+    assert_eq!(approval(&admin.get(&format!("/agents/{id1}/patches")).await, "drv-1").0, "pending");
+    let (s, _) = admin.call(reqwest::Method::DELETE, "/patch-policies/00000000-0000-4000-8000-000000000001", None).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+
+    // Maintenance windows.
+    let (s, _) = admin.call(reqwest::Method::PUT, &format!("/sites/{a_site}/maintenance-window"), Some(json!({ "days": [1], "start": "02:00", "minutes": 120, "tz": "Mars/Olympus" }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    admin
+        .call(reqwest::Method::PUT, &format!("/sites/{a_site}/maintenance-window"), Some(json!({ "days": [0, 1, 2, 3, 4, 5, 6], "start": "00:00", "minutes": 1440, "tz": "Europe/London" })))
+        .await;
+    let w = admin.get("/patch-windows").await;
+    let w = w.as_array().unwrap().iter().find(|w| w["site_id"] == a_site).unwrap().clone();
+    assert_eq!((w["open_now"].as_bool(), w["start"].as_str(), w["tz"].as_str()), (Some(true), Some("00:00"), Some("Europe/London")), "{w}");
+    assert!(w["next_start"].is_string());
+    let in_window: bool = sqlx::query_scalar(
+        "SELECT in_maintenance_window('{6}', '23:00', 120, 'UTC', '2026-11-08 00:30+00')   -- Saturday's window, past midnight
+            AND NOT in_maintenance_window('{6}', '23:00', 120, 'UTC', '2026-11-08 01:30+00')
+            AND in_maintenance_window(NULL, NULL, NULL, 'UTC', now())
+            AND next_maintenance_window('{1}', '02:00', 'America/New_York', '2026-11-08 12:00+00') = '2026-11-09 07:00+00'",
+    )
+    .fetch_one(db)
+    .await
+    .unwrap();
+    assert!(in_window, "window arithmetic");
+
+    // Automatic install: a new critical update, a policy that installs automatically, a
+    // failure that is recorded (and retried later, up to three times).
+    std::fs::write(
+        dir.join("a1-patches.json"),
+        json!({ "updates": [upd("upd-1b", "update", None, false), upd("drv-1", "driver", None, false), upd("sec-2", "security", Some("important"), false)],
+                "fail": ["sec-2"] })
+        .to_string(),
+    )
+    .unwrap();
+    admin
+        .call(
+            reqwest::Method::PUT,
+            "/patch-policies/00000000-0000-4000-8000-000000000001",
+            Some(json!({ "auto_approve_categories": ["security"], "auto_install": true, "reboot_policy": "never" })),
+        )
+        .await;
+    admin.post("/patches/scan", json!({ "agent_ids": [id1] })).await;
+    let (api, id) = (&admin, id1.as_str());
+    let run = eventually(100, "an automatic install", move || async move {
+        let runs = api.get(&format!("/patch-runs?agent_id={id}")).await;
+        runs.as_array().unwrap().iter().find(|r| r["trigger"] == "policy" && r["status"] != "sent" && r["status"] != "queued").cloned()
+    })
+    .await;
+    assert_eq!(run["status"], "failed", "{run}");
+    assert_eq!(run["updates"], 1, "only the approved update: {run}");
+    let (api, id) = (&admin, id1.as_str());
+    let p = eventually(30, "the failure to be recorded", move || async move {
+        let p = api.get(&format!("/agents/{id}/patches")).await;
+        let row = p["patches"].as_array().unwrap().iter().find(|r| r["update_id"] == "sec-2")?.clone();
+        (row["state"] == "failed").then_some(row)
+    })
+    .await;
+    assert_eq!(p["fail_count"], 1);
+    assert!(p["last_error"].as_str().unwrap().contains("simulated"), "{p}");
+    let agent = admin.get(&format!("/agents/{id1}/activity")).await;
+    assert!(agent.as_array().unwrap().iter().any(|r| r["action"] == "agent.patch_result"), "results are in the agent's activity");
+    // Back to the conservative default so the rest of the run isn't patched behind its back.
+    admin
+        .call(
+            reqwest::Method::PUT,
+            "/patch-policies/00000000-0000-4000-8000-000000000001",
+            Some(json!({ "auto_approve_categories": ["security", "critical", "definition"], "reboot_policy": "never" })),
+        )
+        .await;
 
     // Granting client A takes effect on the next request.
     let tech_id = admin.get("/users").await.as_array().unwrap().iter().find(|u| u["email"] == "tech@e2e.test").unwrap()["id"]

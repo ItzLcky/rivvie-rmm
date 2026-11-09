@@ -54,6 +54,7 @@ enum Key {
     Agent(Uuid),
     Job(Uuid),
     Jobs,
+    Patches(Uuid),
 }
 
 fn key(ev: &Event) -> Key {
@@ -61,6 +62,7 @@ fn key(ev: &Event) -> Key {
         Event::Agent { id, .. } => Key::Agent(*id),
         Event::Job { id, .. } => Key::Job(*id),
         Event::Jobs => Key::Jobs,
+        Event::Patches { agent_id, .. } => Key::Patches(*agent_id),
     }
 }
 

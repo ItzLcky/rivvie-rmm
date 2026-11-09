@@ -16,7 +16,7 @@ use crate::collect::{AGENT_VERSION, Collector, system_info};
 use crate::config::{self, Config};
 use crate::shell::ShellSession;
 use crate::update::Updater;
-use crate::{jobs, shell};
+use crate::{jobs, patch, shell};
 
 type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -73,7 +73,8 @@ pub async fn enroll(server_url: &str, token: &str, previous: Option<&Config>) ->
 /// Stay connected until `shutdown` flips to true, reconnecting with backoff.
 pub async fn run_forever(cfg: Config, config_path: std::path::PathBuf, mut shutdown: watch::Receiver<bool>) {
     let tracker = Arc::new(jobs::Tracker::default());
-    let updater = Arc::new(Updater::new(config_path, tracker.clone()));
+    let patches = Arc::new(patch::Manager::new());
+    let updater = Arc::new(Updater::new(config_path, tracker.clone(), patches.clone()));
     let collector = match Collector::new() {
         Ok(c) => Arc::new(Mutex::new(c)),
         Err(e) => {
@@ -85,7 +86,7 @@ pub async fn run_forever(cfg: Config, config_path: std::path::PathBuf, mut shutd
     loop {
         let started = std::time::Instant::now();
         tokio::select! {
-            res = session(&cfg, collector.clone(), tracker.clone(), updater.clone()) => match res {
+            res = session(&cfg, collector.clone(), tracker.clone(), updater.clone(), patches.clone()) => match res {
                 Ok(()) => info!("connection closed"),
                 Err(e) => warn!("connection error: {e:#}"),
             },
@@ -115,6 +116,7 @@ async fn session(
     collector: Arc<Mutex<Collector>>,
     tracker: Arc<jobs::Tracker>,
     updater: Arc<Updater>,
+    patches: Arc<patch::Manager>,
 ) -> Result<()> {
     let mut ws = connect(&cfg.ws_url()).await?;
     send(
@@ -125,6 +127,8 @@ async fn session(
             secret: cfg.secret.clone(),
             agent_version: AGENT_VERSION.to_string(),
             jobs: tracker.ids().await,
+            capabilities: vec![rmm_proto::patch::CAPABILITY.to_string()],
+            patch_runs: patches.ids().await,
         },
     )
     .await?;
@@ -157,6 +161,7 @@ async fn session(
     // Before anything else is queued, so resent job state precedes new output.
     tracker.attach(tx.clone()).await;
     updater.attach(tx.clone()).await;
+    patches.attach(tx.clone()).await;
     let heartbeat = tokio::spawn(periodic(tx.clone(), collector.clone(), heartbeat_secs.max(5), false));
     let inventory = tokio::spawn(periodic(tx.clone(), collector.clone(), inventory_secs.max(300), true));
 
@@ -179,12 +184,13 @@ async fn session(
             Message::Close(_) => break Ok(()),
             _ => continue,
         };
-        handle(msg, &tx, &collector, &tracker, &updater, &mut shells).await;
+        handle(msg, &tx, &collector, &tracker, &updater, &patches, &mut shells).await;
     };
 
     // Running jobs keep going; their output is buffered until the next connection.
     tracker.detach();
     updater.detach();
+    patches.detach();
     heartbeat.abort();
     inventory.abort();
     drop(shells);
@@ -203,6 +209,7 @@ async fn handle(
     collector: &Arc<Mutex<Collector>>,
     tracker: &Arc<jobs::Tracker>,
     updater: &Arc<Updater>,
+    patches: &Arc<patch::Manager>,
     shells: &mut HashMap<Uuid, ShellSession>,
 ) {
     match msg {
@@ -251,6 +258,13 @@ async fn handle(
                 info!(%session_id, "shell closed by server");
             }
         }
+        ServerMsg::PatchScan { request_id } => {
+            tokio::spawn(patches.clone().scan(Some(request_id)));
+        }
+        ServerMsg::PatchInstall { run_id, ids, reboot_policy } => {
+            tokio::spawn(patches.clone().install(run_id, ids, reboot_policy));
+        }
+        ServerMsg::PatchAck { run_id } => patches.ack(run_id).await,
         ServerMsg::Enrolled { .. } | ServerMsg::AuthOk { .. } | ServerMsg::AuthFailed { .. } => {}
     }
 }

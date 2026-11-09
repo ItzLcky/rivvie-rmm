@@ -84,3 +84,67 @@ export interface SearchResults {
 }
 
 export interface Session { id: string; created_at: string; last_seen_at: string; expires_at: string; user_agent: string | null; current: boolean }
+
+// Patch management
+export type Severity = 'critical' | 'important' | 'moderate' | 'low' | 'unspecified';
+export type PatchCategory = 'security' | 'critical' | 'definition' | 'driver' | 'feature' | 'rollup' | 'update' | 'other';
+export type PatchState = 'missing' | 'installing' | 'installed' | 'failed';
+export type Approval = 'pending' | 'approved' | 'declined';
+export type RebootPolicy = 'never' | 'if_required' | 'always';
+export type RunStatus = 'queued' | 'sent' | 'succeeded' | 'partial' | 'failed' | 'lost' | 'expired' | 'cancelled';
+
+/** One update across the fleet (`GET /patches`). */
+export interface UpdateGroup {
+	update_id: string; title: string; kb: string | null; severity: Severity | null; category: PatchCategory; size: number | null;
+	requires_reboot: boolean; missing: number; installed: number; failed: number; installing: number;
+	approved: number; pending: number; declined: number; first_seen_at: string;
+}
+export interface UpdateAgent {
+	agent_id: string; hostname: string; online: boolean; os_family: AgentSummary['os_family']; client_id: string; client_name: string;
+	site_name: string; state: PatchState; approval: Approval; approval_manual: boolean; approved_by_name: string | null;
+	approved_at: string | null; version: string | null; current_version: string | null; first_seen_at: string;
+	installed_at: string | null; last_error: string | null; fail_count: number;
+}
+export interface AgentPatch {
+	update_id: string; title: string; kb: string | null; severity: Severity | null; category: PatchCategory; size: number | null;
+	requires_reboot: boolean; version: string | null; current_version: string | null; state: PatchState; approval: Approval;
+	approval_manual: boolean; approved_by_name: string | null; approved_at: string | null; first_seen_at: string;
+	installed_at: string | null; last_error: string | null; fail_count: number; deferred_until: string | null;
+}
+export interface PatchPolicy {
+	id: string; client_id: string | null; site_id: string | null; client_name: string | null; site_name: string | null;
+	auto_approve_severities: Severity[]; auto_approve_categories: PatchCategory[]; deferral_days: number; auto_install: boolean;
+	reboot_policy: RebootPolicy; updated_by_name: string | null; updated_at: string; agents: number;
+	source?: 'site' | 'client' | 'global' | null;
+}
+export interface MaintenanceWindow {
+	site_id: string; site_name: string; client_id: string; client_name: string; days: number[] | null; start: string | null;
+	minutes: number | null; tz: string; open_now: boolean; next_start: string | null; agents: number;
+}
+export interface PatchRun {
+	id: string; agent_id: string; hostname: string; client_id: string; client_name: string; trigger: 'manual' | 'policy';
+	created_by_name: string | null; status: RunStatus; stage: string | null; progress: string | null; percent: number | null;
+	error: string | null; updates: number; succeeded: number; reboot_policy: RebootPolicy; reboot_required: boolean; rebooting: boolean;
+	created_at: string; sent_at: string | null; finished_at: string | null; duration_ms: number | null;
+}
+export interface PatchRunDetail extends PatchRun {
+	output: string;
+	items: { update_id: string; title: string | null; kb: string | null; severity: Severity | null; ok: boolean | null; message: string | null }[];
+}
+export interface AgentPatches {
+	status: {
+		supported: boolean; online: boolean; os_family: string; provider: string | null; all_or_nothing: boolean; scanned_at: string | null;
+		scan_requested_at: string | null; scan_error: string | null; reboot_pending: boolean;
+	};
+	policy: PatchPolicy | null; window: MaintenanceWindow; patches: AgentPatch[]; runs: PatchRun[];
+}
+export interface ComplianceRow {
+	id: string; name: string; client_id: string | null; agents: number; supported: number; scanned: number; compliant: number;
+	missing: number; agents_missing_security: number; failed: number; reboot_pending: number; scan_errors: number;
+	installed_30d: number; oldest_scan: string | null;
+}
+export interface Compliance {
+	by: 'client' | 'site';
+	totals: Omit<ComplianceRow, 'id' | 'name' | 'client_id' | 'oldest_scan'>;
+	rows: ComplianceRow[];
+}

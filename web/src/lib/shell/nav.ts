@@ -1,5 +1,5 @@
 import type { Component } from 'svelte';
-import { Building2, FileCode2, History, LayoutDashboard, ListChecks, Monitor, Settings } from '@lucide/svelte';
+import { Building2, FileCode2, History, LayoutDashboard, ListChecks, Monitor, Settings, ShieldCheck } from '@lucide/svelte';
 import type { Role } from '#lib/types.js';
 
 export interface NavItem {
@@ -18,7 +18,7 @@ export interface NavGroup {
 	items: NavItem[];
 }
 
-/** The sidebar. Later phases add Schedules and Patches (Automation), Alerts and Service desk. */
+/** The sidebar. Later phases add Schedules (Automation), Alerts and Service desk. */
 export const nav: NavGroup[] = [
 	{ label: 'Overview', items: [{ href: '/', label: 'Dashboard', icon: LayoutDashboard, key: 'd', scoped: true }] },
 	{
@@ -32,7 +32,8 @@ export const nav: NavGroup[] = [
 		label: 'Automation',
 		items: [
 			{ href: '/scripts', label: 'Scripts', icon: FileCode2, key: 's', scoped: true },
-			{ href: '/jobs', label: 'Jobs', icon: ListChecks, key: 'j', scoped: true }
+			{ href: '/jobs', label: 'Jobs', icon: ListChecks, key: 'j', scoped: true },
+			{ href: '/patches', label: 'Patches', icon: ShieldCheck, key: 'p', scoped: true }
 		]
 	},
 	{

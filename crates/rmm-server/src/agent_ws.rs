@@ -69,7 +69,7 @@ async fn handle(mut ws: WebSocket, state: Arc<AppState>, ip: IpAddr) -> anyhow::
             let _ = ws.close().await;
             Ok(())
         }
-        AgentMsg::Auth { protocol, agent_id, secret, agent_version, jobs } => {
+        AgentMsg::Auth { protocol, agent_id, secret, agent_version, jobs, capabilities, patch_runs } => {
             if protocol != PROTOCOL_VERSION {
                 send(&mut ws, &ServerMsg::AuthFailed { reason: format!("unsupported protocol {protocol}") }).await?;
                 return Ok(());
@@ -84,7 +84,7 @@ async fn handle(mut ws: WebSocket, state: Arc<AppState>, ip: IpAddr) -> anyhow::
                 &ServerMsg::AuthOk { heartbeat_secs: state.cfg.heartbeat_secs, inventory_secs: state.cfg.inventory_secs },
             )
             .await?;
-            run_session(ws, state, agent_id, agent_version, jobs).await
+            run_session(ws, state, agent_id, agent_version, jobs, capabilities, patch_runs).await
         }
         _ => Ok(()),
     }
@@ -191,6 +191,8 @@ async fn run_session(
     agent_id: Uuid,
     agent_version: String,
     held_jobs: Vec<Uuid>,
+    capabilities: Vec<String>,
+    held_patch_runs: Vec<Uuid>,
 ) -> anyhow::Result<()> {
     let conn_id = Uuid::new_v4();
     let (tx, mut rx) = mpsc::channel::<ServerMsg>(1024);
@@ -245,6 +247,9 @@ async fn run_session(
     });
     if lost > 0 || dispatched > 0 {
         state.hub.publish(Event::Jobs);
+    }
+    if let Err(e) = crate::patches::on_connect(&state, agent_id, client_id, &capabilities, &held_patch_runs, &tx).await {
+        warn!(%agent_id, "patch state on connect: {e:#}");
     }
     // Replies to this connection only (job acks). Weak, so the writer still ends when the
     // hub drops the agent (kick) and every other sender is gone.
@@ -456,6 +461,19 @@ async fn on_message(
                     serde_json::json!({ "version": version, "detail": detail }),
                 )
                 .await;
+            }
+        }
+        AgentMsg::PatchScanResult { request_id: _, provider, all_or_nothing, error, updates, reboot_pending } => {
+            crate::patches::ingest_scan(state, agent_id, client_id, &provider, all_or_nothing, error, &updates, reboot_pending).await?
+        }
+        AgentMsg::PatchProgress { run_id, stage, message, percent } => {
+            crate::patches::ingest_progress(state, agent_id, client_id, run_id, stage, message, percent).await?
+        }
+        AgentMsg::PatchResult(outcome) => {
+            crate::patches::ingest_result(state, agent_id, client_id, &outcome).await?;
+            // Stored (or already final): the agent can forget it.
+            if let Some(tx) = reply.upgrade() {
+                let _ = tx.send(ServerMsg::PatchAck { run_id: outcome.run_id }).await;
             }
         }
         AgentMsg::Pong { .. } => {}

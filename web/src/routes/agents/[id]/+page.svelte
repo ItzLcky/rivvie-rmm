@@ -131,11 +131,16 @@
 			'agent.update_offer': `Offered update to v${d.version}`,
 			'agent.update_completed': `Updated to v${d.version}`,
 			'agent.update_rolled_back': `Update to v${d.version} rolled back${d.detail ? `: ${d.detail}` : ''}`,
-			'agent.update_failed': `Update to v${d.version} failed${d.detail ? `: ${d.detail}` : ''}`
+			'agent.update_failed': `Update to v${d.version} failed${d.detail ? `: ${d.detail}` : ''}`,
+			'agent.patch_install': `Started installing ${d.updates} update${Number(d.updates) === 1 ? '' : 's'}`,
+			'agent.patch_cancel': 'Cancelled a queued install',
+			'agent.patch_result': `Install ${d.status === 'succeeded' ? 'succeeded' : d.status === 'partial' ? 'partly failed' : 'failed'}: ${d.installed} of ${d.requested} installed${d.rebooting ? ', restarting' : ''}${d.error ? ` (${d.error})` : ''}`
 		};
 		return labels[r.action] ?? r.action;
 	}
 
+	// Loaded with its tab.
+	const patches = $derived(tab === 'patches' ? import('#lib/components/AgentPatches.svelte') : null);
 	// The terminal (xterm.js) loads only when its tab opens.
 	const terminal = $derived(tab === 'terminal' ? import('#lib/components/Terminal.svelte') : null);
 </script>
@@ -184,6 +189,7 @@
 				{ value: 'overview', label: 'Overview' },
 				{ value: 'inventory', label: 'Hardware & network' },
 				{ value: 'software', label: 'Software', count: inv ? num(inv.software.length) : undefined },
+				{ value: 'patches', label: 'Patches' },
 				{ value: 'jobs', label: 'Jobs' },
 				{ value: 'activity', label: 'Activity' },
 				{ value: 'terminal', label: 'Terminal', hidden: !can('technician') }
@@ -339,6 +345,14 @@
 				{#snippet empty()}<EmptyState compact title={swq ? 'No packages match' : 'No software inventory yet'} />{/snippet}
 				{#snippet footer()}{#if software.length > 2000}<p class="text-muted px-3 py-2 text-xs">Showing 2,000 of {num(software.length)}; refine the filter.</p>{/if}{/snippet}
 			</DataTable>
+		{:else if tab === 'patches'}
+			{#if patches}
+				{#await patches}
+					<div class="card flex h-40 items-center justify-center" aria-busy="true"><Spinner label="Loading" /></div>
+				{:then P}
+					<P.default agent={a} />
+				{/await}
+			{/if}
 		{:else if tab === 'jobs'}
 			{#snippet startedCell(j: Job)}<a class="hover:text-accent" href="/jobs/{j.id}">{datetime(j.created_at)}</a>{/snippet}
 			{#snippet scriptCell(j: Job)}{j.script_name ?? `Ad-hoc ${j.interpreter}`}{/snippet}
@@ -380,7 +394,7 @@
 								{/each}
 							</ol>
 						{:else}
-							<EmptyState compact title="No activity recorded yet" description="Update offers and results show up here. Jobs have their own tab." />
+							<EmptyState compact title="No activity recorded yet" description="Agent updates and patch installs show up here. Jobs have their own tab." />
 						{/if}
 					{/snippet}
 				</Async>
