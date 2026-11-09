@@ -12,6 +12,7 @@ export interface Prefs {
 	pageSize?: number;
 	sidebarCollapsed?: boolean;
 	terminalFontSize?: number;
+	desktopQuality?: 'low' | 'balanced' | 'high';
 }
 
 export const prefs = $state<Prefs>({});

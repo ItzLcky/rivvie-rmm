@@ -33,3 +33,7 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# Remote desktop frames are JPEG-encoded on the agent; size-optimised code is several times slower.
+[profile.release.package.jpeg-encoder]
+opt-level = 3

@@ -205,20 +205,41 @@ To do:
 - [ ] Run package managers in their own systemd scope, so restarting the agent mid-install doesn't kill dpkg.
 - [ ] Arch security data (`arch-audit`), Ubuntu Pro/ESM, Windows feature-update targeting, and third-party application patching (winget, Chocolatey).
 
-## Phase 6: Remote desktop
+## Phase 6: Remote desktop (v1 done)
 
-The hardest piece. Plan:
+Built as the plan's "simpler v1": frames over the existing agent WebSocket, relayed by the server. Code in `crates/rmm-agent/src/desktop/`, `crates/rmm-server/src/desktop_ws.rs` and `web/src/lib/components/RemoteDesktop.svelte`.
 
-1. **Capture** (agent, a separate `rmm-desktop` helper process):
-   - Windows: DXGI Desktop Duplication. The agent runs as SYSTEM in session 0, so it must launch the helper *into the active console session* (`WTSGetActiveConsoleSessionId` + `WTSQueryUserToken` + `CreateProcessAsUserW`) to see the desktop, the UAC secure desktop, and the login screen.
-   - Linux: PipeWire screencast portal (Wayland) or XShm (X11).
-   - macOS: ScreenCaptureKit (needs the Screen Recording TCC permission).
-2. **Encode:** H.264 via hardware encoders (Media Foundation / VA-API / VideoToolbox) with an `openh264` software fallback. Send only changed frames, with an adaptive bitrate.
-3. **Transport:** WebRTC (the `webrtc-rs` crate) so video goes peer-to-peer when possible, with the server as signalling and a TURN relay fallback. Simpler v1: send encoded frames over the existing WebSocket, relayed by the server, and decode in the browser with WebCodecs (`VideoDecoder`).
-4. **Input:** `SendInput` (Windows), `uinput` or XTest (Linux), `CGEvent` (macOS). Map browser keyboard and mouse events, including a Ctrl+Alt+Del button (`SendSAS` on Windows).
-5. **Extras:** clipboard sync, multi-monitor selection, an end-user consent prompt option per client, session recording to object storage.
+| | Windows | Linux |
+|---|---|---|
+| Where the helper runs | The service's SYSTEM token moved into the active console session (`WTSGetActiveConsoleSessionId` + `SetTokenInformation(TokenSessionId)` + `CreateProcessAsUserW`), so it can follow input to `Winlogon` (sign-in screen, UAC) with `OpenInputDesktop`/`SetThreadDesktop` | As the owner of the X display in use, found from `DISPLAY`/`XAUTHORITY` in `/proc/*/environ` (a signed-in user over a greeter; ssh-forwarded displays ignored) |
+| Capture | GDI `BitBlt` into a DIB, per-monitor DPI aware | MIT-SHM (`0600` segment), else `GetImage`; monitors from RandR 1.5 |
+| Input | `SendInput` by scan code, `KEYEVENTF_UNICODE` for typed text; Ctrl+Alt+Del with `SendSAS` from the service (turns on the `SoftwareSASGeneration` policy if it's off) | XTEST by evdev keycode; typed text by keysym, mapping a spare keycode for characters the layout lacks |
+| Consent prompt | `WTSSendMessageW` Yes/No | zenity, kdialog or xmessage as the display's user |
 
-An interim option is to bundle an existing RustDesk server/client and broker sessions from the dashboard. That's useful for early customers while native remote desktop gets built.
+Done:
+
+- [x] Protocol (`rmm_proto::desktop`): `DesktopOpen { settings, consent }`, `DesktopSettings`, `DesktopInput`, `DesktopAck`, `DesktopClose`; `DesktopInfo { monitors }`, `DesktopFrame { seq, screen size, picture size, rects, cursor }`, `DesktopClosed { reason }`. Agents advertise the `desktop` capability.
+- [x] Helper process (`rmm-agent desktop-helper`, same binary) inside the user's session, talking to the agent over stdin/stdout. A capture crash can't take the agent down, and frame buffers go away with the session. At most 3 sessions per machine.
+- [x] Encoding: 64×64 tile diff, one JPEG per run of changed tiles per 64-row band (`jpeg-encoder`, built at `opt-level = 3`). Quality presets: Low (half resolution, q45), Balanced (q65), High (q85). Up to 20 fps while the screen changes, ~8 fps idle.
+- [x] Flow control: at most 2 unacknowledged frames; the browser acks each frame after drawing it. The rate adapts to the link and the agent socket stays free for heartbeats. The server drops a session whose browser doesn't keep up instead of blocking the agent's read loop.
+- [x] Server: `/api/agents/{id}/desktop` (technician+, Origin check, per-client access, capability check), binary frame format for the browser, input validation, audit (`desktop.open`, `desktop.close` with duration and reason). Per-client consent setting (`PUT /api/clients/{id}/desktop`).
+- [x] Dashboard: Remote desktop tab with fit/actual size, full screen with keyboard lock, monitor picker, quality, Ctrl+Alt+Del, type text, consent-waiting state.
+- [x] Tests: unit tests (tile diff, keymap, display discovery, framing), the X11 helper against Xvfb (capture, keys, typed Unicode, wheel), and the e2e test drives a session through the real server and agent with a synthetic screen (`RMM_DESKTOP_FAKE`): first full frame, deltas, ack pacing, input, monitor/quality switch, audit, consent declined and allowed.
+
+Decided against for v1:
+
+- **H.264 + WebCodecs** (the plan's encoder): a software `openh264` built from source isn't covered by Cisco's patent licence (only their binary is), and it adds ~1 MB to an agent that's 3 MB. Dirty-rectangle JPEG suits mostly static desktops, decodes everywhere with `createImageBitmap`, and the `Codec` field in each rect leaves room to add H.264 (hardware encoders: Media Foundation pays the royalty on Windows) for video-heavy sessions later.
+- **DXGI Desktop Duplication**: GDI first because it works on every desktop, including the secure one, and in RDP sessions, with far less code to get wrong while the Windows agent is untested. DXGI is the faster path to add once it's running on real hosts.
+
+To do:
+
+- [ ] **Run the Windows side on real hosts** (with the rest of the Windows agent). It compiles, but no session has been opened on Windows yet.
+- [ ] Wayland: GNOME (`org.gnome.Mutter.RemoteDesktop` + ScreenCast over D-Bus, as gnome-remote-desktop does) and KDE/wlroots via the portal or PipeWire. Today Wayland sessions get a clear error.
+- [ ] macOS: ScreenCaptureKit + `CGEvent`, with the Screen Recording and Accessibility permissions.
+- [ ] Clipboard sync (text both ways), file drop.
+- [ ] H.264 (hardware encoders) for video, DXGI capture on Windows, and WebRTC peer-to-peer with a TURN fallback to take load off the server.
+- [ ] Remote cursor shape (XFixes / `GetCursorInfo`); today the local cursor is shown and the remote position is marked.
+- [ ] Session recording to object storage; an on-screen "you are being watched" indicator; view-only sessions for the readonly role.
 
 ## Phase 7: PSA (professional services automation)
 

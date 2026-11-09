@@ -110,6 +110,8 @@ impl Agent {
                 .env("RUST_LOG", "info")
                 // Debug agents read updates from this file instead of the real package manager.
                 .env("RMM_PATCH_FAKE", log_dir.join(format!("{name}-patches.json")))
+                // And capture a synthetic screen, logging input here.
+                .env("RMM_DESKTOP_FAKE", log_dir.join(format!("{name}-desktop.jsonl")))
                 .stdout(log.try_clone().unwrap())
                 .stderr(log)
                 .spawn()
@@ -780,6 +782,7 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
     println!("update refused as expected: {}", a["update_detail"]);
     assert!(a["agent_version"] != "99.0.0");
 
+    desktop(&url, &admin, dir, &id1).await;
     monitoring(server, &admin, db, dir, &id1, &id3, a_id).await;
 
     // --- rate limits ------------------------------------------------------------------------------
@@ -876,6 +879,193 @@ async fn wait_hook(hooks: &Hooks, what: &str, pred: impl Fn(&str, &Value) -> boo
 
 async fn alerts_for(api: &Api, query: &str) -> Vec<Value> {
     api.get(&format!("/alerts?{query}")).await["items"].as_array().unwrap().clone()
+}
+
+type DesktopWs = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// A decoded `/desktop` binary frame: (seq, screen w/h, picture w/h, rects as (x, y, w, h, jpeg)).
+type DesktopFrame = (u32, (u16, u16), (u16, u16), Vec<(u16, u16, u16, u16, Vec<u8>)>);
+
+fn parse_desktop_frame(b: &[u8]) -> DesktopFrame {
+    let u16_at = |i: usize| u16::from_be_bytes([b[i], b[i + 1]]);
+    let u32_at = |i: usize| u32::from_be_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
+    assert_eq!(b[0], 1, "frame kind");
+    let n = u16_at(21) as usize;
+    let mut rects = Vec::new();
+    let mut p = 23;
+    for _ in 0..n {
+        assert_eq!(b[p + 8], 1, "JPEG codec");
+        let len = u32_at(p + 9) as usize;
+        rects.push((u16_at(p), u16_at(p + 2), u16_at(p + 4), u16_at(p + 6), b[p + 13..p + 13 + len].to_vec()));
+        p += 13 + len;
+    }
+    assert_eq!(p, b.len(), "frame length");
+    (u32_at(1), (u16_at(5), u16_at(7)), (u16_at(9), u16_at(11)), rects)
+}
+
+enum DesktopMsg {
+    Text(Value),
+    Frame(DesktopFrame),
+}
+
+/// Next message within `secs`, or `None` (timeout or socket closed).
+async fn desktop_next(ws: &mut DesktopWs, secs: u64) -> Option<DesktopMsg> {
+    use futures_util::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+    loop {
+        match tokio::time::timeout(Duration::from_secs(secs), ws.next()).await.ok()?? {
+            Ok(Message::Text(t)) => return Some(DesktopMsg::Text(serde_json::from_str(&t).unwrap())),
+            Ok(Message::Binary(b)) => return Some(DesktopMsg::Frame(parse_desktop_frame(&b))),
+            Ok(Message::Close(_)) | Err(_) => return None,
+            Ok(_) => continue,
+        }
+    }
+}
+
+async fn desktop_send(ws: &mut DesktopWs, v: Value) {
+    use futures_util::SinkExt;
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(v.to_string().into())).await.unwrap();
+}
+
+async fn desktop_frame(ws: &mut DesktopWs) -> DesktopFrame {
+    match desktop_next(ws, 15).await {
+        Some(DesktopMsg::Frame(f)) => f,
+        Some(DesktopMsg::Text(v)) => panic!("expected a frame, got {v}"),
+        None => panic!("expected a frame, got nothing"),
+    }
+}
+
+async fn desktop_text(ws: &mut DesktopWs) -> Value {
+    loop {
+        match desktop_next(ws, 15).await {
+            Some(DesktopMsg::Text(v)) => return v,
+            // Frames still in flight from before a settings change.
+            Some(DesktopMsg::Frame(_)) => continue,
+            None => panic!("expected a control message, got nothing"),
+        }
+    }
+}
+
+/// Phase 6: remote desktop through the server, with the agent's synthetic screen.
+async fn desktop(url: &str, admin: &Api, dir: &Path, id1: &str) {
+    let a = admin.get(&format!("/agents/{id1}")).await;
+    assert!(a["capabilities"].as_array().unwrap().iter().any(|c| c == "desktop"), "{a}");
+    let client_id = a["client_id"].as_str().unwrap().to_string();
+
+    admin
+        .post(
+            "/users",
+            json!({ "email": "desk@e2e.test", "name": "Desk Tech", "password": "desk-password-123", "role": "technician", "all_clients": true }),
+        )
+        .await;
+    let res = reqwest::Client::new()
+        .post(format!("{url}/api/auth/login"))
+        .json(&json!({ "email": "desk@e2e.test", "password": "desk-password-123" }))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success());
+    let cookie = res.headers()["set-cookie"].to_str().unwrap().split(';').next().unwrap().to_string();
+    let ws_url = format!("{}/api/agents/{id1}/desktop?quality=high", url.replacen("http", "ws", 1));
+    let connect = |q: &str| {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let mut req = ws_url.replace("quality=high", q).into_client_request().unwrap();
+        req.headers_mut().insert("cookie", cookie.parse().unwrap());
+        tokio_tungstenite::connect_async(req)
+    };
+
+    // Unauthenticated sockets are refused.
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    assert!(tokio_tungstenite::connect_async(ws_url.clone().into_client_request().unwrap()).await.is_err());
+
+    let (mut ws, _) = connect("quality=high").await.expect("desktop socket");
+    let info = desktop_text(&mut ws).await;
+    assert_eq!(info["type"], "info", "{info}");
+    assert_eq!(info["monitors"].as_array().unwrap().len(), 2);
+    assert_eq!(info["monitor"], 0);
+
+    // The first frame covers the whole 640x360 screen in 64-row bands.
+    let (seq, screen, size, rects) = desktop_frame(&mut ws).await;
+    assert_eq!((seq, screen, size), (1, (640, 360), (640, 360)));
+    assert_eq!(rects.iter().map(|r| r.1).collect::<Vec<_>>(), [0, 64, 128, 192, 256, 320]);
+    assert!(rects.iter().all(|r| r.4.starts_with(&[0xff, 0xd8]) && r.2 == 640));
+    // Then only what changed (the moving block in the top band).
+    let (seq, _, _, rects) = desktop_frame(&mut ws).await;
+    assert_eq!(seq, 2);
+    assert!(!rects.is_empty() && rects.iter().all(|r| r.1 == 0), "{:?}", rects.iter().map(|r| (r.0, r.1, r.2, r.3)).collect::<Vec<_>>());
+    // Two unacknowledged frames: the agent waits.
+    assert!(desktop_next(&mut ws, 2).await.is_none(), "no third frame before an ack");
+    desktop_send(&mut ws, json!({ "type": "ack", "seq": 2 })).await;
+    assert_eq!(desktop_frame(&mut ws).await.0, 3);
+
+    // Input reaches the machine; invalid events are dropped by the server.
+    desktop_send(
+        &mut ws,
+        json!({ "type": "input", "events": [
+            { "t": "move", "x": 10, "y": 20 },
+            { "t": "button", "button": "left", "down": true, "x": 10, "y": 20 },
+            { "t": "key", "code": "Key A", "down": true },
+            { "t": "key", "code": "KeyA", "down": true },
+            { "t": "text", "text": "héllo" },
+            { "t": "ctrl_alt_del" }
+        ] }),
+    )
+    .await;
+    let log = dir.join(format!("{}-desktop.jsonl", "a1"));
+    let lines = eventually(10, "desktop input logged", || async {
+        let raw = std::fs::read_to_string(&log).unwrap_or_default();
+        (raw.lines().count() >= 5).then_some(raw)
+    })
+    .await;
+    let events: Vec<Value> = lines.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    assert_eq!(events[0], json!({ "t": "move", "x": 10, "y": 20 }));
+    assert_eq!(events[2], json!({ "t": "key", "code": "KeyA", "down": true }));
+    assert_eq!(events[3], json!({ "t": "text", "text": "héllo" }));
+    assert_eq!(events.len(), 5, "{events:?}");
+
+    // Switching monitor and quality: fresh info, then a full half-size frame of monitor 2.
+    desktop_send(&mut ws, json!({ "type": "settings", "monitor": 1, "quality": "low" })).await;
+    desktop_send(&mut ws, json!({ "type": "ack", "seq": 3 })).await;
+    let info = desktop_text(&mut ws).await;
+    assert_eq!((info["type"].as_str(), info["monitor"].as_u64()), (Some("info"), Some(1)), "{info}");
+    let (seq, screen, size, rects) = loop {
+        let f = desktop_frame(&mut ws).await;
+        desktop_send(&mut ws, json!({ "type": "ack", "seq": f.0 })).await;
+        if f.1 == (320, 240) {
+            break f;
+        }
+    };
+    assert!(seq > 3);
+    assert_eq!((screen, size), ((320, 240), (160, 120)));
+    assert_eq!(rects.iter().map(|r| (r.0, r.1, r.2, r.3)).collect::<Vec<_>>(), [(0, 0, 160, 64), (0, 64, 160, 56)]);
+    drop(ws);
+
+    let audit = eventually(10, "desktop audit entries", || async {
+        let a = admin.get("/audit?action=desktop.").await;
+        let actions: Vec<String> = a["items"].as_array().unwrap().iter().map(|r| r["action"].as_str().unwrap().to_string()).collect();
+        actions.contains(&"desktop.close".to_string()).then_some(actions)
+    })
+    .await;
+    assert!(audit.contains(&"desktop.open".to_string()), "{audit:?}");
+
+    // Consent: the user declines, then allows.
+    let (s, _) = admin.call(reqwest::Method::PUT, &format!("/clients/{client_id}/desktop"), Some(json!({ "consent": true }))).await;
+    assert!(s.is_success());
+    assert_eq!(admin.get(&format!("/clients/{client_id}")).await["desktop_consent"], true);
+    let mut answer = log.clone().into_os_string();
+    answer.push(".consent");
+    std::fs::write(&answer, "deny").unwrap();
+    let (mut ws, _) = connect("quality=balanced").await.unwrap();
+    assert_eq!(desktop_text(&mut ws).await["type"], "waiting");
+    let closed = desktop_text(&mut ws).await;
+    assert_eq!((closed["type"].as_str(), closed["reason"].as_str()), (Some("closed"), Some("the user declined the session")), "{closed}");
+    std::fs::remove_file(&answer).unwrap();
+    let (mut ws, _) = connect("quality=balanced").await.unwrap();
+    assert_eq!(desktop_text(&mut ws).await["type"], "waiting");
+    assert_eq!(desktop_text(&mut ws).await["type"], "info");
+    assert_eq!(desktop_frame(&mut ws).await.0, 1);
+    drop(ws);
+    admin.call(reqwest::Method::PUT, &format!("/clients/{client_id}/desktop"), Some(json!({ "consent": false }))).await;
 }
 
 /// Phase 4: notification channels, alert policies, services, log watchers, schedules,

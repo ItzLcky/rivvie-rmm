@@ -26,6 +26,7 @@
 	import MoreLink from '#lib/ui/MoreLink.svelte';
 	import Skeleton from '#lib/ui/Skeleton.svelte';
 	import Stat from '#lib/ui/Stat.svelte';
+	import Switch from '#lib/ui/Switch.svelte';
 	import Tabs from '#lib/ui/Tabs.svelte';
 	import EnrollDialog from '#lib/components/EnrollDialog.svelte';
 	import HealthBadge from '#lib/components/HealthBadge.svelte';
@@ -82,6 +83,18 @@
 			await client.reload();
 			loadClients(true);
 		}
+	}
+
+	let consentBusy = $state(false);
+	async function setConsent(c: Client, consent: boolean) {
+		consentBusy = true;
+		const ok = await attempt(
+			() => api.put(`/clients/${c.id}/desktop`, { consent }),
+			consent ? `${c.name}: the person at the machine is asked first.` : `${c.name}: remote desktop sessions start without asking.`
+		);
+		consentBusy = false;
+		if (ok) c.desktop_consent = consent;
+		else await client.reload();
 	}
 
 	async function deleteClient(c: Client) {
@@ -146,7 +159,8 @@
 			onchange={(v) => setParams({ tab: v === 'agents' ? null : v }, { push: true })}
 			items={[
 				{ value: 'agents', label: 'Agents', count: num(total) },
-				{ value: 'sites', label: 'Sites & enrollment', count: c.sites.length }
+				{ value: 'sites', label: 'Sites & enrollment', count: c.sites.length },
+				{ value: 'settings', label: 'Settings', hidden: !can('admin') }
 			]}
 		/>
 
@@ -241,6 +255,18 @@
 					<EmptyState compact icon={MapPin} title="No sites" description="Agents enroll into a site, so add one first." />
 				{/if}
 			</section>
+		{:else if tab === 'settings' && can('admin')}
+			<div class="max-w-2xl space-y-5">
+				<section class="card space-y-4 p-5" aria-labelledby="desktop-heading">
+					<h2 id="desktop-heading" class="font-semibold">Remote desktop</h2>
+					<div>
+						<Switch checked={c.desktop_consent} disabled={consentBusy} onchange={(v) => setConsent(c, v)}>Ask the user before connecting</Switch>
+						<p class="hint ml-11.5">
+							The person at the machine gets an Allow / Deny prompt, and the session is refused if nobody answers within 30 seconds. If nobody is signed in, the session starts without asking.
+						</p>
+					</div>
+				</section>
+			</div>
 		{/if}
 
 		{#if enrolling}<EnrollDialog client={c} site={enrolling} onclose={() => (enrolling = null)} />{/if}

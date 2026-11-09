@@ -6,8 +6,9 @@
 //! [`ServerMsg::Enrolled`], [`ServerMsg::AuthOk`] or [`ServerMsg::AuthFailed`].
 //!
 //! Everything is multiplexed over that one connection: metrics, jobs,
-//! interactive shells and (later) patching and remote desktop streams.
+//! interactive shells, patching and remote desktop streams.
 
+pub mod desktop;
 pub mod patch;
 pub mod update;
 
@@ -174,6 +175,22 @@ pub enum AgentMsg {
         percent: Option<u8>,
     },
     PatchResult(patch::PatchOutcome),
+    /// The session's monitors and which one is shown. Sent first, and again when either changes.
+    DesktopInfo {
+        session_id: Uuid,
+        monitors: Vec<desktop::Monitor>,
+        monitor: u32,
+    },
+    DesktopFrame {
+        session_id: Uuid,
+        frame: desktop::Frame,
+    },
+    /// The session ended (or never started): declined by the user, no desktop to show, the
+    /// capture failed...
+    DesktopClosed {
+        session_id: Uuid,
+        reason: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -296,6 +313,30 @@ pub enum ServerMsg {
     /// The server has stored this install's result; the agent can forget it.
     PatchAck {
         run_id: Uuid,
+    },
+    /// Start a remote desktop session (only sent to agents listing [`desktop::CAPABILITY`]).
+    DesktopOpen {
+        session_id: Uuid,
+        settings: desktop::Settings,
+        /// Ask the person at the machine first.
+        #[serde(default)]
+        consent: Option<desktop::Consent>,
+    },
+    DesktopSettings {
+        session_id: Uuid,
+        settings: desktop::Settings,
+    },
+    DesktopInput {
+        session_id: Uuid,
+        events: Vec<desktop::InputEvent>,
+    },
+    /// The browser has drawn frame `seq` (and everything before it).
+    DesktopAck {
+        session_id: Uuid,
+        seq: u32,
+    },
+    DesktopClose {
+        session_id: Uuid,
     },
 }
 

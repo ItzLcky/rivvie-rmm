@@ -5,19 +5,19 @@ The agent and server are written in Rust; the dashboard is a SvelteKit SPA.
 
 | Platform | Status |
 |---|---|
-| Linux agent | Working: inventory, metrics, scripts, terminal, systemd service, service monitoring and control, journald watchers |
-| Windows agent | Code complete, compile-checked in CI only (registry inventory, PowerShell/cmd, ConPTY, Windows service, service monitoring, Event Log watchers). Needs testing on a real host. |
+| Linux agent | Working: inventory, metrics, scripts, terminal, systemd service, service monitoring and control, journald watchers, remote desktop (X11 sessions) |
+| Windows agent | Code complete, compile-checked in CI only (registry inventory, PowerShell/cmd, ConPTY, Windows service, service monitoring, Event Log watchers, remote desktop). Needs testing on a real host. |
 | macOS agent | Builds; metrics and scripts work. No launchd install or software inventory yet. |
 
-The release agent is a **3.0 MB** single binary that idles at **~10 MB RSS** with 3 threads (plus a `journalctl` child while log watchers are set).
+The release agent (Linux x86_64) is a **3.7 MB** single binary that idles at **~10 MB RSS** with 3 threads (plus a `journalctl` child while log watchers are set, and a helper process per open remote desktop session).
 
 ## Layout
 
 ```
 crates/
   rmm-proto/    Wire protocol shared by agent and server (MessagePack over WebSocket)
-  rmm-agent/    Endpoint agent: collector, script runner, PTY shell, service install, self-update
-  rmm-server/   axum server: agent hub, REST API, terminal relay, serves the dashboard
+  rmm-agent/    Endpoint agent: collector, script runner, PTY shell, remote desktop, service install, self-update
+  rmm-server/   axum server: agent hub, REST API, terminal and desktop relay, serves the dashboard
     migrations/ Postgres schema (applied automatically on start)
     tests/      End-to-end test: real server, Postgres and agent processes
   rmm-sign/     Offline release signing for agent self-update (never deployed to the server)
@@ -34,7 +34,7 @@ docs/           Roadmap and design notes
  └───────────┘                                               │  (axum)      │      └──────────┘
                     https://…/api/*  (REST, cookie auth)     │              │
  ┌───────────┐ ◄───────────────────────────────────────────► │  agent hub   │
- │  browser  │   wss://…/api/agents/{id}/shell (terminal)    │  shell relay │
+ │  browser  │   wss://…/api/agents/{id}/shell|desktop       │  relays      │
  └───────────┘ ◄───────────────────────────────────────────► └──────────────┘
 ```
 
@@ -43,12 +43,13 @@ docs/           Roadmap and design notes
 - **Transport:** the agent dials out, so endpoints need no inbound ports. Everything is multiplexed over one WebSocket: heartbeats (every 30 s), inventory (every 6 h or on demand), script jobs, and PTY streams. The agent reconnects with jittered exponential backoff, and treats 100 s of silence from the server as a dead connection.
 - **Jobs:** sending a script to an offline agent queues it, and it runs on reconnect (queued jobs expire after `RMM_JOB_QUEUE_DAYS`). Output streams into Postgres (capped at 1 MB per stream). Jobs outlive the connection: the agent keeps a copy of each job's output and its result, and resends them after a reconnect or server restart until the server acknowledges them. A job is only marked `lost` when the agent comes back without it (the agent itself restarted) or never comes back. Timeouts kill the whole process tree on Unix, and closing a terminal kills everything started from it.
 - **Terminal:** xterm.js ↔ server relay ↔ PTY on the agent (bash/zsh on Linux, PowerShell through ConPTY on Windows).
+- **Remote desktop:** view and control the machine's screen from the browser, relayed over the agent's existing socket (no extra ports). Changed areas are sent as JPEG, paced by the browser so slow links get fewer frames rather than lag. Optional consent prompt per client. See [Remote desktop](#remote-desktop).
 - **Per-client access:** admins see every client. Technicians and read-only users see every client by default, or only the clients an admin picks under Company settings → Users. Everything they can reach (agents, sites, tokens, jobs, terminal, dashboard counts) is scoped to those clients, and anything outside them reads as "not found". Scripts are MSP-wide (admins edit them; they run anywhere) or belong to one client (its technicians edit them; they only run on its agents).
 - **Alerting:** alert policies, per client or site (and optionally one OS), raise alerts for agents that are offline, CPU, memory or disk held over a threshold, a stopped or failed service, a failed script, or a log entry that matches. Offline and threshold policies are checked every minute; the others act as agents report. An alert stays open until its condition clears (or someone resolves it), and open alerts feed the health model. See [Monitoring and alerts](#monitoring-and-alerts).
 - **Schedules:** saved scripts run on a cron timetable, in any time zone, on every agent of a client or site. Each schedule keeps its runs' output for as many days as you choose.
 - **Patch management:** agents scan for OS updates (Windows Update Agent, apt, dnf/yum, pacman, softwareupdate) when they connect and every `RMM_PATCH_SCAN_HOURS`. Patch policies approve updates by category or severity and can install them during each site's maintenance window, with a reboot policy. Technicians approve, decline and install from the Patches page or an agent's Patches tab, and the Compliance tab shows how many agents per client are fully patched. See [Patch management](#patch-management).
 - **Self-update:** agents install new versions signed with an offline ed25519 key whose public half is compiled into the agent, and roll themselves back if the new version can't reconnect. See [Agent updates](#agent-updates).
-- **Security:** argon2id passwords; opaque, revocable session tokens in an HttpOnly SameSite=Strict cookie, with an idle timeout and a 7-day cap; users can change their password and review or revoke their sessions, and admins can reset passwords, re-enable users, and revoke anyone's sessions; TOTP two-factor auth with single-use recovery codes, required for admins and optionally for everyone; an Origin check on the terminal socket; three roles (admin / technician / readonly); an audit log covering logins, shells, jobs, enrollment, and deletes. Failed sign-ins are rate-limited per client IP and per account, and bad enrollment tokens per IP (see `RMM_TRUSTED_PROXIES`). The dashboard ships a hash-based script CSP, so no inline or third-party script runs.
+- **Security:** argon2id passwords; opaque, revocable session tokens in an HttpOnly SameSite=Strict cookie, with an idle timeout and a 7-day cap; users can change their password and review or revoke their sessions, and admins can reset passwords, re-enable users, and revoke anyone's sessions; TOTP two-factor auth with single-use recovery codes, required for admins and optionally for everyone; an Origin check on the terminal and desktop sockets; three roles (admin / technician / readonly); an audit log covering logins, shells, remote desktop sessions, jobs, enrollment, and deletes. Failed sign-ins are rate-limited per client IP and per account, and bad enrollment tokens per IP (see `RMM_TRUSTED_PROXIES`). The dashboard ships a hash-based script CSP, so no inline or third-party script runs.
 
 ## Development
 
@@ -300,4 +301,32 @@ security tags either: include **Updates** in the policy for Arch machines). On A
 macOS updates that need a restart may need a signed-in user to approve them. The Windows provider
 is compile-checked only so far, like the rest of the Windows agent.
 
-See [docs/ROADMAP.md](docs/ROADMAP.md) for what's next: alerting, remote desktop, PSA and more.
+## Remote desktop
+
+Open an agent and choose **Remote desktop** (technicians and admins). The agent starts a helper
+process (`rmm-agent desktop-helper`) inside the machine's graphical session, which captures the
+screen and injects input; the agent relays between it and the server over its one socket.
+
+| OS | Session | Capture | Input |
+|---|---|---|---|
+| Windows | The console session. The helper runs as SYSTEM there, so it follows input to the sign-in screen and UAC prompts | GDI `BitBlt` | `SendInput`; Ctrl+Alt+Del through `SendSAS` |
+| Linux | The X11 display in use (a signed-in user's, else the display manager's greeter). The helper runs as that display's user | MIT-SHM, else `GetImage` | XTEST |
+
+- The screen is compared in 64×64 tiles and only changed areas are sent, as JPEG. **Low**
+  quality halves the resolution for slow links. At most two frames are in flight; the browser
+  acknowledges each one it has drawn, so the frame rate (up to 20 fps) adapts to the link.
+- Keys are sent by physical position, so the remote machine's own keyboard layout applies.
+  **Type text** types a string independently of the layout (handy for passwords).
+- Multiple monitors: pick one from the toolbar.
+- **Consent:** under a client's settings, admins can turn on **Ask the user before connecting**.
+  The person at the machine gets an Allow/Deny prompt (a message box on Windows; zenity, kdialog
+  or xmessage on Linux) and the session is refused if nobody answers within 30 seconds. If
+  nobody is signed in, there is nobody to ask and the session starts.
+- Every session is in the audit log (`desktop.open`, `desktop.close` with its duration).
+
+Limits: Wayland sessions aren't supported yet (the agent says so; choose an Xorg session at the
+sign-in screen), there's no clipboard sync or session recording, and the Windows side is
+compile-checked only, like the rest of the Windows agent. `RMM_DESKTOP_FAKE=<file>` makes the
+agent serve a synthetic screen and log input to `<file>`, for testing without a display.
+
+See [docs/ROADMAP.md](docs/ROADMAP.md) for what's next: PSA and more.

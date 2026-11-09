@@ -14,6 +14,7 @@ use uuid::Uuid;
 
 use crate::collect::{AGENT_VERSION, Collector, system_info};
 use crate::config::{self, Config};
+use crate::desktop::DesktopSession;
 use crate::shell::ShellSession;
 use crate::update::Updater;
 use crate::logwatch::LogWatchers;
@@ -130,7 +131,7 @@ async fn session(
             secret: cfg.secret.clone(),
             agent_version: AGENT_VERSION.to_string(),
             jobs: tracker.ids().await,
-            capabilities: vec![rmm_proto::patch::CAPABILITY.to_string()],
+            capabilities: capabilities(),
             patch_runs: patches.ids().await,
         },
     )
@@ -173,6 +174,7 @@ async fn session(
     let ctx = Ctx { tx: tx.clone(), collector, tracker: tracker.clone(), updater: updater.clone(), watchers: watchers.clone(), patches: patches.clone(), services_refresh };
 
     let mut shells: HashMap<Uuid, ShellSession> = HashMap::new();
+    let mut desktops: HashMap<Uuid, DesktopSession> = HashMap::new();
     let result = loop {
         let frame = match tokio::time::timeout(READ_IDLE_TIMEOUT, stream.next()).await {
             Err(_) => break Err(anyhow!("nothing from the server for {}s; reconnecting", READ_IDLE_TIMEOUT.as_secs())),
@@ -191,7 +193,7 @@ async fn session(
             Message::Close(_) => break Ok(()),
             _ => continue,
         };
-        handle(msg, &ctx, &mut shells).await;
+        handle(msg, &ctx, &mut shells, &mut desktops).await;
     };
 
     // Running jobs keep going; their output is buffered until the next connection.
@@ -204,6 +206,7 @@ async fn session(
     heartbeat.abort();
     inventory.abort();
     drop(shells);
+    drop(desktops);
     drop(tx);
     // A dead socket can stall the writer mid-send. Give it a moment to flush, then move on.
     let abort = writer.abort_handle();
@@ -225,7 +228,7 @@ struct Ctx {
     services_refresh: mpsc::Sender<()>,
 }
 
-async fn handle(msg: ServerMsg, ctx: &Ctx, shells: &mut HashMap<Uuid, ShellSession>) {
+async fn handle(msg: ServerMsg, ctx: &Ctx, shells: &mut HashMap<Uuid, ShellSession>, desktops: &mut HashMap<Uuid, DesktopSession>) {
     let Ctx { tx, collector, tracker, updater, .. } = ctx;
     match msg {
         ServerMsg::Ping { nonce } => {
@@ -288,8 +291,49 @@ async fn handle(msg: ServerMsg, ctx: &Ctx, shells: &mut HashMap<Uuid, ShellSessi
             tokio::spawn(ctx.patches.clone().install(run_id, ids, reboot_policy));
         }
         ServerMsg::PatchAck { run_id } => ctx.patches.ack(run_id).await,
+        ServerMsg::DesktopOpen { session_id, settings, consent } => {
+            if desktops.len() >= MAX_DESKTOPS {
+                let reason = Some(format!("this machine already has {MAX_DESKTOPS} remote desktop sessions open"));
+                let _ = tx.send(AgentMsg::DesktopClosed { session_id, reason }).await;
+            } else {
+                info!(%session_id, consent = consent.is_some(), "desktop session requested");
+                desktops.insert(session_id, DesktopSession::open(session_id, settings, consent, tx.clone()));
+            }
+        }
+        ServerMsg::DesktopSettings { session_id, settings } => {
+            if let Some(d) = desktops.get(&session_id) {
+                d.settings(settings);
+            }
+        }
+        ServerMsg::DesktopInput { session_id, events } => {
+            if let Some(d) = desktops.get(&session_id) {
+                d.input(events);
+            }
+        }
+        ServerMsg::DesktopAck { session_id, seq } => {
+            if let Some(d) = desktops.get(&session_id) {
+                d.ack(seq);
+            }
+        }
+        ServerMsg::DesktopClose { session_id } => {
+            if desktops.remove(&session_id).is_some() {
+                info!(%session_id, "desktop closed by server");
+            }
+        }
         ServerMsg::Enrolled { .. } | ServerMsg::AuthOk { .. } | ServerMsg::AuthFailed { .. } => {}
     }
+}
+
+/// Concurrent remote desktop sessions per machine.
+const MAX_DESKTOPS: usize = 3;
+
+/// Optional features to announce in `Auth`.
+fn capabilities() -> Vec<String> {
+    let mut caps = vec![rmm_proto::patch::CAPABILITY.to_string()];
+    if cfg!(any(target_os = "linux", windows)) || std::env::var_os("RMM_DESKTOP_FAKE").is_some() {
+        caps.push(rmm_proto::desktop::CAPABILITY.to_string());
+    }
+    caps
 }
 
 async fn periodic(tx: mpsc::Sender<AgentMsg>, collector: Arc<Mutex<Collector>>, every_secs: u32, inventory: bool) {

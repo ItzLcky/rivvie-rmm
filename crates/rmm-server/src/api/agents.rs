@@ -191,6 +191,8 @@ pub struct AgentDetail {
     machine_id: Option<String>,
     inventory: Option<serde_json::Value>,
     inventory_at: Option<DateTime<Utc>>,
+    /// Optional features its build supports, as of its last connection (`patch`, `desktop`).
+    capabilities: Vec<String>,
 }
 
 pub async fn get(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uuid>) -> ApiResult<Json<AgentDetail>> {
@@ -201,12 +203,18 @@ pub async fn get(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uuid>)
         .fetch_optional(&st.db)
         .await?
         .ok_or(ApiError::NotFound("agent"))?;
-    let (kernel_version, machine_id, inventory, inventory_at): (String, Option<String>, Option<serde_json::Value>, Option<DateTime<Utc>>) =
-        sqlx::query_as("SELECT kernel_version, machine_id, inventory, inventory_at FROM agents WHERE id = $1")
-            .bind(id)
-            .fetch_one(&st.db)
-            .await?;
-    Ok(Json(AgentDetail { summary, kernel_version, machine_id, inventory, inventory_at }))
+    #[allow(clippy::type_complexity)]
+    let (kernel_version, machine_id, inventory, inventory_at, capabilities): (
+        String,
+        Option<String>,
+        Option<serde_json::Value>,
+        Option<DateTime<Utc>>,
+        Vec<String>,
+    ) = sqlx::query_as("SELECT kernel_version, machine_id, inventory, inventory_at, capabilities FROM agents WHERE id = $1")
+        .bind(id)
+        .fetch_one(&st.db)
+        .await?;
+    Ok(Json(AgentDetail { summary, kernel_version, machine_id, inventory, inventory_at, capabilities }))
 }
 
 pub async fn remove(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uuid>) -> ApiResult<Json<serde_json::Value>> {

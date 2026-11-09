@@ -25,13 +25,15 @@ pub struct ClientOut {
     id: Uuid,
     name: String,
     created_at: DateTime<Utc>,
+    /// Ask the person at the machine before a remote desktop session starts.
+    desktop_consent: bool,
     sites: Vec<SiteRow>,
 }
 
 /// Clients (all visible ones, or just `only`) with their sites and agent counts.
 async fn load(st: &AppState, u: &User, only: Option<Uuid>) -> ApiResult<Vec<ClientOut>> {
-    let clients: Vec<(Uuid, String, DateTime<Utc>)> = sqlx::query_as(
-        "SELECT id, name, created_at FROM clients
+    let clients: Vec<(Uuid, String, DateTime<Utc>, bool)> = sqlx::query_as(
+        "SELECT id, name, created_at, desktop_consent FROM clients
           WHERE ($1::uuid[] IS NULL OR id = ANY($1)) AND ($2::uuid IS NULL OR id = $2) ORDER BY lower(name)",
     )
     .bind(u.scope())
@@ -51,7 +53,7 @@ async fn load(st: &AppState, u: &User, only: Option<Uuid>) -> ApiResult<Vec<Clie
     .fetch_all(&st.db)
     .await?;
     let mut out: Vec<ClientOut> =
-        clients.into_iter().map(|(id, name, created_at)| ClientOut { id, name, created_at, sites: vec![] }).collect();
+        clients.into_iter().map(|(id, name, created_at, desktop_consent)| ClientOut { id, name, created_at, desktop_consent, sites: vec![] }).collect();
     for s in sites {
         if let Some(c) = out.iter_mut().find(|c| c.id == s.client_id) {
             c.sites.push(s);
@@ -98,6 +100,31 @@ pub async fn rename_site(
         return Err(ApiError::NotFound("site"));
     }
     auth::audit(&st.db, Some(u.id), "site.rename", Some(("site", id)), json!({ "name": name })).await;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+pub struct DesktopBody {
+    consent: bool,
+}
+
+pub async fn update_desktop(
+    State(st): State<Arc<AppState>>,
+    u: User,
+    Path(id): Path<Uuid>,
+    Json(b): Json<DesktopBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    u.require(Role::Admin)?;
+    let n = sqlx::query("UPDATE clients SET desktop_consent = $2 WHERE id = $1")
+        .bind(id)
+        .bind(b.consent)
+        .execute(&st.db)
+        .await?
+        .rows_affected();
+    if n == 0 {
+        return Err(ApiError::NotFound("client"));
+    }
+    auth::audit(&st.db, Some(u.id), "client.desktop_settings", Some(("client", id)), json!({ "consent": b.consent })).await;
     Ok(Json(json!({ "ok": true })))
 }
 

@@ -1,6 +1,7 @@
 mod collect;
 mod config;
 mod conn;
+mod desktop;
 mod jobs;
 mod logwatch;
 mod patch;
@@ -64,6 +65,9 @@ enum Cmd {
         #[arg(long)]
         no_refresh: bool,
     },
+    /// Remote desktop capture and input, started by the agent inside the user's session.
+    #[command(hide = true)]
+    DesktopHelper,
     /// Entry point used by the Windows Service Control Manager.
     #[command(hide = true)]
     Service,
@@ -79,6 +83,17 @@ fn main() -> Result<()> {
     // Windows SCM entry must happen before we build a runtime; it builds its own.
     if let Cmd::Service = cli.cmd {
         return service::run_as_service(config_path);
+    }
+
+    if let Cmd::DesktopHelper = cli.cmd {
+        // stdout carries frames to the agent, so logs must go to stderr.
+        tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+            .with_writer(std::io::stderr)
+            .with_ansi(false)
+            .without_time()
+            .init();
+        return desktop::helper_main();
     }
 
     if let Cmd::UpdateWatchdog = cli.cmd {
@@ -135,7 +150,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Patches { install, no_refresh } => patch::cli(&install, !no_refresh),
-        Cmd::Service | Cmd::UpdateWatchdog => unreachable!(),
+        Cmd::Service | Cmd::UpdateWatchdog | Cmd::DesktopHelper => unreachable!(),
     }
 }
 

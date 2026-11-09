@@ -20,7 +20,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::auth::{random_token, token_hash};
-use crate::hub::{AgentHandle, Event, ShellEvent};
+use crate::hub::{AgentHandle, DesktopEvent, Event, ShellEvent};
 use crate::ratelimit::ClientIp;
 use crate::state::AppState;
 
@@ -438,6 +438,13 @@ async fn on_message(
         AgentMsg::ShellOutput { session_id, data } => state.hub.route_shell(agent_id, session_id, ShellEvent::Output(data)).await,
         AgentMsg::ShellClosed { session_id, reason } => {
             state.hub.route_shell(agent_id, session_id, ShellEvent::Closed(reason)).await
+        }
+        AgentMsg::DesktopInfo { session_id, monitors, monitor } => {
+            state.hub.route_desktop(agent_id, session_id, DesktopEvent::Info { monitors, monitor })
+        }
+        AgentMsg::DesktopFrame { session_id, frame } => state.hub.route_desktop(agent_id, session_id, DesktopEvent::Frame(frame)),
+        AgentMsg::DesktopClosed { session_id, reason } => {
+            state.hub.route_desktop(agent_id, session_id, DesktopEvent::Closed(reason))
         }
         AgentMsg::UpdateFetch { version, offset } => {
             let chunk = crate::updates::chunk(state, agent_id, &version, offset).await;

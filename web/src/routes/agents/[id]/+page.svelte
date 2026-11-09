@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
-	import { CloudDownload, Copy, Play, RefreshCw, Search, SquareTerminal, Trash2 } from '@lucide/svelte';
+	import { CloudDownload, Copy, MonitorUp, Play, RefreshCw, Search, SquareTerminal, Trash2 } from '@lucide/svelte';
 	import { api } from '#lib/api.js';
 	import { confirmAction } from '#lib/confirm.svelte.js';
 	import { ago, bytes, datetime, duration, ms, num, pct } from '#lib/format.js';
@@ -149,6 +149,12 @@
 	const patches = $derived(tab === 'patches' ? import('#lib/components/AgentPatches.svelte') : null);
 	// The terminal (xterm.js) loads only when its tab opens.
 	const terminal = $derived(tab === 'terminal' ? import('#lib/components/Terminal.svelte') : null);
+	const desktop = $derived(tab === 'desktop' ? import('#lib/components/RemoteDesktop.svelte') : null);
+	/** Why remote desktop can't start, if it can't. */
+	function desktopBlocked(a: AgentDetail): string | undefined {
+		if (!a.capabilities?.includes('desktop')) return 'This agent version doesn’t support remote desktop; update the agent';
+		if (!a.online) return 'The agent is offline';
+	}
 </script>
 
 <svelte:head>{#if agent.data}<title>{agent.data.hostname}</title>{/if}</svelte:head>
@@ -181,6 +187,7 @@
 			{#snippet actions()}
 				{#if can('technician')}
 					<Button icon={SquareTerminal} disabled={!a.online} onclick={() => setParams({ tab: 'terminal' })} title={a.online ? undefined : 'The agent is offline'}>Terminal</Button>
+					<Button icon={MonitorUp} class="max-sm:hidden" disabled={!!desktopBlocked(a)} onclick={() => setParams({ tab: 'desktop' })} title={desktopBlocked(a)}>Remote desktop</Button>
 					<Button variant="primary" icon={Play} onclick={() => (running = true)}>Run script</Button>
 				{/if}
 			{/snippet}
@@ -201,7 +208,8 @@
 				{ value: 'patches', label: 'Patches' },
 				{ value: 'jobs', label: 'Jobs' },
 				{ value: 'activity', label: 'Activity' },
-				{ value: 'terminal', label: 'Terminal', hidden: !can('technician') }
+				{ value: 'terminal', label: 'Terminal', hidden: !can('technician') },
+				{ value: 'desktop', label: 'Desktop', hidden: !can('technician'), title: 'Remote desktop' }
 			]}
 		/>
 
@@ -422,6 +430,20 @@
 					<div class="card flex h-64 items-center justify-center"><Spinner label="Loading terminal" /></div>
 				{:then T}
 					<T.default agentId={a.id} hostname={a.hostname} />
+				{/await}
+			{/if}
+		{:else if tab === 'desktop'}
+			{#if !a.capabilities?.includes('desktop')}
+				<div class="card">
+					<EmptyState icon={MonitorUp} title="Remote desktop needs a newer agent" description="This agent's version (v{a.agent_version}) can't share its screen. Update the agent, then reopen this tab." />
+				</div>
+			{:else if !a.online}
+				<div class="card"><EmptyState icon={MonitorUp} title="The agent is offline" description="Remote desktop opens once the agent reconnects." /></div>
+			{:else if desktop}
+				{#await desktop}
+					<div class="card flex h-64 items-center justify-center"><Spinner label="Loading remote desktop" /></div>
+				{:then D}
+					{#key a.id}<D.default agentId={a.id} hostname={a.hostname} />{/key}
 				{/await}
 			{/if}
 		{/if}

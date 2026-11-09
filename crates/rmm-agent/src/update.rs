@@ -477,7 +477,17 @@ fn launch_watchdog(backup: &Path, config: &Path) -> Result<()> {
 fn swap_in(staged: &Path, exe: &Path) -> Result<()> {
     // A running .exe can't be replaced, so stop the service first.
     crate::service::stop_service()?;
-    let moved = std::fs::rename(staged, exe).with_context(|| format!("moving {} to {}", staged.display(), exe.display()));
+    // A remote desktop helper (a separate process running this .exe) notices the service is
+    // gone within a fraction of a second; until it exits the file is still in use.
+    let mut moved = std::fs::rename(staged, exe);
+    for _ in 0..20 {
+        if moved.is_ok() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        moved = std::fs::rename(staged, exe);
+    }
+    let moved = moved.with_context(|| format!("moving {} to {}", staged.display(), exe.display()));
     crate::service::start_service()?;
     moved
 }
@@ -485,7 +495,15 @@ fn swap_in(staged: &Path, exe: &Path) -> Result<()> {
 #[cfg(windows)]
 fn restore(backup: &Path, exe: &Path) -> Result<()> {
     crate::service::stop_service()?;
-    let copied = std::fs::copy(backup, exe).map(|_| ()).with_context(|| format!("restoring {}", exe.display()));
+    let mut copied = std::fs::copy(backup, exe).map(|_| ());
+    for _ in 0..20 {
+        if copied.is_ok() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        copied = std::fs::copy(backup, exe).map(|_| ());
+    }
+    let copied = copied.with_context(|| format!("restoring {}", exe.display()));
     crate::service::start_service()?;
     copied
 }

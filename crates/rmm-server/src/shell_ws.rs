@@ -52,7 +52,7 @@ pub async fn handler(
 }
 
 /// Cross-site WebSocket hijacking guard (defence in depth on top of SameSite cookies).
-fn check_origin(headers: &HeaderMap, public_url: &str) -> ApiResult<()> {
+pub(crate) fn check_origin(headers: &HeaderMap, public_url: &str) -> ApiResult<()> {
     let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) else {
         return Ok(()); // non-browser client
     };

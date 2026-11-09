@@ -1,5 +1,6 @@
 import AxeBuilder from '@axe-core/playwright';
-import { expect, test, type Page } from '@playwright/test';
+import { readFileSync } from 'node:fs';
+import { expect, test, type Page, type WebSocketRoute } from '@playwright/test';
 import { mockApi } from './mock';
 
 const pages: [string, string][] = [
@@ -15,6 +16,7 @@ const pages: [string, string][] = [
 	['agent-alerts', '/agents/a-3?tab=alerts'],
 	['agent-services', '/agents/a-3?tab=services'],
 	['agent-logs', '/agents/a-3?tab=logs'],
+	['agent-desktop-unsupported', '/agents/a-6?tab=desktop'],
 	['alerts', '/alerts'],
 	['alert', '/alerts/al-5'],
 	['policies', '/policies'],
@@ -37,6 +39,7 @@ const pages: [string, string][] = [
 	['clients', '/clients'],
 	['client', '/clients/c-acme'],
 	['client-sites', '/clients/c-acme?tab=sites'],
+	['client-settings', '/clients/c-acme?tab=settings'],
 	['scripts', '/scripts'],
 	['script', '/scripts/s-spool'],
 	['audit', '/audit'],
@@ -52,6 +55,27 @@ const phone: [string, string][] = [
 	['alerts', '/alerts'],
 	['patches', '/patches'],
 	['agent-patches', '/agents/a-3?tab=patches']
+];
+
+const jpeg = readFileSync(new URL('./fixtures/desktop.jpg', import.meta.url));
+
+/** One remote desktop frame (desktop_ws.rs layout): the fixture as a single full-screen rect. */
+function desktopFrame(seq: number) {
+	const head = Buffer.alloc(23 + 13);
+	let o = head.writeUInt8(1, 0);
+	o = head.writeUInt32BE(seq, o);
+	for (const v of [1920, 1080, 960, 540]) o = head.writeUInt16BE(v, o);
+	o = head.writeInt32BE(1400, o); // remote cursor, screen pixels
+	o = head.writeInt32BE(300, o);
+	o = head.writeUInt16BE(1, o);
+	for (const v of [0, 0, 960, 540]) o = head.writeUInt16BE(v, o);
+	o = head.writeUInt8(1, o);
+	head.writeUInt32BE(jpeg.length, o);
+	return Buffer.concat([head, jpeg]);
+}
+const monitors = [
+	{ name: 'DISPLAY1', x: 0, y: 0, width: 1920, height: 1080, primary: true },
+	{ name: 'DISPLAY2', x: 1920, y: 0, width: 1280, height: 1024, primary: false }
 ];
 
 /** Waits until nothing is loading: no skeletons, fonts in, lazy editors mounted. */
@@ -112,6 +136,49 @@ for (const theme of ['light', 'dark'] as const) {
 			await page.getByRole('button', { name: 'Edit' }).nth(1).click();
 			await expect(page.getByRole('dialog', { name: 'Policy for Acme Corp' })).toBeVisible();
 			await expect(page).toHaveScreenshot(`${theme}-patch-policy.png`);
+		});
+
+		test('remote desktop', async ({ page }) => {
+			await mockApi(page);
+			const sent: Record<string, unknown>[] = [];
+			let url = '';
+			await page.routeWebSocket(/\/api\/agents\/[^/]+\/desktop/, (ws: WebSocketRoute) => {
+				url = ws.url();
+				ws.onMessage((m) => sent.push(JSON.parse(String(m))));
+				ws.send(JSON.stringify({ type: 'info', monitors, monitor: 0 }));
+				ws.send(desktopFrame(1));
+			});
+			await page.goto('/agents/a-3?tab=desktop');
+			await settle(page);
+			await expect(page.getByText('Connected', { exact: true })).toBeVisible();
+			await expect.poll(() => sent).toContainEqual({ type: 'ack', seq: 1 });
+			expect(url).toMatch(/quality=balanced&monitor=0$/);
+			await expect(page.getByLabel('Monitor')).toBeVisible();
+
+			// Input goes out in screen pixels (the frame is half the screen's size here).
+			const screen = page.getByRole('application');
+			const box = (await screen.boundingBox())!;
+			await screen.click({ position: { x: box.width / 2, y: box.height / 2 } });
+			await expect.poll(() => sent.flatMap((m) => (m.type === 'input' ? (m.events as Record<string, unknown>[]) : [])).find((e) => e.t === 'button' && e.down)).toMatchObject({ button: 'left', x: 960, y: 540 });
+			await page.keyboard.press('KeyA');
+			await expect.poll(() => sent.some((m) => m.type === 'input' && (m.events as { code?: string; down?: boolean }[]).some((e) => e.code === 'KeyA' && e.down === false))).toBe(true);
+			await page.mouse.move(0, 0);
+
+			await expect(page).toHaveScreenshot(`${theme}-agent-desktop.png`);
+			const r = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa']).analyze();
+			expect(r.violations.filter((v) => v.impact === 'serious' || v.impact === 'critical').map((v) => v.id)).toEqual([]);
+		});
+
+		test('remote desktop waiting for consent', async ({ page }) => {
+			await mockApi(page);
+			await page.routeWebSocket(/\/api\/agents\/[^/]+\/desktop/, (ws: WebSocketRoute) => {
+				ws.send(JSON.stringify({ type: 'waiting' }));
+			});
+			await page.goto('/agents/a-1?tab=desktop');
+			await page.getByText('Waiting for the person at acme-dc01 to allow the session…').waitFor();
+			await expect(page.getByText('Waiting for approval', { exact: true })).toBeVisible();
+			await page.evaluate(() => document.fonts.ready);
+			await expect(page).toHaveScreenshot(`${theme}-agent-desktop-waiting.png`);
 		});
 
 		test('confirm dialog', async ({ page }) => {

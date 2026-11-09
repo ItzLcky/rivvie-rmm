@@ -8,10 +8,10 @@ export const NOW = new Date('2026-06-15T14:30:00Z');
 const ago = (mins: number) => new Date(NOW.getTime() - mins * 60_000).toISOString();
 
 const clients = [
-	{ id: 'c-acme', name: 'Acme Corp', created_at: ago(60 * 24 * 200) },
-	{ id: 'c-globex', name: 'Globex', created_at: ago(60 * 24 * 90) },
-	{ id: 'c-initech', name: 'Initech', created_at: ago(60 * 24 * 30) },
-	{ id: 'c-umbrella', name: 'Umbrella Health', created_at: ago(60 * 24 * 3) }
+	{ id: 'c-acme', name: 'Acme Corp', created_at: ago(60 * 24 * 200), desktop_consent: true },
+	{ id: 'c-globex', name: 'Globex', created_at: ago(60 * 24 * 90), desktop_consent: false },
+	{ id: 'c-initech', name: 'Initech', created_at: ago(60 * 24 * 30), desktop_consent: false },
+	{ id: 'c-umbrella', name: 'Umbrella Health', created_at: ago(60 * 24 * 3), desktop_consent: true }
 ];
 const sites = [
 	{ id: 's-acme-hq', client_id: 'c-acme', name: 'Head office' },
@@ -120,6 +120,8 @@ const detail = (a: Agent) => ({
 	...a,
 	kernel_version: a.os_family === 'windows' ? '10.0.20348' : '6.8.0-45-generic',
 	machine_id: 'm-' + a.id,
+	// globex-db01 runs an agent build without remote desktop.
+	capabilities: a.id === 'a-6' ? ['patch'] : ['patch', 'desktop'],
 	inventory_at: ago(12),
 	inventory: {
 		collected_at: ago(12), cpu_brand: 'Intel(R) Xeon(R) Silver 4314 CPU @ 2.40GHz', cpu_cores_physical: 16, cpu_cores_logical: 32, mem_total: 64 * 2 ** 30,

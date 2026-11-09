@@ -1,4 +1,4 @@
-//! In-memory registry of connected agents and live shell sessions.
+//! In-memory registry of connected agents and live shell and remote desktop sessions.
 //!
 //! Single-node for now. To scale horizontally, swap this for a pub/sub
 //! (Postgres LISTEN/NOTIFY or NATS) keyed by agent id.
@@ -94,9 +94,25 @@ struct ShellRoute {
     tx: mpsc::Sender<ShellEvent>,
 }
 
+pub enum DesktopEvent {
+    Info { monitors: Vec<rmm_proto::desktop::Monitor>, monitor: u32 },
+    Frame(rmm_proto::desktop::Frame),
+    Closed(Option<String>),
+}
+
+/// Frames are paced by the browser's acks, so a well-behaved session never has more than
+/// [`rmm_proto::desktop::FRAME_WINDOW`] queued. Room beyond that is for info and close.
+const DESKTOP_QUEUE: usize = 8;
+
+struct DesktopRoute {
+    agent_id: Uuid,
+    tx: mpsc::Sender<DesktopEvent>,
+}
+
 pub struct Hub {
     agents: RwLock<HashMap<Uuid, AgentHandle>>,
     shells: RwLock<HashMap<Uuid, ShellRoute>>,
+    desktops: RwLock<HashMap<Uuid, DesktopRoute>>,
     /// Service control requests waiting for the agent's answer, with the agent asked.
     controls: std::sync::Mutex<HashMap<Uuid, (Uuid, oneshot::Sender<ControlResult>)>>,
     events: broadcast::Sender<Event>,
@@ -106,7 +122,7 @@ impl Default for Hub {
     fn default() -> Self {
         // A browser that falls this far behind gets a `resync` and refetches instead.
         let (events, _) = broadcast::channel(4096);
-        Hub { agents: Default::default(), shells: Default::default(), controls: Default::default(), events }
+        Hub { agents: Default::default(), shells: Default::default(), desktops: Default::default(), controls: Default::default(), events }
     }
 }
 
@@ -185,6 +201,28 @@ impl Hub {
         }
     }
 
+    pub fn open_desktop(&self, session_id: Uuid, agent_id: Uuid) -> mpsc::Receiver<DesktopEvent> {
+        let (tx, rx) = mpsc::channel(DESKTOP_QUEUE);
+        self.desktops.write().unwrap().insert(session_id, DesktopRoute { agent_id, tx });
+        rx
+    }
+
+    pub fn close_desktop(&self, session_id: Uuid) {
+        self.desktops.write().unwrap().remove(&session_id);
+    }
+
+    /// Delivers agent output to the browser that owns the desktop session, only from the
+    /// agent it was opened on. Never waits: this runs on the agent's read loop, and a full
+    /// queue means the browser isn't pacing the stream (or can't keep up with its own acks).
+    /// Such a session is dropped, which ends the browser socket and closes it on the agent.
+    pub fn route_desktop(&self, from_agent: Uuid, session_id: Uuid, ev: DesktopEvent) {
+        let mut desktops = self.desktops.write().unwrap();
+        let Some(r) = desktops.get(&session_id).filter(|r| r.agent_id == from_agent) else { return };
+        if let Err(mpsc::error::TrySendError::Full(_)) = r.tx.try_send(ev) {
+            desktops.remove(&session_id);
+        }
+    }
+
     /// Registers a pending service control request; the receiver gets the agent's answer.
     pub fn await_control(&self, request_id: Uuid, agent_id: Uuid) -> oneshot::Receiver<ControlResult> {
         let (tx, rx) = oneshot::channel();
@@ -206,8 +244,16 @@ impl Hub {
         }
     }
 
-    /// Agent went away: tell every open terminal for it.
+    /// Agent went away: tell every open terminal and desktop session for it.
     pub fn drop_agent_shells(&self, agent_id: Uuid) {
+        self.desktops.write().unwrap().retain(|_, r| {
+            if r.agent_id == agent_id {
+                let _ = r.tx.try_send(DesktopEvent::Closed(Some("agent disconnected".into())));
+                false
+            } else {
+                true
+            }
+        });
         let mut shells = self.shells.write().unwrap();
         shells.retain(|_, r| {
             if r.agent_id == agent_id {

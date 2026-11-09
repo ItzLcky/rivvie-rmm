@@ -1,5 +1,6 @@
 mod agent_ws;
 mod alerts;
+mod desktop_ws;
 mod api;
 mod auth;
 mod error;

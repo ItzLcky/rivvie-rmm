@@ -38,6 +38,8 @@ export interface Inventory {
 }
 export interface AgentDetail extends AgentSummary {
 	kernel_version: string; machine_id: string | null; inventory: Inventory | null; inventory_at: string | null;
+	/** Optional features its build supports, as of its last connection (`patch`, `desktop`). */
+	capabilities: string[];
 }
 
 export interface MetricPoint {
@@ -45,7 +47,11 @@ export interface MetricPoint {
 }
 
 export interface Site { id: string; client_id: string; name: string; agent_count: number; online_count: number }
-export interface Client { id: string; name: string; created_at: string; sites: Site[] }
+export interface Client {
+	id: string; name: string; created_at: string; sites: Site[];
+	/** Ask the person at the machine before a remote desktop session starts. */
+	desktop_consent: boolean;
+}
 
 export type Interpreter = 'bash' | 'sh' | 'powershell' | 'cmd' | 'python';
 export interface Script {
