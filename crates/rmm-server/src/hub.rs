@@ -8,7 +8,7 @@ use std::sync::RwLock;
 
 use rmm_proto::ServerMsg;
 use serde::Serialize;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use uuid::Uuid;
 
 /// Something the dashboard should redraw: pushed to browsers over `/api/events`.
@@ -38,16 +38,37 @@ pub enum Event {
     },
     /// Many jobs changed at once (the housekeeping sweep): refetch job lists.
     Jobs,
+    /// An alert opened, changed (acknowledged, fired again) or resolved.
+    Alert {
+        id: Uuid,
+        agent_id: Uuid,
+        #[serde(skip)]
+        client_id: Uuid,
+        /// open / acknowledged / resolved
+        state: String,
+    },
+    /// The agent reported a new service list.
+    Services {
+        agent_id: Uuid,
+        #[serde(skip)]
+        client_id: Uuid,
+    },
 }
 
 impl Event {
     pub fn client_id(&self) -> Option<Uuid> {
         match self {
-            Event::Agent { client_id, .. } | Event::Job { client_id, .. } => Some(*client_id),
+            Event::Agent { client_id, .. }
+            | Event::Job { client_id, .. }
+            | Event::Alert { client_id, .. }
+            | Event::Services { client_id, .. } => Some(*client_id),
             Event::Jobs => None,
         }
     }
 }
+
+/// Outcome of a service start/stop/restart: `(ok, message)`.
+pub type ControlResult = (bool, String);
 
 #[derive(Clone)]
 pub struct AgentHandle {
@@ -69,6 +90,8 @@ struct ShellRoute {
 pub struct Hub {
     agents: RwLock<HashMap<Uuid, AgentHandle>>,
     shells: RwLock<HashMap<Uuid, ShellRoute>>,
+    /// Service control requests waiting for the agent's answer, with the agent asked.
+    controls: std::sync::Mutex<HashMap<Uuid, (Uuid, oneshot::Sender<ControlResult>)>>,
     events: broadcast::Sender<Event>,
 }
 
@@ -76,7 +99,7 @@ impl Default for Hub {
     fn default() -> Self {
         // A browser that falls this far behind gets a `resync` and refetches instead.
         let (events, _) = broadcast::channel(4096);
-        Hub { agents: Default::default(), shells: Default::default(), events }
+        Hub { agents: Default::default(), shells: Default::default(), controls: Default::default(), events }
     }
 }
 
@@ -152,6 +175,27 @@ impl Hub {
         };
         if let Some(tx) = tx {
             let _ = tx.send(ev).await;
+        }
+    }
+
+    /// Registers a pending service control request; the receiver gets the agent's answer.
+    pub fn await_control(&self, request_id: Uuid, agent_id: Uuid) -> oneshot::Receiver<ControlResult> {
+        let (tx, rx) = oneshot::channel();
+        self.controls.lock().unwrap().insert(request_id, (agent_id, tx));
+        rx
+    }
+
+    pub fn forget_control(&self, request_id: Uuid) {
+        self.controls.lock().unwrap().remove(&request_id);
+    }
+
+    /// Delivers an answer, only from the agent that was asked.
+    pub fn complete_control(&self, from_agent: Uuid, request_id: Uuid, result: ControlResult) {
+        let mut controls = self.controls.lock().unwrap();
+        if controls.get(&request_id).is_some_and(|(a, _)| *a == from_agent)
+            && let Some((_, tx)) = controls.remove(&request_id)
+        {
+            let _ = tx.send(result);
         }
     }
 

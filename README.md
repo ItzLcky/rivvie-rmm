@@ -5,11 +5,11 @@ The agent and server are written in Rust; the dashboard is a SvelteKit SPA.
 
 | Platform | Status |
 |---|---|
-| Linux agent | Working: inventory, metrics, scripts, terminal, systemd service |
-| Windows agent | Code complete, compile-checked in CI only (registry inventory, PowerShell/cmd, ConPTY, Windows service). Needs testing on a real host. |
+| Linux agent | Working: inventory, metrics, scripts, terminal, systemd service, service monitoring and control, journald watchers |
+| Windows agent | Code complete, compile-checked in CI only (registry inventory, PowerShell/cmd, ConPTY, Windows service, service monitoring, Event Log watchers). Needs testing on a real host. |
 | macOS agent | Builds; metrics and scripts work. No launchd install or software inventory yet. |
 
-The release agent is a **2.7 MB** single binary that idles at **~8 MB RSS** with 5 threads.
+The release agent is a **3.0 MB** single binary that idles at **~10 MB RSS** with 3 threads (plus a `journalctl` child while log watchers are set).
 
 ## Layout
 
@@ -44,6 +44,8 @@ docs/           Roadmap and design notes
 - **Jobs:** sending a script to an offline agent queues it, and it runs on reconnect (queued jobs expire after `RMM_JOB_QUEUE_DAYS`). Output streams into Postgres (capped at 1 MB per stream). Jobs outlive the connection: the agent keeps a copy of each job's output and its result, and resends them after a reconnect or server restart until the server acknowledges them. A job is only marked `lost` when the agent comes back without it (the agent itself restarted) or never comes back. Timeouts kill the whole process tree on Unix, and closing a terminal kills everything started from it.
 - **Terminal:** xterm.js ↔ server relay ↔ PTY on the agent (bash/zsh on Linux, PowerShell through ConPTY on Windows).
 - **Per-client access:** admins see every client. Technicians and read-only users see every client by default, or only the clients an admin picks under Company settings → Users. Everything they can reach (agents, sites, tokens, jobs, terminal, dashboard counts) is scoped to those clients, and anything outside them reads as "not found". Scripts are MSP-wide (admins edit them; they run anywhere) or belong to one client (its technicians edit them; they only run on its agents).
+- **Alerting:** alert policies, per client or site (and optionally one OS), raise alerts for agents that are offline, CPU, memory or disk held over a threshold, a stopped or failed service, a failed script, or a log entry that matches. Offline and threshold policies are checked every minute; the others act as agents report. An alert stays open until its condition clears (or someone resolves it), and open alerts feed the health model. See [Monitoring and alerts](#monitoring-and-alerts).
+- **Schedules:** saved scripts run on a cron timetable, in any time zone, on every agent of a client or site. Each schedule keeps its runs' output for as many days as you choose.
 - **Self-update:** agents install new versions signed with an offline ed25519 key whose public half is compiled into the agent, and roll themselves back if the new version can't reconnect. See [Agent updates](#agent-updates).
 - **Security:** argon2id passwords; opaque, revocable session tokens in an HttpOnly SameSite=Strict cookie, with an idle timeout and a 7-day cap; users can change their password and review or revoke their sessions, and admins can reset passwords, re-enable users, and revoke anyone's sessions; TOTP two-factor auth with single-use recovery codes, required for admins and optionally for everyone; an Origin check on the terminal socket; three roles (admin / technician / readonly); an audit log covering logins, shells, jobs, enrollment, and deletes. Failed sign-ins are rate-limited per client IP and per account, and bad enrollment tokens per IP (see `RMM_TRUSTED_PROXIES`). The dashboard ships a hash-based script CSP, so no inline or third-party script runs.
 
@@ -176,10 +178,58 @@ to SYSTEM and Administrators. Windows service logs go to `C:\ProgramData\RMM\log
 | `RMM_AGENT_DIR` | `agents` (`/srv/agents` in the image) | Agent binaries offered for download: `rmm-agent-linux-x86_64`, `rmm-agent-windows-x86_64.exe` |
 | `RMM_HEARTBEAT_SECS` | `30` | Agent metrics interval |
 | `RMM_INVENTORY_SECS` | `21600` | Agent inventory interval |
-| `RMM_METRICS_RETENTION_DAYS` | `30` | Metric history kept |
+| `RMM_METRICS_RAW_DAYS` | `7` | Raw heartbeat samples kept (charts up to 48 hours, threshold alerts) |
+| `RMM_METRICS_RETENTION_DAYS` | `90` | Hourly metric rollups kept (charts beyond 48 hours) |
+| `RMM_ALERT_RETENTION_DAYS` | `180` | Resolved alerts are deleted after this |
 | `RMM_JOB_QUEUE_DAYS` | `7` | Jobs queued for an offline agent expire after this |
 | `RMM_SESSION_IDLE_HOURS` | `12` | Dashboard sessions unused this long are signed out (sessions last 7 days at most). Admins can override it under Company settings |
 | `RMM_TRUSTED_PROXIES` | empty | Reverse proxies whose `X-Forwarded-For` gives the client IP (for rate limiting and the audit log): comma-separated addresses/CIDRs, or `private` for loopback + RFC 1918 + IPv6 ULA. The bundled compose stack sets `private` for Caddy |
+
+## Monitoring and alerts
+
+**Policies** (Monitoring → Alert policies) say what to watch and where. Admins write MSP-wide
+policies; technicians write policies for the clients they can see. Each has a severity: open
+critical alerts make an agent *unhealthy*, warnings make it *need attention*.
+
+| Type | Opens when | Clears when |
+|---|---|---|
+| Agent offline | no heartbeat for N minutes (after a server restart, agents get N minutes to reconnect) | the agent reconnects |
+| CPU / memory / disk | every sample in the last M minutes is at or above the threshold (disk: the fullest volume) | the last 5 minutes are all below it |
+| Service stopped | a watched service is stopped or failed. Watch names (`nginx`, `Spooler`, `php*-fpm`), every automatic service, or both, minus exclusions | it runs again |
+| Failed job | a script fails, errors or times out (any script, or one) | the same script next succeeds on that agent |
+| Event log match | a journal entry (Linux) or Event Log entry (Windows) matches the level, sources, event IDs and regular expression | someone resolves it |
+
+Agents report their services (systemd units, Windows services) once a minute when something changed,
+and technicians can start, stop and restart them from the agent's Services tab. Log watchers run on
+the agent, which sends at most 20 matches a minute per policy and counts the rest; matched entries
+are kept for 30 days on the agent's Event log tab.
+
+**Notifications** go to channels set up by an admin under Company settings → Notifications: email
+(through the SMTP server set there), a generic webhook, Slack incoming webhooks, or Teams Workflows
+webhooks (Adaptive Cards). A policy notifies its channels when an alert opens and, optionally, when
+it clears. Deliveries are queued in Postgres and retried (after 1, 5 and 30 minutes, then every 2
+hours, 5 attempts in all), so a mail server outage delays them rather than losing them. The delivery
+log is on the same settings page.
+
+A webhook receives a JSON body like this, with `X-RMM-Event: opened|resolved|test`, and, when the
+channel has a secret, `X-RMM-Signature: sha256=<hex HMAC-SHA256 of the body with the secret>`:
+
+```json
+{
+  "event": "opened",
+  "alert": { "id": "…", "kind": "disk", "severity": "critical", "title": "Disk at or above 90% for 5 minutes",
+             "details": { "value": 96.2, "threshold": 90, "minutes": 5 }, "occurrences": 1,
+             "opened_at": "…", "resolved_at": null, "resolution": null, "policy": "Disk nearly full" },
+  "agent": { "id": "…", "hostname": "acme-fs01", "client": "Acme Corp", "site": "Head office" },
+  "url": "https://rmm.example.com/agents/…?tab=alerts"
+}
+```
+
+**Metrics storage.** Heartbeats land in `agent_metrics` and are rolled up into
+`agent_metrics_hourly` every few minutes. Charts up to 48 hours read raw samples; longer ranges (up
+to 90 days by default) read the rollups. Raw samples are kept for `RMM_METRICS_RAW_DAYS`, so the raw
+table stays at about a week of heartbeats however long the history is. That is what keeps Postgres
+comfortable into the thousands of agents. TimescaleDB would be the next step beyond that.
 
 ## Agent updates
 

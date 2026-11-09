@@ -113,7 +113,7 @@
 		<div><dt class="text-muted text-xs">Duration</dt><dd>{ms(job.duration_ms)}</dd></div>
 		<div><dt class="text-muted text-xs">Created</dt><dd>{datetime(job.created_at)}</dd></div>
 		<div><dt class="text-muted text-xs">Finished</dt><dd>{datetime(job.finished_at)}</dd></div>
-		<div><dt class="text-muted text-xs">By</dt><dd>{job.created_by_name ?? '–'}</dd></div>
+		<div><dt class="text-muted text-xs">By</dt><dd>{#if job.schedule_id}<a class="link" href="/schedules/{job.schedule_id}">{job.schedule_name}</a>{#if job.created_by_name}<span class="text-muted"> · {job.created_by_name}</span>{/if}{:else}{job.created_by_name ?? '–'}{/if}</dd></div>
 	</dl>
 
 	<section class="card mb-4 overflow-hidden" aria-label="Output">

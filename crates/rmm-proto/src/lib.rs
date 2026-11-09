@@ -119,6 +119,25 @@ pub enum AgentMsg {
     Pong {
         nonce: u64,
     },
+    /// Every service on the machine (systemd units / Windows services). Sent after connecting,
+    /// when anything changes, and after a [`ServerMsg::ServiceControl`].
+    Services {
+        services: Vec<ServiceInfo>,
+    },
+    /// Answer to [`ServerMsg::ServiceControl`].
+    ServiceControlResult {
+        request_id: Uuid,
+        ok: bool,
+        message: String,
+    },
+    /// Log entries that matched a [`LogWatcher`]. `suppressed` counts further matches dropped
+    /// by the agent's rate limit since the previous batch.
+    LogMatches {
+        watcher_id: Uuid,
+        entries: Vec<LogEntry>,
+        #[serde(default)]
+        suppressed: u32,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -214,7 +233,179 @@ pub enum ServerMsg {
     Ping {
         nonce: u64,
     },
+    /// Send a fresh [`AgentMsg::Services`].
+    RequestServices,
+    /// Start, stop or restart a service; the agent answers with [`AgentMsg::ServiceControlResult`].
+    ServiceControl {
+        request_id: Uuid,
+        name: String,
+        action: ServiceAction,
+    },
+    /// The complete set of log watchers for this agent, replacing any earlier set. Sent after
+    /// connecting and whenever an alert policy changes.
+    Watchers {
+        watchers: Vec<LogWatcher>,
+    },
 }
+
+// ---------------------------------------------------------------------------
+// Services and logs
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceState {
+    Running,
+    Stopped,
+    /// systemd `failed`.
+    Failed,
+    Starting,
+    Stopping,
+    Paused,
+    #[serde(other)]
+    Unknown,
+}
+
+impl ServiceState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ServiceState::Running => "running",
+            ServiceState::Stopped => "stopped",
+            ServiceState::Failed => "failed",
+            ServiceState::Starting => "starting",
+            ServiceState::Stopping => "stopping",
+            ServiceState::Paused => "paused",
+            ServiceState::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum StartMode {
+    /// systemd `enabled`, Windows Automatic (including delayed and boot/system drivers).
+    Auto,
+    /// Started on demand or by another unit (systemd `static`, `indirect`...).
+    Manual,
+    Disabled,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct ServiceInfo {
+    /// Unit name (`nginx.service`) or Windows service name (`Spooler`).
+    pub name: String,
+    pub display_name: String,
+    pub state: ServiceState,
+    pub start_mode: StartMode,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceAction {
+    Start,
+    Stop,
+    Restart,
+}
+
+impl ServiceAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ServiceAction::Start => "start",
+            ServiceAction::Stop => "stop",
+            ServiceAction::Restart => "restart",
+        }
+    }
+}
+
+/// Severity, most severe first, so `level <= min_level` means "at least this severe".
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum LogLevel {
+    Critical,
+    Error,
+    Warning,
+    Info,
+}
+
+impl LogLevel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LogLevel::Critical => "critical",
+            LogLevel::Error => "error",
+            LogLevel::Warning => "warning",
+            LogLevel::Info => "info",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "critical" => LogLevel::Critical,
+            "error" => LogLevel::Error,
+            "warning" => LogLevel::Warning,
+            "info" => LogLevel::Info,
+            _ => return None,
+        })
+    }
+
+    /// syslog/journald priority (0 emerg ... 7 debug).
+    pub fn from_syslog(p: u8) -> Self {
+        match p {
+            0..=2 => LogLevel::Critical,
+            3 => LogLevel::Error,
+            4 => LogLevel::Warning,
+            _ => LogLevel::Info,
+        }
+    }
+
+    /// Windows event `Level` (1 critical, 2 error, 3 warning, 4/0 information, 5 verbose).
+    pub fn from_windows(l: u8) -> Self {
+        match l {
+            1 => LogLevel::Critical,
+            2 => LogLevel::Error,
+            3 => LogLevel::Warning,
+            _ => LogLevel::Info,
+        }
+    }
+}
+
+/// What to watch for in the system log (journald on Linux, the Event Log on Windows).
+/// Every set condition must hold for an entry to match.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LogWatcher {
+    pub id: Uuid,
+    /// Windows event log channels (`System`, `Application`, ...). Ignored on Linux, where
+    /// the whole journal is read.
+    #[serde(default)]
+    pub channels: Vec<String>,
+    /// systemd units or syslog identifiers on Linux, event providers on Windows. Empty = any.
+    #[serde(default)]
+    pub sources: Vec<String>,
+    /// Windows event ids. Empty = any (and always on Linux).
+    #[serde(default)]
+    pub event_ids: Vec<u32>,
+    /// Least severe level that matches.
+    pub min_level: LogLevel,
+    /// Regular expression (`regex-lite` syntax) the message must match. Case-insensitive.
+    #[serde(default)]
+    pub pattern: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LogEntry {
+    pub ts: DateTime<Utc>,
+    pub level: LogLevel,
+    /// Unit, syslog identifier or event provider.
+    pub source: String,
+    /// Windows event id.
+    #[serde(default)]
+    pub event_id: Option<u32>,
+    pub message: String,
+}
+
+/// Longest log message the agent sends, in bytes.
+pub const LOG_MESSAGE_MAX: usize = 4096;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -409,6 +600,27 @@ mod tests {
         });
         let buf = encode(&msg).unwrap();
         assert!(matches!(decode::<ServerMsg>(&buf).unwrap(), ServerMsg::RunScript(_)));
+    }
+
+    #[test]
+    fn unknown_service_state_decodes() {
+        #[derive(Serialize)]
+        struct Raw {
+            name: &'static str,
+            display_name: &'static str,
+            state: &'static str,
+            start_mode: &'static str,
+        }
+        let buf = encode(&Raw { name: "x", display_name: "", state: "reloading-ish", start_mode: "weird" }).unwrap();
+        let s: ServiceInfo = decode(&buf).unwrap();
+        assert_eq!((s.state, s.start_mode), (ServiceState::Unknown, StartMode::Unknown));
+    }
+
+    #[test]
+    fn log_levels_order_by_severity() {
+        assert!(LogLevel::Critical < LogLevel::Error && LogLevel::Warning < LogLevel::Info);
+        assert_eq!(LogLevel::from_syslog(3), LogLevel::Error);
+        assert_eq!(LogLevel::from_windows(3), LogLevel::Warning);
     }
 
     /// Agents built before `previous` existed must still be able to enroll.

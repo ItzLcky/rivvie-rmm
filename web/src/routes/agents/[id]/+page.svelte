@@ -31,10 +31,13 @@
 	import RunScript from '#lib/components/RunScript.svelte';
 	import Status from '#lib/components/Status.svelte';
 	import UsageBar from '#lib/components/UsageBar.svelte';
+	import AgentAlerts from '#lib/components/agent/AgentAlerts.svelte';
+	import AgentLogs from '#lib/components/agent/AgentLogs.svelte';
+	import AgentServices from '#lib/components/agent/AgentServices.svelte';
 
 	const id = $derived(page.params.id!);
 	const tab = $derived(param('tab', 'overview'));
-	const ranges = { '1h': 1, '24h': 24, '7d': 168, '30d': 720 } as const;
+	const ranges = { '1h': 1, '24h': 24, '7d': 168, '30d': 720, '90d': 2160 } as const;
 	type Range = keyof typeof ranges;
 	const range = $derived((param('range', '24h') in ranges ? param('range', '24h') : '24h') as Range);
 
@@ -53,7 +56,7 @@
 			if (e.last_metrics) agent.data.last_metrics = e.last_metrics;
 		}
 	});
-	liveReload(() => agent.reload(), (e) => e.type === 'agent' && e.id === id && !e.last_metrics, { debounceMs: 500, pollMs: 15000 });
+	liveReload(() => agent.reload(), (e) => (e.type === 'agent' && e.id === id && !e.last_metrics) || (e.type === 'alert' && e.agent_id === id), { debounceMs: 500, pollMs: 15000 });
 	liveReload(() => recentJobs.reload(), (e) => (e.type === 'job' && e.agent_id === id && !e.output) || e.type === 'jobs', { debounceMs: 500 });
 	// Metrics charts: refresh every minute, the heartbeat events carry only the latest sample.
 	$effect(() => {
@@ -131,7 +134,10 @@
 			'agent.update_offer': `Offered update to v${d.version}`,
 			'agent.update_completed': `Updated to v${d.version}`,
 			'agent.update_rolled_back': `Update to v${d.version} rolled back${d.detail ? `: ${d.detail}` : ''}`,
-			'agent.update_failed': `Update to v${d.version} failed${d.detail ? `: ${d.detail}` : ''}`
+			'agent.update_failed': `Update to v${d.version} failed${d.detail ? `: ${d.detail}` : ''}`,
+			'service.start': `Started ${d.service}${d.ok ? '' : ` (failed: ${d.message})`}`,
+			'service.stop': `Stopped ${d.service}${d.ok ? '' : ` (failed: ${d.message})`}`,
+			'service.restart': `Restarted ${d.service}${d.ok ? '' : ` (failed: ${d.message})`}`
 		};
 		return labels[r.action] ?? r.action;
 	}
@@ -184,6 +190,9 @@
 				{ value: 'overview', label: 'Overview' },
 				{ value: 'inventory', label: 'Hardware & network' },
 				{ value: 'software', label: 'Software', count: inv ? num(inv.software.length) : undefined },
+				{ value: 'alerts', label: 'Alerts', count: a.open_alerts ? num(a.open_alerts) : undefined },
+				{ value: 'services', label: 'Services' },
+				{ value: 'logs', label: 'Event log' },
 				{ value: 'jobs', label: 'Jobs' },
 				{ value: 'activity', label: 'Activity' },
 				{ value: 'terminal', label: 'Terminal', hidden: !can('technician') }
@@ -366,6 +375,12 @@
 				{#snippet empty()}<EmptyState compact title="No jobs on this agent yet" />{/snippet}
 				{#snippet footer()}{#if jobs.data?.next}<p class="text-muted px-3 py-2 text-xs">Showing the latest 200. <a class="link" href="/jobs?q={encodeURIComponent(a.hostname)}">See all in Jobs</a></p>{/if}{/snippet}
 			</DataTable>
+		{:else if tab === 'alerts'}
+			<AgentAlerts agentId={a.id} />
+		{:else if tab === 'services'}
+			<AgentServices agentId={a.id} online={a.online} hostname={a.hostname} />
+		{:else if tab === 'logs'}
+			<AgentLogs agentId={a.id} />
 		{:else if tab === 'activity'}
 			<section class="card" aria-label="Activity">
 				<Async res={activity} compact>
@@ -380,7 +395,7 @@
 								{/each}
 							</ol>
 						{:else}
-							<EmptyState compact title="No activity recorded yet" description="Update offers and results show up here. Jobs have their own tab." />
+							<EmptyState compact title="No activity recorded yet" description="Update offers and results, and service starts and stops, show up here. Jobs have their own tab." />
 						{/if}
 					{/snippet}
 				</Async>

@@ -10,7 +10,9 @@ export type LiveEvent =
 	| { type: 'resync' }
 	| { type: 'agent'; id: string; online: boolean; last_metrics?: Metrics }
 	| { type: 'job'; id: string; agent_id: string; status: string; output: boolean }
-	| { type: 'jobs' };
+	| { type: 'jobs' }
+	| { type: 'alert'; id: string; agent_id: string; state: 'open' | 'acknowledged' | 'resolved' }
+	| { type: 'services'; agent_id: string };
 
 export const live = $state<{ status: 'connecting' | 'live' | 'offline' }>({ status: 'connecting' });
 

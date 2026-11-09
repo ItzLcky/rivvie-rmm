@@ -12,6 +12,12 @@ pub struct AppState {
     pub company: RwLock<Company>,
     pub limits: crate::ratelimit::Limits,
     pub releases: crate::updates::Releases,
+    /// When this process started (offline alerts allow agents time to reconnect).
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    /// Outbound HTTP for webhook, Slack and Teams notifications.
+    pub http: reqwest::Client,
+    /// Wakes the notification worker when something is queued.
+    pub notify_wake: tokio::sync::Notify,
 }
 
 #[derive(Debug, Clone, Default, sqlx::FromRow)]
@@ -22,10 +28,19 @@ pub struct Company {
     pub require_2fa_all: bool,
     /// Offer the newest signed agent release to agents as they connect.
     pub auto_update_agents: bool,
+    /// Outgoing mail for email notification channels.
+    pub smtp_host: String,
+    pub smtp_port: i32,
+    /// starttls / tls / none
+    pub smtp_security: String,
+    pub smtp_username: String,
+    pub smtp_password: String,
+    pub smtp_from: String,
 }
 
 impl Company {
-    pub const COLUMNS: &str = "company_name, session_idle_hours, require_2fa_all, auto_update_agents";
+    pub const COLUMNS: &str = "company_name, session_idle_hours, require_2fa_all, auto_update_agents,
+        smtp_host, smtp_port, smtp_security, smtp_username, smtp_password, smtp_from";
 
     pub async fn load(db: &PgPool) -> sqlx::Result<Self> {
         sqlx::query_as(sqlx::AssertSqlSafe(format!("SELECT {} FROM company_settings", Self::COLUMNS))).fetch_one(db).await
@@ -58,6 +73,12 @@ pub struct Settings {
     pub session_idle_hours: u32,
     /// Peers whose `X-Forwarded-For` is believed (RMM_TRUSTED_PROXIES).
     pub trusted_proxies: Vec<crate::ratelimit::Cidr>,
+    /// Raw heartbeat samples are kept this long; hourly rollups for `metrics_retention_days`.
+    pub metrics_raw_days: u32,
+    /// Resolved alerts are deleted after this many days.
+    pub alert_retention_days: u32,
+    /// How often polled alert policies (offline, CPU, memory, disk) are checked.
+    pub alert_eval_secs: u32,
 }
 
 impl Settings {

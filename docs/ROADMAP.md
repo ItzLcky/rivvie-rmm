@@ -154,16 +154,28 @@ Quality:
 - [ ] Select every row matching a filter, not just the rows on screen, for bulk actions.
 - [ ] Saved views (Phase 8), built on the URL state.
 - [ ] Configurable dashboard widgets; script version history.
-- [ ] Agent tabs added by later phases: Patches (5), Alerts (4), Tickets (7). Move tabs to a side sub-nav once there are more than about eight.
+- [ ] Agent tabs added by later phases: Patches (5), Tickets (7). Phase 4 added Alerts, Services and Event log (nine tabs now): move them to a side sub-nav before adding more.
 
-## Phase 4: Monitoring and alerting
+## Phase 4: Monitoring and alerting (done)
 
-- [ ] Alert policies per client or site: offline > N min, CPU/mem/disk thresholds held for M min, service stopped, failed job
-- [ ] Notification channels: email (SMTP), webhook, Slack/Teams
-- [ ] Service monitoring: systemd units / Windows services. Inventory them, alert on state, start/stop/restart from the UI.
-- [ ] Event log / journald watchers with match rules
-- [ ] Scheduled scripts (cron-style) per client or site, with output retention
-- [ ] Move `agent_metrics` to TimescaleDB, or add hourly rollups, once fleets reach thousands of agents
+- [x] **Alert policies** per client or site, optionally narrowed to one OS: agent offline > N min; CPU, memory or disk held at or above a threshold for M min; service stopped or failed; failed job (any script or one); event log match. Severity (critical / warning / info) feeds the health model: open critical alerts make an agent unhealthy, warnings make it need attention.
+  - Offline and threshold policies are evaluated every `RMM_ALERT_EVAL_SECS` (60) with one set-based statement per policy; the others are event-driven as agents report. Offline alerts clear as soon as the agent reconnects, and a restarted server gives agents N minutes to come back before alerting.
+  - One unresolved alert per (policy, agent, key): re-checks refresh it, repeated failures and log matches count occurrences. States: open → acknowledged → resolved (cleared, manual, or closed quietly when the policy changes scope, is disabled or deleted).
+  - Alerts page (bulk acknowledge/resolve, filters in the URL), alert detail with its deliveries and matched log entries, an Alerts tab per agent, a sidebar badge, and open alerts at the top of the dashboard.
+- [x] **Notification channels:** email (SMTP settings under Company settings), generic webhook (optional HMAC-SHA256 signature), Slack incoming webhooks, Teams Workflows webhooks (Adaptive Cards). A Postgres outbox with retries and backoff survives restarts and outages; test sends; a delivery log.
+- [x] **Service monitoring:** agents report systemd units / Windows services (state and start mode) when they change; Services tab with start/stop/restart (technicians, audited, names checked against the agent's own list); service alert policies by name, glob, or every automatic service minus exclusions.
+- [x] **Event log / journald watchers:** log policies are pushed to the agents they cover (`ServerMsg::Watchers`) and re-pushed when policies change. Linux follows `journalctl -o json`; Windows polls each channel with `wevtutil` by record id. Matching by level, source (unit, syslog identifier, provider), event id and a case-insensitive regex (`regex-lite`, validated on the server). Rate-limited to 20 matches/min per policy on the agent; matches are kept 30 days.
+- [x] **Scheduled scripts:** cron expressions (5 fields or `@daily`...) in any IANA time zone, targeting a client, site and/or OS; Run now; a missed run fires once after downtime; agents still busy with the previous run are skipped, so offline machines don't pile up runs; per-schedule output retention (`retain_days`).
+- [x] **Metric rollups** instead of TimescaleDB: `agent_metrics_hourly` is upserted every few minutes; raw samples are kept `RMM_METRICS_RAW_DAYS` (7), rollups `RMM_METRICS_RETENTION_DAYS` (now 90); charts beyond 48 hours (and the new 90-day range) read the rollups.
+
+Later:
+
+- [ ] Test the Windows service list/control (PowerShell `Get-CimInstance Win32_Service`) and Event Log watching (`wevtutil`) on real hosts. Both are compile-checked only, like the rest of the Windows agent.
+- [ ] Maintenance windows / alert snoozing per agent, and re-notify while an alert stays open.
+- [ ] Per-agent policy overrides (exclude one machine from a client-wide policy).
+- [ ] macOS: launchd services and the unified log.
+- [ ] TimescaleDB (hypertables + continuous aggregates) if Postgres with rollups stops keeping up.
+- [ ] Alerts open PSA tickets (Phase 7).
 
 ## Phase 5: Patch management
 
@@ -205,8 +217,8 @@ Out of scope: general ledger, accounts payable, payroll and tax filing. Finalise
 ### Prerequisites
 
 - **Per-client access control** (done in Phase 2: `user_clients`, scoped queries). Every PSA query is scoped by client. The client-portal role was deferred to here: it's the contacts auth below, and portal users must never reach technician endpoints.
-- **Notification channels and outbound email** (Phase 4). Ticket replies, SLA warnings and invoice delivery all go through them.
-- **Alert policies** (Phase 4). Alerts are the main automatic source of tickets.
+- **Notification channels and outbound email** (Phase 4, done). Ticket replies, SLA warnings and invoice delivery all go through them.
+- **Alert policies** (Phase 4, done). Alerts are the main automatic source of tickets.
 - **A permissions model instead of the `role` enum.** The PSA needs finer roles: dispatcher, billing, and a technician who can log time but can't see rates or invoices. Move to named permission sets (`tickets.write`, `billing.read`, `contracts.manage`, ...) assigned to roles. Keep `admin`/`technician`/`readonly` as built-in sets.
 - **Object storage** (S3-compatible, MinIO in the deploy stack) for ticket attachments and invoice PDFs. Session recordings in Phase 6 need it too.
 

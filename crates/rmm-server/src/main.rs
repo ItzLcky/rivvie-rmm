@@ -1,11 +1,14 @@
 mod agent_ws;
+mod alerts;
 mod api;
 mod auth;
 mod error;
 mod events;
 mod hub;
+mod notify;
 mod paging;
 mod ratelimit;
+mod scheduler;
 mod shell_ws;
 mod state;
 mod totp;
@@ -80,8 +83,18 @@ struct ServeArgs {
     heartbeat_secs: u32,
     #[arg(long, env = "RMM_INVENTORY_SECS", default_value_t = 6 * 3600)]
     inventory_secs: u32,
-    #[arg(long, env = "RMM_METRICS_RETENTION_DAYS", default_value_t = 30)]
+    /// Hourly metric rollups (charts beyond 48 hours) are kept this long.
+    #[arg(long, env = "RMM_METRICS_RETENTION_DAYS", default_value_t = 90)]
     metrics_retention_days: u32,
+    /// Raw heartbeat samples (charts up to 48 hours, threshold alerts) are kept this long.
+    #[arg(long, env = "RMM_METRICS_RAW_DAYS", default_value_t = 7)]
+    metrics_raw_days: u32,
+    /// Resolved alerts are deleted after this many days.
+    #[arg(long, env = "RMM_ALERT_RETENTION_DAYS", default_value_t = 180)]
+    alert_retention_days: u32,
+    /// How often offline, CPU, memory and disk policies are checked.
+    #[arg(long, env = "RMM_ALERT_EVAL_SECS", default_value_t = 60, hide = true)]
+    alert_eval_secs: u32,
     /// Jobs queued for an offline agent expire after this many days instead of running late.
     #[arg(long, env = "RMM_JOB_QUEUE_DAYS", default_value_t = 7)]
     job_queue_days: u32,
@@ -106,7 +119,10 @@ impl Default for ServeArgs {
             agent_dir: env("RMM_AGENT_DIR", "agents").into(),
             heartbeat_secs: env("RMM_HEARTBEAT_SECS", "30").parse().unwrap_or(30),
             inventory_secs: env("RMM_INVENTORY_SECS", "21600").parse().unwrap_or(21600),
-            metrics_retention_days: env("RMM_METRICS_RETENTION_DAYS", "30").parse().unwrap_or(30),
+            metrics_retention_days: env("RMM_METRICS_RETENTION_DAYS", "90").parse().unwrap_or(90),
+            metrics_raw_days: env("RMM_METRICS_RAW_DAYS", "7").parse().unwrap_or(7),
+            alert_retention_days: env("RMM_ALERT_RETENTION_DAYS", "180").parse().unwrap_or(180),
+            alert_eval_secs: env("RMM_ALERT_EVAL_SECS", "60").parse().unwrap_or(60),
             job_queue_days: env("RMM_JOB_QUEUE_DAYS", "7").parse().unwrap_or(7),
             session_idle_hours: env("RMM_SESSION_IDLE_HOURS", "12").parse().unwrap_or(12),
             trusted_proxies: env("RMM_TRUSTED_PROXIES", ""),
@@ -173,6 +189,14 @@ async fn serve(db: sqlx::PgPool, args: ServeArgs) -> Result<()> {
         hub: Default::default(),
         limits: Default::default(),
         releases: Default::default(),
+        started_at: chrono::Utc::now(),
+        http: reqwest::Client::builder()
+            .user_agent(concat!("rmm-server/", env!("CARGO_PKG_VERSION")))
+            .timeout(Duration::from_secs(20))
+            .redirect(reqwest::redirect::Policy::limited(3))
+            .build()
+            .context("building HTTP client")?,
+        notify_wake: Default::default(),
         cfg: Settings {
             agent_dir: args.agent_dir.clone(),
             public_url: args.public_url.trim_end_matches('/').to_string(),
@@ -182,9 +206,15 @@ async fn serve(db: sqlx::PgPool, args: ServeArgs) -> Result<()> {
             job_queue_days: args.job_queue_days,
             session_idle_hours: args.session_idle_hours.max(1),
             trusted_proxies,
+            metrics_raw_days: args.metrics_raw_days.max(1),
+            alert_retention_days: args.alert_retention_days.max(1),
+            alert_eval_secs: args.alert_eval_secs,
         },
     });
     tokio::spawn(housekeeping(state.clone()));
+    tokio::spawn(alerts::run(state.clone()));
+    tokio::spawn(notify::worker(state.clone()));
+    tokio::spawn(scheduler::run(state.clone()));
 
     // adapter-static writes the SPA shell as 200.html; every non-file route falls back to it.
     let found: Vec<_> = api::agent_platforms().filter(|id| api::agent_binary_exists(&state, id)).collect();
@@ -261,7 +291,7 @@ async fn bootstrap_admin(db: &sqlx::PgPool) -> Result<()> {
     Ok(())
 }
 
-/// Periodic cleanup: expired sessions, old metrics, jobs that will never finish.
+/// Periodic cleanup: expired sessions, old metrics, jobs that will never finish; metric rollups.
 async fn housekeeping(state: Arc<AppState>) {
     let mut tick = tokio::time::interval(Duration::from_secs(300));
     let mut runs: u64 = 0;
@@ -289,6 +319,23 @@ async fn housekeeping(state: Arc<AppState>) {
         if results.iter().any(|r| r.as_ref().is_ok_and(|r| r.rows_affected() > 0)) {
             state.hub.publish(hub::Event::Jobs);
         }
+        // Roll the last few complete hours of samples up (idempotent; late samples are folded in).
+        results.push(
+            sqlx::query(
+                "INSERT INTO agent_metrics_hourly
+                 SELECT agent_id, date_trunc('hour', ts), count(*), avg(cpu_percent), max(cpu_percent), avg(mem_used)::bigint,
+                        max(mem_used), max(mem_total), max(disk_max_pct), max(net_rx_bytes), max(net_tx_bytes)
+                   FROM agent_metrics
+                  WHERE ts >= date_trunc('hour', now()) - interval '3 hours' AND ts < date_trunc('hour', now())
+                  GROUP BY 1, 2
+                 ON CONFLICT (agent_id, hour) DO UPDATE SET
+                   samples = EXCLUDED.samples, cpu_avg = EXCLUDED.cpu_avg, cpu_max = EXCLUDED.cpu_max,
+                   mem_used_avg = EXCLUDED.mem_used_avg, mem_used_max = EXCLUDED.mem_used_max, mem_total = EXCLUDED.mem_total,
+                   disk_max_pct = EXCLUDED.disk_max_pct, net_rx_bytes = EXCLUDED.net_rx_bytes, net_tx_bytes = EXCLUDED.net_tx_bytes",
+            )
+            .execute(db)
+            .await,
+        );
         // The rest is bulk deletion; hourly is plenty.
         if runs.is_multiple_of(12) {
             state.limits.prune();
@@ -303,7 +350,36 @@ async fn housekeeping(state: Arc<AppState>) {
             );
             results.push(
                 sqlx::query("DELETE FROM agent_metrics WHERE ts < now() - make_interval(days => $1)")
+                    .bind(state.cfg.metrics_raw_days as i32)
+                    .execute(db)
+                    .await,
+            );
+            results.push(
+                sqlx::query("DELETE FROM agent_metrics_hourly WHERE hour < now() - make_interval(days => $1)")
                     .bind(state.cfg.metrics_retention_days as i32)
+                    .execute(db)
+                    .await,
+            );
+            // Output retention for scheduled runs, per schedule.
+            results.push(
+                sqlx::query(
+                    "DELETE FROM jobs j USING schedules s
+                      WHERE j.schedule_id = s.id AND j.finished_at < now() - make_interval(days => s.retain_days)",
+                )
+                .execute(db)
+                .await,
+            );
+            results.push(
+                sqlx::query("DELETE FROM alerts WHERE resolved_at < now() - make_interval(days => $1)")
+                    .bind(state.cfg.alert_retention_days as i32)
+                    .execute(db)
+                    .await,
+            );
+            results.push(
+                sqlx::query("DELETE FROM log_events WHERE received_at < now() - interval '30 days'").execute(db).await,
+            );
+            results.push(
+                sqlx::query("DELETE FROM notifications WHERE status <> 'pending' AND created_at < now() - interval '30 days'")
                     .execute(db)
                     .await,
             );

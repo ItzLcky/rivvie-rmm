@@ -12,6 +12,17 @@ const pages: [string, string][] = [
 	['agent-software', '/agents/a-3?tab=software'],
 	['agent-jobs', '/agents/a-3?tab=jobs'],
 	['agent-activity', '/agents/a-1?tab=activity'],
+	['agent-alerts', '/agents/a-3?tab=alerts'],
+	['agent-services', '/agents/a-3?tab=services'],
+	['agent-logs', '/agents/a-3?tab=logs'],
+	['alerts', '/alerts'],
+	['alert', '/alerts/al-5'],
+	['policies', '/policies'],
+	['policy', '/policies/p-svc'],
+	['policy-new', '/policies/new'],
+	['schedules', '/schedules'],
+	['schedule', '/schedules/sc-2'],
+	['notifications', '/settings/notifications'],
 	['jobs', '/jobs'],
 	['job', '/jobs/j-1'],
 	['clients', '/clients'],
@@ -28,7 +39,8 @@ const phone: [string, string][] = [
 	['dashboard', '/'],
 	['agents', '/agents'],
 	['agent', '/agents/a-3'],
-	['job', '/jobs/j-1']
+	['job', '/jobs/j-1'],
+	['alerts', '/alerts']
 ];
 
 /** Waits until nothing is loading: no skeletons, fonts in, lazy editors mounted. */

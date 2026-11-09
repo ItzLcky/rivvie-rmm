@@ -31,15 +31,18 @@ pub struct JobRow {
     sent_at: Option<DateTime<Utc>>,
     finished_at: Option<DateTime<Utc>>,
     duration_ms: Option<i64>,
+    schedule_id: Option<Uuid>,
+    schedule_name: Option<String>,
     #[sqlx(default)]
     #[serde(skip)]
     sort_key: String,
 }
 
 const JOB_COLS: &str = "j.id, j.agent_id, a.hostname, j.script_id, sc.name AS script_name, j.interpreter, j.status, j.exit_code,
-       u.name AS created_by_name, j.created_at, j.sent_at, j.finished_at, j.duration_ms";
+       u.name AS created_by_name, j.created_at, j.sent_at, j.finished_at, j.duration_ms, j.schedule_id, sch.name AS schedule_name";
 const JOB_FROM: &str = "FROM jobs j JOIN agents a ON a.id = j.agent_id JOIN sites s ON s.id = a.site_id
-       LEFT JOIN scripts sc ON sc.id = j.script_id LEFT JOIN users u ON u.id = j.created_by";
+       LEFT JOIN scripts sc ON sc.id = j.script_id LEFT JOIN users u ON u.id = j.created_by
+       LEFT JOIN schedules sch ON sch.id = j.schedule_id";
 
 pub async fn list_for_agent(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uuid>) -> ApiResult<Json<Vec<JobRow>>> {
     super::access::agent(&st, &u, id).await?;
@@ -65,6 +68,7 @@ pub struct ListQuery {
     script_id: Option<Uuid>,
     client_id: Option<Uuid>,
     agent_id: Option<Uuid>,
+    schedule_id: Option<Uuid>,
     /// Hostname or script name.
     q: Option<String>,
 }
@@ -75,7 +79,7 @@ pub async fn list_recent(
     Query(q): Query<ListQuery>,
     Query(page): Query<PageQuery>,
 ) -> ApiResult<Json<Page<JobRow>>> {
-    let plan = Plan::new(SORT_KEYS, ("created", true), &page, "j.id", "uuid", 7)?;
+    let plan = Plan::new(SORT_KEYS, ("created", true), &page, "j.id", "uuid", 8)?;
     let status: Option<Vec<String>> = q.status.as_deref().filter(|s| !s.is_empty()).map(|s| {
         s.split(',')
             .flat_map(|x| if x == "failed" { FAILED.to_vec() } else { vec![x] })
@@ -89,12 +93,13 @@ pub async fn list_recent(
             AND ($3::uuid IS NULL OR j.script_id = $3)
             AND ($4::uuid IS NULL OR s.client_id = $4)
             AND ($5::uuid IS NULL OR j.agent_id = $5)
-            AND ($6::text IS NULL OR a.hostname ILIKE '%' || $6 || '%' OR sc.name ILIKE '%' || $6 || '%')"
+            AND ($6::text IS NULL OR a.hostname ILIKE '%' || $6 || '%' OR sc.name ILIKE '%' || $6 || '%')
+            AND ($7::uuid IS NULL OR j.schedule_id = $7)"
     );
     let search = q.q.as_deref().map(str::trim).filter(|s| !s.is_empty());
     macro_rules! bind_filters {
         ($query:expr) => {
-            $query.bind(u.scope()).bind(&status).bind(q.script_id).bind(q.client_id).bind(q.agent_id).bind(search)
+            $query.bind(u.scope()).bind(&status).bind(q.script_id).bind(q.client_id).bind(q.agent_id).bind(search).bind(q.schedule_id)
         };
     }
     let sql = format!("SELECT {JOB_COLS}, {} {filters} {} {} {}", plan.key_select, plan.keyset, plan.order, plan.limit_sql());
@@ -170,6 +175,30 @@ pub async fn get(
     Ok(Json(JobDetail { row, body, args, timeout_secs, stdout, stderr, stdout_len, stderr_len }))
 }
 
+/// Sends a freshly inserted (queued) job to its agent if it's online, and announces it.
+/// Returns the job's status: `sent`, or `queued` until the agent reconnects.
+pub async fn deliver(st: &AppState, agent_id: Uuid, client_id: Uuid, job: ScriptJob) -> ApiResult<&'static str> {
+    let job_id = job.job_id;
+    let delivered = st.hub.is_online(agent_id) && {
+        // Claim the job first so a concurrent reconnect can't dispatch it twice.
+        let claimed = sqlx::query("UPDATE jobs SET status = 'sent', sent_at = now() WHERE id = $1 AND status = 'queued'")
+            .bind(job_id)
+            .execute(&st.db)
+            .await?
+            .rows_affected()
+            == 1;
+        if claimed && !st.hub.send(agent_id, ServerMsg::RunScript(job)).await {
+            sqlx::query("UPDATE jobs SET status = 'queued', sent_at = NULL WHERE id = $1").bind(job_id).execute(&st.db).await?;
+            false
+        } else {
+            claimed
+        }
+    };
+    let status = if delivered { "sent" } else { "queued" };
+    st.hub.publish(Event::Job { id: job_id, agent_id, client_id, status: status.into(), output: false });
+    Ok(status)
+}
+
 #[derive(Deserialize)]
 pub struct NewJob {
     agent_ids: Vec<Uuid>,
@@ -243,31 +272,8 @@ pub async fn create(State(st): State<Arc<AppState>>, u: User, Json(b): Json<NewJ
             continue;
         };
 
-        // Online agents get it now; offline ones pick it up on reconnect.
-        let msg = ServerMsg::RunScript(ScriptJob {
-            job_id,
-            interpreter,
-            script: body.clone(),
-            args: b.args.clone(),
-            timeout_secs: timeout as u32,
-        });
-        let delivered = st.hub.is_online(*agent_id) && {
-            // Claim the job first so a concurrent reconnect can't dispatch it twice.
-            let claimed = sqlx::query("UPDATE jobs SET status = 'sent', sent_at = now() WHERE id = $1 AND status = 'queued'")
-                .bind(job_id)
-                .execute(&st.db)
-                .await?
-                .rows_affected()
-                == 1;
-            if claimed && !st.hub.send(*agent_id, msg).await {
-                sqlx::query("UPDATE jobs SET status = 'queued', sent_at = NULL WHERE id = $1").bind(job_id).execute(&st.db).await?;
-                false
-            } else {
-                claimed
-            }
-        };
-        let status = if delivered { "sent" } else { "queued" };
-        st.hub.publish(Event::Job { id: job_id, agent_id: *agent_id, client_id, status: status.into(), output: false });
+        let job = ScriptJob { job_id, interpreter, script: body.clone(), args: b.args.clone(), timeout_secs: timeout as u32 };
+        let status = deliver(&st, *agent_id, client_id, job).await?;
         jobs.push(json!({ "job_id": job_id, "agent_id": agent_id, "status": status }));
     }
     if jobs.is_empty() {

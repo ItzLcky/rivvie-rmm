@@ -54,7 +54,7 @@ impl ScriptIn {
 
 /// MSP-wide scripts are admin-only to change (they run on every client); a client's own
 /// scripts can be changed by technicians who can see that client.
-fn may_edit(u: &User, client_id: Option<Uuid>) -> ApiResult<()> {
+pub(crate) fn may_edit(u: &User, client_id: Option<Uuid>) -> ApiResult<()> {
     match client_id {
         None => u.require(Role::Admin),
         Some(c) => {

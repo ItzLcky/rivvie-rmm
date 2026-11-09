@@ -19,7 +19,7 @@
 	import OsIcon from '#lib/components/OsIcon.svelte';
 
 	const res = resource(() => api.get<Dashboard>(`/dashboard${qs({ client_id: clientId() })}`));
-	liveReload(() => res.reload(), (e) => e.type === 'jobs' || (e.type === 'job' && !e.output) || (e.type === 'agent' && !e.last_metrics), {
+	liveReload(() => res.reload(), (e) => e.type === 'jobs' || e.type === 'alert' || (e.type === 'job' && !e.output) || (e.type === 'agent' && !e.last_metrics), {
 		debounceMs: 1500,
 		pollMs: 20000
 	});
@@ -28,13 +28,18 @@
 	const link = (path: string) => withClient(path);
 	const failedCount = (d: Dashboard) => (['failed', 'error', 'timed_out', 'lost'] as const).reduce((n, s) => n + (d.jobs_24h[s] ?? 0), 0);
 
-	/** One feed of what needs a look, worst first: full disks, failed jobs, then offline agents. */
-	type Item = { key: string; kind: string; tone: 'danger' | 'warning' | 'neutral'; href: string; title: string; where: string; when: string };
+	/** One feed of what needs a look, worst first: open alerts, full disks, failed jobs, then offline agents. */
+	type Item = { key: string; kind: string; tone: 'danger' | 'warning' | 'info' | 'neutral'; href: string; title: string; where: string; when: string };
+	const sevTone = { critical: 'danger', warning: 'warning', info: 'info' } as const;
+	const openAlerts = (d: Dashboard) => (d.alerts.critical ?? 0) + (d.alerts.warning ?? 0) + (d.alerts.info ?? 0);
 	function feed(d: Dashboard): Item[] {
+		const alerts: Item[] = d.open_alerts.map((a) => ({ key: `a-${a.id}`, kind: a.severity === 'critical' ? 'Critical' : a.severity === 'warning' ? 'Warning' : 'Info', tone: sevTone[a.severity], href: `/alerts/${a.id}`, title: `${a.hostname}: ${a.title}`, where: a.client_name, when: ago(a.opened_at) }));
 		const disks: Item[] = d.high_disk.map((a) => ({ key: `d-${a.id}`, kind: `Disk ${a.disk_max_pct.toFixed(0)}%`, tone: 'danger', href: `/agents/${a.id}`, title: a.hostname, where: a.client_name, when: a.online ? 'now' : ago(a.last_seen_at) }));
 		const jobs: Item[] = d.failed_jobs.map((j: Job) => ({ key: `j-${j.id}`, kind: j.status === 'failed' || j.status === 'error' ? 'Job failed' : j.status === 'timed_out' ? 'Job timed out' : 'Job lost', tone: j.status === 'failed' || j.status === 'error' ? 'danger' : 'warning', href: `/jobs/${j.id}`, title: j.script_name ?? `Ad-hoc ${j.interpreter}`, where: j.hostname, when: ago(j.created_at) }));
 		const off: Item[] = d.offline.map((a) => ({ key: `o-${a.id}`, kind: 'Offline', tone: 'neutral', href: `/agents/${a.id}`, title: a.hostname, where: `${a.client_name} › ${a.site_name}`, when: ago(a.last_seen_at) }));
-		return [...disks, ...jobs, ...off];
+		// An alert usually says the same as the disk or job row; keep the alert.
+		const alerted = new Set(d.open_alerts.map((a) => `${a.kind}:${a.agent_id}`));
+		return [...alerts, ...disks.filter((x) => !alerted.has(`disk:${x.key.slice(2)}`)), ...jobs, ...off.filter((x) => !alerted.has(`offline:${x.key.slice(2)}`))];
 	}
 </script>
 
@@ -61,7 +66,8 @@
 			</div>
 		{:else}
 			<!-- Every number links to the matching filtered list. -->
-			<section aria-label="Needs attention" class="grid grid-cols-2 gap-3 lg:grid-cols-4">
+			<section aria-label="Needs attention" class="grid grid-cols-2 gap-3 sm:grid-cols-3 xl:grid-cols-5">
+				<Stat label="Open alerts" value={openAlerts(d)} tone={d.alerts.critical ? 'danger' : 'warning'} href={link('/alerts')} />
 				<Stat label="Offline" value={d.agents_total - d.agents_online} of={d.agents_total} tone="warning" href={link('/agents?view=offline')} />
 				<Stat label="Need attention" value={(d.health.attention ?? 0) + (d.health.unhealthy ?? 0)} tone={(d.health.unhealthy ?? 0) ? 'danger' : 'warning'} href={link('/agents?view=attention')} />
 				<Stat label="Failed jobs (24 h)" value={failedCount(d)} tone="danger" href={link('/jobs?status=failed')} />
@@ -86,7 +92,7 @@
 							{/each}
 						</ul>
 					{:else}
-						<EmptyState compact icon={ListX} title="Nothing needs attention" description="Every agent is online, no disk is over 90% and no job failed in the last day." />
+						<EmptyState compact icon={ListX} title="Nothing needs attention" description="No open alerts, every agent is online, no disk is over 90% and no job failed in the last day." />
 					{/if}
 				</section>
 

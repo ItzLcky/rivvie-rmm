@@ -21,7 +21,8 @@
 	onchange={(v) => goto(v)}
 	items={[
 		{ value: '/settings', label: 'General' },
-		{ value: '/settings/users', label: 'Users' }
+		{ value: '/settings/users', label: 'Users' },
+		{ value: '/settings/notifications', label: 'Notifications' }
 	]}
 />
 {#if session.user && can('admin')}

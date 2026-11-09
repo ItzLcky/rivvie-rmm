@@ -23,7 +23,7 @@ export interface AgentSummary {
 	arch: string; agent_version: string; online: boolean; last_seen_at: string | null; enrolled_at: string;
 	site_id: string; site_name: string; client_id: string; client_name: string; last_metrics: Metrics | null;
 	update_state: UpdateState | null; update_version: string | null; update_detail: string | null; update_at: string | null;
-	health: Health; disk_max_pct: number; failed_jobs_24h: number;
+	health: Health; disk_max_pct: number; failed_jobs_24h: number; open_alerts: number;
 }
 
 export type UpdateState = 'offered' | 'downloading' | 'waiting' | 'applying' | 'completed' | 'rolled_back' | 'failed';
@@ -59,7 +59,7 @@ export type JobStatus = 'queued' | 'sent' | 'succeeded' | 'failed' | 'timed_out'
 export interface Job {
 	id: string; agent_id: string; hostname: string; script_id: string | null; script_name: string | null; interpreter: Interpreter;
 	status: JobStatus; exit_code: number | null; created_by_name: string | null; created_at: string; sent_at: string | null;
-	finished_at: string | null; duration_ms: number | null;
+	finished_at: string | null; duration_ms: number | null; schedule_id: string | null; schedule_name: string | null;
 }
 export interface JobDetail extends Job {
 	body: string; args: string[]; timeout_secs: number; stdout: string; stderr: string;
@@ -67,11 +67,12 @@ export interface JobDetail extends Job {
 	stdout_len: number; stderr_len: number;
 }
 
-export interface ClientHealth { id: string; name: string; agents: number; online: number; attention: number; unhealthy: number; failed_jobs_24h: number }
+export interface ClientHealth { id: string; name: string; agents: number; online: number; attention: number; unhealthy: number; failed_jobs_24h: number; open_alerts: number }
 export interface Dashboard {
 	agents_total: number; agents_online: number; clients: number; by_os: Record<string, number>;
 	health: Partial<Record<Health, number>>; jobs_24h: Partial<Record<JobStatus, number>>;
 	offline: AgentSummary[]; high_disk: AgentSummary[]; failed_jobs: Job[]; client_health: ClientHealth[];
+	alerts: Partial<Record<Severity, number>>; open_alerts: Alert[];
 }
 
 export interface AuditRow { id: number; ts: string; user_name: string | null; action: string; target_type: string | null; target_id: string | null; details: Record<string, unknown> }
@@ -84,3 +85,52 @@ export interface SearchResults {
 }
 
 export interface Session { id: string; created_at: string; last_seen_at: string; expires_at: string; user_agent: string | null; current: boolean }
+
+export type Severity = 'critical' | 'warning' | 'info';
+export type AlertState = 'open' | 'acknowledged' | 'resolved';
+export type PolicyKind = 'offline' | 'cpu' | 'memory' | 'disk' | 'service' | 'job_failed' | 'log';
+export type LogLevel = 'critical' | 'error' | 'warning' | 'info';
+
+export interface Alert {
+	id: string; policy_id: string | null; policy_name: string | null; agent_id: string; hostname: string; client_id: string;
+	client_name: string; site_name: string; kind: PolicyKind; severity: Severity; title: string; details: Record<string, unknown>;
+	occurrences: number; state: AlertState; opened_at: string; last_seen_at: string; acknowledged_at: string | null;
+	acknowledged_by_name: string | null; resolved_at: string | null; resolved_by_name: string | null;
+	/** cleared (condition went away), manual, policy (policy changed or deleted) */
+	resolution: 'cleared' | 'manual' | 'policy' | null;
+}
+export interface Delivery {
+	id: number; channel_name: string; channel_kind: ChannelKind; event: 'opened' | 'resolved' | 'test';
+	status: 'pending' | 'sent' | 'failed'; attempts: number; last_error: string | null; created_at: string; sent_at: string | null;
+}
+export interface LogEvent {
+	id: number; ts: string; received_at?: string; level: LogLevel; source: string; event_id: number | null; message: string;
+	policy_id?: string | null; policy_name: string | null; alert_id?: string | null;
+}
+export interface AlertDetail extends Alert { notifications: Delivery[]; log_events: LogEvent[] }
+
+export interface Policy {
+	id: string; name: string; kind: PolicyKind; params: Record<string, unknown>; severity: Severity;
+	client_id: string | null; client_name: string | null; site_id: string | null; site_name: string | null; os_family: 'linux' | 'windows' | 'macos' | null;
+	channel_ids: string[]; notify_resolved: boolean; enabled: boolean; open_alerts: number; created_at: string; updated_at: string;
+}
+
+export type ChannelKind = 'email' | 'webhook' | 'slack' | 'teams';
+export interface Channel {
+	id: string; name: string; kind: ChannelKind; enabled: boolean; policies: number; created_at: string; has_secret: boolean;
+	/** Admins only. */
+	config?: { to?: string[]; url?: string };
+}
+export interface DeliveryRow extends Delivery { channel_id: string; alert_id: string | null; alert_title: string | null; hostname: string | null; next_attempt_at: string }
+export interface Smtp { host: string; port: number; security: 'starttls' | 'tls' | 'none'; username: string; password_set: boolean; from: string }
+
+export interface Schedule {
+	id: string; name: string; script_id: string; script_name: string; interpreter: Interpreter; client_id: string | null; client_name: string | null;
+	site_id: string | null; site_name: string | null; os_family: 'linux' | 'windows' | 'macos' | null; cron: string; timezone: string; args: string[];
+	timeout_secs: number | null; retain_days: number; enabled: boolean; next_run_at: string | null; last_run_at: string | null;
+	last_run: Partial<Record<JobStatus, number>>; created_by_name: string | null; created_at: string; updated_at: string;
+}
+
+export type ServiceState = 'running' | 'stopped' | 'failed' | 'starting' | 'stopping' | 'paused' | 'unknown';
+export interface ServiceInfo { name: string; display_name: string; state: ServiceState; start_mode: 'auto' | 'manual' | 'disabled' | 'unknown' }
+export interface AgentServices { services: ServiceInfo[] | null; services_at: string | null; alerting: string[] }

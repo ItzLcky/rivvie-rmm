@@ -1,5 +1,5 @@
 import type { Component } from 'svelte';
-import { Building2, FileCode2, History, LayoutDashboard, ListChecks, Monitor, Settings } from '@lucide/svelte';
+import { BellRing, Building2, CalendarClock, FileCode2, History, LayoutDashboard, ListChecks, Monitor, Settings, ShieldCheck } from '@lucide/svelte';
 import type { Role } from '#lib/types.js';
 
 export interface NavItem {
@@ -12,13 +12,15 @@ export interface NavItem {
 	key?: string;
 	/** Keeps the client switcher's ?client= when followed. */
 	scoped?: boolean;
+	/** Shows the open alert count. */
+	badge?: 'alerts';
 }
 export interface NavGroup {
 	label: string;
 	items: NavItem[];
 }
 
-/** The sidebar. Later phases add Schedules and Patches (Automation), Alerts and Service desk. */
+/** The sidebar. Later phases add Patches (Automation) and Service desk. */
 export const nav: NavGroup[] = [
 	{ label: 'Overview', items: [{ href: '/', label: 'Dashboard', icon: LayoutDashboard, key: 'd', scoped: true }] },
 	{
@@ -29,9 +31,17 @@ export const nav: NavGroup[] = [
 		]
 	},
 	{
+		label: 'Monitoring',
+		items: [
+			{ href: '/alerts', label: 'Alerts', icon: BellRing, key: 'e', scoped: true, badge: 'alerts' },
+			{ href: '/policies', label: 'Alert policies', icon: ShieldCheck, key: 'p', scoped: true }
+		]
+	},
+	{
 		label: 'Automation',
 		items: [
 			{ href: '/scripts', label: 'Scripts', icon: FileCode2, key: 's', scoped: true },
+			{ href: '/schedules', label: 'Schedules', icon: CalendarClock, key: 'h', scoped: true },
 			{ href: '/jobs', label: 'Jobs', icon: ListChecks, key: 'j', scoped: true }
 		]
 	},

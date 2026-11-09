@@ -16,7 +16,8 @@ use crate::collect::{AGENT_VERSION, Collector, system_info};
 use crate::config::{self, Config};
 use crate::shell::ShellSession;
 use crate::update::Updater;
-use crate::{jobs, shell};
+use crate::logwatch::LogWatchers;
+use crate::{jobs, services, shell};
 
 type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -73,6 +74,7 @@ pub async fn enroll(server_url: &str, token: &str, previous: Option<&Config>) ->
 /// Stay connected until `shutdown` flips to true, reconnecting with backoff.
 pub async fn run_forever(cfg: Config, config_path: std::path::PathBuf, mut shutdown: watch::Receiver<bool>) {
     let tracker = Arc::new(jobs::Tracker::default());
+    let watchers = Arc::new(LogWatchers::default());
     let updater = Arc::new(Updater::new(config_path, tracker.clone()));
     let collector = match Collector::new() {
         Ok(c) => Arc::new(Mutex::new(c)),
@@ -85,7 +87,7 @@ pub async fn run_forever(cfg: Config, config_path: std::path::PathBuf, mut shutd
     loop {
         let started = std::time::Instant::now();
         tokio::select! {
-            res = session(&cfg, collector.clone(), tracker.clone(), updater.clone()) => match res {
+            res = session(&cfg, collector.clone(), tracker.clone(), updater.clone(), watchers.clone()) => match res {
                 Ok(()) => info!("connection closed"),
                 Err(e) => warn!("connection error: {e:#}"),
             },
@@ -115,6 +117,7 @@ async fn session(
     collector: Arc<Mutex<Collector>>,
     tracker: Arc<jobs::Tracker>,
     updater: Arc<Updater>,
+    watchers: Arc<LogWatchers>,
 ) -> Result<()> {
     let mut ws = connect(&cfg.ws_url()).await?;
     send(
@@ -159,6 +162,10 @@ async fn session(
     updater.attach(tx.clone()).await;
     let heartbeat = tokio::spawn(periodic(tx.clone(), collector.clone(), heartbeat_secs.max(5), false));
     let inventory = tokio::spawn(periodic(tx.clone(), collector.clone(), inventory_secs.max(300), true));
+    watchers.attach(tx.clone());
+    let (services_refresh, refresh_rx) = mpsc::channel(4);
+    let services = tokio::spawn(services::watch(tx.clone(), refresh_rx));
+    let ctx = Ctx { tx: tx.clone(), collector, tracker: tracker.clone(), updater: updater.clone(), watchers: watchers.clone(), services_refresh };
 
     let mut shells: HashMap<Uuid, ShellSession> = HashMap::new();
     let result = loop {
@@ -179,12 +186,15 @@ async fn session(
             Message::Close(_) => break Ok(()),
             _ => continue,
         };
-        handle(msg, &tx, &collector, &tracker, &updater, &mut shells).await;
+        handle(msg, &ctx, &mut shells).await;
     };
 
     // Running jobs keep going; their output is buffered until the next connection.
     tracker.detach();
     updater.detach();
+    watchers.detach();
+    services.abort();
+    drop(ctx);
     heartbeat.abort();
     inventory.abort();
     drop(shells);
@@ -197,14 +207,19 @@ async fn session(
     result
 }
 
-async fn handle(
-    msg: ServerMsg,
-    tx: &mpsc::Sender<AgentMsg>,
-    collector: &Arc<Mutex<Collector>>,
-    tracker: &Arc<jobs::Tracker>,
-    updater: &Arc<Updater>,
-    shells: &mut HashMap<Uuid, ShellSession>,
-) {
+/// What a connection's message handler works with.
+struct Ctx {
+    tx: mpsc::Sender<AgentMsg>,
+    collector: Arc<Mutex<Collector>>,
+    tracker: Arc<jobs::Tracker>,
+    updater: Arc<Updater>,
+    watchers: Arc<LogWatchers>,
+    /// Makes the service watcher send its list now.
+    services_refresh: mpsc::Sender<()>,
+}
+
+async fn handle(msg: ServerMsg, ctx: &Ctx, shells: &mut HashMap<Uuid, ShellSession>) {
+    let Ctx { tx, collector, tracker, updater, .. } = ctx;
     match msg {
         ServerMsg::Ping { nonce } => {
             let _ = tx.send(AgentMsg::Pong { nonce }).await;
@@ -251,6 +266,14 @@ async fn handle(
                 info!(%session_id, "shell closed by server");
             }
         }
+        ServerMsg::RequestServices => {
+            let _ = ctx.services_refresh.try_send(());
+        }
+        ServerMsg::ServiceControl { request_id, name, action } => {
+            info!(service = %name, action = action.as_str(), "service control");
+            tokio::spawn(services::control(request_id, name, action, tx.clone(), ctx.services_refresh.clone()));
+        }
+        ServerMsg::Watchers { watchers } => ctx.watchers.set(watchers).await,
         ServerMsg::Enrolled { .. } | ServerMsg::AuthOk { .. } | ServerMsg::AuthFailed { .. } => {}
     }
 }

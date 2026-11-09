@@ -73,7 +73,7 @@
 	{#snippet statusCell(j: Job)}<JobBadge status={j.status} />{/snippet}
 	{#snippet exitCell(j: Job)}{#if j.exit_code != null}{j.exit_code}{:else}<span class="text-muted" aria-label="none">–</span>{/if}{/snippet}
 	{#snippet durCell(j: Job)}{#if j.duration_ms != null}{ms(j.duration_ms)}{:else}<span class="text-muted" aria-label="none">–</span>{/if}{/snippet}
-	{#snippet byCell(j: Job)}<span class="text-muted">{j.created_by_name ?? '–'}</span>{/snippet}
+	{#snippet byCell(j: Job)}{#if j.schedule_id}<a class="text-muted hover:text-accent" href="/schedules/{j.schedule_id}">{j.schedule_name}</a>{:else}<span class="text-muted">{j.created_by_name ?? '–'}</span>{/if}{/snippet}
 	{#snippet actionCell(j: Job)}
 		{#if can('technician') && finished(j)}
 			<!-- Quiet until the row is hovered or focused; always there on touch screens. -->

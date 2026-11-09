@@ -7,11 +7,13 @@
 	import { withClient } from '#lib/scope.svelte.js';
 	import { can, company } from '#lib/session.svelte.js';
 	import Tooltip from '#lib/ui/Tooltip.svelte';
+	import { alertCounts } from '#lib/monitoring/alerts.svelte.js';
 	import { isActive, nav } from './nav';
 
 	/** `collapsed` shows icons only; the mobile drawer always renders it expanded. */
 	let { mobile = false, onnavigate }: { mobile?: boolean; onnavigate?: () => void } = $props();
 	const collapsed = $derived(!mobile && !!prefs.sidebarCollapsed);
+	const openAlerts = $derived(alertCounts.critical + alertCounts.warning + alertCounts.info);
 	const groups = $derived(nav.map((g) => ({ ...g, items: g.items.filter((i) => !i.role || can(i.role)) })).filter((g) => g.items.length));
 </script>
 
@@ -46,8 +48,16 @@
 											on ? 'bg-accent-soft text-accent font-medium' : 'text-muted hover:bg-hover hover:text-fg'
 										)}
 									>
-										<item.icon />
+										<span class="relative flex">
+											<item.icon />
+											{#if collapsed && item.badge && openAlerts}<span class={cx('ring-raised absolute -top-0.5 -right-0.5 size-2 rounded-full ring-2', alertCounts.critical ? 'bg-danger' : 'bg-warning')} aria-hidden="true"></span>{/if}
+										</span>
 										{#if !collapsed}<span class="truncate">{item.label}</span>{/if}
+										{#if item.badge && openAlerts}
+											<span class={cx('tabular ml-auto rounded-full px-1.5 text-[11px] leading-[18px] font-semibold', collapsed && 'sr-only', alertCounts.critical ? 'bg-danger-soft text-danger' : 'bg-warning-soft text-warning')}>
+												{openAlerts > 999 ? '999+' : openAlerts}<span class="sr-only"> open</span>
+											</span>
+										{/if}
 									</a>
 								{/snippet}
 							</Tooltip>

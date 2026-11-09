@@ -7,17 +7,22 @@ use crate::state::AppState;
 
 pub mod access;
 mod agents;
+mod alerts;
+mod channels;
 mod auth;
 mod clients;
 mod downloads;
 mod jobs;
 mod packages;
+mod schedules;
 mod search;
 mod scripts;
+mod services;
 mod settings;
 mod totp;
 pub(crate) mod users;
 
+pub use jobs::{FAILED as JOB_FAILED, deliver as deliver_job};
 pub use totp::clear as clear_totp;
 pub use users::create_user as create_user_cli;
 
@@ -84,4 +89,25 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/audit", get(users::audit_log))
         .route("/settings", get(settings::get).put(settings::update))
         .route("/settings/public", get(settings::public))
+        .route("/settings/smtp", get(channels::get_smtp).put(channels::update_smtp))
+        .route("/notification-channels", get(channels::list).post(channels::create))
+        .route("/notification-channels/{id}", axum::routing::put(channels::update).delete(channels::remove))
+        .route("/notification-channels/{id}/test", post(channels::test))
+        .route("/notifications", get(channels::deliveries))
+        .route("/alerts", get(alerts::list))
+        .route("/alerts/summary", get(alerts::summary_handler))
+        .route("/alerts/bulk", post(alerts::bulk))
+        .route("/alerts/{id}", get(alerts::get))
+        .route("/alerts/{id}/acknowledge", post(alerts::acknowledge))
+        .route("/alerts/{id}/resolve", post(alerts::resolve))
+        .route("/alert-policies", get(alerts::list_policies).post(alerts::create_policy))
+        .route("/alert-policies/{id}", get(alerts::get_policy).put(alerts::update_policy).delete(alerts::remove_policy))
+        .route("/schedules", get(schedules::list).post(schedules::create))
+        .route("/schedules/preview", get(schedules::preview))
+        .route("/schedules/{id}", get(schedules::get).put(schedules::update).delete(schedules::remove))
+        .route("/schedules/{id}/run", post(schedules::run_now))
+        .route("/agents/{id}/services", get(services::list))
+        .route("/agents/{id}/services/refresh", post(services::refresh))
+        .route("/agents/{id}/services/control", post(services::control))
+        .route("/agents/{id}/log-events", get(services::log_events))
 }

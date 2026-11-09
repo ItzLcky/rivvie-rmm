@@ -28,12 +28,21 @@ macro_rules! failed_24h {
              AND fj.status IN ('failed', 'error', 'timed_out', 'lost'))"
     };
 }
+/// Unresolved alerts on this agent with the given severity.
+macro_rules! open_alert {
+    ($sev:literal) => {
+        concat!("EXISTS (SELECT 1 FROM alerts oa WHERE oa.agent_id = a.id AND oa.resolved_at IS NULL AND oa.severity = '", $sev, "')")
+    };
+}
 /// Health rank: 0 healthy, 1 unknown (never reported), 2 needs attention, 3 unhealthy.
-/// Online/offline is separate: a workstation that is switched off isn't unhealthy.
+/// Online/offline is separate: a workstation that is switched off isn't unhealthy (unless an
+/// offline alert policy says so). Open critical alerts make an agent unhealthy, warnings
+/// make it need attention.
 macro_rules! health_rank {
     () => {
         concat!(
-            "(CASE WHEN a.last_metrics IS NULL THEN 1 WHEN ", disk_pct!(), " >= 95 THEN 3 WHEN ", disk_pct!(), " >= 90 OR ",
+            "(CASE WHEN ", open_alert!("critical"), " THEN 3 WHEN a.last_metrics IS NULL THEN 1 WHEN ", disk_pct!(), " >= 95 THEN 3 WHEN ",
+            disk_pct!(), " >= 90 OR ", open_alert!("warning"), " OR ",
             failed_24h!(), " > 0 OR (a.update_state IN ('failed', 'rolled_back') AND a.update_at > now() - interval '7 days') ",
             "THEN 2 ELSE 0 END)"
         )
@@ -71,6 +80,8 @@ pub struct AgentSummary {
     health: String,
     disk_max_pct: f64,
     failed_jobs_24h: i64,
+    /// Unresolved alerts.
+    open_alerts: i64,
     #[sqlx(default)]
     #[serde(skip)]
     sort_key: String,
@@ -85,7 +96,7 @@ pub(crate) const SUMMARY_COLS: &str = concat!(
     disk_pct!(),
     " AS disk_max_pct, ",
     failed_24h!(),
-    " AS failed_jobs_24h"
+    " AS failed_jobs_24h, (SELECT count(*) FROM alerts oa WHERE oa.agent_id = a.id AND oa.resolved_at IS NULL) AS open_alerts"
 );
 const AGENT_FROM: &str = "FROM agents a JOIN sites s ON s.id = a.site_id JOIN clients c ON c.id = s.client_id";
 
@@ -234,28 +245,35 @@ pub async fn metrics(
     Query(q): Query<MetricsQuery>,
 ) -> ApiResult<Json<Vec<MetricPoint>>> {
     super::access::agent(&st, &u, id).await?;
-    let hours = q.hours.unwrap_or(24).clamp(1, 24 * 30);
-    // Bucket so a 30-day chart is ~500 points regardless of heartbeat rate.
+    let hours = q.hours.unwrap_or(24).clamp(1, 24 * 366);
+    // Bucket so a chart is ~500 points regardless of heartbeat rate. Beyond two days the
+    // hourly rollups are used: raw samples are only kept for RMM_METRICS_RAW_DAYS.
     let bucket_secs = ((hours * 3600) / 500).max(60);
-    Ok(Json(
-        sqlx::query_as(
-            "SELECT to_timestamp(floor(extract(epoch FROM ts) / $3) * $3) AS ts,
-                    avg(cpu_percent)::real AS cpu_percent,
-                    avg(mem_used)::bigint AS mem_used,
-                    max(mem_total) AS mem_total,
-                    max(disk_max_pct) AS disk_max_pct,
-                    max(net_rx_bytes) AS net_rx_bytes,
-                    max(net_tx_bytes) AS net_tx_bytes
-               FROM agent_metrics
-              WHERE agent_id = $1 AND ts > $2
-              GROUP BY 1 ORDER BY 1",
-        )
-        .bind(id)
-        .bind(Utc::now() - Duration::hours(hours))
-        .bind(bucket_secs as f64)
-        .fetch_all(&st.db)
-        .await?,
-    ))
+    let sql = if hours <= 48 {
+        "SELECT to_timestamp(floor(extract(epoch FROM ts) / $3) * $3) AS ts,
+                avg(cpu_percent)::real AS cpu_percent,
+                avg(mem_used)::bigint AS mem_used,
+                max(mem_total) AS mem_total,
+                max(disk_max_pct) AS disk_max_pct,
+                max(net_rx_bytes) AS net_rx_bytes,
+                max(net_tx_bytes) AS net_tx_bytes
+           FROM agent_metrics
+          WHERE agent_id = $1 AND ts > $2
+          GROUP BY 1 ORDER BY 1"
+    } else {
+        "SELECT to_timestamp(floor(extract(epoch FROM hour) / $3) * $3) AS ts,
+                (sum(cpu_avg * samples) / sum(samples))::real AS cpu_percent,
+                (sum(mem_used_avg::float8 * samples) / sum(samples))::bigint AS mem_used,
+                max(mem_total) AS mem_total,
+                max(disk_max_pct) AS disk_max_pct,
+                max(net_rx_bytes) AS net_rx_bytes,
+                max(net_tx_bytes) AS net_tx_bytes
+           FROM agent_metrics_hourly
+          WHERE agent_id = $1 AND hour > $2
+          GROUP BY 1 ORDER BY 1"
+    };
+    let bucket = if hours <= 48 { bucket_secs } else { bucket_secs.max(3600) / 3600 * 3600 };
+    Ok(Json(sqlx::query_as(sql).bind(id).bind(Utc::now() - Duration::hours(hours)).bind(bucket as f64).fetch_all(&st.db).await?))
 }
 
 pub async fn refresh_inventory(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uuid>) -> ApiResult<Json<serde_json::Value>> {
@@ -284,6 +302,10 @@ pub struct Dashboard {
     failed_jobs: Vec<super::jobs::JobRow>,
     /// One row per client, worst first.
     client_health: Vec<ClientHealth>,
+    /// Unresolved alerts by severity.
+    alerts: serde_json::Value,
+    /// The worst and newest unresolved alerts.
+    open_alerts: Vec<super::alerts::AlertRow>,
 }
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -295,6 +317,7 @@ pub struct ClientHealth {
     attention: i64,
     unhealthy: i64,
     failed_jobs_24h: i64,
+    open_alerts: i64,
 }
 
 #[derive(Deserialize)]
@@ -372,17 +395,20 @@ pub async fn dashboard(State(st): State<Arc<AppState>>, u: User, Query(q): Query
                 count(a.id) FILTER (WHERE a.online) AS online,
                 count(a.id) FILTER (WHERE {rank} = 2) AS attention,
                 count(a.id) FILTER (WHERE {rank} = 3) AS unhealthy,
-                coalesce(sum({failed}), 0)::bigint AS failed_jobs_24h
+                coalesce(sum({failed}), 0)::bigint AS failed_jobs_24h,
+                coalesce(sum((SELECT count(*) FROM alerts oa WHERE oa.agent_id = a.id AND oa.resolved_at IS NULL)), 0)::bigint AS open_alerts
            FROM clients c LEFT JOIN sites s ON s.client_id = c.id LEFT JOIN agents a ON a.site_id = s.id
           WHERE ($1::uuid[] IS NULL OR c.id = ANY($1))
           GROUP BY c.id
-          ORDER BY 6 DESC, 5 DESC, count(a.id) - count(a.id) FILTER (WHERE a.online) DESC, lower(c.name)",
+          ORDER BY 6 DESC, 5 DESC, 8 DESC, count(a.id) - count(a.id) FILTER (WHERE a.online) DESC, lower(c.name)",
         rank = health_rank!(),
         failed = failed_24h!(),
     )))
     .bind(scope)
     .fetch_all(&st.db)
     .await?;
+    let alerts = super::alerts::summary(&st, scope).await?;
+    let open_alerts = super::alerts::recent_open(&st, scope).await?;
     Ok(Json(Dashboard {
         agents_total,
         agents_online,
@@ -394,6 +420,8 @@ pub async fn dashboard(State(st): State<Arc<AppState>>, u: User, Query(q): Query
         high_disk,
         failed_jobs,
         client_health,
+        alerts,
+        open_alerts,
     }))
 }
 

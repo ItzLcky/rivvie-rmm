@@ -239,6 +239,8 @@ async fn run_session(
 
     // Ask for fresh inventory and flush anything queued while the agent was offline.
     let _ = tx.send(ServerMsg::RequestInventory).await;
+    let _ = tx.send(ServerMsg::Watchers { watchers: crate::alerts::watchers_for(&state, agent_id).await }).await;
+    crate::alerts::agent_online(&state, agent_id).await;
     let dispatched = dispatch_queued(&state, agent_id, &tx).await.unwrap_or_else(|e| {
         warn!(%agent_id, "dispatching queued jobs: {e}");
         0
@@ -391,7 +393,7 @@ async fn on_message(
             job_event(job_id, status, true);
         }
         AgentMsg::JobFinished { job_id, status, exit_code, duration_ms } => {
-            let status = sqlx::query_scalar(
+            let status: Option<String> = sqlx::query_scalar(
                 // `lost` too: the timeout reaper may have given up on a job that then finished.
                 "UPDATE jobs SET status = $3, exit_code = $4, duration_ms = $5, finished_at = now()
                   WHERE id = $1 AND agent_id = $2 AND status IN ('sent', 'lost') RETURNING status",
@@ -403,6 +405,9 @@ async fn on_message(
             .bind(duration_ms as i64)
             .fetch_optional(&state.db)
             .await?;
+            if let Some(s) = &status {
+                crate::alerts::job_finished(state, agent_id, job_id, s).await;
+            }
             job_event(job_id, status, false);
             // Stored (or already final from an earlier delivery): the agent can forget it.
             if let Some(tx) = reply.upgrade() {
@@ -457,6 +462,23 @@ async fn on_message(
                 )
                 .await;
             }
+        }
+        AgentMsg::Services { services } => {
+            let mut services = services;
+            services.truncate(5000);
+            sqlx::query("UPDATE agents SET services = $2, services_at = now() WHERE id = $1")
+                .bind(agent_id)
+                .bind(serde_json::to_value(&services)?)
+                .execute(&state.db)
+                .await?;
+            state.hub.publish(Event::Services { agent_id, client_id });
+            crate::alerts::services_reported(state, agent_id, &services).await;
+        }
+        AgentMsg::ServiceControlResult { request_id, ok, message } => {
+            state.hub.complete_control(agent_id, request_id, (ok, message.chars().take(2000).collect()));
+        }
+        AgentMsg::LogMatches { watcher_id, entries, suppressed } => {
+            crate::alerts::log_matched(state, agent_id, watcher_id, entries, suppressed).await;
         }
         AgentMsg::Pong { .. } => {}
         AgentMsg::Enroll { .. } | AgentMsg::Auth { .. } => {}

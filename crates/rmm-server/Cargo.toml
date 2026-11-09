@@ -33,6 +33,11 @@ data-encoding = "2"
 tar = { version = "0.4", default-features = false }
 flate2 = "1"
 rpm = { version = "0.30", default-features = false, features = ["payload", "gzip-compression"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
+lettre = { version = "0.11", default-features = false, features = ["tokio1-rustls", "smtp-transport", "builder", "hostname", "ring", "rustls-native-certs"] }
+croner = "4"
+chrono-tz = "0.10"
+regex-lite = "0.1"
 
 [dev-dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["json", "cookies"] }

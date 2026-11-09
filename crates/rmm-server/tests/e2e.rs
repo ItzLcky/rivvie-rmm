@@ -48,6 +48,7 @@ impl Server {
             .env("RMM_WEB_DIR", dir.join("web"))
             .env("RMM_AGENT_DIR", dir.join("agents"))
             .env("RMM_HEARTBEAT_SECS", "5")
+            .env("RMM_ALERT_EVAL_SECS", "2")
             .env("RMM_TRUSTED_PROXIES", "127.0.0.1")
             .env("RMM_ADMIN_EMAIL", ADMIN_EMAIL)
             .env("RMM_ADMIN_PASSWORD", ADMIN_PASSWORD)
@@ -611,6 +612,8 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
     println!("update refused as expected: {}", a["update_detail"]);
     assert!(a["agent_version"] != "99.0.0");
 
+    monitoring(server, &admin, db, dir, &id1, &id3, a_id).await;
+
     // --- rate limits ------------------------------------------------------------------------------
     // Failed sign-ins from one client IP (via the trusted proxy's X-Forwarded-For).
     let mut limited = None;
@@ -660,4 +663,259 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
 
     a1.kill();
     Ok(())
+}
+
+/// Collects webhook deliveries: (X-RMM-Event, X-RMM-Signature, body).
+type Hooks = std::sync::Arc<std::sync::Mutex<Vec<(String, String, Value)>>>;
+
+async fn webhook_receiver() -> (String, Hooks) {
+    use axum::http::HeaderMap;
+    let hooks: Hooks = Default::default();
+    let store = hooks.clone();
+    let app = axum::Router::new().route(
+        "/hook",
+        axum::routing::post(move |headers: HeaderMap, body: axum::body::Bytes| {
+            let store = store.clone();
+            async move {
+                let h = |k: &str| headers.get(k).and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
+                let sig = h("x-rmm-signature");
+                // Check the signature here, against the raw body.
+                let mut mac = Hmac::<sha2::Sha256>::new_from_slice(b"hook-secret").unwrap();
+                mac.update(&body);
+                let ok = sig == format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+                store.lock().unwrap().push((h("x-rmm-event"), if ok { "valid".into() } else { sig }, serde_json::from_slice(&body).unwrap()));
+                "ok"
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/hook", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (url, hooks)
+}
+
+async fn wait_hook(hooks: &Hooks, what: &str, pred: impl Fn(&str, &Value) -> bool) -> Value {
+    eventually(30, what, || async {
+        let h = hooks.lock().unwrap();
+        h.iter().find(|(ev, sig, body)| {
+            assert_eq!(sig, "valid", "webhook signature");
+            pred(ev, body)
+        })
+        .map(|(_, _, b)| b.clone())
+    })
+    .await
+}
+
+async fn alerts_for(api: &Api, query: &str) -> Vec<Value> {
+    api.get(&format!("/alerts?{query}")).await["items"].as_array().unwrap().clone()
+}
+
+/// Phase 4: notification channels, alert policies, services, log watchers, schedules,
+/// retention and metric rollups.
+async fn monitoring(server: &mut Server, admin: &Api, db: &sqlx::PgPool, dir: &Path, id1: &str, id3: &str, a_id: &str) {
+    let (hook_url, hooks) = webhook_receiver().await;
+
+    // --- channels: a signed webhook, with a test send ---------------------------------------
+    let ch = admin
+        .post("/notification-channels", json!({ "name": "e2e hook", "kind": "webhook", "config": { "url": hook_url, "secret": "hook-secret" } }))
+        .await;
+    assert_eq!((ch["has_secret"].as_bool(), ch["config"].get("secret")), (Some(true), None), "the secret is never sent back: {ch}");
+    let ch_id = ch["id"].as_str().unwrap().to_string();
+    let t = admin.post(&format!("/notification-channels/{ch_id}/test"), json!({})).await;
+    assert_eq!(t["ok"], true, "{t}");
+    wait_hook(&hooks, "test webhook", |ev, _| ev == "test").await;
+    let (s, _) = admin
+        .call(reqwest::Method::POST, "/notification-channels", Some(json!({ "name": "bad", "kind": "email", "config": { "to": ["nope"] } })))
+        .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+
+    // --- failed job: opens on failure, clears on the next success ----------------------------
+    let policy = |name: &str, kind: &str, params: Value| {
+        json!({ "name": name, "kind": kind, "params": params, "severity": "warning", "client_id": a_id, "channel_ids": [ch_id] })
+    };
+    let (s, v) = admin.call(reqwest::Method::POST, "/alert-policies", Some(policy("bad", "cpu", json!({ "threshold": 500, "minutes": 5 })))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    let jf = admin.post("/alert-policies", policy("Jobs fail", "job_failed", json!({}))).await;
+    let failing = admin.run_script(id1, "exit 4", 30).await;
+    admin.wait_job(&failing, 30).await;
+    let opened = wait_hook(&hooks, "job alert opened", |ev, b| ev == "opened" && b["alert"]["kind"] == "job_failed").await;
+    assert_eq!(opened["agent"]["id"], id1);
+    assert_eq!(opened["alert"]["details"]["exit_code"], 4, "{opened}");
+    let alert_id = opened["alert"]["id"].as_str().unwrap().to_string();
+    let again = admin.run_script(id1, "exit 5", 30).await;
+    admin.wait_job(&again, 30).await;
+    let (api, aid) = (admin, alert_id.as_str());
+    eventually(10, "a second failure counts on the open alert", move || async move {
+        (api.get(&format!("/alerts/{aid}")).await["occurrences"] == 2).then_some(())
+    })
+    .await;
+    assert!(matches!(admin.get(&format!("/agents/{id1}")).await["health"].as_str(), Some("attention" | "unhealthy")));
+    let ok = admin.run_script(id1, "true", 30).await;
+    admin.wait_job(&ok, 30).await;
+    wait_hook(&hooks, "job alert resolved", |ev, b| ev == "resolved" && b["alert"]["id"] == alert_id.as_str()).await;
+    let detail = admin.get(&format!("/alerts/{alert_id}")).await;
+    assert_eq!((detail["state"].as_str(), detail["resolution"].as_str()), (Some("resolved"), Some("cleared")), "{detail}");
+    assert!(detail["notifications"].as_array().unwrap().iter().all(|n| n["status"] == "sent"), "{detail}");
+
+    // --- memory held over a threshold, and an offline agent ------------------------------------
+    let mem = admin.post("/alert-policies", policy("Memory", "memory", json!({ "threshold": 1, "minutes": 1 }))).await;
+    let off = admin.post("/alert-policies", json!({ "name": "Offline", "kind": "offline", "params": { "minutes": 1 }, "severity": "critical", "client_id": a_id })).await;
+    let mem_id = mem["id"].as_str().unwrap().to_string();
+    let (api, m) = (admin, mem_id.as_str());
+    let mem_alert = eventually(120, "memory alert", move || async move {
+        alerts_for(api, &format!("policy_id={m}")).await.into_iter().next()
+    })
+    .await;
+    assert_eq!(mem_alert["agent_id"], id1);
+    assert!(mem_alert["title"].as_str().unwrap().starts_with("Memory at or above 1"), "{mem_alert}");
+    let off_id = off["id"].as_str().unwrap().to_string();
+    let (api, o) = (admin, off_id.as_str());
+    let off_alert = eventually(120, "offline alert", move || async move {
+        alerts_for(api, &format!("policy_id={o}")).await.into_iter().next()
+    })
+    .await;
+    assert_eq!(off_alert["agent_id"], id3);
+    assert_eq!(admin.get(&format!("/agents/{id3}")).await["health"], "unhealthy", "an open critical alert");
+    let dash = admin.get("/dashboard").await;
+    assert!(dash["alerts"]["critical"].as_i64() >= Some(1) && dash["open_alerts"][0]["severity"] == "critical", "{dash}");
+    // Raising the threshold out of reach clears the memory alert at the next check.
+    let mut edit = policy("Memory", "memory", json!({ "threshold": 100, "minutes": 1 }));
+    edit["notify_resolved"] = json!(false);
+    let (s, v) = admin.call(reqwest::Method::PUT, &format!("/alert-policies/{mem_id}"), Some(edit)).await;
+    assert!(s.is_success(), "{v}");
+    let (api, aid) = (admin, mem_alert["id"].as_str().unwrap().to_string());
+    eventually(30, "memory alert to clear", || async { (api.get(&format!("/alerts/{aid}")).await["state"] == "resolved").then_some(()) }).await;
+    // Acknowledge, then resolve by hand.
+    let off_alert_id = off_alert["id"].as_str().unwrap();
+    let a = admin.post(&format!("/alerts/{off_alert_id}/acknowledge"), json!({})).await;
+    assert_eq!(a["state"], "acknowledged");
+    assert_eq!(alerts_for(admin, "state=acknowledged").await.len(), 1);
+    admin.post("/alerts/bulk", json!({ "ids": [off_alert_id], "action": "resolve" })).await;
+    assert_eq!(admin.get(&format!("/alerts/{off_alert_id}")).await["resolution"], "manual");
+    let (s, _) = admin.call(reqwest::Method::DELETE, &format!("/alert-policies/{off_id}"), None).await;
+    assert!(s.is_success());
+
+    // --- services (systemd hosts only) ---------------------------------------------------------
+    let (api, id) = (admin, id1);
+    let services = eventually(30, "the agent's service list", move || async move {
+        let v = api.get(&format!("/agents/{id}/services")).await;
+        (!v["services"].is_null()).then_some(v)
+    })
+    .await;
+    let list = services["services"].as_array().unwrap();
+    if list.is_empty() {
+        println!("no systemd here; skipping service alerts");
+    } else {
+        println!("agent reported {} services", list.len());
+        let r = admin
+            .post(&format!("/agents/{id1}/services/control"), json!({ "name": "no-such-unit-e2e.service", "action": "restart" }))
+            .await;
+        assert_eq!(r["ok"], false, "{r}");
+        assert!(r["message"].as_str().unwrap().contains("no service named"), "{r}");
+        if let Some(stopped) = list.iter().find(|s| s["state"] == "stopped") {
+            let name = stopped["name"].as_str().unwrap();
+            let sp = admin.post("/alert-policies", policy("Service down", "service", json!({ "services": [name] }))).await;
+            let sp_id = sp["id"].as_str().unwrap().to_string();
+            let (api, p) = (admin, sp_id.as_str());
+            let a = eventually(20, "service alert", move || async move {
+                alerts_for(api, &format!("policy_id={p}")).await.into_iter().next()
+            })
+            .await;
+            assert_eq!(a["details"]["service"], name);
+            let alerting = admin.get(&format!("/agents/{id1}/services")).await["alerting"].clone();
+            assert_eq!(alerting, json!([name]));
+            admin.call(reqwest::Method::DELETE, &format!("/alert-policies/{sp_id}"), None).await;
+            let a = admin.get(&format!("/alerts/{}", a["id"].as_str().unwrap())).await;
+            assert_eq!(a["resolution"], "policy", "deleting a policy closes its alerts quietly");
+        }
+    }
+
+    // --- log watcher (needs a journal this user can read) ------------------------------------------
+    let marker = format!("rmm-e2e-{}", uuid::Uuid::new_v4().simple());
+    let lp = admin.post("/alert-policies", policy("Marker", "log", json!({ "min_level": "error", "pattern": marker }))).await;
+    tokio::time::sleep(Duration::from_secs(2)).await; // the watcher set reaches the agent
+    let lj = admin.run_script(id1, &format!("logger -p user.err '{marker}' || true"), 30).await;
+    admin.wait_job(&lj, 30).await;
+    let lp_id = lp["id"].as_str().unwrap().to_string();
+    let mut found = None;
+    for _ in 0..40 {
+        if let Some(a) = alerts_for(admin, &format!("policy_id={lp_id}")).await.into_iter().next() {
+            found = Some(a);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    match found {
+        Some(a) => {
+            assert!(a["details"]["message"].as_str().unwrap().contains(&marker), "{a}");
+            let logs = admin.get(&format!("/agents/{id1}/log-events")).await;
+            assert!(logs[0]["message"].as_str().unwrap().contains(&marker), "{logs}");
+            println!("log watcher matched");
+        }
+        None => println!("no log match (journal not readable by this user?); skipping the log watcher check"),
+    }
+    admin.call(reqwest::Method::DELETE, &format!("/alert-policies/{lp_id}"), None).await;
+    admin.call(reqwest::Method::DELETE, &format!("/alert-policies/{}", jf["id"].as_str().unwrap()), None).await;
+
+    // --- schedules -------------------------------------------------------------------------------
+    let script = admin.post("/scripts", json!({ "name": "scheduled", "interpreter": "bash", "body": "echo scheduled \"$1\"" })).await;
+    let preview = admin.get("/schedules/preview?cron=0%203%20*%20*%201&timezone=Europe/Berlin").await;
+    assert_eq!(preview["runs"].as_array().unwrap().len(), 5, "{preview}");
+    let (s, v) = admin
+        .call(reqwest::Method::POST, "/schedules", Some(json!({ "name": "bad", "script_id": script["id"], "cron": "every day", "client_id": a_id })))
+        .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    let sched = admin
+        .post(
+            "/schedules",
+            json!({ "name": "Nightly", "script_id": script["id"], "client_id": a_id, "cron": "0 3 * * *", "timezone": "America/Chicago",
+                    "args": ["x1"], "retain_days": 1 }),
+        )
+        .await;
+    assert!(sched["next_run_at"].is_string(), "{sched}");
+    let sid = sched["id"].as_str().unwrap().to_string();
+    let r = admin.post(&format!("/schedules/{sid}/run"), json!({})).await;
+    assert_eq!((r["sent"].as_i64(), r["queued"].as_i64()), (Some(1), Some(1)), "online agent gets it, offline one queues: {r}");
+    let runs = admin.get(&format!("/jobs?schedule_id={sid}")).await;
+    let run_id = runs["items"].as_array().unwrap().iter().find(|j| j["agent_id"] == id1).unwrap()["id"].as_str().unwrap().to_string();
+    let j = admin.wait_job(&run_id, 30).await;
+    assert_eq!((j["stdout"].as_str(), j["schedule_name"].as_str()), (Some("scheduled x1\n"), Some("Nightly")), "{j}");
+    let r = admin.post(&format!("/schedules/{sid}/run"), json!({})).await;
+    assert_eq!((r["sent"].as_i64(), r["skipped"].as_i64()), (Some(1), Some(1)), "the offline agent's run is still queued: {r}");
+    let listed = admin.get("/schedules").await;
+    assert_eq!(listed[0]["name"], "Nightly");
+    // A due schedule runs on its own and moves to its next time.
+    sqlx::query("UPDATE schedules SET next_run_at = now() - interval '1 minute' WHERE id = $1::uuid").bind(&sid).execute(db).await.unwrap();
+    let (api, s) = (admin, sid.as_str());
+    eventually(40, "the scheduler to run a due schedule", move || async move {
+        let v = api.get(&format!("/schedules/{s}")).await;
+        (v["next_run_at"].as_str().is_some_and(|t| t > v["last_run_at"].as_str().unwrap_or(""))
+            && api.get(&format!("/jobs?schedule_id={s}&agent_id={}", id1)).await["total"].as_i64() >= Some(3))
+        .then_some(())
+    })
+    .await;
+
+    // --- retention and rollups run at startup -------------------------------------------------------
+    sqlx::query("UPDATE jobs SET finished_at = now() - interval '2 days' WHERE id = $1::uuid").bind(&run_id).execute(db).await.unwrap();
+    sqlx::query(
+        "INSERT INTO agent_metrics (agent_id, ts, cpu_percent, mem_used, mem_total, disk_max_pct, net_rx_bytes, net_tx_bytes)
+         VALUES ($1::uuid, date_trunc('hour', now()) - interval '90 minutes', 42, 1, 2, 3, 4, 5)",
+    )
+    .bind(id1)
+    .execute(db)
+    .await
+    .unwrap();
+    server.restart().await;
+    admin.wait_online(id1, true).await;
+    let (s, _) = admin.call(reqwest::Method::GET, &format!("/jobs/{run_id}"), None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "scheduled output past its retention is deleted");
+    let hourly: i64 = sqlx::query_scalar("SELECT count(*) FROM agent_metrics_hourly WHERE agent_id = $1::uuid AND cpu_max >= 42")
+        .bind(id1)
+        .fetch_one(db)
+        .await
+        .unwrap();
+    assert_eq!(hourly, 1, "the sample was rolled up");
+    let week = admin.get(&format!("/agents/{id1}/metrics?hours=168")).await;
+    assert!(!week.as_array().unwrap().is_empty(), "long ranges read the rollups");
+    let _ = (dir, id3);
 }
