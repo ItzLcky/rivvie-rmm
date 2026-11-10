@@ -119,6 +119,36 @@ fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
     std::fs::write(path, data)
 }
 
+/// Where the agent keeps state that must survive restarts and stay away from users: the
+/// endpoint protection content, quarantine, telemetry and unsent results. `RMM_STATE_DIR`
+/// overrides it (tests run the agent unprivileged).
+pub fn state_dir() -> PathBuf {
+    if let Some(d) = std::env::var_os("RMM_STATE_DIR") {
+        return PathBuf::from(d);
+    }
+    if cfg!(windows) {
+        default_path().parent().map(|p| p.join("state")).unwrap_or_else(|| PathBuf::from("C:\\ProgramData\\RMM\\state"))
+    } else if cfg!(target_os = "macos") {
+        PathBuf::from("/Library/Application Support/RMM/state")
+    } else {
+        PathBuf::from("/var/lib/rmm-agent")
+    }
+}
+
+/// Creates `state_dir()/sub`, readable by the agent's account only (on Windows the data
+/// directory's ACL already allows only SYSTEM and Administrators).
+pub fn state_subdir(sub: &str) -> Result<PathBuf> {
+    let dir = state_dir().join(sub);
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        let _ = std::fs::set_permissions(state_dir(), std::fs::Permissions::from_mode(0o700));
+    }
+    Ok(dir)
+}
+
 /// Where the agent keeps its config, logs and job scratch files.
 #[cfg(windows)]
 pub fn data_dir() -> Option<PathBuf> {

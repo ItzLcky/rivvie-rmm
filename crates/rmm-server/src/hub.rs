@@ -59,6 +59,12 @@ pub enum Event {
         #[serde(skip)]
         client_id: Uuid,
     },
+    /// An agent's protection state changed: a report, or a scan or update's progress.
+    Security {
+        agent_id: Uuid,
+        #[serde(skip)]
+        client_id: Uuid,
+    },
     /// A ticket was created or changed (fields, timeline).
     Ticket {
         id: Uuid,
@@ -75,7 +81,8 @@ impl Event {
             | Event::Job { client_id, .. }
             | Event::Alert { client_id, .. }
             | Event::Services { client_id, .. }
-            | Event::Patches { client_id, .. } => Some(*client_id),
+            | Event::Patches { client_id, .. }
+            | Event::Security { client_id, .. } => Some(*client_id),
             Event::Ticket { client_id, .. } => *client_id,
             Event::Jobs => None,
         }
@@ -132,14 +139,26 @@ pub struct Hub {
     desktops: RwLock<HashMap<Uuid, DesktopRoute>>,
     /// Service control requests waiting for the agent's answer, with the agent asked.
     controls: std::sync::Mutex<HashMap<Uuid, (Uuid, oneshot::Sender<ControlResult>)>>,
+    /// Telemetry queries waiting for the agent's answer.
+    queries: std::sync::Mutex<HashMap<Uuid, (Uuid, oneshot::Sender<QueryResult>)>>,
     events: broadcast::Sender<Event>,
 }
+
+/// An agent's answer to a telemetry query: (events, truncated, error).
+pub type QueryResult = (Vec<rmm_proto::telemetry::Event>, bool, Option<String>);
 
 impl Default for Hub {
     fn default() -> Self {
         // A browser that falls this far behind gets a `resync` and refetches instead.
         let (events, _) = broadcast::channel(4096);
-        Hub { agents: Default::default(), shells: Default::default(), desktops: Default::default(), controls: Default::default(), events }
+        Hub {
+            agents: Default::default(),
+            shells: Default::default(),
+            desktops: Default::default(),
+            controls: Default::default(),
+            queries: Default::default(),
+            events,
+        }
     }
 }
 
@@ -256,6 +275,25 @@ impl Hub {
         let mut controls = self.controls.lock().unwrap();
         if controls.get(&request_id).is_some_and(|(a, _)| *a == from_agent)
             && let Some((_, tx)) = controls.remove(&request_id)
+        {
+            let _ = tx.send(result);
+        }
+    }
+
+    pub fn await_query(&self, request_id: Uuid, agent_id: Uuid) -> oneshot::Receiver<QueryResult> {
+        let (tx, rx) = oneshot::channel();
+        self.queries.lock().unwrap().insert(request_id, (agent_id, tx));
+        rx
+    }
+
+    pub fn forget_query(&self, request_id: Uuid) {
+        self.queries.lock().unwrap().remove(&request_id);
+    }
+
+    pub fn complete_query(&self, from_agent: Uuid, request_id: Uuid, result: QueryResult) {
+        let mut q = self.queries.lock().unwrap();
+        if q.get(&request_id).is_some_and(|(a, _)| *a == from_agent)
+            && let Some((_, tx)) = q.remove(&request_id)
         {
             let _ = tx.send(result);
         }

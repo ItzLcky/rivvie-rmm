@@ -12,7 +12,7 @@
 
 #[cfg(any(target_os = "linux", test))]
 mod apt;
-mod cmd;
+pub(crate) mod cmd;
 #[cfg(debug_assertions)]
 mod fake;
 #[cfg(any(target_os = "linux", test))]

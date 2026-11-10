@@ -5,6 +5,8 @@ mod desktop;
 mod jobs;
 mod logwatch;
 mod patch;
+mod security;
+mod sensor;
 mod service;
 mod services;
 mod shell;
@@ -65,9 +67,18 @@ enum Cmd {
         #[arg(long)]
         no_refresh: bool,
     },
+    /// Print the antivirus state the server would see, as JSON. With `--run`, start a
+    /// `quick_scan`, `full_scan` or `update_signatures` and wait for it.
+    Security {
+        #[arg(long)]
+        run: Option<String>,
+    },
     /// Remote desktop capture and input, started by the agent inside the user's session.
     #[command(hide = true)]
     DesktopHelper,
+    /// The endpoint protection sensor, started and supervised by the agent.
+    #[command(hide = true)]
+    Sensor,
     /// Entry point used by the Windows Service Control Manager.
     #[command(hide = true)]
     Service,
@@ -94,6 +105,16 @@ fn main() -> Result<()> {
             .without_time()
             .init();
         return desktop::helper_main();
+    }
+
+    if let Cmd::Sensor = cli.cmd {
+        // stdout carries messages to the agent; logs go to stderr (the agent's log).
+        tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+            .with_writer(std::io::stderr)
+            .with_ansi(false)
+            .init();
+        return sensor::main();
     }
 
     if let Cmd::UpdateWatchdog = cli.cmd {
@@ -150,7 +171,8 @@ fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Patches { install, no_refresh } => patch::cli(&install, !no_refresh),
-        Cmd::Service | Cmd::UpdateWatchdog | Cmd::DesktopHelper => unreachable!(),
+        Cmd::Security { run } => security::cli(run.as_deref()),
+        Cmd::Service | Cmd::UpdateWatchdog | Cmd::DesktopHelper | Cmd::Sensor => unreachable!(),
     }
 }
 

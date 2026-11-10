@@ -25,3 +25,13 @@ export function can(min: 'readonly' | 'technician' | 'admin'): boolean {
 	const order = { readonly: 0, technician: 1, admin: 2 };
 	return !!session.user && order[session.user.role] >= order[min];
 }
+
+export type Permission = 'security.read' | 'security.respond' | 'security.manage';
+
+/** Holds a named permission (the server sends the effective set; older servers: role defaults). */
+export function allowed(perm: Permission): boolean {
+	const u = session.user;
+	if (!u) return false;
+	if (u.permissions) return u.permissions.includes(perm);
+	return perm === 'security.read' || (perm === 'security.respond' ? can('technician') : can('admin'));
+}

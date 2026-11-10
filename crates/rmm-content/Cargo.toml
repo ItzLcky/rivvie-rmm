@@ -1,0 +1,18 @@
+[package]
+name = "rmm-content"
+description = "Detection content for the RMM sensor: signed bundles, the behaviour rule engine and file matching"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rmm-proto.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+sha2.workspace = true
+hex.workspace = true
+ed25519-dalek.workspace = true
+thiserror.workspace = true
+regex-lite = "0.1"
+aho-corasick = "1"

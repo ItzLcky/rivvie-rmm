@@ -13,7 +13,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use rmm_proto::{LogEntry, LogLevel, LogWatcher, ServerMsg, ServiceInfo, ServiceState, StartMode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -62,6 +62,38 @@ pub struct LogRule {
     pub pattern: Option<String>,
 }
 
+/// Which detections raise alerts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreatAlerts {
+    Off,
+    /// One alert per active threat, cleared when the product deals with it.
+    #[default]
+    Active,
+    /// Every new detection, even one the product already quarantined or blocked. These
+    /// stay open until someone resolves them.
+    Any,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SecurityRule {
+    /// No antivirus product is enabled.
+    #[serde(default)]
+    pub unprotected: bool,
+    /// Products are enabled but none scans files as they're opened.
+    #[serde(default)]
+    pub realtime_off: bool,
+    /// Every enabled product's signatures are older than this. None = don't check.
+    #[serde(default)]
+    pub signature_max_age_hours: Option<i32>,
+    #[serde(default)]
+    pub threats: ThreatAlerts,
+    /// The policy runs our sensor here, but it isn't running (crashed, keeps restarting, or
+    /// was stopped).
+    #[serde(default)]
+    pub sensor_down: bool,
+}
+
 /// What a policy checks: `kind` and `params` columns together.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "params", rename_all = "snake_case")]
@@ -76,6 +108,7 @@ pub enum Rule {
         script_id: Option<Uuid>,
     },
     Log(LogRule),
+    Security(SecurityRule),
 }
 
 impl Rule {
@@ -92,6 +125,7 @@ impl Rule {
             Rule::Service(_) => "service",
             Rule::JobFailed { .. } => "job_failed",
             Rule::Log(_) => "log",
+            Rule::Security(_) => "security",
         }
     }
 
@@ -130,6 +164,15 @@ impl Rule {
                         return Err("pattern must be at most 1000 characters".into());
                     }
                     regex_lite::Regex::new(p).map_err(|e| format!("invalid pattern: {e}"))?;
+                }
+                Ok(())
+            }
+            Rule::Security(r) => {
+                if r.signature_max_age_hours.is_some_and(|h| !(1..=8760).contains(&h)) {
+                    return Err("signature age must be 1-8760 hours".into());
+                }
+                if !r.unprotected && !r.realtime_off && r.signature_max_age_hours.is_none() && r.threats == ThreatAlerts::Off && !r.sensor_down {
+                    return Err("pick at least one thing to alert on".into());
                 }
                 Ok(())
             }
@@ -321,6 +364,10 @@ pub async fn policy_changed(st: &Arc<AppState>, policy_id: Uuid) {
             let st = st.clone();
             tokio::spawn(async move { recheck_services(&st, policy_id).await });
         }
+        Some("security") => {
+            let st = st.clone();
+            tokio::spawn(async move { recheck_security(&st, policy_id).await });
+        }
         Some("log") | None => push_watchers(st).await,
         _ => {}
     }
@@ -350,7 +397,7 @@ pub async fn run(st: Arc<AppState>) {
 
 async fn evaluate(st: &AppState) -> sqlx::Result<()> {
     let policies: Vec<Policy> = sqlx::query_as(AssertSqlSafe(format!(
-        "SELECT {POLICY_COLS} FROM alert_policies p WHERE p.enabled AND p.kind IN ('offline', 'cpu', 'memory', 'disk')"
+        "SELECT {POLICY_COLS} FROM alert_policies p WHERE p.enabled AND p.kind IN ('offline', 'cpu', 'memory', 'disk', 'security')"
     )))
     .fetch_all(&st.db)
     .await?;
@@ -360,6 +407,8 @@ async fn evaluate(st: &AppState) -> sqlx::Result<()> {
             Some(Rule::Cpu(t)) => check_threshold(st, p, "m.cpu_percent", "CPU", &t).await,
             Some(Rule::Memory(t)) => check_threshold(st, p, "100.0 * m.mem_used / nullif(m.mem_total, 0)", "Memory", &t).await,
             Some(Rule::Disk(t)) => check_threshold(st, p, "m.disk_max_pct", "Disk", &t).await,
+            // Signatures age without the agent reporting anything new.
+            Some(Rule::Security(SecurityRule { signature_max_age_hours: Some(h), .. })) => check_signatures(st, p, h).await,
             _ => Ok(()),
         };
         if let Err(e) = res {
@@ -672,6 +721,244 @@ pub async fn log_matched(st: &AppState, agent_id: Uuid, policy_id: Uuid, entries
 }
 
 // ---------------------------------------------------------------------------
+// Endpoint protection
+// ---------------------------------------------------------------------------
+
+/// A product as the security checks see it (a `security_products` row).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ProductState {
+    pub name: String,
+    pub enabled: Option<bool>,
+    pub realtime: Option<bool>,
+    pub signatures_updated_at: Option<DateTime<Utc>>,
+    pub signatures_current: Option<bool>,
+}
+
+/// A `security_detections` row.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct DetectionState {
+    pub id: Uuid,
+    pub product: String,
+    pub name: String,
+    pub severity: String,
+    pub status: String,
+    pub resources: Vec<String>,
+    pub detected_at: Option<DateTime<Utc>>,
+}
+
+/// Up-to-date signatures, as SQL on `sp` (security_products) with the age in hours at `$n`.
+/// Products without a date go by Security Center's verdict, else count as current.
+fn fresh_sql(n: usize) -> String {
+    format!("coalesce(sp.signatures_updated_at > now() - make_interval(hours => ${n}), sp.signatures_current, true)")
+}
+
+fn fresh(p: &ProductState, max_age_hours: i32, now: DateTime<Utc>) -> bool {
+    match (p.signatures_updated_at, p.signatures_current) {
+        (Some(t), _) => t > now - chrono::Duration::hours(max_age_hours.into()),
+        (None, Some(current)) => current,
+        (None, None) => true,
+    }
+}
+
+/// What a security policy finds on one agent: `(key, title, details)`. `new` are
+/// detections first seen in the report being checked.
+pub fn security_findings(
+    rule: &SecurityRule,
+    products: &[ProductState],
+    detections: &[DetectionState],
+    new: &[Uuid],
+    sensor: Option<&Value>,
+    now: DateTime<Utc>,
+) -> Vec<(String, String, Value)> {
+    let enabled: Vec<&ProductState> = products.iter().filter(|p| p.enabled == Some(true)).collect();
+    let all_names: Vec<&str> = products.iter().map(|p| p.name.as_str()).collect();
+    let mut out = Vec::new();
+    if rule.unprotected && enabled.is_empty() {
+        out.push(("unprotected".into(), "No active antivirus".into(), json!({ "products": all_names })));
+    }
+    if rule.realtime_off && !enabled.is_empty() && enabled.iter().all(|p| p.realtime == Some(false)) {
+        let names: Vec<&str> = enabled.iter().map(|p| p.name.as_str()).collect();
+        out.push(("realtime".into(), "Real-time protection is off".into(), json!({ "products": names })));
+    }
+    if let Some(h) = rule.signature_max_age_hours
+        && !enabled.is_empty()
+        && !enabled.iter().any(|p| fresh(p, h, now))
+    {
+        let newest = enabled.iter().filter_map(|p| p.signatures_updated_at).max();
+        out.push(("signatures".into(), "Antivirus signatures out of date".into(), json!({ "newest": newest, "max_age_hours": h })));
+    }
+    if rule.sensor_down
+        && let Some(s) = sensor
+        && s.get("enabled").and_then(Value::as_bool) == Some(true)
+    {
+        let running = s.get("running").and_then(Value::as_bool) == Some(true);
+        let restarts = s.get("restarts").and_then(Value::as_u64).unwrap_or(0);
+        if !running || restarts >= 3 {
+            let title = if running { "Sensor keeps restarting" } else { "Sensor not running" };
+            out.push(("sensor".into(), title.into(), json!({ "restarts": restarts, "error": s.get("error") })));
+        }
+    }
+    for d in detections {
+        let active = d.status == "active";
+        let recent_new = new.contains(&d.id) && d.detected_at.is_none_or(|t| now - t < chrono::Duration::hours(24));
+        let raise = match rule.threats {
+            ThreatAlerts::Off => false,
+            ThreatAlerts::Active => active,
+            ThreatAlerts::Any => active || recent_new,
+        };
+        if !raise {
+            continue;
+        }
+        let verb = match d.status.as_str() {
+            "quarantined" => "quarantined",
+            "removed" => "removed",
+            "blocked" => "blocked",
+            "allowed" => "allowed",
+            _ => "detected",
+        };
+        out.push((
+            format!("threat:{}", d.id),
+            format!("Threat {verb}: {}", d.name),
+            json!({
+                "detection_id": d.id, "product": d.product, "name": d.name, "severity": d.severity,
+                "status": d.status, "resources": d.resources.iter().take(5).collect::<Vec<_>>(),
+            }),
+        ));
+    }
+    out
+}
+
+async fn check_security(st: &AppState, p: &Policy, agent_id: Uuid, new: &[Uuid]) -> sqlx::Result<()> {
+    let Some(Rule::Security(rule)) = p.rule() else { return Ok(()) };
+    let reported: bool = sqlx::query_scalar("SELECT security_at IS NOT NULL FROM agents WHERE id = $1")
+        .bind(agent_id)
+        .fetch_optional(&st.db)
+        .await?
+        .unwrap_or(false);
+    if !reported {
+        return Ok(());
+    }
+    let products: Vec<ProductState> = sqlx::query_as(
+        "SELECT name, enabled, realtime, signatures_updated_at, signatures_current FROM security_products WHERE agent_id = $1",
+    )
+    .bind(agent_id)
+    .fetch_all(&st.db)
+    .await?;
+    let detections: Vec<DetectionState> = sqlx::query_as(
+        "SELECT id, product, name, severity, status, resources, detected_at FROM security_detections
+          WHERE agent_id = $1 AND NOT audit AND ((resolved_at IS NULL AND status = 'active') OR id = ANY($2))",
+    )
+    .bind(agent_id)
+    .bind(new)
+    .fetch_all(&st.db)
+    .await?;
+    let sensor: Option<Value> = sqlx::query_scalar("SELECT sensor FROM agents WHERE id = $1").bind(agent_id).fetch_one(&st.db).await?;
+    let findings = security_findings(&rule, &products, &detections, new, sensor.as_ref(), Utc::now());
+    let keep: Vec<String> = findings.iter().map(|f| f.0.clone()).collect();
+    for (key, title, details) in findings {
+        fire(st, p, agent_id, &key, &title, details, 0).await?;
+    }
+    // Whatever no longer holds clears. Under `any`, threat alerts wait for a person.
+    let ids: Vec<Uuid> = sqlx::query_scalar(
+        "UPDATE alerts SET resolved_at = now(), resolution = 'cleared'
+          WHERE policy_id = $1 AND agent_id = $2 AND resolved_at IS NULL AND NOT (key = ANY($3))
+            AND ($4 OR key NOT LIKE 'threat:%')
+          RETURNING id",
+    )
+    .bind(p.id)
+    .bind(agent_id)
+    .bind(&keep)
+    .bind(rule.threats != ThreatAlerts::Any)
+    .fetch_all(&st.db)
+    .await?;
+    announce(st, &ids, "resolved", &p.channel_ids, p.notify_resolved).await;
+    Ok(())
+}
+
+/// The agent reported its protection state; `new` are detections seen for the first time.
+pub async fn security_reported(st: &AppState, agent_id: Uuid, new: &[Uuid]) {
+    let res: sqlx::Result<()> = async {
+        for p in policies_for(st, agent_id, "security").await? {
+            check_security(st, &p, agent_id, new).await?;
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(e) = res {
+        warn!(%agent_id, "security alerts: {e}");
+    }
+}
+
+/// A security policy changed: check it against every covered agent's last report.
+async fn recheck_security(st: &AppState, policy_id: Uuid) {
+    let Ok(Some(p)) = load_policy(st, policy_id).await else { return };
+    let agents: sqlx::Result<Vec<Uuid>> = sqlx::query_scalar(AssertSqlSafe(format!(
+        "SELECT a.id FROM agents a JOIN sites s ON s.id = a.site_id WHERE a.security_at IS NOT NULL AND {}",
+        scope_sql(1)
+    )))
+    .bind(p.client_id)
+    .bind(p.site_id)
+    .bind(&p.os_family)
+    .fetch_all(&st.db)
+    .await;
+    for agent_id in agents.unwrap_or_default() {
+        if let Err(e) = check_security(st, &p, agent_id, &[]).await {
+            warn!(%agent_id, "security alerts: {e}");
+        }
+    }
+}
+
+/// Polled: signatures go stale without the agent reporting anything new.
+async fn check_signatures(st: &AppState, p: &Policy, hours: i32) -> sqlx::Result<()> {
+    let stale = |n: usize| {
+        format!(
+            "EXISTS (SELECT 1 FROM security_products sp WHERE sp.agent_id = a.id AND sp.enabled)
+             AND NOT EXISTS (SELECT 1 FROM security_products sp WHERE sp.agent_id = a.id AND sp.enabled AND {})",
+            fresh_sql(n)
+        )
+    };
+    let opened: Vec<Uuid> = sqlx::query_scalar(AssertSqlSafe(format!(
+        "INSERT INTO alerts (id, policy_id, agent_id, key, kind, severity, title, details)
+         SELECT gen_random_uuid(), $1, a.id, 'signatures', 'security', $2, 'Antivirus signatures out of date',
+                jsonb_build_object('newest', (SELECT max(sp.signatures_updated_at) FROM security_products sp WHERE sp.agent_id = a.id AND sp.enabled),
+                                   'max_age_hours', $3::int)
+           FROM agents a JOIN sites s ON s.id = a.site_id
+          WHERE a.security_at IS NOT NULL AND {} AND {}
+         ON CONFLICT (policy_id, agent_id, key) WHERE resolved_at IS NULL DO NOTHING
+         RETURNING id",
+        scope_sql(4),
+        stale(3)
+    )))
+    .bind(p.id)
+    .bind(&p.severity)
+    .bind(hours)
+    .bind(p.client_id)
+    .bind(p.site_id)
+    .bind(&p.os_family)
+    .fetch_all(&st.db)
+    .await?;
+    announce(st, &opened, "opened", &p.channel_ids, true).await;
+
+    let cleared: Vec<Uuid> = sqlx::query_scalar(AssertSqlSafe(format!(
+        "UPDATE alerts al SET resolved_at = now(), resolution = 'cleared'
+          WHERE al.policy_id = $1 AND al.key = 'signatures' AND al.resolved_at IS NULL
+            AND NOT EXISTS (SELECT 1 FROM agents a JOIN sites s ON s.id = a.site_id WHERE a.id = al.agent_id AND {} AND {})
+          RETURNING al.id",
+        scope_sql(3),
+        stale(2)
+    )))
+    .bind(p.id)
+    .bind(hours)
+    .bind(p.client_id)
+    .bind(p.site_id)
+    .bind(&p.os_family)
+    .fetch_all(&st.db)
+    .await?;
+    announce(st, &cleared, "resolved", &p.channel_ids, p.notify_resolved).await;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Log watcher distribution
 // ---------------------------------------------------------------------------
 
@@ -742,6 +1029,69 @@ mod tests {
         let log = Rule::parse("log", &json!({ "min_level": "error", "pattern": "(" })).unwrap();
         assert!(log.validate().is_err(), "bad regex is rejected");
         assert_eq!(Rule::parse("job_failed", &json!({})).unwrap(), Rule::JobFailed { script_id: None });
+    }
+
+    #[test]
+    fn security_rule_parses_and_finds() {
+        let r = Rule::parse("security", &json!({ "unprotected": true, "signature_max_age_hours": 72 })).unwrap();
+        let Rule::Security(rule) = &r else { panic!() };
+        assert_eq!(rule.threats, ThreatAlerts::Active, "threats default to active");
+        assert!(r.validate().is_ok());
+        assert!(Rule::parse("security", &json!({ "threats": "off" })).unwrap().validate().is_err(), "nothing to alert on");
+        assert!(Rule::parse("security", &json!({ "signature_max_age_hours": 0 })).unwrap().validate().is_err());
+
+        let now = Utc::now();
+        let product = |name: &str, enabled, realtime, age_h: Option<i64>| ProductState {
+            name: name.into(),
+            enabled: Some(enabled),
+            realtime: Some(realtime),
+            signatures_updated_at: age_h.map(|h| now - chrono::Duration::hours(h)),
+            signatures_current: None,
+        };
+        let all = SecurityRule { unprotected: true, realtime_off: true, signature_max_age_hours: Some(72), threats: ThreatAlerts::Active, sensor_down: false };
+        let keys = |f: Vec<(String, String, Value)>| f.into_iter().map(|f| f.0).collect::<Vec<_>>();
+        assert!(keys(security_findings(&all, &[product("Defender", true, true, Some(2))], &[], &[], None, now)).is_empty());
+        assert_eq!(keys(security_findings(&all, &[product("Defender", false, false, Some(2))], &[], &[], None, now)), ["unprotected"]);
+        assert_eq!(keys(security_findings(&all, &[], &[], &[], None, now)), ["unprotected"], "nothing installed at all");
+        assert_eq!(keys(security_findings(&all, &[product("ClamAV", true, false, Some(100))], &[], &[], None, now)), ["realtime", "signatures"]);
+        // One product with fresh signatures is enough; a disabled one doesn't count.
+        let two = [product("ClamAV", true, false, Some(100)), product("Other", true, true, Some(1)), product("Off", false, false, Some(1))];
+        assert!(keys(security_findings(&all, &two, &[], &[], None, now)).is_empty());
+        // Security Center's verdict stands in for a missing date.
+        let mut sc = product("Sophos", true, true, None);
+        sc.signatures_current = Some(false);
+        assert_eq!(keys(security_findings(&all, &[sc], &[], &[], None, now)), ["signatures"]);
+
+        let det = |status: &str, hours_ago: i64| DetectionState {
+            id: Uuid::new_v4(),
+            product: "defender".into(),
+            name: "EICAR".into(),
+            severity: "severe".into(),
+            status: status.into(),
+            resources: vec!["C:\\eicar.com".into()],
+            detected_at: Some(now - chrono::Duration::hours(hours_ago)),
+        };
+        let (active, quarantined, old) = (det("active", 1), det("quarantined", 1), det("quarantined", 48));
+        let ds = [active.clone(), quarantined.clone(), old.clone()];
+        let new = [active.id, quarantined.id, old.id];
+        let ok = [product("Defender", true, true, Some(1))];
+        let f = security_findings(&all, &ok, &ds, &new, None, now);
+        assert_eq!(keys(f.clone()), [format!("threat:{}", active.id)]);
+        assert_eq!(f[0].1, "Threat detected: EICAR");
+        let any = SecurityRule { threats: ThreatAlerts::Any, ..all.clone() };
+        let f = security_findings(&any, &ok, &ds, &new, None, now);
+        assert_eq!(keys(f.clone()), [format!("threat:{}", active.id), format!("threat:{}", quarantined.id)], "old history doesn't alert");
+        assert_eq!(f[1].1, "Threat quarantined: EICAR");
+        assert!(keys(security_findings(&any, &ok, &ds, &[], None, now)).len() == 1, "only new detections, apart from active ones");
+        let off = SecurityRule { threats: ThreatAlerts::Off, ..all.clone() };
+        assert!(keys(security_findings(&off, &ok, &ds, &new, None, now)).is_empty());
+        let sd = SecurityRule { sensor_down: true, ..all };
+        let down = json!({ "enabled": true, "running": false, "restarts": 1 });
+        assert_eq!(keys(security_findings(&sd, &ok, &[], &[], Some(&down), now)), ["sensor"]);
+        let flapping = json!({ "enabled": true, "running": true, "restarts": 4 });
+        assert_eq!(security_findings(&sd, &ok, &[], &[], Some(&flapping), now)[0].1, "Sensor keeps restarting");
+        let off_by_policy = json!({ "enabled": false, "running": false, "restarts": 0 });
+        assert!(keys(security_findings(&sd, &ok, &[], &[], Some(&off_by_policy), now)).is_empty());
     }
 
     #[test]

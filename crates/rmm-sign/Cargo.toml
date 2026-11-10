@@ -8,6 +8,7 @@ publish = false
 
 [dependencies]
 rmm-proto.workspace = true
+rmm-content.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 hex.workspace = true

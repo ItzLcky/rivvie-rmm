@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/rmm-proto", "crates/rmm-agent", "crates/rmm-server", "crates/rmm-sign"]
+members = ["crates/rmm-proto", "crates/rmm-content", "crates/rmm-agent", "crates/rmm-server", "crates/rmm-sign"]
 
 [workspace.package]
 version = "0.1.0"
@@ -9,6 +9,7 @@ license = "AGPL-3.0-or-later"
 
 [workspace.dependencies]
 rmm-proto = { path = "crates/rmm-proto" }
+rmm-content = { path = "crates/rmm-content" }
 anyhow = "1"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }

@@ -26,6 +26,8 @@ pub struct UserRow {
     /// Ignored for admins, who always see every client.
     all_clients: bool,
     client_ids: Vec<Uuid>,
+    /// Explicit permission set; null = the role's defaults.
+    permissions: Option<Vec<String>>,
 }
 
 pub async fn list(State(st): State<Arc<AppState>>, u: User) -> ApiResult<Json<Vec<UserRow>>> {
@@ -33,7 +35,7 @@ pub async fn list(State(st): State<Arc<AppState>>, u: User) -> ApiResult<Json<Ve
     Ok(Json(
         sqlx::query_as(
             "SELECT id, email, name, role, disabled, totp_secret IS NOT NULL AS totp_enabled, created_at, last_login_at,
-                    all_clients, ARRAY(SELECT client_id FROM user_clients WHERE user_id = users.id) AS client_ids
+                    all_clients, ARRAY(SELECT client_id FROM user_clients WHERE user_id = users.id) AS client_ids, permissions
                FROM users ORDER BY email",
         )
         .fetch_all(&st.db)
@@ -321,4 +323,39 @@ pub async fn audit_log(
         .fetch_one(&st.db)
         .await?;
     Ok(Json(plan.finish(rows, |r| (r.sort_key.clone(), r.id.to_string()), total)))
+}
+
+#[derive(Deserialize)]
+pub struct Permissions {
+    /// null = back to the role's defaults.
+    permissions: Option<Vec<String>>,
+}
+
+/// Gives a user an explicit permission set (admins only; admins always hold everything).
+pub async fn update_permissions(
+    State(st): State<Arc<AppState>>,
+    u: User,
+    Path(id): Path<Uuid>,
+    Json(b): Json<Permissions>,
+) -> ApiResult<Json<serde_json::Value>> {
+    u.require(Role::Admin)?;
+    let perms: Option<Vec<String>> = match b.permissions {
+        Some(list) => {
+            let mut out = Vec::new();
+            for p in list {
+                let p = auth::Perm::parse(&p).ok_or_else(|| ApiError::BadRequest(format!("unknown permission {p}")))?;
+                if !out.contains(&p.as_str().to_string()) {
+                    out.push(p.as_str().to_string());
+                }
+            }
+            Some(out)
+        }
+        None => None,
+    };
+    let n = sqlx::query("UPDATE users SET permissions = $2 WHERE id = $1").bind(id).bind(&perms).execute(&st.db).await?.rows_affected();
+    if n == 0 {
+        return Err(ApiError::NotFound("user"));
+    }
+    auth::audit(&st.db, Some(u.id), "user.permissions", Some(("user", id)), json!({ "permissions": perms })).await;
+    Ok(Json(json!({ "ok": true, "permissions": perms })))
 }

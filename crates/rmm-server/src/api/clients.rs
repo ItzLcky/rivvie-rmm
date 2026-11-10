@@ -29,14 +29,16 @@ pub struct ClientOut {
     desktop_consent: bool,
     /// Mail from these domains is filed under the client.
     email_domains: Vec<String>,
+    /// Gets new detection content before everyone else.
+    security_canary: bool,
     sites: Vec<SiteRow>,
 }
 
 /// Clients (all visible ones, or just `only`) with their sites and agent counts.
 async fn load(st: &AppState, u: &User, only: Option<Uuid>) -> ApiResult<Vec<ClientOut>> {
     #[allow(clippy::type_complexity)]
-    let clients: Vec<(Uuid, String, DateTime<Utc>, bool, Vec<String>)> = sqlx::query_as(
-        "SELECT id, name, created_at, desktop_consent, email_domains FROM clients
+    let clients: Vec<(Uuid, String, DateTime<Utc>, bool, Vec<String>, bool)> = sqlx::query_as(
+        "SELECT id, name, created_at, desktop_consent, email_domains, security_canary FROM clients
           WHERE ($1::uuid[] IS NULL OR id = ANY($1)) AND ($2::uuid IS NULL OR id = $2) ORDER BY lower(name)",
     )
     .bind(u.scope())
@@ -58,7 +60,15 @@ async fn load(st: &AppState, u: &User, only: Option<Uuid>) -> ApiResult<Vec<Clie
     let mut out: Vec<ClientOut> =
         clients
         .into_iter()
-        .map(|(id, name, created_at, desktop_consent, email_domains)| ClientOut { id, name, created_at, desktop_consent, email_domains, sites: vec![] })
+        .map(|(id, name, created_at, desktop_consent, email_domains, security_canary)| ClientOut {
+            id,
+            name,
+            created_at,
+            desktop_consent,
+            email_domains,
+            security_canary,
+            sites: vec![],
+        })
         .collect();
     for s in sites {
         if let Some(c) = out.iter_mut().find(|c| c.id == s.client_id) {

@@ -27,6 +27,20 @@ const pages: [string, string][] = [
 	['notifications', '/settings/notifications'],
 	['agent-patches', '/agents/a-3?tab=patches'],
 	['agent-patches-windows', '/agents/a-1?tab=patches'],
+	['security', '/security'],
+	['security-detections', '/security?tab=detections&view=all'],
+	['agent-security', '/agents/a-2?tab=security'],
+	['agent-security-linux', '/agents/a-3?tab=security'],
+	['agent-security-none', '/agents/a-5?tab=security'],
+	['agent-security-sensor', '/agents/a-1?tab=security'],
+	['security-detection', '/security/detections/d-5'],
+	['security-detection-file', '/security/detections/d-6'],
+	['security-quarantine', '/security?tab=quarantine&show=all'],
+	['security-hunt', '/security?tab=hunt&sha256=9f2c4e1a7b3d5f60812a4c6e8b0d2f4a6c8e0b2d4f6a8c0e2b4d6f8a0c2e4b6d'],
+	['security-rules', '/security?tab=rules'],
+	['security-content', '/security?tab=content'],
+	['security-settings', '/security?tab=settings'],
+	['policy-new-security', '/policies/new?kind=security'],
 	['patches', '/patches'],
 	['patches-update', '/patches?update=b3c1d2e4-0001'],
 	['patches-compliance', '/patches?tab=compliance'],
@@ -63,6 +77,10 @@ const phone: [string, string][] = [
 	['alerts', '/alerts'],
 	['patches', '/patches'],
 	['agent-patches', '/agents/a-3?tab=patches'],
+	['security', '/security'],
+	['agent-security', '/agents/a-2?tab=security'],
+	['security-detection', '/security/detections/d-5'],
+	['security-rules', '/security?tab=rules'],
 	['tickets', '/tickets'],
 	['ticket', '/tickets/t-1']
 ];
@@ -191,6 +209,27 @@ for (const theme of ['light', 'dark'] as const) {
 			await expect(page).toHaveScreenshot(`${theme}-agent-desktop-waiting.png`);
 		});
 
+		test('rule mode menu', async ({ page }) => {
+			await mockApi(page);
+			await page.goto('/security?tab=rules');
+			await settle(page);
+			await page.getByRole('button', { name: 'Mode of RMM-B-0018' }).click();
+			await expect(page.getByRole('menuitem', { name: /Block/ })).toHaveAttribute('aria-disabled', 'true');
+			await expect(page.getByRole('menuitem', { name: /Block/ })).toHaveAttribute('title', /needs 7 days/);
+			await expect(page).toHaveScreenshot(`${theme}-security-rule-menu.png`);
+		});
+
+		test('kill process dialog', async ({ page }) => {
+			await mockApi(page);
+			await page.goto('/security/detections/d-5');
+			await settle(page);
+			await page.getByRole('button', { name: 'Kill process tree' }).click();
+			const dialog = page.getByRole('dialog', { name: 'Kill a process on acme-fs01' });
+			await expect(dialog).toBeVisible();
+			await expect(dialog.getByLabel('Process ID')).toHaveValue('6120');
+			await expect(page).toHaveScreenshot(`${theme}-security-kill-dialog.png`);
+		});
+
 		test('confirm dialog', async ({ page }) => {
 			await mockApi(page);
 			await page.goto('/clients/c-acme');
@@ -226,7 +265,7 @@ for (const theme of ['light', 'dark'] as const) {
 
 		// WCAG 2.2 AA checks (contrast, names, roles) on every page, in this theme.
 		test('accessibility', async ({ page }) => {
-			test.setTimeout(180_000);
+			test.setTimeout(420_000);
 			await mockApi(page);
 			const problems: string[] = [];
 			for (const [name, path] of [...pages, ['gallery', '/dev/ui'] as [string, string]]) {

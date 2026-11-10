@@ -8,7 +8,8 @@ export const kindLabels: Record<PolicyKind, string> = {
 	disk: 'Disk space',
 	service: 'Service stopped',
 	job_failed: 'Failed job',
-	log: 'Event log match'
+	log: 'Event log match',
+	security: 'Antivirus'
 };
 
 export const kindHelp: Record<PolicyKind, string> = {
@@ -18,7 +19,8 @@ export const kindHelp: Record<PolicyKind, string> = {
 	disk: 'The fullest volume stays at or above a threshold.',
 	service: 'A watched service (systemd unit or Windows service) is stopped or failed.',
 	job_failed: 'A script fails, errors or times out. Clears when the same script next succeeds.',
-	log: 'An entry in the journal (Linux) or the Event Log (Windows) matches your rules.'
+	log: 'An entry in the journal (Linux) or the Event Log (Windows) matches your rules.',
+	security: 'Protection is off or out of date, or the antivirus finds a threat.'
 };
 
 export const severityTone: Record<Severity, Tone> = { critical: 'danger', warning: 'warning', info: 'info' };
@@ -57,6 +59,16 @@ export function describePolicy(p: Pick<Policy, 'kind' | 'params'>): string {
 		}
 		case 'job_failed':
 			return q.script_id ? 'One script fails' : 'Any script fails';
+		case 'security': {
+			const bits: string[] = [];
+			if (q.unprotected) bits.push('no antivirus');
+			if (q.realtime_off) bits.push('real-time off');
+			if (q.sensor_down) bits.push('sensor not running');
+			if (q.signature_max_age_hours) bits.push(`signatures over ${q.signature_max_age_hours} h`);
+			if (q.threats === 'any') bits.push('every detection');
+			else if (q.threats !== 'off') bits.push('active threats');
+			return bits.join(', ') || 'Nothing';
+		}
 		case 'log': {
 			const bits = [`${String(q.min_level ?? 'error')} or worse`];
 			if (list(q.sources).length) bits.push(`from ${list(q.sources).join(', ')}`);

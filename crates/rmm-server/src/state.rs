@@ -20,6 +20,8 @@ pub struct AppState {
     pub notify_wake: tokio::sync::Notify,
     /// Ticket attachments and raw email.
     pub storage: crate::storage::Storage,
+    /// Triage packages being received, by action id.
+    pub triage: std::sync::Mutex<std::collections::HashMap<uuid::Uuid, Vec<u8>>>,
 }
 
 #[derive(Debug, Clone, Default, sqlx::FromRow)]
@@ -87,6 +89,12 @@ pub struct Settings {
     pub ticket_close_days: u32,
     /// Raw inbound email (MIME) is deleted from storage after this many days.
     pub email_raw_days: u32,
+    /// Canary content is promoted to everyone after this long without problems.
+    pub content_soak_minutes: u32,
+    /// When set, uploaded content must be signed by this key (the agents' release key).
+    pub content_pubkey: Option<String>,
+    /// Encrypts sensitive columns at rest (RMM_DATA_KEY).
+    pub data_key: Option<crate::crypto::DataKey>,
 }
 
 impl Settings {

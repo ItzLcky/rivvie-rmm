@@ -34,6 +34,7 @@
 		ticket_board_id: string | null; ticket_priority: Priority; ticket_auto_resolve: boolean;
 		minutes: number; threshold: number; services: string; auto_only: boolean; exclude: string; script_id: string;
 		min_level: LogLevel; channels: string; sources: string; event_ids: string; pattern: string;
+		unprotected: boolean; realtime_off: boolean; sensor_down: boolean; sig_check: boolean; sig_hours: number; threats: 'off' | 'active' | 'any';
 	};
 	const defaults: Record<PolicyKind, Partial<Draft>> = {
 		offline: { minutes: 10 },
@@ -42,12 +43,14 @@
 		disk: { threshold: 90, minutes: 5 },
 		service: {},
 		job_failed: {},
-		log: {}
+		log: {},
+		security: {}
 	};
 	const blank = (kind: PolicyKind, client: string | null): Draft => ({
 		name: '', kind, severity: 'warning', client_id: client, site_id: null, os_family: null, channel_ids: [], notify_resolved: true, enabled: true,
 		ticket_board_id: null, ticket_priority: 3, ticket_auto_resolve: true,
 		minutes: 10, threshold: 90, services: '', auto_only: false, exclude: '', script_id: '', min_level: 'error', channels: '', sources: '', event_ids: '', pattern: '',
+		unprotected: true, realtime_off: false, sensor_down: true, sig_check: true, sig_hours: 72, threats: 'active',
 		...defaults[kind]
 	});
 	const list = (s: string) => s.split(/[\n,]/).map((x) => x.trim()).filter(Boolean);
@@ -61,7 +64,9 @@
 			ticket_board_id: p.ticket_board_id ?? null, ticket_priority: p.ticket_priority ?? 3, ticket_auto_resolve: p.ticket_auto_resolve ?? true,
 			minutes: Number(q.minutes ?? 10), threshold: Number(q.threshold ?? 90), services: text(q.services), auto_only: !!q.auto_only, exclude: text(q.exclude),
 			script_id: (q.script_id as string) ?? '', min_level: (q.min_level as LogLevel) ?? 'error', channels: text(q.channels).replaceAll('\n', ', '),
-			sources: text(q.sources), event_ids: Array.isArray(q.event_ids) ? q.event_ids.join(', ') : '', pattern: (q.pattern as string) ?? ''
+			sources: text(q.sources), event_ids: Array.isArray(q.event_ids) ? q.event_ids.join(', ') : '', pattern: (q.pattern as string) ?? '',
+			unprotected: !!q.unprotected, realtime_off: !!q.realtime_off, sensor_down: !!q.sensor_down, sig_check: q.signature_max_age_hours != null,
+			sig_hours: Number(q.signature_max_age_hours ?? 72), threats: (q.threats as Draft['threats']) ?? 'active'
 		};
 	}
 	function params(d: Draft): Record<string, unknown> {
@@ -80,6 +85,10 @@
 				return {
 					min_level: d.min_level, channels: list(d.channels), sources: list(d.sources), pattern: d.pattern.trim() || null,
 					event_ids: list(d.event_ids).map(Number).filter((n) => Number.isInteger(n) && n >= 0)
+				};
+			case 'security':
+				return {
+					unprotected: d.unprotected, realtime_off: d.realtime_off, sensor_down: d.sensor_down, signature_max_age_hours: d.sig_check ? Number(d.sig_hours) : null, threats: d.threats
 				};
 		}
 	}
@@ -267,6 +276,32 @@
 					<Field label="Windows event IDs" id="p-ids" hint="Comma-separated; empty = any."><Input id="p-ids" inputmode="numeric" bind:value={draft.event_ids} placeholder="41, 6008" /></Field>
 				</div>
 				<p class="hint -mt-2">Agents send at most 20 matches a minute per policy; the rest are counted on the alert. Matches stay on one open alert until someone resolves it.</p>
+			{:else if draft.kind === 'security'}
+				<div class="space-y-3">
+					<Switch bind:checked={draft.unprotected}>No antivirus is switched on</Switch>
+					<div>
+						<Switch bind:checked={draft.realtime_off}>Real-time protection is off</Switch>
+						<p class="hint ml-11.5">ClamAV only scans on access with clamonacc, so most Linux servers would alert; narrow this policy to Windows if that's noise.</p>
+					</div>
+					<div>
+						<Switch bind:checked={draft.sensor_down}>Our sensor isn't running (crashed, keeps restarting or stopped)</Switch>
+						<p class="hint ml-11.5">Only where the security policy switches the sensor on; agents it's off for never alert.</p>
+					</div>
+					<div>
+						<Switch bind:checked={draft.sig_check}>Signatures are out of date</Switch>
+						{#if draft.sig_check}
+							<div class="mt-2 ml-11.5 flex items-center gap-2">
+								<span class="text-muted text-sm">Older than</span>
+								<Input id="p-sig" type="number" min="1" max="8760" class="w-24" aria-label="Signature age in hours" bind:value={draft.sig_hours} />
+								<span class="text-muted text-sm">hours</span>
+							</div>
+						{/if}
+					</div>
+				</div>
+				<Field label="Threats" id="p-threats" hint={draft.threats === 'any' ? 'Raises an alert for each new detection, even one the antivirus already quarantined. These stay open until someone resolves them.' : draft.threats === 'active' ? 'One alert per threat the antivirus hasn’t dealt with; it clears once the threat is quarantined or removed.' : undefined}>
+					<Select id="p-threats" class="max-w-80" bind:value={draft.threats} options={[{ value: 'active', label: 'Alert on active threats' }, { value: 'any', label: 'Alert on every detection' }, { value: 'off', label: 'Don’t alert on threats' }]} />
+				</Field>
+				<p class="hint -mt-2">Agents report Microsoft Defender and other Windows Security Center products, ClamAV, XProtect and our own sensor. The <a class="link" href="/security">Security</a> page shows every agent's state.</p>
 			{/if}
 
 			<div>

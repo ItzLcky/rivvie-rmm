@@ -33,10 +33,13 @@
 	import UsageBar from '#lib/components/UsageBar.svelte';
 	import AgentAlerts from '#lib/components/agent/AgentAlerts.svelte';
 	import AgentLogs from '#lib/components/agent/AgentLogs.svelte';
+	import AgentSecurity from '#lib/components/agent/AgentSecurity.svelte';
 	import AgentServices from '#lib/components/agent/AgentServices.svelte';
 	import NewTicket from '#lib/components/ticket/NewTicket.svelte';
 	import TicketTable from '#lib/components/ticket/TicketTable.svelte';
 	import { paged } from '#lib/paged.svelte.js';
+	import { actionLabels, productLabels, verdictLabels } from '#lib/security.js';
+	import type { ProductKind, SecurityAction, Verdict } from '#lib/types.js';
 	import { qs, sortState } from '#lib/url.svelte.js';
 	import type { Ticket } from '#lib/types.js';
 
@@ -142,6 +145,8 @@
 
 	function describe(r: AuditRow): string {
 		const d = r.details as Record<string, string>;
+		const rp = (r.details.params ?? {}) as { pid?: number; tree?: boolean; path?: string; allow?: string[] };
+		const fromDetection = r.details.detection ? ' (from a detection)' : '';
 		const labels: Record<string, string> = {
 			'agent.delete': 'Removed the agent',
 			'agent.update_offer': `Offered update to v${d.version}`,
@@ -153,6 +158,21 @@
 			'service.restart': `Restarted ${d.service}${d.ok ? '' : ` (failed: ${d.message})`}`,
 			'agent.patch_install': `Started installing ${d.updates} update${Number(d.updates) === 1 ? '' : 's'}`,
 			'agent.patch_cancel': 'Cancelled a queued install',
+			'security.quick_scan': `Started a quick scan (${productLabels[d.product as ProductKind] ?? d.product})`,
+			'security.full_scan': `Started a full scan (${productLabels[d.product as ProductKind] ?? d.product})`,
+			'security.update_signatures': `Started a signature update (${productLabels[d.product as ProductKind] ?? d.product})`,
+			'security.succeeded': `${actionLabels[d.action as SecurityAction] ?? d.action} finished${d.message ? `: ${d.message}` : ''}`,
+			'security.failed': `${actionLabels[d.action as SecurityAction] ?? d.action} failed${d.message ? `: ${d.message}` : ''}`,
+			'security.kill_process': `Killed process ${rp.pid ?? ''}${rp.tree ? ' and its children' : ''}${fromDetection}`,
+			'security.quarantine_file': `Quarantined ${rp.path ?? 'a file'}${fromDetection}`,
+			'security.restore_file': `Restored a file from quarantine${fromDetection}`,
+			'security.delete_quarantined': 'Deleted a quarantined file permanently',
+			'security.isolate': `Isolated the machine from the network${Array.isArray(rp.allow) && rp.allow.length ? ` (also allowing ${rp.allow.join(', ')})` : ''}${fromDetection}`,
+			'security.release': 'Released the machine from network isolation',
+			'security.collect_triage': `Started collecting a triage package${fromDetection}`,
+			'security.scan_path': `Started a scan of ${rp.path ?? 'a path'}`,
+			'security.triage_download': 'Downloaded a triage package',
+			'security.verdict': r.details.verdict ? `Marked a detection as ${verdictLabels[r.details.verdict as Verdict]?.toLowerCase() ?? r.details.verdict}` : 'Reopened a detection',
 			'agent.patch_result': `Install ${d.status === 'succeeded' ? 'succeeded' : d.status === 'partial' ? 'partly failed' : 'failed'}: ${d.installed} of ${d.requested} installed${d.rebooting ? ', restarting' : ''}${d.error ? ` (${d.error})` : ''}`
 		};
 		return labels[r.action] ?? r.action;
@@ -221,6 +241,7 @@
 				{ value: 'services', label: 'Services' },
 				{ value: 'logs', label: 'Event log' },
 				{ value: 'patches', label: 'Patches' },
+				{ value: 'security', label: 'Security' },
 				{ value: 'jobs', label: 'Jobs' },
 				{ value: 'activity', label: 'Activity' },
 				{ value: 'terminal', label: 'Terminal', hidden: !can('technician') },
@@ -422,6 +443,8 @@
 				{/snippet}
 				{#snippet empty()}<EmptyState compact title={ticketView === 'open' ? 'No open tickets about this agent' : 'No tickets about this agent'} description="Tickets list the agents they're about; alert tickets link theirs automatically." />{/snippet}
 			</TicketTable>
+		{:else if tab === 'security'}
+			<AgentSecurity agentId={a.id} hostname={a.hostname} />
 		{:else if tab === 'services'}
 			<AgentServices agentId={a.id} online={a.online} hostname={a.hostname} />
 		{:else if tab === 'logs'}
@@ -440,7 +463,7 @@
 								{/each}
 							</ol>
 						{:else}
-							<EmptyState compact title="No activity recorded yet" description="Agent updates, patch installs, and service starts and stops show up here. Jobs have their own tab." />
+							<EmptyState compact title="No activity recorded yet" description="Agent updates, patch installs, antivirus scans, and service starts and stops show up here. Jobs have their own tab." />
 						{/if}
 					{/snippet}
 				</Async>

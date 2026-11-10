@@ -4,6 +4,8 @@ export interface User {
 	/** null = every client */
 	client_ids: string[] | null;
 	preferences?: import('./prefs.svelte').Prefs;
+	/** Effective named permissions (security.read / security.respond / security.manage). */
+	permissions?: string[];
 }
 
 /** A keyset-paged list response. Pass `next`/`prev` back as `?after=`/`?before=`. */
@@ -53,6 +55,8 @@ export interface Client {
 	desktop_consent: boolean;
 	/** Mail from these domains is filed under this client. */
 	email_domains: string[];
+	/** Gets new security content first (canary ring). */
+	security_canary?: boolean;
 }
 
 export type Interpreter = 'bash' | 'sh' | 'powershell' | 'cmd' | 'python';
@@ -97,7 +101,7 @@ export interface Session { id: string; created_at: string; last_seen_at: string;
 
 export type Severity = 'critical' | 'warning' | 'info';
 export type AlertState = 'open' | 'acknowledged' | 'resolved';
-export type PolicyKind = 'offline' | 'cpu' | 'memory' | 'disk' | 'service' | 'job_failed' | 'log';
+export type PolicyKind = 'offline' | 'cpu' | 'memory' | 'disk' | 'service' | 'job_failed' | 'log' | 'security';
 export type LogLevel = 'critical' | 'error' | 'warning' | 'info';
 
 export interface Alert {
@@ -265,3 +269,133 @@ export interface InboundMail {
 	id: string; mailbox_name: string | null; from_addr: string; subject: string; status: 'received' | 'ignored';
 	ignored_reason: string | null; ticket_id: string | null; ticket_number: number | null; created_at: string;
 }
+
+// Endpoint protection (Phase 8)
+/** threats: an active detection; unprotected: no product enabled; at_risk: real-time protection off or signatures over 72 h old. */
+export type ProtectionState = 'threats' | 'unprotected' | 'at_risk' | 'unknown' | 'protected';
+export type ProductKind = 'defender' | 'clamav' | 'xprotect' | 'rmm' | 'other';
+export type SecurityAction = 'quick_scan' | 'full_scan' | 'update_signatures';
+export type ThreatSeverity = 'severe' | 'high' | 'moderate' | 'low' | 'unknown';
+export type ThreatStatus = 'active' | 'quarantined' | 'removed' | 'blocked' | 'allowed' | 'unknown';
+export type SecurityActionStatus = 'sent' | 'running' | 'succeeded' | 'failed' | 'lost';
+export interface SecurityProduct {
+	kind: ProductKind; name: string; version: string | null; enabled: boolean | null; realtime: boolean | null;
+	signature_version: string | null; signatures_updated_at: string | null;
+	/** Security Center's verdict, for products that don't give a date. */
+	signatures_current: boolean | null;
+	last_quick_scan_at: string | null; last_full_scan_at: string | null; tamper_protection: boolean | null;
+	actions: SecurityAction[]; detail: string | null;
+}
+export interface SecurityDetection {
+	id: string; agent_id: string; hostname: string; client_id: string; client_name: string; site_name: string;
+	product: ProductKind; name: string; severity: ThreatSeverity; status: ThreatStatus; resources: string[];
+	process: string | null; username: string | null; detected_at: string | null; first_seen_at: string; last_seen_at: string;
+	resolved_at: string | null;
+	source: DetectionSource; rule_id: string | null; mitre: string[];
+	/** Recorded by a rule in audit mode: not acted on, not alerted. */
+	audit: boolean; action_taken: string | null; sha256: string | null; verdict: Verdict | null;
+}
+export interface SecurityActionRow {
+	id: string; product: ProductKind; action: SecurityAction | ResponseActionName; status: SecurityActionStatus; message: string | null;
+	created_by_name: string | null; created_at: string; started_at: string | null; finished_at: string | null;
+	params: Record<string, unknown>; result: Record<string, unknown> | null; has_download: boolean;
+}
+export interface AgentSecurity {
+	supported: boolean; online: boolean; state: ProtectionState; reported_at: string | null; error: string | null;
+	products: SecurityProduct[]; detections: SecurityDetection[]; actions: SecurityActionRow[];
+	sensor_supported: boolean; sensor: SensorStatus | null; sensor_at: string | null; content_version: string | null;
+	isolated: boolean; policy: SensorPolicy; quarantine: QuarantineRow[];
+}
+export interface SecurityAgentRow {
+	id: string; hostname: string; online: boolean; os_family: AgentSummary['os_family']; client_id: string; client_name: string;
+	site_id: string; site_name: string; state: ProtectionState; security_at: string | null; security_error: string | null;
+	products: { kind: ProductKind; name: string; enabled: boolean | null; realtime: boolean | null }[];
+	signatures_updated_at: string | null; last_scan_at: string | null; active_threats: number; running_action: SecurityAction | null;
+	isolated: boolean; sensor: SensorStatus | null; content_version: string | null;
+}
+export interface SecuritySummary {
+	agents: Record<ProtectionState, number>; active_threats: number; detections_7d: number; actions_running: number;
+}
+
+// Our sensor, response and investigation (Phase 8, milestones 2-7)
+export type DetectionSource = 'product' | 'file' | 'behaviour';
+export type Verdict = 'true_positive' | 'false_positive' | 'benign';
+export type RuleMode = 'disabled' | 'audit' | 'alert' | 'block';
+export type ExclusionKind = 'path' | 'sha256' | 'rule' | 'process';
+export type EventKind = 'process' | 'network' | 'file' | 'registry' | 'module';
+export type ContentStage = 'canary' | 'general' | 'rolled_back' | 'retired';
+export type QuarantineState = 'quarantined' | 'restored' | 'deleted' | 'gone';
+export type ResponseActionName =
+	| 'kill_process' | 'quarantine_file' | 'restore_file' | 'delete_quarantined' | 'isolate' | 'release' | 'collect_triage' | 'scan_path';
+export type ResponseAction =
+	| { type: 'kill_process'; pid: number; tree: boolean }
+	| { type: 'quarantine_file'; path: string }
+	| { type: 'restore_file'; id: string }
+	| { type: 'delete_quarantined'; id: string }
+	| { type: 'isolate'; allow: string[] }
+	| { type: 'release' }
+	| { type: 'collect_triage' }
+	| { type: 'scan_path'; path: string };
+
+export interface SensorPolicy {
+	enabled: boolean; quick_scan_hours: number; full_scan_days: number; auto_quarantine: boolean; prevention: boolean;
+	telemetry_mb: number; canaries: boolean; exclusions: { kind: ExclusionKind; value: string }[]; rule_modes: [string, RuleMode][];
+}
+export interface SensorHealth {
+	events_total: number; events_per_min: number; store_bytes: number; cpu_percent: number; rss_bytes: number; rules: number;
+	/** [collector, mechanism] */
+	collectors: [string, string][];
+	canaries: number; last_scan: string | null;
+}
+export interface SensorStatus {
+	enabled: boolean; running: boolean; restarts: number; content_version: string | null; error: string | null; isolated: boolean;
+	health: SensorHealth | null;
+}
+export interface Proc {
+	pid: number; ppid: number; name: string; exe?: string; command_line: string; user?: string; sha256?: string; started_at?: string;
+}
+export interface TelemetryEvent {
+	seq: number; ts: string; kind: EventKind; action: string; process?: Proc; parent?: Proc;
+	file?: { path: string; old_path?: string; sha256?: string };
+	network?: { protocol: string; local_addr: string; local_port: number; remote_addr: string; remote_port: number };
+	registry?: { key: string; value: string; data?: string };
+	module?: { name: string; path?: string };
+}
+export interface TelemetryResult { events: TelemetryEvent[]; truncated: boolean; error: string | null }
+export interface QuarantineRow {
+	id: string; agent_id: string; hostname: string; client_id: string; client_name: string; path: string; sha256: string; size: number;
+	reason: string | null; quarantined_at: string; state: QuarantineState; updated_at: string;
+}
+export interface PrevalenceRow { agent_id: string; hostname: string; client_name: string; first_seen: string; how: string }
+export interface DetectionRule {
+	id: string; name: string; description: string; kind: 'file' | 'behaviour'; event: EventKind | null; severity: ThreatSeverity;
+	confidence: 'low' | 'medium' | 'high'; mode: RuleMode; mitre: string[]; digest?: string | null;
+}
+export interface DetectionDetail extends SecurityDetection {
+	os_family: AgentSummary['os_family']; online: boolean; isolated: boolean; context: TelemetryEvent[]; context_unavailable: boolean;
+	content_version: string | null; notes: string | null; verdict_by_name: string | null; verdict_at: string | null; quarantine_id: string | null;
+	prevalence: PrevalenceRow[]; actions: SecurityActionRow[]; alert: { id: string; title: string; state: string } | null; rule: DetectionRule | null;
+}
+export interface HuntResult {
+	hits: { agent_id: string; hostname: string; client_name: string; events: TelemetryEvent[]; truncated: boolean }[];
+	searched: number; offline: number; errors: { agent_id: string; hostname: string; error: string }[];
+}
+export interface SecurityPolicyRow {
+	id: string; client_id: string | null; client_name: string | null; site_id: string | null; site_name: string | null; sensor_enabled: boolean;
+	quick_scan_hours: number; full_scan_days: number; auto_quarantine: boolean; prevention: boolean; canaries: boolean; telemetry_mb: number;
+	updated_by_name: string | null; updated_at: string;
+}
+export interface ExclusionRow {
+	id: string; client_id: string | null; client_name: string | null; kind: ExclusionKind; value: string; comment: string;
+	created_by_name: string | null; created_at: string;
+}
+export interface RuleRow extends DetectionRule {
+	override_mode: RuleMode | null; override_reason: string | null; effective_mode: RuleMode; first_seen: string | null; stage: string;
+	hits_7d: number; audit_hits_7d: number; agents_30d: number; true_positives: number; false_positives: number; fp_rate: number | null;
+	can_block: boolean; block_blocker: string | null;
+}
+export interface ContentVersion {
+	id: string; version: string; sha256: string; description: string; rule_count: number; hashes: number; stage: ContentStage;
+	stage_reason: string | null; uploaded_by_name: string | null; uploaded_at: string; stage_changed_at: string; agents: number;
+}
+export interface ContentOverview { versions: ContentVersion[]; canary_clients: number; soak_minutes: number; verifies_signatures: boolean }

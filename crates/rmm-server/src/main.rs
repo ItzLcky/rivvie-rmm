@@ -12,6 +12,8 @@ mod paging;
 mod patches;
 mod ratelimit;
 mod scheduler;
+mod crypto;
+mod security;
 mod shell_ws;
 mod state;
 mod storage;
@@ -123,6 +125,15 @@ struct ServeArgs {
     ticket_close_days: u32,
     #[arg(long, env = "RMM_EMAIL_RAW_DAYS", default_value_t = 90)]
     email_raw_days: u32,
+    /// Minutes new detection content stays on canary clients before everyone gets it.
+    #[arg(long, env = "RMM_CONTENT_SOAK_MINUTES", default_value_t = 1440)]
+    content_soak_minutes: u32,
+    /// The agents' release public key (hex). When set, content uploads are verified here too.
+    #[arg(long, env = "RMM_UPDATE_PUBKEY")]
+    content_pubkey: Option<String>,
+    /// 32-byte key (hex or base64) for encrypting detection context at rest.
+    #[arg(long, env = "RMM_DATA_KEY", hide_env_values = true)]
+    data_key: Option<String>,
 }
 
 impl Default for ServeArgs {
@@ -148,6 +159,9 @@ impl Default for ServeArgs {
             mail_poll_secs: env("RMM_MAIL_POLL_SECS", "60").parse().unwrap_or(60),
             ticket_close_days: env("RMM_TICKET_CLOSE_DAYS", "7").parse().unwrap_or(7),
             email_raw_days: env("RMM_EMAIL_RAW_DAYS", "90").parse().unwrap_or(90),
+            content_soak_minutes: env("RMM_CONTENT_SOAK_MINUTES", "1440").parse().unwrap_or(1440),
+            content_pubkey: std::env::var("RMM_UPDATE_PUBKEY").ok().filter(|s| !s.trim().is_empty()),
+            data_key: std::env::var("RMM_DATA_KEY").ok().filter(|s| !s.trim().is_empty()),
         }
     }
 }
@@ -214,6 +228,13 @@ async fn serve(db: sqlx::PgPool, args: ServeArgs) -> Result<()> {
     let storage = storage::Storage::from_env(args.storage_dir.clone(), http.clone())?;
     info!("file storage: {}", storage.describe());
 
+    let data_key = match args.data_key.as_deref() {
+        Some(k) => Some(crypto::DataKey::parse(k)?),
+        None => {
+            warn!("RMM_DATA_KEY isn't set: detection context (command lines) is stored unencrypted");
+            None
+        }
+    };
     let state = Arc::new(AppState {
         storage,
         company: company.into(),
@@ -239,13 +260,18 @@ async fn serve(db: sqlx::PgPool, args: ServeArgs) -> Result<()> {
             alert_eval_secs: args.alert_eval_secs,
             ticket_close_days: args.ticket_close_days.max(1),
             email_raw_days: args.email_raw_days.max(1),
+            content_soak_minutes: args.content_soak_minutes,
+            content_pubkey: args.content_pubkey.clone(),
+            data_key,
         },
+        triage: Default::default(),
     });
     tokio::spawn(housekeeping(state.clone()));
     tokio::spawn(alerts::run(state.clone()));
     tokio::spawn(notify::worker(state.clone()));
     tokio::spawn(scheduler::run(state.clone()));
     tokio::spawn(patches::scheduler(state.clone()));
+    tokio::spawn(security::rollout_loop(state.clone()));
     tokio::spawn(email::poll_loop(state.clone(), args.mail_poll_secs));
 
     // adapter-static writes the SPA shell as 200.html; every non-file route falls back to it.
@@ -350,6 +376,9 @@ async fn housekeeping(state: Arc<AppState>) {
         ];
         if results.iter().any(|r| r.as_ref().is_ok_and(|r| r.rows_affected() > 0)) {
             state.hub.publish(hub::Event::Jobs);
+        }
+        if let Err(e) = security::sweep(&state).await {
+            warn!("housekeeping: security actions: {e}");
         }
         // Roll the last few complete hours of samples up (idempotent; late samples are folded in).
         results.push(

@@ -1,5 +1,5 @@
 import type { Component } from 'svelte';
-import { BellRing, Building2, LifeBuoy, CalendarClock, FileCode2, History, LayoutDashboard, ListChecks, Monitor, PackageCheck, Settings, ShieldCheck } from '@lucide/svelte';
+import { BellRing, Building2, LifeBuoy, CalendarClock, FileCode2, History, LayoutDashboard, ListChecks, Monitor, PackageCheck, Settings, Shield, ShieldCheck } from '@lucide/svelte';
 import type { Role } from '#lib/types.js';
 
 export interface NavItem {
@@ -38,6 +38,7 @@ export const nav: NavGroup[] = [
 		label: 'Monitoring',
 		items: [
 			{ href: '/alerts', label: 'Alerts', icon: BellRing, key: 'e', scoped: true, badge: 'alerts' },
+			{ href: '/security', label: 'Security', icon: Shield, key: 'v', scoped: true },
 			{ href: '/policies', label: 'Alert policies', icon: ShieldCheck, key: 'p', scoped: true }
 		]
 	},

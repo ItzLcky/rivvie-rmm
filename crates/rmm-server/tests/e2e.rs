@@ -31,6 +31,12 @@ use sqlx::Connection;
 
 const ADMIN_EMAIL: &str = "admin@e2e.test";
 const ADMIN_PASSWORD: &str = "e2e-admin-password";
+/// Seed of the key that signs the e2e detection content (agents and server get its public half).
+const CONTENT_SEED: [u8; 32] = [9u8; 32];
+
+fn content_pubkey() -> String {
+    hex::encode(ed25519_dalek::SigningKey::from_bytes(&CONTENT_SEED).verifying_key().as_bytes())
+}
 
 struct Server {
     child: Child,
@@ -58,6 +64,9 @@ impl Server {
             .env("RMM_TRUSTED_PROXIES", "127.0.0.1")
             .env("RMM_ADMIN_EMAIL", ADMIN_EMAIL)
             .env("RMM_ADMIN_PASSWORD", ADMIN_PASSWORD)
+            .env("RMM_UPDATE_PUBKEY", content_pubkey())
+            .env("RMM_CONTENT_SOAK_MINUTES", "0")
+            .env("RMM_DATA_KEY", "ab".repeat(32))
             .env("RUST_LOG", "info,rmm_server=debug")
             .stdout(log.try_clone().unwrap())
             .stderr(log)
@@ -118,6 +127,14 @@ impl Agent {
                 .env("RMM_PATCH_FAKE", log_dir.join(format!("{name}-patches.json")))
                 // And capture a synthetic screen, logging input here.
                 .env("RMM_DESKTOP_FAKE", log_dir.join(format!("{name}-desktop.jsonl")))
+                // And report antivirus state from this file.
+                .env("RMM_SECURITY_FAKE", log_dir.join(format!("{name}-security.json")))
+                // The sensor runs unprivileged on scratch directories, with test-signed content.
+                .env("RMM_STATE_DIR", sensor_dir(log_dir, &name, "state"))
+                .env("RMM_CONTENT_PUBKEY", content_pubkey())
+                .env("RMM_SENSOR_WATCH", sensor_dir(log_dir, &name, "watch"))
+                .env("RMM_SENSOR_CANARY_DIRS", sensor_dir(log_dir, &name, "home"))
+                .env("RMM_SENSOR_SCAN_ROOTS", sensor_dir(log_dir, &name, "scan"))
                 .stdout(log.try_clone().unwrap())
                 .stderr(log)
                 .spawn()
@@ -137,6 +154,12 @@ impl Drop for Agent {
     fn drop(&mut self) {
         self.kill();
     }
+}
+
+fn sensor_dir(log_dir: &Path, agent: &str, what: &str) -> PathBuf {
+    let d = log_dir.join(format!("{agent}-{what}"));
+    std::fs::create_dir_all(&d).unwrap();
+    d
 }
 
 fn agent_bin() -> PathBuf {
@@ -790,6 +813,8 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
 
     desktop(&url, &admin, dir, &id1).await;
     tickets(&url, &admin, &id1, a_id, b_id).await;
+    security(&admin, dir, &id1, &id3).await;
+    sensor(&url, &admin, db, dir, &id1, a_id).await;
     monitoring(server, &admin, db, dir, &id1, &id3, a_id).await;
 
     // --- rate limits ------------------------------------------------------------------------------
@@ -882,6 +907,450 @@ async fn wait_hook(hooks: &Hooks, what: &str, pred: impl Fn(&str, &Value) -> boo
         .map(|(_, _, b)| b.clone())
     })
     .await
+}
+
+/// Signs a content bundle the way `rmm-sign sign-content` does.
+fn signed(bundle: &Value) -> Value {
+    use ed25519_dalek::Signer;
+    use sha2::Digest;
+    let text = serde_json::to_string_pretty(bundle).unwrap();
+    let sha = hex::encode(sha2::Sha256::digest(text.as_bytes()));
+    let version = bundle["version"].as_str().unwrap();
+    let sig = ed25519_dalek::SigningKey::from_bytes(&CONTENT_SEED).sign(&rmm_proto::security::content_signed_message(version, &sha));
+    json!({ "bundle": text, "signature": { "version": version, "sha256": sha, "signature": hex::encode(sig.to_bytes()) } })
+}
+
+fn e2e_bundle(version: &str) -> Value {
+    let proc_ev = |cmd: &str| json!({ "ts": "2026-11-10T00:00:00Z", "kind": "process", "action": "start", "process": { "pid": 9, "name": "sh", "command_line": cmd } });
+    let file_ev = |path: &str| json!({ "ts": "2026-11-10T00:00:00Z", "kind": "file", "action": "create", "file": { "path": path } });
+    json!({
+        "version": version, "created_at": chrono::Utc::now(), "description": "e2e content",
+        "hashes": [],
+        "file_rules": [{
+            "id": "E2E-F-1", "name": "E2E test malware", "severity": "high", "confidence": "high", "mode": "alert", "mitre": ["T1204"],
+            "strings": [{ "text": "RMM-E2E-MALWARE" }],
+            "tests": [{ "text": "x RMM-E2E-MALWARE x", "expect": true }, { "text": "clean", "expect": false }]
+        }],
+        "behaviour_rules": [
+            { "id": "E2E-B-1", "name": "E2E marker process", "severity": "high", "confidence": "high", "mode": "alert", "mitre": ["T1059"],
+              "event": "process", "actions": ["start"], "when": { "field": "process.command_line", "op": "contains", "value": "rmm-e2e-marker" },
+              "tests": [{ "event": proc_ev("sh -c sleep 4 rmm-e2e-marker"), "expect": true }, { "event": proc_ev("sh -c sleep 4"), "expect": false }] },
+            { "id": "E2E-B-2", "name": "E2E audit-only rule", "severity": "medium", "confidence": "medium", "mode": "audit",
+              "event": "process", "actions": ["start"], "when": { "field": "process.command_line", "op": "contains", "value": "rmm-e2e-audit" },
+              "tests": [{ "event": proc_ev("sh -c sleep 4 rmm-e2e-audit"), "expect": true }, { "event": proc_ev("sh"), "expect": false }] },
+            { "id": "E2E-B-3", "name": "E2E unit file dropped", "severity": "medium", "confidence": "high", "mode": "alert", "mitre": ["T1543.002"],
+              "event": "file", "actions": ["create"], "when": { "field": "file.name", "op": "equals", "value": "evil.service" },
+              "tests": [{ "event": file_ev("/x/evil.service"), "expect": true }, { "event": file_ev("/x/good.service"), "expect": false }] }
+        ]
+    })
+}
+
+async fn detections_for(api: &Api, agent: &str, rule: &str) -> Vec<Value> {
+    api.get(&format!("/security/detections?view=all&audit=true&agent_id={agent}&rule_id={rule}")).await["items"].as_array().unwrap().clone()
+}
+
+async fn wait_action(api: &Api, agent: &str, action_id: &str) -> Value {
+    eventually(60, &format!("action {action_id} to finish"), || async {
+        let s = api.get(&format!("/agents/{agent}/security")).await;
+        let a = s["actions"].as_array().unwrap().iter().find(|a| a["id"] == action_id)?.clone();
+        (!matches!(a["status"].as_str(), Some("sent" | "running"))).then_some(a)
+    })
+    .await
+}
+
+async fn sensor(url: &str, admin: &Api, db: &sqlx::PgPool, dir: &Path, id1: &str, a_id: &str) {
+    let respond = |action: Value| async move {
+        let v = admin.post(&format!("/agents/{id1}/security/respond"), json!({ "action": action })).await;
+        v["id"].as_str().unwrap().to_string()
+    };
+
+    // --- the sensor follows the policy --------------------------------------------------------
+    let s = admin.get(&format!("/agents/{id1}/security")).await;
+    assert_eq!((s["sensor_supported"].as_bool(), s["policy"]["enabled"].as_bool()), (Some(true), Some(false)), "{}", s["policy"]);
+    let global = admin.get("/security/policies").await.as_array().unwrap().iter().find(|p| p["client_id"].is_null()).unwrap().clone();
+    let gid = global["id"].as_str().unwrap().to_string();
+    let policy = |enabled: bool| json!({ "sensor_enabled": enabled, "quick_scan_hours": 0, "full_scan_days": 0, "auto_quarantine": true,
+                                        "prevention": false, "canaries": true, "telemetry_mb": 16 });
+    let (s, _) = admin.call(reqwest::Method::PUT, &format!("/security/policies/{gid}"), Some(json!({ "sensor_enabled": true, "quick_scan_hours": 0, "full_scan_days": 0,
+        "auto_quarantine": true, "prevention": false, "canaries": true, "telemetry_mb": 1 }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "telemetry below 16 MB");
+    let (s, v) = admin.call(reqwest::Method::PUT, &format!("/security/policies/{gid}"), Some(policy(true))).await;
+    assert!(s.is_success(), "{v}");
+    eventually(30, "the sensor to start", || async {
+        let s = admin.get(&format!("/agents/{id1}/security")).await;
+        (s["sensor"]["running"] == true).then_some(())
+    })
+    .await;
+    let canary = dir.join("a1-home/.rmm-canary-do-not-touch.docx");
+    eventually(20, "decoy planted", || async { canary.exists().then_some(()) }).await;
+
+    // --- signed content: checked on upload, canary first, then promoted ------------------------
+    let mut tampered = signed(&e2e_bundle("e2e.0"));
+    tampered["bundle"] = json!(tampered["bundle"].as_str().unwrap().replace("E2E marker process", "Changed after signing"));
+    let (s, v) = admin.call(reqwest::Method::POST, "/security/content", Some(tampered)).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    let mut failing = e2e_bundle("e2e.0");
+    failing["file_rules"][0]["tests"][0]["text"] = json!("no marker in here");
+    let (s, v) = admin.call(reqwest::Method::POST, "/security/content", Some(signed(&failing))).await;
+    assert!(s == StatusCode::BAD_REQUEST && v["error"].as_str().unwrap().contains("tests fail"), "{v}");
+    admin.call(reqwest::Method::PUT, &format!("/clients/{a_id}/security"), Some(json!({ "canary": true }))).await;
+    let up = admin.post("/security/content", signed(&e2e_bundle("e2e.1"))).await;
+    assert_eq!(up["stage"], "canary");
+    eventually(30, "content on the agent", || async {
+        (admin.get(&format!("/agents/{id1}/security")).await["content_version"] == "e2e.1").then_some(())
+    })
+    .await;
+    eventually(30, "automatic promotion after the (zero) soak", || async {
+        let c = admin.get("/security/content").await;
+        (c["versions"][0]["stage"] == "general").then_some(())
+    })
+    .await;
+    let rules = admin.get("/security/rules").await;
+    assert_eq!(rules.as_array().unwrap().len(), 4, "{rules}");
+
+    // A policy that alerts on every new detection and on the sensor going down.
+    let pol = admin
+        .post("/alert-policies", json!({ "name": "Sensor", "kind": "security", "severity": "critical",
+                                          "params": { "threats": "any", "sensor_down": true } }))
+        .await;
+    let pol_id = pol["id"].as_str().unwrap().to_string();
+    let sec_alerts = || async { alerts_for(admin, &format!("agent_id={id1}&kind=security&state=all")).await };
+
+    // --- file scan, auto-quarantine, restore with an exclusion ---------------------------------
+    let bad = dir.join("a1-scan/sub/payload.bin");
+    std::fs::create_dir_all(bad.parent().unwrap()).unwrap();
+    std::fs::write(&bad, b"header RMM-E2E-MALWARE trailer").unwrap();
+    let scan = respond(json!({ "type": "scan_path", "path": dir.join("a1-scan").to_string_lossy() })).await;
+    let a = wait_action(admin, id1, &scan).await;
+    assert_eq!(a["status"], "succeeded", "{a}");
+    assert!(a["message"].as_str().unwrap().starts_with("Found 1 threat"), "{a}");
+    let d = eventually(20, "file detection", || async { detections_for(admin, id1, "E2E-F-1").await.into_iter().next() }).await;
+    assert_eq!((d["source"].as_str(), d["status"].as_str(), d["action_taken"].as_str()), (Some("file"), Some("quarantined"), Some("quarantined")), "{d}");
+    assert!(!bad.exists(), "moved into quarantine");
+    let q = eventually(20, "quarantine list", || async {
+        admin.get(&format!("/security/quarantine?agent_id={id1}")).await.as_array().unwrap().first().cloned()
+    })
+    .await;
+    assert_eq!(q["sha256"], d["sha256"]);
+    let restore = admin
+        .post(&format!("/agents/{id1}/security/respond"), json!({ "action": { "type": "restore_file", "id": q["id"] }, "exclude_hash": true }))
+        .await;
+    let a = wait_action(admin, id1, restore["id"].as_str().unwrap()).await;
+    assert_eq!(a["status"], "succeeded", "{a}");
+    assert_eq!(std::fs::read(&bad).unwrap(), b"header RMM-E2E-MALWARE trailer", "restored byte for byte");
+    let ex = admin.get("/security/exclusions").await;
+    assert!(ex.as_array().unwrap().iter().any(|e| e["kind"] == "sha256" && e["value"] == d["sha256"]), "{ex}");
+    eventually(20, "quarantine row marked restored", || async {
+        admin.get(&format!("/security/quarantine?agent_id={id1}&state=all")).await.as_array().unwrap().iter().any(|i| i["state"] == "restored").then_some(())
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await; // the agent applies the new exclusion
+    let rescan = respond(json!({ "type": "scan_path", "path": dir.join("a1-scan").to_string_lossy() })).await;
+    let a = wait_action(admin, id1, &rescan).await;
+    assert!(a["message"].as_str().unwrap().starts_with("No threats found"), "the excluded hash is skipped: {a}");
+    let quick = admin.post(&format!("/agents/{id1}/security/actions"), json!({ "action": "quick_scan", "product": "rmm" })).await;
+    let a = wait_action(admin, id1, quick["id"].as_str().unwrap()).await;
+    assert_eq!(a["status"], "succeeded", "{a}");
+
+    // --- behaviour rules, telemetry, hunting ---------------------------------------------------
+    admin.run_script(id1, "sh -c 'sleep 4; true' rmm-e2e-marker", 30).await;
+    admin.run_script(id1, "sh -c 'sleep 4; true' rmm-e2e-audit", 30).await;
+    let hit = eventually(30, "behaviour detection", || async { detections_for(admin, id1, "E2E-B-1").await.into_iter().next() }).await;
+    assert_eq!((hit["source"].as_str(), hit["audit"].as_bool(), hit["mitre"][0].as_str()), (Some("behaviour"), Some(false), Some("T1059")), "{hit}");
+    let audit = eventually(30, "audit-mode detection", || async { detections_for(admin, id1, "E2E-B-2").await.into_iter().next() }).await;
+    assert_eq!(audit["audit"], true);
+    assert!(
+        !admin.get(&format!("/security/detections?view=all&agent_id={id1}")).await["items"].as_array().unwrap().iter().any(|d| d["rule_id"] == "E2E-B-2"),
+        "audit hits stay out of the default list"
+    );
+    eventually(20, "an alert for the behaviour detection", || async {
+        sec_alerts().await.into_iter().find(|a| a["title"] == "Threat detected: E2E marker process")
+    })
+    .await;
+    assert!(!sec_alerts().await.iter().any(|a| a["title"].as_str().unwrap().contains("audit")), "audit hits don't alert");
+    let detail = admin.get(&format!("/security/detections/{}", hit["id"].as_str().unwrap())).await;
+    let ctx = detail["context"].as_array().unwrap();
+    assert!(ctx[0]["process"]["command_line"].as_str().unwrap().contains("rmm-e2e-marker"), "{detail}");
+    assert!(ctx.len() > 1, "ancestors come with it: {detail}");
+    assert_eq!(detail["rule"]["mitre"][0], "T1059");
+    let enc: bool = sqlx::query_scalar("SELECT context_encrypted FROM security_detections WHERE id = $1::uuid").bind(hit["id"].as_str().unwrap()).fetch_one(db).await.unwrap();
+    assert!(enc, "context is encrypted at rest with RMM_DATA_KEY");
+    eventually(20, "the marker in the agent's telemetry", || async {
+        let t = admin.get(&format!("/agents/{id1}/telemetry?text=rmm-e2e-marker&kinds=process")).await;
+        (!t["events"].as_array().unwrap().is_empty()).then_some(())
+    })
+    .await;
+    let h = admin.post("/security/hunt", json!({ "text": "rmm-e2e-marker", "kinds": "process" })).await;
+    assert_eq!((h["hits"][0]["agent_id"].as_str(), h["searched"].as_i64()), (Some(id1), Some(1)), "{h}");
+    let (s, _) = admin.call(reqwest::Method::POST, "/security/hunt", Some(json!({}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "a hunt needs a search term");
+
+    // Files appearing in watched places, and the ransomware decoy.
+    std::fs::write(dir.join("a1-watch/evil.service"), b"[Service]
+ExecStart=/tmp/x
+").unwrap();
+    eventually(40, "file-watch detection", || async { detections_for(admin, id1, "E2E-B-3").await.into_iter().next() }).await;
+    std::fs::write(&canary, b"encrypted!").unwrap();
+    let c = eventually(30, "decoy detection", || async { detections_for(admin, id1, "RMM-CANARY").await.into_iter().next() }).await;
+    assert_eq!((c["name"].as_str(), c["severity"].as_str()), (Some("Ransomware decoy file modified"), Some("severe")));
+
+    // --- verdicts feed rule stats; blocking needs history; the kill switch ---------------------
+    admin.post(&format!("/security/detections/{}/verdict", hit["id"].as_str().unwrap()), json!({ "verdict": "false_positive", "notes": "e2e" })).await;
+    let r = admin.get("/security/rules").await.as_array().unwrap().iter().find(|r| r["id"] == "E2E-B-1").unwrap().clone();
+    assert_eq!((r["false_positives"].as_i64(), r["can_block"].as_bool()), (Some(1), Some(false)), "{r}");
+    let (s, v) = admin.call(reqwest::Method::PUT, "/security/rules/E2E-B-1", Some(json!({ "mode": "block" }))).await;
+    assert!(s == StatusCode::BAD_REQUEST && v["error"].as_str().unwrap().contains("can't block yet"), "{v}");
+    admin.call(reqwest::Method::PUT, "/security/rules/E2E-B-1", Some(json!({ "mode": "disabled", "reason": "e2e kill switch" }))).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    admin.run_script(id1, "sh -c 'sleep 4; true' rmm-e2e-marker-again", 30).await;
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    assert_eq!(detections_for(admin, id1, "E2E-B-1").await.len(), 1, "a disabled rule doesn't fire");
+    admin.call(reqwest::Method::PUT, "/security/rules/E2E-B-1", Some(json!({ "mode": null }))).await;
+
+    // --- response: kill a process tree, triage, isolation ----------------------------------------
+    let job = admin.run_script(id1, "sleep 300 # rmm-e2e-victim", 400).await;
+    let pid = eventually(20, "the victim in telemetry", || async {
+        let t = admin.get(&format!("/agents/{id1}/telemetry?text=sleep%20300&kinds=process")).await;
+        t["events"].as_array().unwrap().iter().find(|e| e["action"] == "start" && e["process"]["name"] == "sleep").map(|e| e["process"]["pid"].as_u64().unwrap())
+    })
+    .await;
+    let kill = respond(json!({ "type": "kill_process", "pid": pid, "tree": true })).await;
+    let a = wait_action(admin, id1, &kill).await;
+    assert_eq!(a["status"], "succeeded", "{a}");
+    let j = admin.wait_job(&job, 30).await;
+    assert_ne!(j["status"], "succeeded", "the job's process was killed: {j}");
+    let agent_pid = std::fs::read_dir("/proc").unwrap().flatten().filter_map(|e| e.file_name().to_string_lossy().parse::<u32>().ok()).find(|p| {
+        std::fs::read(format!("/proc/{p}/cmdline")).is_ok_and(|c| String::from_utf8_lossy(&c).split('\0').collect::<Vec<_>>().ends_with(&["sensor", ""]))
+    });
+    if let Some(sensor_pid) = agent_pid {
+        let refused = respond(json!({ "type": "kill_process", "pid": sensor_pid })).await;
+        let a = wait_action(admin, id1, &refused).await;
+        assert!(a["status"] == "failed" && a["message"].as_str().unwrap().contains("protected"), "our own sensor is protected: {a}");
+    }
+    let triage = respond(json!({ "type": "collect_triage" })).await;
+    let a = wait_action(admin, id1, &triage).await;
+    assert!(a["status"] == "succeeded" && a["has_download"] == true, "{a}");
+    let res = admin.http.get(format!("{}/security/actions/{triage}/download", admin.base)).send().await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert!(res.headers()["content-disposition"].to_str().unwrap().contains("triage-"));
+    let body = res.bytes().await.unwrap();
+    assert!(body.len() > 100 && body[..2] == [0x1f, 0x8b], "a gzip file");
+    // Unprivileged, isolation can't touch the firewall: it must fail cleanly, not half-apply.
+    let iso = respond(json!({ "type": "isolate", "allow": [] })).await;
+    let a = wait_action(admin, id1, &iso).await;
+    assert_eq!(a["status"], "failed", "{a}");
+    assert_eq!(admin.get(&format!("/agents/{id1}/security")).await["isolated"], false);
+
+    // --- the sensor crashing is noticed and it comes back ------------------------------------------
+    if let Some(sensor_pid) = agent_pid {
+        let _ = Command::new("kill").args(["-9", &sensor_pid.to_string()]).status();
+        eventually(30, "a sensor-down alert", || async { sec_alerts().await.into_iter().find(|a| a["title"] == "Sensor not running") }).await;
+        eventually(60, "the sensor restarted", || async {
+            let s = admin.get(&format!("/agents/{id1}/security")).await;
+            (s["sensor"]["running"] == true && s["sensor"]["restarts"].as_u64() >= Some(1)).then_some(())
+        })
+        .await;
+    }
+
+    // --- permission sets ----------------------------------------------------------------------------
+    admin.post("/users", json!({ "email": "viewer@e2e.test", "name": "Viewer", "password": "viewer-password-1", "role": "technician" })).await;
+    let vid = admin.get("/users").await.as_array().unwrap().iter().find(|u| u["email"] == "viewer@e2e.test").unwrap()["id"].as_str().unwrap().to_string();
+    admin.call(reqwest::Method::PUT, &format!("/users/{vid}/permissions"), Some(json!({ "permissions": ["security.read"] }))).await;
+    let viewer = Api::new(url);
+    let me = viewer.post("/auth/login", json!({ "email": "viewer@e2e.test", "password": "viewer-password-1" })).await;
+    assert_eq!(me["user"]["permissions"], json!(["security.read"]));
+    viewer.get("/security/detections").await;
+    let (s, _) = viewer.call(reqwest::Method::POST, &format!("/agents/{id1}/security/respond"), Some(json!({ "action": { "type": "collect_triage" } }))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "read-only security permissions can't respond");
+    let (s, _) = viewer.call(reqwest::Method::POST, "/security/exclusions", Some(json!({ "kind": "path", "value": "/x" }))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+
+    // --- switching the sensor off takes the decoys away --------------------------------------------
+    admin.call(reqwest::Method::DELETE, &format!("/alert-policies/{pol_id}"), None).await;
+    admin.call(reqwest::Method::PUT, &format!("/security/policies/{gid}"), Some(policy(false))).await;
+    eventually(30, "the sensor to stop", || async {
+        (admin.get(&format!("/agents/{id1}/security")).await["sensor"]["running"] == false).then_some(())
+    })
+    .await;
+    eventually(20, "decoys removed", || async { (!dir.join("a1-home/.rmm-canary-do-not-touch.docx").exists()).then_some(()) }).await;
+    println!("sensor: ok");
+}
+
+/// The fake antivirus state the agent reads (`RMM_SECURITY_FAKE`).
+fn write_security(dir: &Path, state: &Value) {
+    std::fs::write(dir.join("a1-security.json"), serde_json::to_vec_pretty(state).unwrap()).unwrap();
+}
+
+async fn security(admin: &Api, dir: &Path, id1: &str, id3: &str) {
+    let hours_ago = |h: i64| (chrono::Utc::now() - chrono::Duration::hours(h)).to_rfc3339();
+    let defender = |enabled: bool, sig_hours: i64| {
+        json!({
+            "kind": "defender", "name": "Microsoft Defender Antivirus", "version": "4.18.24090.11", "enabled": enabled, "realtime": enabled,
+            "signature_version": "1.421.0.0", "signatures_updated_at": hours_ago(sig_hours), "tamper_protection": true,
+            "actions": ["quick_scan", "full_scan", "update_signatures"]
+        })
+    };
+    let detection = |id: &str, status: &str, hours: i64| {
+        json!({ "id": id, "product": "defender", "name": format!("Virus:DOS/EICAR {id}"), "severity": "severe", "status": status,
+                "resources": [format!("file:_C:\\Users\\bob\\{id}.com")], "detected_at": hours_ago(hours) })
+    };
+    let fetch = || async { admin.get(&format!("/agents/{id1}/security")).await };
+    let refresh = || async { admin.post(&format!("/agents/{id1}/security/refresh"), json!({})).await };
+    let wait_state = |want: &'static str| async move {
+        eventually(20, &format!("protection state {want}"), || async {
+            let s = admin.get(&format!("/agents/{id1}/security")).await;
+            (s["state"] == want).then_some(s)
+        })
+        .await
+    };
+    let security_alerts = || async { alerts_for(admin, &format!("agent_id={id1}&kind=security")).await };
+
+    // --- status: reported on connect, refreshed on request ------------------------------------
+    let s = fetch().await;
+    assert_eq!(s["supported"], true, "{s}");
+    write_security(dir, &json!({ "products": [defender(true, 1)], "detections": [detection("old", "quarantined", 48)] }));
+    refresh().await;
+    let s = wait_state("protected").await;
+    assert_eq!(s["products"][0]["kind"], "defender");
+    assert_eq!(s["products"][0]["tamper_protection"], true);
+    assert_eq!(s["detections"].as_array().unwrap().len(), 1);
+    assert!(!s["detections"][0]["resolved_at"].is_null(), "a quarantined detection isn't open");
+    let fleet = admin.get("/security/agents?state=protected").await;
+    assert!(fleet["items"].as_array().unwrap().iter().any(|a| a["id"] == id1), "{fleet}");
+    let never = admin.get("/security/agents?state=unknown").await;
+    assert!(never["items"].as_array().unwrap().iter().any(|a| a["id"] == id3), "an agent that never reported is unknown");
+    for sort in ["state", "hostname", "client", "signatures", "last_scan", "threats"] {
+        admin.get(&format!("/security/agents?sort={sort}&dir=desc&limit=1")).await;
+    }
+
+    // --- a policy on every condition, alerting on every new detection ---------------------------
+    let pol = admin
+        .post(
+            "/alert-policies",
+            json!({ "name": "Protection", "kind": "security", "severity": "critical",
+                    "params": { "unprotected": true, "realtime_off": true, "signature_max_age_hours": 24, "threats": "any" } }),
+        )
+        .await;
+    let pol_id = pol["id"].as_str().unwrap().to_string();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(security_alerts().await.is_empty(), "old history doesn't alert");
+
+    // An active threat appears.
+    write_security(dir, &json!({ "products": [defender(true, 1)], "detections": [detection("old", "quarantined", 48), detection("live", "active", 0)] }));
+    refresh().await;
+    wait_state("threats").await;
+    let a = eventually(20, "threat alert", || async { security_alerts().await.into_iter().find(|a| a["title"] == "Threat detected: Virus:DOS/EICAR live") }).await;
+    assert_eq!((a["severity"].as_str(), a["details"]["status"].as_str()), (Some("critical"), Some("active")), "{a}");
+    let sum = admin.get("/security/summary").await;
+    assert_eq!(sum["active_threats"], 1, "{sum}");
+    assert_eq!(sum["agents"]["threats"], 1);
+    let active = admin.get("/security/detections").await;
+    assert_eq!(active["total"], 1, "{active}");
+    assert_eq!(admin.get("/security/detections?view=all&q=old").await["total"], 1, "search by name");
+    assert_eq!(admin.get(&format!("/agents/{id1}")).await["health"], "unhealthy", "a critical alert makes the agent unhealthy");
+
+    // --- a quick scan finds (and quarantines) something --------------------------------------------
+    let mut state = json!({ "products": [defender(true, 1)], "detections": [detection("old", "quarantined", 48), detection("live", "active", 0)],
+                            "scan_finds": [detection("scanned", "quarantined", 0)] });
+    write_security(dir, &state);
+    let (s, v) = admin.call(reqwest::Method::POST, &format!("/agents/{id1}/security/actions"), Some(json!({ "action": "reboot" }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    let started = admin.post(&format!("/agents/{id1}/security/actions"), json!({ "action": "quick_scan" })).await;
+    assert_eq!(started["product"], "defender");
+    let action_id = started["id"].as_str().unwrap().to_string();
+    let done = eventually(20, "quick scan to finish", || async {
+        let s = admin.get(&format!("/agents/{id1}/security")).await;
+        let a = s["actions"].as_array().unwrap().iter().find(|a| a["id"] == action_id.as_str()).cloned()?;
+        (a["status"] == "succeeded").then_some((s, a))
+    })
+    .await;
+    assert_eq!(done.1["message"], "Found 1 threats", "{}", done.1);
+    eventually(20, "scan time reported", || async { (!fetch().await["products"][0]["last_quick_scan_at"].is_null()).then_some(()) }).await;
+    eventually(20, "quarantined-on-scan alert (threats: any)", || async {
+        security_alerts().await.into_iter().find(|a| a["title"] == "Threat quarantined: Virus:DOS/EICAR scanned")
+    })
+    .await;
+
+    // One action at a time per agent.
+    state["scan_ms"] = json!(3000);
+    write_security(dir, &state);
+    admin.post(&format!("/agents/{id1}/security/actions"), json!({ "action": "full_scan" })).await;
+    let (s, v) = admin.call(reqwest::Method::POST, &format!("/agents/{id1}/security/actions"), Some(json!({ "action": "quick_scan" }))).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    let bulk = admin.post("/security/actions", json!({ "agent_ids": [id1, id3], "action": "update_signatures" })).await;
+    assert_eq!(bulk["started"], 0, "{bulk}");
+    assert_eq!(bulk["skipped"].as_array().unwrap().len(), 2, "busy and offline: {bulk}");
+    eventually(20, "full scan to finish", || async {
+        let s = fetch().await;
+        s["actions"].as_array().unwrap().iter().all(|a| a["status"] != "sent" && a["status"] != "running").then_some(())
+    })
+    .await;
+
+    // --- the threat is dealt with; switching to "active" clears what isn't active ---------------
+    state["scan_ms"] = json!(0);
+    state["detections"] = json!([detection("live", "quarantined", 0), detection("scanned", "quarantined", 0)]);
+    write_security(dir, &state);
+    refresh().await;
+    wait_state("protected").await;
+    assert_eq!(security_alerts().await.len(), 2, "under \"any\", threat alerts wait for a person");
+    let all = admin.get(&format!("/security/detections?view=all&agent_id={id1}")).await;
+    let old = all["items"].as_array().unwrap().iter().find(|d| d["name"] == "Virus:DOS/EICAR old").unwrap().clone();
+    assert!(!old["resolved_at"].is_null(), "a detection the product stopped listing is resolved");
+    let mut body = pol.clone();
+    body["params"]["threats"] = json!("active");
+    let (s, v) = admin.call(reqwest::Method::PUT, &format!("/alert-policies/{pol_id}"), Some(body.clone())).await;
+    assert!(s.is_success(), "{v}");
+    eventually(20, "threat alerts to clear", || async { security_alerts().await.is_empty().then_some(()) }).await;
+
+    // --- stale signatures, fixed by a signature update ---------------------------------------------
+    state["products"] = json!([defender(true, 100)]);
+    write_security(dir, &state);
+    refresh().await;
+    let a = eventually(20, "stale signature alert", || async {
+        security_alerts().await.into_iter().find(|a| a["title"] == "Antivirus signatures out of date")
+    })
+    .await;
+    assert_eq!(a["details"]["max_age_hours"], 24, "{a}");
+    wait_state("at_risk").await;
+    admin.post(&format!("/agents/{id1}/security/actions"), json!({ "action": "update_signatures", "product": "defender" })).await;
+    eventually(20, "signature alert to clear after the update", || async { security_alerts().await.is_empty().then_some(()) }).await;
+    wait_state("protected").await;
+
+    // --- protection switched off, then on -----------------------------------------------------------
+    state["products"] = json!([defender(false, 1)]);
+    write_security(dir, &state);
+    refresh().await;
+    eventually(20, "unprotected alert", || async { security_alerts().await.into_iter().find(|a| a["title"] == "No active antivirus") }).await;
+    wait_state("unprotected").await;
+    let (s, _) = admin.call(reqwest::Method::POST, &format!("/agents/{id1}/security/actions"), Some(json!({ "action": "quick_scan", "product": "clamav" }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "no such product here");
+    state["products"] = json!([defender(true, 1)]);
+    write_security(dir, &state);
+    refresh().await;
+    eventually(20, "unprotected alert to clear", || async { security_alerts().await.is_empty().then_some(()) }).await;
+
+    // --- a failed read keeps the last known state ------------------------------------------------------
+    std::fs::write(dir.join("a1-security.json"), b"{ not json").unwrap();
+    refresh().await;
+    let s = eventually(20, "the read error to show", || async {
+        let s = fetch().await;
+        s["error"].as_str().is_some_and(|e| e.contains("parsing")).then_some(s)
+    })
+    .await;
+    assert_eq!((s["state"].as_str(), s["products"].as_array().unwrap().len()), (Some("protected"), 1), "{s}");
+    assert!(security_alerts().await.is_empty(), "no \"no antivirus\" alert from a failed read");
+    write_security(dir, &state);
+    refresh().await;
+    eventually(20, "the error to clear", || async { fetch().await["error"].is_null().then_some(()) }).await;
+
+    // --- audit: actions and their results --------------------------------------------------------------
+    let activity = admin.get(&format!("/agents/{id1}/activity")).await;
+    let actions: Vec<&str> = activity.as_array().unwrap().iter().filter_map(|r| r["action"].as_str()).collect();
+    assert!(actions.contains(&"security.quick_scan") && actions.contains(&"security.succeeded"), "{actions:?}");
+
+    let (s, _) = admin.call(reqwest::Method::DELETE, &format!("/alert-policies/{pol_id}"), None).await;
+    assert!(s.is_success());
+    println!("security: ok");
 }
 
 async fn alerts_for(api: &Api, query: &str) -> Vec<Value> {

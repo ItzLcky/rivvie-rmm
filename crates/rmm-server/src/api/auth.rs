@@ -101,7 +101,7 @@ pub async fn login(
     Ok((
         AppendHeaders([(header::SET_COOKIE, auth::session_cookie(&token, st.cfg.secure_cookies()))]),
         // Token is also returned for non-browser API clients.
-        Json(json!({ "user": user, "token": token })),
+        Json(json!({ "user": user_json(&user), "token": token })),
     ))
 }
 
@@ -113,10 +113,17 @@ pub async fn logout(State(st): State<Arc<AppState>>, headers: HeaderMap) -> ApiR
 }
 
 /// The signed-in user, plus their saved UI preferences.
+/// The signed-in user for the dashboard, with the permissions they hold.
+fn user_json(u: &User) -> serde_json::Value {
+    let mut v = serde_json::to_value(u).unwrap_or_default();
+    v["permissions"] = json!(u.effective_permissions());
+    v
+}
+
 pub async fn me(State(st): State<Arc<AppState>>, user: User) -> ApiResult<Json<serde_json::Value>> {
     let prefs: serde_json::Value =
         sqlx::query_scalar("SELECT preferences FROM users WHERE id = $1").bind(user.id).fetch_one(&st.db).await?;
-    let mut v = serde_json::to_value(&user).map_err(anyhow::Error::from)?;
+    let mut v = user_json(&user);
     v["preferences"] = prefs;
     Ok(Json(v))
 }

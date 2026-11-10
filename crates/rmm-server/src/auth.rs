@@ -102,6 +102,9 @@ pub struct User {
     /// The clients this user may see, or `None` for all of them (admins, and accounts with
     /// `all_clients` set).
     pub client_ids: Option<Vec<Uuid>>,
+    /// Explicit permission set, replacing the role's defaults (`None` = defaults).
+    #[serde(skip)]
+    pub permissions: Option<Vec<String>>,
     /// The session this request authenticated with.
     #[serde(skip)]
     pub session_id: Uuid,
@@ -125,6 +128,63 @@ impl User {
     pub fn can_see_client(&self, client_id: Uuid) -> bool {
         self.scope().is_none_or(|ids| ids.contains(&client_id))
     }
+
+    /// Whether the user holds a named permission. Admins hold all of them.
+    pub fn has(&self, perm: Perm) -> bool {
+        if self.role() == Role::Admin {
+            return true;
+        }
+        match &self.permissions {
+            Some(list) => list.iter().any(|p| p == perm.as_str()),
+            None => perm.default_for(self.role()),
+        }
+    }
+
+    pub fn need(&self, perm: Perm) -> Result<(), ApiError> {
+        if self.has(perm) { Ok(()) } else { Err(ApiError::Forbidden) }
+    }
+
+    /// Every permission the user holds, for the dashboard.
+    pub fn effective_permissions(&self) -> Vec<&'static str> {
+        Perm::ALL.into_iter().filter(|p| self.has(*p)).map(Perm::as_str).collect()
+    }
+}
+
+/// Named permissions (the permission sets the roadmap asked for before endpoint response).
+/// Roles grant defaults; an admin can give a user an explicit set instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)] // more areas (billing, tickets) will join security
+pub enum Perm {
+    /// See protection state, detections, quarantine and telemetry.
+    SecurityRead,
+    /// Scans, kill, quarantine and restore, isolate, triage, verdicts.
+    SecurityRespond,
+    /// Security policies, exclusions, rule modes, content uploads and rollout.
+    SecurityManage,
+}
+
+impl Perm {
+    pub const ALL: [Perm; 3] = [Perm::SecurityRead, Perm::SecurityRespond, Perm::SecurityManage];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Perm::SecurityRead => "security.read",
+            Perm::SecurityRespond => "security.respond",
+            Perm::SecurityManage => "security.manage",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Perm> {
+        Perm::ALL.into_iter().find(|p| p.as_str() == s)
+    }
+
+    fn default_for(self, role: Role) -> bool {
+        match self {
+            Perm::SecurityRead => true,
+            Perm::SecurityRespond => role >= Role::Technician,
+            Perm::SecurityManage => role >= Role::Admin,
+        }
+    }
 }
 
 /// SQL select list for [`User`] from a `users u` row, given the placeholder bound to
@@ -135,7 +195,7 @@ macro_rules! user_columns {
             "u.id, u.email, u.name, u.role, u.totp_secret IS NOT NULL AS totp_enabled, ",
             "(u.totp_secret IS NULL AND (u.role = 'admin' OR ", $require_all, ")) AS mfa_setup_required, ",
             "CASE WHEN u.role = 'admin' OR u.all_clients THEN NULL ",
-            "ELSE ARRAY(SELECT uc.client_id FROM user_clients uc WHERE uc.user_id = u.id) END AS client_ids, ",
+            "ELSE ARRAY(SELECT uc.client_id FROM user_clients uc WHERE uc.user_id = u.id) END AS client_ids, u.permissions, ",
             $session_id, " AS session_id"
         )
     };

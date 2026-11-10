@@ -18,6 +18,7 @@ mod schedules;
 mod patches;
 mod search;
 mod scripts;
+mod security;
 mod servicedesk;
 mod services;
 mod settings;
@@ -91,6 +92,32 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/patch-policies/{id}", axum::routing::put(patches::update_policy).delete(patches::delete_policy))
         .route("/patch-windows", get(patches::windows))
         .route("/sites/{id}/maintenance-window", axum::routing::put(patches::set_window))
+        .route("/agents/{id}/security", get(security::for_agent))
+        .route("/agents/{id}/security/actions", post(security::start))
+        .route("/agents/{id}/security/refresh", post(security::refresh))
+        .route("/security/summary", get(security::summary))
+        .route("/security/agents", get(security::agents))
+        .route("/security/detections", get(security::detections))
+        .route("/security/actions", post(security::bulk_action))
+        .route("/security/actions/{id}/download", get(security::download))
+        .route("/agents/{id}/security/respond", post(security::respond))
+        .route("/agents/{id}/telemetry", get(security::telemetry))
+        .route("/security/detections/{id}", get(security::detection))
+        .route("/security/detections/{id}/verdict", post(security::verdict))
+        .route("/security/quarantine", get(security::quarantine))
+        .route("/security/policies", get(security::policies).post(security::create_policy))
+        .route("/security/policies/{id}", axum::routing::put(security::update_policy).delete(security::delete_policy))
+        .route("/security/exclusions", get(security::exclusions).post(security::create_exclusion))
+        .route("/security/exclusions/{id}", delete(security::delete_exclusion))
+        .route("/security/rules", get(security::rules))
+        .route("/security/rules/{id}", axum::routing::put(security::set_rule_mode))
+        .route("/security/content", get(security::content).post(security::upload_content))
+        .route("/security/content/{id}/promote", post(security::promote_content))
+        .route("/security/content/{id}/rollback", post(security::rollback_content))
+        .route("/security/hunt", post(security::hunt))
+        .route("/security/prevalence", get(security::prevalence))
+        .route("/clients/{id}/security", axum::routing::put(security::set_canary))
+        .route("/users/{id}/permissions", axum::routing::put(users::update_permissions))
         .route("/agents/{id}/shell", get(crate::shell_ws::handler))
         .route("/agents/{id}/desktop", get(crate::desktop_ws::handler))
         .route("/jobs", get(jobs::list_recent).post(jobs::create))

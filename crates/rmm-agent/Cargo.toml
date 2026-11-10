@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 rmm-proto.workspace = true
+rmm-content.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 uuid.workspace = true
@@ -31,6 +32,8 @@ portable-pty = "0.9"
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake", "rustls-tls-native-roots", "url"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 jpeg-encoder = { version = "0.7", features = ["simd"] }
+tar = { version = "0.4", default-features = false }
+flate2 = "1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -8,7 +8,13 @@
 //! rmm-sign keygen --out release.key          # prints the public key for RMM_UPDATE_PUBKEY
 //! rmm-sign sign --key release.key --platform linux-x86_64 --version 0.2.0 rmm-agent-linux-x86_64
 //! rmm-sign verify --pubkey <hex> rmm-agent-linux-x86_64
+//! rmm-sign test-content content/starter.json      # rule tests + benign corpus
+//! rmm-sign sign-content --key release.key content/starter.json   # writes starter.json.sig
 //! ```
+//!
+//! Detection content (Phase 8) is signed with the same release key: agents only run rules
+//! signed by it. `sign-content` runs the replay harness first and refuses a bundle whose rule
+//! tests fail or that fires on the benign corpus.
 //!
 //! The key file holds the 32-byte ed25519 seed in hex. `--key` can be omitted when
 //! `RMM_UPDATE_SIGNING_KEY` holds that hex (for CI secrets).
@@ -52,6 +58,22 @@ enum Cmd {
         version: String,
         binary: PathBuf,
     },
+    /// Run a content bundle's rule tests and the benign corpus.
+    TestContent {
+        bundle: PathBuf,
+        /// Extra benign events (JSON lines) on top of the built-in corpus.
+        #[arg(long)]
+        benign: Option<PathBuf>,
+    },
+    /// Test, then sign a content bundle: writes `<bundle>.sig` ({version, sha256, signature}),
+    /// which the server takes together with the bundle.
+    SignContent {
+        #[arg(long, env = "RMM_UPDATE_SIGNING_KEY_FILE")]
+        key: Option<PathBuf>,
+        bundle: PathBuf,
+        #[arg(long)]
+        benign: Option<PathBuf>,
+    },
     /// Check `<binary>.update.json` against the binary and a public key.
     Verify {
         #[arg(long)]
@@ -86,6 +108,23 @@ fn main() -> Result<()> {
             println!("wrote {} ({platform} {version}, sha256 {})", out.display(), manifest.sha256);
             Ok(())
         }
+        Cmd::TestContent { bundle, benign } => {
+            let (_, b) = test_content(&bundle, benign.as_deref())?;
+            println!("ok: {} ({} rules, {} hashes)", b.version, b.rule_count(), b.hashes.len());
+            Ok(())
+        }
+        Cmd::SignContent { key, bundle, benign } => {
+            let key = load_key(key.as_deref())?;
+            let (json, b) = test_content(&bundle, benign.as_deref())?;
+            let sha256 = rmm_content::Bundle::sha256(&json);
+            let signature = key.sign(&rmm_proto::security::content_signed_message(&b.version, &sha256));
+            let mut out = bundle.clone().into_os_string();
+            out.push(".sig");
+            let sig = serde_json::json!({ "version": b.version, "sha256": sha256, "signature": hex::encode(signature.to_bytes()) });
+            std::fs::write(&out, serde_json::to_string_pretty(&sig)? + "\n")?;
+            println!("wrote {} ({} {} rules)", PathBuf::from(out).display(), b.version, b.rule_count());
+            Ok(())
+        }
         Cmd::Verify { pubkey, binary } => {
             let raw = std::fs::read_to_string(manifest_path(&binary)).context("reading manifest")?;
             let manifest: Manifest = serde_json::from_str(&raw)?;
@@ -94,6 +133,21 @@ fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn test_content(path: &Path, extra: Option<&Path>) -> Result<(Vec<u8>, rmm_content::Bundle)> {
+    let json = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let b = rmm_content::Bundle::parse(&json)?;
+    let mut benign = rmm_content::test::benign_corpus();
+    if let Some(p) = extra {
+        benign.extend(rmm_content::test::parse_events(&std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?));
+    }
+    let report = rmm_content::test::run(&b, &benign);
+    eprintln!("{}", report.summary());
+    if !report.ok() {
+        bail!("content tests failed; not signing");
+    }
+    Ok((json, b))
 }
 
 fn manifest_path(binary: &Path) -> PathBuf {

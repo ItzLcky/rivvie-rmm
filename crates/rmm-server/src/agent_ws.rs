@@ -69,7 +69,7 @@ async fn handle(mut ws: WebSocket, state: Arc<AppState>, ip: IpAddr) -> anyhow::
             let _ = ws.close().await;
             Ok(())
         }
-        AgentMsg::Auth { protocol, agent_id, secret, agent_version, jobs, capabilities, patch_runs } => {
+        AgentMsg::Auth { protocol, agent_id, secret, agent_version, jobs, capabilities, patch_runs, security_actions } => {
             if protocol != PROTOCOL_VERSION {
                 send(&mut ws, &ServerMsg::AuthFailed { reason: format!("unsupported protocol {protocol}") }).await?;
                 return Ok(());
@@ -84,7 +84,8 @@ async fn handle(mut ws: WebSocket, state: Arc<AppState>, ip: IpAddr) -> anyhow::
                 &ServerMsg::AuthOk { heartbeat_secs: state.cfg.heartbeat_secs, inventory_secs: state.cfg.inventory_secs },
             )
             .await?;
-            run_session(ws, state, agent_id, agent_version, jobs, capabilities, patch_runs).await
+            let held = Held { jobs, patch_runs, security_actions };
+            run_session(ws, state, agent_id, agent_version, held, capabilities).await
         }
         _ => Ok(()),
     }
@@ -185,21 +186,27 @@ async fn authenticate(state: &AppState, agent_id: Uuid, secret: &str) -> anyhow:
     Ok(stored.is_some_and(|h| bool::from(h.ct_eq(&token_hash(secret)))))
 }
 
+/// What a reconnecting agent says it still holds: anything else it was sent can't report.
+struct Held {
+    jobs: Vec<Uuid>,
+    patch_runs: Vec<Uuid>,
+    security_actions: Vec<Uuid>,
+}
+
 async fn run_session(
     ws: WebSocket,
     state: Arc<AppState>,
     agent_id: Uuid,
     agent_version: String,
-    held_jobs: Vec<Uuid>,
+    held: Held,
     capabilities: Vec<String>,
-    held_patch_runs: Vec<Uuid>,
 ) -> anyhow::Result<()> {
     let conn_id = Uuid::new_v4();
     let (tx, mut rx) = mpsc::channel::<ServerMsg>(1024);
     // The agent resends output and results for the jobs it still holds; anything else marked
     // `sent` can never finish. Do this before registering: a job created in between sees the
     // agent offline, stays queued, and is dispatched below.
-    let lost = mark_lost(&state.db, agent_id, &held_jobs).await?;
+    let lost = mark_lost(&state.db, agent_id, &held.jobs).await?;
     if let Some(old) = state.hub.register(agent_id, AgentHandle { conn_id, tx: tx.clone() }) {
         debug!(%agent_id, old = %old.conn_id, "replacing stale connection");
     }
@@ -250,8 +257,11 @@ async fn run_session(
     if lost > 0 || dispatched > 0 {
         state.hub.publish(Event::Jobs);
     }
-    if let Err(e) = crate::patches::on_connect(&state, agent_id, client_id, &capabilities, &held_patch_runs, &tx).await {
+    if let Err(e) = crate::patches::on_connect(&state, agent_id, client_id, &capabilities, &held.patch_runs, &tx).await {
         warn!(%agent_id, "patch state on connect: {e:#}");
+    }
+    if let Err(e) = crate::security::on_connect(&state, agent_id, client_id, &capabilities, &held.security_actions).await {
+        warn!(%agent_id, "security state on connect: {e:#}");
     }
     // Replies to this connection only (job acks). Weak, so the writer still ends when the
     // hub drops the agent (kick) and every other sender is gone.
@@ -505,6 +515,24 @@ async fn on_message(
             if let Some(tx) = reply.upgrade() {
                 let _ = tx.send(ServerMsg::PatchAck { run_id: outcome.run_id }).await;
             }
+        }
+        AgentMsg::SecurityStatus(report) => crate::security::ingest_report(state, agent_id, client_id, report).await?,
+        AgentMsg::SecurityActionResult { request_id, state: phase, message, data } => {
+            crate::security::ingest_action(state, agent_id, client_id, request_id, phase, message, data).await?
+        }
+        AgentMsg::SensorStatus(s) => crate::security::ingest_status(state, agent_id, client_id, s).await?,
+        AgentMsg::SensorDetection(d) => {
+            crate::security::ingest_detection(state, agent_id, client_id, &d).await?;
+            if let Some(tx) = reply.upgrade() {
+                let _ = tx.send(ServerMsg::SensorDetectionAck { id: d.id }).await;
+            }
+        }
+        AgentMsg::QuarantineList { items } => crate::security::ingest_quarantine(state, agent_id, client_id, &items).await?,
+        AgentMsg::TelemetryResult { request_id, events, truncated, error } => {
+            state.hub.complete_query(agent_id, request_id, (events, truncated, error));
+        }
+        AgentMsg::TriageChunk { request_id, offset, data, done: _ } => {
+            crate::security::ingest_triage_chunk(state, agent_id, request_id, offset, data).await?
         }
         AgentMsg::Pong { .. } => {}
         AgentMsg::Enroll { .. } | AgentMsg::Auth { .. } => {}

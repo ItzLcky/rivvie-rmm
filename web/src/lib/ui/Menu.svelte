@@ -9,6 +9,8 @@
 				danger?: boolean;
 				disabled?: boolean;
 				hint?: string;
+				/** Tooltip, e.g. why it's disabled. */
+				title?: string;
 		  }
 		| { separator: true }
 		| { heading: string };
@@ -56,6 +58,7 @@
 				{:else}
 					<DropdownMenu.Item
 						disabled={item.disabled}
+						title={item.title}
 						onSelect={() => (item.href ? goto(item.href) : item.onSelect?.())}
 						class={cx(
 							'flex h-8 cursor-pointer items-center gap-2 rounded-md px-2 outline-none select-none data-[disabled]:cursor-not-allowed data-[disabled]:opacity-50 [&_svg]:size-4',

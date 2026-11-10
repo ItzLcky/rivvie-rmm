@@ -412,11 +412,61 @@ Each milestone should be usable by itself. After step 2, an MSP can already run 
 - **Retention:** how long to keep raw email MIME and attachments, and whether closed tickets can be purged per client (GDPR requests from a client's contacts).
 - **Who works the tickets:** if a client's own IT staff (co-managed IT) need to work tickets, they need technician-like access limited to one client. This is the same `user_clients` work from Phase 2.
 
-## Phase 8: Endpoint protection (EDR / AV) (planned)
+## Phase 8: Endpoint protection (EDR / AV) (milestones 1-7 built)
 
 Goal: endpoint protection managed from the same console, so a detection becomes an alert, a ticket and a response action next to the device's live state. MSPs pay per seat for this today, and cyber insurers ask for it.
 
-This is the largest phase on the roadmap. Detection quality decides whether it is any good, and that takes years of tuning against false positives, not just sensor code. The milestones are ordered so each one is useful alone and the riskiest work (blocking, kernel code) comes last.
+### Progress
+
+Milestone 1 (protection status and management) is built. Code in `crates/rmm-agent/src/security/`, `crates/rmm-server/src/security.rs`, `crates/rmm-server/src/api/security.rs` and `web/src/routes/security/`.
+
+- [x] Protocol (`rmm_proto::security`): `AgentMsg::SecurityStatus(Report { products, detections, error })`, `ServerMsg::SecurityRefresh`, `ServerMsg::SecurityAction { request_id, product, action }`, `AgentMsg::SecurityActionResult { request_id, state, message }`. Agents list the `security` capability and their running or unreported actions (`security_actions`) in `Auth`.
+- [x] Agent providers: Defender (`Get-MpComputerStatus`, `Get-MpThreatDetection`/`Get-MpThreat`, passive mode, tamper protection) plus Windows Security Center products (`productState` decoded); ClamAV (`clamscan --version`, `clamonacc`/`clamd`/`freshclam` processes, its own scan record, quick and full scans, `freshclam` or a service restart); XProtect (bundle version and date, Gatekeeper, `xprotect update`). One action at a time; results resent after reconnects for an hour. `rmm-agent security [--run ACTION]` for debugging; `RMM_SECURITY_FAKE` for tests.
+- [x] Server: `security_products` (replaced per report), `security_detections` (per product id, following the product's status; open while active), `security_actions` (sent → running → succeeded/failed, `lost` after a restart or timeout). Protection state per agent: threats / unprotected / at_risk (real-time off, or signatures over 72 h) / unknown / protected.
+- [x] Alerts: a `security` alert policy kind (no antivirus on, real-time off, signatures older than N hours, active threats or every new detection). Event-driven on each report, signature age polled. Feeds health and tickets like any alert.
+- [x] Dashboard: Security page (state tiles, agents by state with bulk quick scan / signature update, detections across the fleet), a Security tab per agent (products, detections, scans and updates), the policy editor, activity entries.
+- [x] Tests: provider parsers (Defender JSON, Security Center states, ClamAV version and scan output), the agent manager, alert findings, and an e2e run through status, policy alerts (threats, stale signatures, protection off), scans, busy and bulk actions. The ClamAV provider was run against real ClamAV 1.5.4 (signature update, EICAR found by a quick scan, removal noticed).
+
+Decided while building it:
+
+- **Permission sets** aren't in yet (Phase 7 deferred them). Until then: read-only users see protection (`security.read`), technicians start scans and updates (`security.respond`), and security alert policies follow the usual policy rules (`security.manage`). Quarantine and isolation (milestones 2 and 5) need the real permission sets first.
+- **Alerts through alert policies, not a separate `security_policies` table.** Milestone 1 only needs thresholds and notifications, which alert policies already have (scope, severity, channels, tickets). `security_policies` arrives with scheduled scans and exclusions in milestone 2.
+- **No sensor process yet.** Milestone 1 only reads the platform's own products and runs their CLIs, from the agent. The separate `rmm-sensor` comes with our own scanning (milestone 2) and telemetry (milestone 3).
+- **Detections the product forgets are resolved**, not deleted: Defender drops old detections from its history, and the server keeps the record.
+
+To do from milestone 1:
+
+- [ ] **Run the Windows provider on real hosts** (Defender, Security Center on a workstation with a third-party product, passive mode). It's compile-checked and unit-tested against recorded output only.
+- [ ] ClamAV's own on-access detections (`clamonacc` / clamd's log or `VirusEvent`), and the XProtect Remediator log on macOS.
+- [ ] Alert when an agent stops reporting its protection state.
+
+Milestones 2-7 (our own sensor) are built too. Code in `crates/rmm-content/` (bundle format, rule engine, file matcher, test harness), `crates/rmm-agent/src/sensor/` (the sensor process), `crates/rmm-agent/src/security/{supervisor,response,quarantine,isolation}.rs`, `crates/rmm-server/src/security.rs`, `crates/rmm-server/src/api/security.rs`, `content/` (starter content and benign corpus) and the dashboard's Security pages.
+
+Prerequisites, done:
+
+- [x] **Permission sets:** `security.read`, `security.respond`, `security.manage`. Roles grant defaults (read-only: read; technician: + respond; admin: all); an admin can give a user an explicit set (`users.permissions`, Users settings). Other areas (tickets, billing) can join the same mechanism.
+- [x] **Signed content pipeline:** bundles are JSON signed with the release key (`rmm-sign test-content`, `rmm-sign sign-content`); the server re-runs the tests on upload and checks the signature when it has `RMM_UPDATE_PUBKEY`; every agent verifies before use and keeps the verified bundle on disk.
+- [x] **Persisted agent buffers:** sensor detections stay on disk until the server acknowledges them; scan and response results survive an agent restart.
+- [x] **Encryption at rest:** detection context (command lines) is sealed with ChaCha20-Poly1305 under `RMM_DATA_KEY` (warned about at startup when unset).
+
+Milestones:
+
+- [x] **2. File scanning:** the sensor scans quick/full/one-path (on demand and on a schedule from the security policy) and every program as it starts, against hashes and file rules (Aho-Corasick over all patterns, text/hex/case-insensitive, any/all/at-least-N). Quarantine moves files into an obfuscated store under the state directory with their hash, permissions and times; restore puts them back byte for byte (optionally excluding the hash); delete is explicit. Exclusions (path/glob, hash, rule, process), MSP-wide or per client, audited.
+- [x] **3. Telemetry:** process start/exit (Linux process connector as root, else a poll; sysinfo polling on Windows/macOS), network connect/listen (`/proc/net`, `netstat`, `lsof`), files of interest (autostart locations, SSH keys, profiles, hosts, sudoers), Windows autorun registry keys, kernel modules/drivers. A size-capped local store (JSON lines in segments); the agent answers queries from the console.
+- [x] **4. Behaviour detection:** rule format with fields, operators, all/any/not, thresholds (count within a window per group) and MITRE tags; 27 starter rules for ransomware preparation, credential theft, persistence, execution and evasion, each with tests, plus a benign corpus no rule may fire on (CI and signing run both). Rules default to audit: hits are recorded without alerting. Ransomware decoy files in user folders. Rule stats: hits, audit hits, agents, verdicts and false-positive rate.
+- [x] **5. Response:** kill a process tree (system and agent processes protected), quarantine/restore/delete files, isolate the host (nftables or iptables, Windows Firewall, pf; only the server, DNS and DHCP reachable; re-applied after reboots and re-resolved while isolated), collect a triage package (.tar.gz: processes, connections, autoruns, logs, recent telemetry) downloaded from the console. All audited and permission-gated, from the agent, the detection page or the fleet.
+- [x] **6. Investigation UI:** a detection page with the process tree, a timeline (stored context plus a live query around the time), "seen elsewhere" by hash, response buttons and verdicts; fleet-wide hunting over agents' telemetry; hash prevalence.
+- [x] **7. Prevention:** `block` kills the process or quarantines the file, only for high-confidence rules that have been in general content for 7 days without false positives, and only where the policy turns prevention on. Content rolls out to canary clients first and is promoted after `RMM_CONTENT_SOAK_MINUTES` (default a day), or rolled back automatically if the sensor crashes on 20% of canary agents, new or changed rules fire on 10% (at least 3), or any of their detections is marked a false positive. A rule can be switched off fleet-wide from the server at once (the kill switch).
+
+Tests: rule engine, file matcher, signing, the starter content's own tests and benign corpus; sensor parts (store, process poller, connections, file watch, decoys, scanner, exclusions and modes, quarantine round trip, kill tree, triage tarball, isolation rulesets); rollout decisions and alert findings; and an e2e run of the real sensor (unprivileged): signed upload (tampered and failing bundles refused), canary rollout and promotion, scan and auto-quarantine, restore with exclusion, behaviour and audit-mode detections, encrypted context, telemetry query and hunt, file-watch and decoy detections, verdicts and rule stats, block refused without history, the kill switch, kill/triage/isolation, a crashed sensor alerting and restarting, permission sets, and decoys removed when switched off. Run as root separately: nftables and iptables isolation applied in a container (server reachable, others blocked, atomic re-apply, release) and the process connector (`proc_connector_live`, host network namespace).
+
+To do from milestones 2-7:
+
+- [ ] **Run the sensor on real Windows and macOS hosts.** Both compile (Windows checked with clippy); neither has run. Windows needs ETW (Microsoft-Windows-Kernel-Process, -Network, -Registry) instead of polling, and macOS the Endpoint Security framework (entitlement and notarisation), before short-lived processes are reliably seen there.
+- [ ] Mass file encryption beyond the decoys (fanotify on Linux, a minifilter or ETW file events on Windows); today the many-renames rule only sees watched folders.
+- [ ] Rollback beyond restoring quarantined files: undoing Run keys, services and scheduled tasks a detection created.
+- [ ] Performance budget measured on low-end hardware (the sensor halves its polling above ~5% CPU; no published numbers yet) and an adversary-emulation run in a lab.
+- [ ] A licensed signature or threat-intel feed for hashes (the decision in the risks below), and ingesting detections from other EDRs.
 
 ### Scope decisions
 

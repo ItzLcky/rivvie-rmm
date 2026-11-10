@@ -6,10 +6,12 @@
 //! [`ServerMsg::Enrolled`], [`ServerMsg::AuthOk`] or [`ServerMsg::AuthFailed`].
 //!
 //! Everything is multiplexed over that one connection: metrics, jobs,
-//! interactive shells, patching and remote desktop streams.
+//! interactive shells, patching, remote desktop streams and endpoint protection.
 
 pub mod desktop;
 pub mod patch;
+pub mod security;
+pub mod telemetry;
 pub mod update;
 
 use chrono::{DateTime, Utc};
@@ -76,6 +78,9 @@ pub enum AgentMsg {
         /// Patch installs still running or awaiting [`ServerMsg::PatchAck`], like `jobs`.
         #[serde(default)]
         patch_runs: Vec<Uuid>,
+        /// Security actions still running, or finished and not yet reported to this server.
+        #[serde(default)]
+        security_actions: Vec<Uuid>,
     },
     Heartbeat(Metrics),
     Inventory(Inventory),
@@ -190,6 +195,43 @@ pub enum AgentMsg {
     DesktopClosed {
         session_id: Uuid,
         reason: Option<String>,
+    },
+    /// Protection status. Sent after connecting, when it changes, and when asked.
+    SecurityStatus(security::Report),
+    /// A [`ServerMsg::SecurityAction`] or [`ServerMsg::Response`] started (`Running`) or ended.
+    SecurityActionResult {
+        request_id: Uuid,
+        state: security::ActionState,
+        #[serde(default)]
+        message: Option<String>,
+        /// Structured result, as JSON (a response action's details).
+        #[serde(default)]
+        data: Option<String>,
+    },
+    /// The sensor's state. Sent after connecting, when it changes, and every few minutes.
+    SensorStatus(security::SensorStatus),
+    /// A sensor finding. Kept by the agent and resent until [`ServerMsg::SensorDetectionAck`].
+    SensorDetection(security::SensorDetection),
+    /// Every file in quarantine on this machine. Sent after connecting and on every change.
+    QuarantineList {
+        items: Vec<security::QuarantineItem>,
+    },
+    /// Answer to [`ServerMsg::TelemetryQuery`].
+    TelemetryResult {
+        request_id: Uuid,
+        events: Vec<telemetry::Event>,
+        #[serde(default)]
+        truncated: bool,
+        #[serde(default)]
+        error: Option<String>,
+    },
+    /// A piece of a triage package ([`security::ResponseAction::CollectTriage`]).
+    TriageChunk {
+        request_id: Uuid,
+        offset: u64,
+        #[serde(with = "serde_bytes")]
+        data: Vec<u8>,
+        done: bool,
     },
 }
 
@@ -337,6 +379,37 @@ pub enum ServerMsg {
     },
     DesktopClose {
         session_id: Uuid,
+    },
+    /// Send a fresh [`AgentMsg::SecurityStatus`] (only to agents listing [`security::CAPABILITY`]).
+    SecurityRefresh,
+    /// Start a scan or signature update with one product; answered with
+    /// [`AgentMsg::SecurityActionResult`].
+    SecurityAction {
+        request_id: Uuid,
+        product: security::ProductKind,
+        action: security::Action,
+    },
+    /// The content bundle (rules and hashes) to run: JSON, with an ed25519 signature over
+    /// [`security::content_signed_message`].
+    Content {
+        version: String,
+        #[serde(with = "serde_bytes")]
+        bundle: Vec<u8>,
+        signature: String,
+    },
+    SensorPolicy(security::SensorPolicy),
+    /// The server stored this detection.
+    SensorDetectionAck {
+        id: String,
+    },
+    /// A response action; answered with [`AgentMsg::SecurityActionResult`].
+    Response {
+        request_id: Uuid,
+        action: security::ResponseAction,
+    },
+    TelemetryQuery {
+        request_id: Uuid,
+        query: telemetry::Query,
     },
 }
 
@@ -724,7 +797,9 @@ mod tests {
         }
         let buf = encode(&Old::Auth { protocol: 1, agent_id: Uuid::nil(), secret: "s".into(), agent_version: "0.1.0".into() }).unwrap();
         match decode::<AgentMsg>(&buf).unwrap() {
-            AgentMsg::Auth { capabilities, patch_runs, jobs, .. } => assert!(capabilities.is_empty() && patch_runs.is_empty() && jobs.is_empty()),
+            AgentMsg::Auth { capabilities, patch_runs, jobs, security_actions, .. } => {
+                assert!(capabilities.is_empty() && patch_runs.is_empty() && jobs.is_empty() && security_actions.is_empty())
+            }
             other => panic!("unexpected {other:?}"),
         }
         let run_id = Uuid::new_v4();
@@ -748,6 +823,46 @@ mod tests {
             AgentMsg::PatchResult(o) => assert_eq!(o, out),
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn security_messages_roundtrip() {
+        use security::*;
+        let mut p = Product::new(ProductKind::Defender, "Microsoft Defender Antivirus");
+        p.enabled = Some(true);
+        p.actions = vec![Action::QuickScan, Action::UpdateSignatures];
+        let report = Report {
+            products: vec![p],
+            detections: vec![Detection {
+                id: "{1}".into(),
+                product: ProductKind::Defender,
+                name: "Virus:DOS/EICAR_Test_File".into(),
+                severity: ThreatSeverity::Severe,
+                status: ThreatStatus::Quarantined,
+                resources: vec!["file:_C:\\eicar.com".into()],
+                detected_at: None,
+                process: None,
+                user: None,
+            }],
+            error: None,
+        };
+        match decode::<AgentMsg>(&encode(&AgentMsg::SecurityStatus(report.clone())).unwrap()).unwrap() {
+            AgentMsg::SecurityStatus(r) => assert_eq!(r, report),
+            other => panic!("unexpected {other:?}"),
+        }
+        let msg = ServerMsg::SecurityAction { request_id: Uuid::nil(), product: ProductKind::Clamav, action: Action::FullScan };
+        assert!(matches!(
+            decode::<ServerMsg>(&encode(&msg).unwrap()).unwrap(),
+            ServerMsg::SecurityAction { product: ProductKind::Clamav, action: Action::FullScan, .. }
+        ));
+        // A product kind from a newer agent decodes as Other rather than failing the report.
+        #[derive(Serialize)]
+        struct Raw {
+            kind: &'static str,
+            name: &'static str,
+        }
+        let p: Product = decode(&encode(&Raw { kind: "sentinelone", name: "x" }).unwrap()).unwrap();
+        assert_eq!(p.kind, ProductKind::Other);
     }
 
     /// Agents built before `previous` existed must still be able to enroll.

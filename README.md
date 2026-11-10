@@ -48,6 +48,7 @@ docs/           Roadmap and design notes
 - **Alerting:** alert policies, per client or site (and optionally one OS), raise alerts for agents that are offline, CPU, memory or disk held over a threshold, a stopped or failed service, a failed script, or a log entry that matches. Offline and threshold policies are checked every minute; the others act as agents report. An alert stays open until its condition clears (or someone resolves it), and open alerts feed the health model. See [Monitoring and alerts](#monitoring-and-alerts).
 - **Schedules:** saved scripts run on a cron timetable, in any time zone, on every agent of a client or site. Each schedule keeps its runs' output for as many days as you choose.
 - **Patch management:** agents scan for OS updates (Windows Update Agent, apt, dnf/yum, pacman, softwareupdate) when they connect and every `RMM_PATCH_SCAN_HOURS`. Patch policies approve updates by category or severity and can install them during each site's maintenance window, with a reboot policy. Technicians approve, decline and install from the Patches page or an agent's Patches tab, and the Compliance tab shows how many agents per client are fully patched. See [Patch management](#patch-management).
+- **Endpoint protection:** agents report the antivirus the machine already has (Microsoft Defender and other Windows Security Center products, ClamAV, XProtect), and can run our own sensor: telemetry, behaviour rules and file scanning from signed content rolled out to canary clients first, quarantine, network isolation, triage packages and fleet-wide hunting. Technicians start scans and signature updates from the Security page or an agent's Security tab, and alert policies raise alerts for protection that's off or out of date and for threats. See [Endpoint protection](#endpoint-protection).
 - **Self-update:** agents install new versions signed with an offline ed25519 key whose public half is compiled into the agent, and roll themselves back if the new version can't reconnect. See [Agent updates](#agent-updates).
 - **Security:** argon2id passwords; opaque, revocable session tokens in an HttpOnly SameSite=Strict cookie, with an idle timeout and a 7-day cap; users can change their password and review or revoke their sessions, and admins can reset passwords, re-enable users, and revoke anyone's sessions; TOTP two-factor auth with single-use recovery codes, required for admins and optionally for everyone; an Origin check on the terminal and desktop sockets; three roles (admin / technician / readonly); an audit log covering logins, shells, remote desktop sessions, jobs, enrollment, and deletes. Failed sign-ins are rate-limited per client IP and per account, and bad enrollment tokens per IP (see `RMM_TRUSTED_PROXIES`). The dashboard ships a hash-based script CSP, so no inline or third-party script runs.
 
@@ -372,5 +373,59 @@ Limits: Wayland sessions aren't supported yet (the agent says so; choose an Xorg
 sign-in screen), there's no clipboard sync or session recording, and the Windows side is
 compile-checked only, like the rest of the Windows agent. `RMM_DESKTOP_FAKE=<file>` makes the
 agent serve a synthetic screen and log input to `<file>`, for testing without a display.
+
+## Endpoint protection
+
+Agents report the protection the operating system already has. Nothing replaces it: the agent
+reads its state and drives its scans.
+
+| OS | Product | State from | Actions |
+|---|---|---|---|
+| Windows | Microsoft Defender | `Get-MpComputerStatus`, `Get-MpThreatDetection` | Quick scan, full scan (`Start-MpScan`), signature update (`Update-MpSignature`) |
+| Windows | Any other antivirus registered with Windows Security Center (workstations) | `root/SecurityCenter2` (on/off, signatures current) | None: manage it in its own console |
+| Linux | ClamAV | `clamscan --version` (signature version and date), `clamonacc` for real-time | Quick scan (home and temporary directories; through `clamd` when it runs), full scan (every top-level directory, one filesystem each, at low priority), signature update (`freshclam`, or restarting the freshclam service) |
+| macOS | XProtect (always on), Gatekeeper | The XProtect bundle's version and date, `spctl --status` | Signature update (`xprotect update`, macOS 15+) |
+
+The agent sends its state after connecting, whenever it changes (checked every 5 minutes) and
+when asked. The **Security** page shows every agent by protection state: **Active threats**,
+**Unprotected** (no product on), **At risk** (real-time protection off, or signatures over 72 hours
+old), **No data** and **Protected**, plus the detections across the fleet. An agent's
+**Security** tab shows each product, its detections and the scans and updates started from the
+dashboard. One scan or update runs per machine at a time; ClamAV's findings are remembered by the
+agent (`/var/lib/rmm-agent/security/clamav.json`) because ClamAV keeps no history.
+
+**Alerts.** An **Antivirus** alert policy can alert when no antivirus is on, real-time protection
+is off, signatures are older than N hours, and on threats: either each active threat (cleared
+once it's quarantined or removed) or every new detection, even one already quarantined (stays
+open until someone resolves it). Alerts feed agent health and can open tickets like any other.
+
+`rmm-agent security` prints what the agent would report, and `rmm-agent security --run
+quick_scan` (or `full_scan`, `update_signatures`) runs an action in the foreground.
+`RMM_SECURITY_FAKE=<file>` (debug builds) reads the state from a JSON file instead, for tests.
+
+### Our own sensor
+
+Turn it on per client or site under **Security → Settings** (the MSP-wide policy is off by default). The agent then starts `rmm-agent sensor`, a separate process it restarts if it crashes, which:
+
+- records telemetry (process starts with their parents and image hashes, network connections, changes to autostart locations, SSH keys and profiles, Windows Run keys and services, kernel modules) in a local store capped by the policy (`telemetry_mb`). It stays on the machine; the console queries it (an agent's Security tab, the detection page, and **Hunt** across the fleet).
+- runs behaviour rules on every event, scans files (quick and full scans on the policy's schedule, one path on demand, every program as it starts) against hashes and file rules, and watches ransomware decoys it places in each user's folder.
+- quarantines what scans find (high and severe, with **auto-quarantine** on) into a store only root/SYSTEM can read. Files can be restored byte for byte, optionally excluding their hash.
+
+Detection content is a signed bundle, never code from the server:
+
+```sh
+rmm-sign test-content content/starter.json                    # rule tests + benign corpus
+rmm-sign sign-content --key release.key content/starter.json  # writes content/starter.json.sig
+```
+
+Upload both files under **Security → Content**. A new version goes to canary clients first, and everyone gets it after `RMM_CONTENT_SOAK_MINUTES` (1440) unless the canaries show trouble (the sensor crashing, new rules firing widely, or a false-positive verdict), in which case it's rolled back. Agents verify the signature with the release key they were built with (`RMM_UPDATE_PUBKEY`); set the same variable on the server to check uploads there too. `content/build_starter.py` regenerates the starter bundle.
+
+Rules start in **audit** mode (recorded, not alerted). Promote them under **Security → Rules** once their hit counts and verdicts look right; **disabled** is a fleet-wide kill switch. **Block** (kill the process or quarantine the file) needs a high-confidence rule, 7 days in general content without false positives, and **prevention** on in the policy.
+
+Response actions (technicians with `security.respond`): kill a process tree, quarantine/restore/delete files, isolate the machine (only the RMM server, DNS and DHCP stay reachable; nftables/iptables, Windows Firewall or pf), and collect a triage package (.tar.gz of processes, connections, autoruns, logs and recent telemetry). Every action is audited. Permissions: `security.read`, `security.respond`, `security.manage`, granted by role or set per user under **Company settings → Users**.
+
+Set `RMM_DATA_KEY` (32 bytes, hex or base64) to encrypt detection context at rest: it contains command lines, which can contain passwords.
+
+Limits: the Windows and macOS sensors are compile-checked only and poll for processes (fast short-lived processes can be missed; ETW and Endpoint Security are planned); on Linux the real-time process source needs root. ClamAV's own on-access detections aren't collected yet. See the roadmap for the rest.
 
 See [docs/ROADMAP.md](docs/ROADMAP.md) for what's next: the rest of the PSA and more.

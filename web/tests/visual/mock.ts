@@ -165,6 +165,7 @@ function clientOut(c: (typeof clients)[number]) {
 	return {
 		...c,
 		email_domains: c.id === 'c-acme' ? ['acme.example'] : [],
+		security_canary: c.id === 'c-initech',
 		sites: sites.filter((s) => s.client_id === c.id).map((s) => {
 			const as = agents.filter((a) => a.site_id === s.id);
 			return { ...s, agent_count: as.length, online_count: as.filter((a) => a.online).length };
@@ -386,7 +387,229 @@ function ticketList(q: URLSearchParams) {
 	);
 }
 
-const admin = { id: 'u-1', email: 'dana@northwind.example', name: 'Dana Admin', role: 'admin', totp_enabled: true, mfa_setup_required: false, client_ids: null, preferences: {} };
+// --- security ---------------------------------------------------------------------------------
+type Prod = Record<string, unknown> & { kind: string; name: string; enabled: boolean | null; realtime: boolean | null };
+const defender = (sigMins: number, extra: Partial<Prod> = {}): Prod => ({
+	kind: 'defender', name: 'Microsoft Defender Antivirus', version: '4.18.25090.3009', enabled: true, realtime: true,
+	signature_version: '1.439.218.0', signatures_updated_at: ago(sigMins), signatures_current: null, last_quick_scan_at: ago(60 * 20),
+	last_full_scan_at: ago(60 * 24 * 10), tamper_protection: true, actions: ['quick_scan', 'full_scan', 'update_signatures'], detail: 'Engine 1.1.25090.3001', ...extra
+});
+const clamav = (sigMins: number, extra: Partial<Prod> = {}): Prod => ({
+	kind: 'clamav', name: 'ClamAV', version: '1.4.3', enabled: true, realtime: false, signature_version: '27671', signatures_updated_at: ago(sigMins),
+	signatures_current: null, last_quick_scan_at: ago(60 * 24 * 2), last_full_scan_at: null, tamper_protection: null,
+	actions: ['quick_scan', 'full_scan', 'update_signatures'], detail: 'Scans load the signatures themselves (clamd isn\'t running)', ...extra
+});
+const security: Record<string, { state: string; products: Prod[]; reported: number | null }> = {
+	'a-1': { state: 'protected', products: [defender(180)], reported: 4 },
+	'a-2': { state: 'threats', products: [defender(95)], reported: 2 },
+	'a-3': { state: 'at_risk', products: [clamav(60 * 20)], reported: 3 },
+	'a-4': {
+		state: 'protected',
+		products: [
+			{ kind: 'other', name: 'Sophos Intercept X', version: null, enabled: true, realtime: true, signature_version: null, signatures_updated_at: null, signatures_current: true, last_quick_scan_at: null, last_full_scan_at: null, tamper_protection: null, actions: [], detail: 'Reported by Windows Security Center' },
+			defender(60 * 30, { enabled: false, realtime: false, detail: 'Passive Mode (another antivirus is primary)', last_quick_scan_at: null })
+		],
+		reported: 40
+	},
+	'a-5': { state: 'unprotected', products: [], reported: 6 },
+	'a-6': { state: 'at_risk', products: [clamav(60 * 24 * 6)], reported: 5 },
+	'a-7': { state: 'unknown', products: [], reported: null }
+};
+const detections = [
+	{ id: 'd-1', agent_id: 'a-2', product: 'defender', name: 'Trojan:Win32/Wacatac.B!ml', severity: 'severe', status: 'active', resources: ['file:_C:\\Users\\jsmith\\Downloads\\invoice_0614.pdf.exe', 'process:_pid:4412'], process: 'C:\\Windows\\explorer.exe', username: 'ACME\\jsmith', detected_at: ago(25), first_seen_at: ago(24), last_seen_at: ago(2), resolved_at: null },
+	{ id: 'd-2', agent_id: 'a-2', product: 'defender', name: 'PUA:Win32/Presenoker', severity: 'low', status: 'quarantined', resources: ['file:_C:\\Users\\jsmith\\AppData\\Local\\Temp\\setup_x64.exe'], process: null, username: 'ACME\\jsmith', detected_at: ago(60 * 26), first_seen_at: ago(60 * 26), last_seen_at: ago(2), resolved_at: ago(60 * 26) },
+	{ id: 'd-3', agent_id: 'a-1', product: 'defender', name: 'Virus:DOS/EICAR_Test_File', severity: 'severe', status: 'removed', resources: ['file:_C:\\temp\\eicar.com'], process: null, username: 'ACME\\dana', detected_at: ago(60 * 24 * 2), first_seen_at: ago(60 * 24 * 2), last_seen_at: ago(4), resolved_at: ago(60 * 24 * 2) },
+	{ id: 'd-4', agent_id: 'a-3', product: 'clamav', name: 'Unix.Trojan.Mirai-7100807-0', severity: 'unknown', status: 'removed', resources: ['/tmp/.x/bins.sh'], process: null, username: null, detected_at: ago(60 * 24 * 2), first_seen_at: ago(60 * 24 * 2), last_seen_at: ago(3), resolved_at: ago(60 * 24 * 1) }
+].map((d) => {
+	const a = agents.find((x) => x.id === d.agent_id)!;
+	return { ...d, hostname: a.hostname, client_id: a.client_id, client_name: a.client_name, site_name: a.site_name };
+});
+const securityActions: Record<string, Record<string, unknown>[]> = {
+	'a-2': [
+		{ id: 'sa-3', product: 'defender', action: 'quick_scan', status: 'running', message: null, created_by_name: 'Dana Admin', created_at: ago(3), started_at: ago(3), finished_at: null },
+		{ id: 'sa-2', product: 'defender', action: 'update_signatures', status: 'succeeded', message: 'Signatures updated', created_by_name: 'Dana Admin', created_at: ago(95), started_at: ago(95), finished_at: ago(94) }
+	],
+	'a-3': [
+		{ id: 'sa-1', product: 'clamav', action: 'quick_scan', status: 'succeeded', message: 'Found 1 infected file (18,204 files scanned)', created_by_name: 'Terry Tech', created_at: ago(60 * 24 * 2 + 9), started_at: ago(60 * 24 * 2 + 9), finished_at: ago(60 * 24 * 2) },
+		{ id: 'sa-0', product: 'clamav', action: 'update_signatures', status: 'failed', message: 'freshclam failed: Can\'t connect to port 80 of host database.clamav.net', created_by_name: 'Terry Tech', created_at: ago(60 * 24 * 3), started_at: ago(60 * 24 * 3), finished_at: ago(60 * 24 * 3 - 1) }
+	]
+};
+function securityRow(a: Agent) {
+	const s = security[a.id];
+	const enabled = s.products.filter((p) => p.enabled);
+	const sigs = enabled.map((p) => p.signatures_updated_at as string | null).filter(Boolean).sort().reverse();
+	const scans = s.products.flatMap((p) => [p.last_quick_scan_at, p.last_full_scan_at] as (string | null)[]).filter(Boolean).sort().reverse();
+	return {
+		id: a.id, hostname: a.hostname, online: a.online, os_family: a.os_family, client_id: a.client_id, client_name: a.client_name, site_id: a.site_id, site_name: a.site_name,
+		state: s.state, security_at: s.reported === null ? null : ago(s.reported), security_error: null,
+		products: s.products.map(({ kind, name, enabled, realtime }) => ({ kind, name, enabled, realtime })),
+		signatures_updated_at: sigs[0] ?? null, last_scan_at: scans[0] ?? null,
+		active_threats: allDetections.filter((d) => d.agent_id === a.id && d.status === 'active' && !d.resolved_at && !d.audit).length,
+		running_action: a.id === 'a-2' ? 'quick_scan' : null,
+		isolated: sensors[a.id].isolated, sensor: sensors[a.id].sensor, content_version: (sensors[a.id].sensor?.content_version as string | null) ?? null
+	};
+}
+function securitySummary(client: string | null) {
+	const rows = agents.filter((a) => !client || a.client_id === client).map(securityRow);
+	const by = Object.fromEntries(['threats', 'unprotected', 'at_risk', 'unknown', 'protected'].map((k) => [k, rows.filter((r) => r.state === k).length]));
+	return { agents: by, active_threats: rows.reduce((n, r) => n + r.active_threats, 0), detections_7d: 3, actions_running: 1 };
+}
+
+// --- security: our sensor, response, investigation (Phase 8, milestones 2-7) -------------------
+const HASH_BEACON = '9f2c4e1a7b3d5f60812a4c6e8b0d2f4a6c8e0b2d4f6a8c0e2b4d6f8a0c2e4b6d';
+const HASH_DROPPER = '3b7a91c2d4e6f8a0b2c4d6e8f0a2b4c6d8e0f2a4b6c8d0e2f4a6b8c0d2e4f6a8';
+const sensorPolicy = (o: Record<string, unknown> = {}) => ({
+	enabled: true, quick_scan_hours: 24, full_scan_days: 7, auto_quarantine: true, prevention: true, telemetry_mb: 256, canaries: true,
+	exclusions: [{ kind: 'path', value: 'D:\\Backups\\' }], rule_modes: [], ...o
+});
+const health = (o: Record<string, unknown> = {}) => ({
+	events_total: 1_284_330, events_per_min: 212.4, store_bytes: 141 * 2 ** 20, cpu_percent: 0.8, rss_bytes: 38 * 2 ** 20, rules: 64,
+	collectors: [['process', 'etw'], ['network', 'etw'], ['file', 'etw'], ['registry', 'etw']], canaries: 6, last_scan: ago(60 * 5), ...o
+});
+const sensors: Record<string, { sensor: Record<string, unknown> | null; policy: Record<string, unknown>; isolated: boolean }> = {
+	'a-1': { sensor: { enabled: true, running: true, restarts: 4, content_version: '2026.06.14.1', error: null, isolated: false, health: health({ events_per_min: 96.1, cpu_percent: 1.4 }) }, policy: sensorPolicy(), isolated: false },
+	'a-2': { sensor: { enabled: true, running: true, restarts: 0, content_version: '2026.06.14.1', error: null, isolated: true, health: health() }, policy: sensorPolicy(), isolated: true },
+	'a-3': { sensor: { enabled: true, running: false, restarts: 2, content_version: '2026.06.10.2', error: 'fanotify: permission denied (the agent needs CAP_SYS_ADMIN)', isolated: false, health: null }, policy: sensorPolicy({ prevention: false, canaries: false }), isolated: false },
+	'a-4': { sensor: { enabled: true, running: true, restarts: 0, content_version: '2026.06.10.2', error: null, isolated: false, health: health({ events_per_min: 40 }) }, policy: sensorPolicy(), isolated: false },
+	'a-5': { sensor: { enabled: false, running: false, restarts: 0, content_version: null, error: null, isolated: false, health: null }, policy: sensorPolicy({ enabled: false }), isolated: false },
+	'a-6': { sensor: { enabled: true, running: true, restarts: 0, content_version: '2026.06.14.1', error: null, isolated: false, health: health({ collectors: [['process', 'proc-connector'], ['network', 'poll'], ['file', 'fanotify']], canaries: 0 }) }, policy: sensorPolicy({ canaries: false }), isolated: false },
+	'a-7': { sensor: null, policy: sensorPolicy(), isolated: false }
+};
+const rmmProduct = (a: string): Prod => ({
+	kind: 'rmm', name: 'RMM sensor', version: '0.4.2', enabled: true, realtime: true, signature_version: '2026.06.14.1', signatures_updated_at: ago(60 * 20),
+	signatures_current: null, last_quick_scan_at: ago(60 * 5), last_full_scan_at: ago(60 * 24 * 3), tamper_protection: null, actions: ['quick_scan', 'full_scan'], detail: a === 'a-1' ? 'Engine 0.4.2' : null
+});
+security['a-1'].products.push(rmmProduct('a-1'));
+security['a-2'].products.push(rmmProduct('a-2'));
+const proc = (pid: number, ppid: number, name: string, exe: string, cmd: string, started: number, user = 'ACME\\jsmith', sha256?: string) => ({ pid, ppid, name, exe, command_line: cmd, user, sha256, started_at: ago(started) });
+const pExplorer = proc(3120, 2988, 'explorer.exe', 'C:\\Windows\\explorer.exe', 'C:\\Windows\\Explorer.EXE', 60 * 6);
+const pWord = proc(5544, 3120, 'WINWORD.EXE', 'C:\\Program Files\\Microsoft Office\\root\\Office16\\WINWORD.EXE', '"C:\\Program Files\\Microsoft Office\\root\\Office16\\WINWORD.EXE" /n "C:\\Users\\jsmith\\Downloads\\Invoice_0614.docm"', 28);
+const pPs = proc(6120, 5544, 'powershell.exe', 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe', 'powershell.exe -NoP -W Hidden -Enc SQBFAFgAIAAoAE4AZQB3AC0ATwBiAGoAZQBjAHQAIABOAGUAdAAuAFcAZQBiAEMAbABpAGUAbgB0ACkA', 27, 'ACME\\jsmith', 'de96a6e69944335375dc1ac238336066889d9ffc7d73628ef4fe1b1b160ab32c');
+const ev = (seq: number, mins: number, kind: string, action: string, extra: Record<string, unknown>) => ({ seq, ts: ago(mins), kind, action, ...extra });
+const contextD5 = [
+	ev(88412, 27, 'process', 'start', { process: pPs, parent: pWord }),
+	ev(88100, 28, 'process', 'running', { process: pWord }),
+	ev(10220, 60 * 6, 'process', 'running', { process: pExplorer }),
+	ev(88415, 26.9, 'network', 'connect', { process: pPs, network: { protocol: 'tcp', local_addr: '10.1.0.24', local_port: 51544, remote_addr: '185.220.101.4', remote_port: 443 } }),
+	ev(88419, 26.8, 'file', 'create', { process: pPs, file: { path: 'C:\\Users\\jsmith\\AppData\\Local\\Temp\\upd4412.exe', sha256: HASH_BEACON } }),
+	ev(88422, 26.7, 'registry', 'set', { process: pPs, registry: { key: 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run', value: 'OneDriveSync', data: 'C:\\Users\\jsmith\\AppData\\Local\\Temp\\upd4412.exe' } }),
+	ev(88430, 26.5, 'process', 'start', { process: proc(7012, 6120, 'upd4412.exe', 'C:\\Users\\jsmith\\AppData\\Local\\Temp\\upd4412.exe', 'C:\\Users\\jsmith\\AppData\\Local\\Temp\\upd4412.exe', 26.5, 'ACME\\jsmith', HASH_BEACON), parent: pPs })
+];
+const extraDetections = [
+	{ id: 'd-5', agent_id: 'a-2', product: 'rmm', source: 'behaviour', name: 'Office application started an encoded PowerShell command', severity: 'high', status: 'active', resources: ['process:_pid:6120'], process: pPs.exe, username: 'ACME\\jsmith', detected_at: ago(27), first_seen_at: ago(27), last_seen_at: ago(27), resolved_at: null, rule_id: 'RMM-B-0007', mitre: ['T1059.001', 'T1566.001'], audit: false, action_taken: null, sha256: null, verdict: null },
+	{ id: 'd-6', agent_id: 'a-2', product: 'rmm', source: 'file', name: 'Known-bad file: Cobalt Strike beacon', severity: 'severe', status: 'quarantined', resources: ['file:_C:\\Users\\jsmith\\AppData\\Local\\Temp\\upd4412.exe'], process: null, username: 'ACME\\jsmith', detected_at: ago(26), first_seen_at: ago(26), last_seen_at: ago(26), resolved_at: ago(26), rule_id: 'RMM-F-0002', mitre: ['T1071.001'], audit: false, action_taken: 'Quarantined automatically', sha256: HASH_BEACON, verdict: 'true_positive' },
+	{ id: 'd-7', agent_id: 'a-1', product: 'rmm', source: 'behaviour', name: 'Scheduled task created from a temp folder', severity: 'moderate', status: 'active', resources: [], process: 'C:\\Windows\\System32\\schtasks.exe', username: 'ACME\\dana', detected_at: ago(60 * 9), first_seen_at: ago(60 * 9), last_seen_at: ago(60 * 9), resolved_at: null, rule_id: 'RMM-B-0031', mitre: ['T1053.005'], audit: true, action_taken: null, sha256: null, verdict: 'benign' }
+].map((d) => {
+	const a = agents.find((x) => x.id === d.agent_id)!;
+	return { ...d, hostname: a.hostname, client_id: a.client_id, client_name: a.client_name, site_name: a.site_name };
+});
+const allDetections = [
+	...extraDetections.slice(0, 2),
+	...detections.map((d) => ({ ...d, source: 'product', rule_id: null, mitre: [] as string[], audit: false, action_taken: d.status === 'active' ? null : d.status === 'quarantined' ? 'Quarantined' : 'Removed', sha256: d.id === 'd-3' ? '275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f' : null, verdict: d.id === 'd-3' ? 'benign' : null })),
+	extraDetections[2]
+].sort((x, y) => Date.parse(y.detected_at) - Date.parse(x.detected_at));
+const quarantine = [
+	{ id: 'q-1', agent_id: 'a-2', path: 'C:\\Users\\jsmith\\AppData\\Local\\Temp\\upd4412.exe', sha256: HASH_BEACON, size: 284_672, reason: 'Known-bad file: Cobalt Strike beacon (RMM-F-0002)', quarantined_at: ago(26), state: 'quarantined', updated_at: ago(26) },
+	{ id: 'q-2', agent_id: 'a-2', path: 'C:\\Users\\jsmith\\Downloads\\Invoice_0614.docm', sha256: HASH_DROPPER, size: 61_440, reason: 'Quarantined by Dana Admin', quarantined_at: ago(20), state: 'quarantined', updated_at: ago(20) },
+	{ id: 'q-3', agent_id: 'a-6', path: '/tmp/.cache/kdevtmpfsi', sha256: 'c41f9a0e7d2b5c8f3e6a1d4b7c0f2e5a8d1b4c7e0f3a6d9b2c5e8f1a4d7b0c3e', size: 2_301_440, reason: 'Linux coin miner (RMM-F-0011)', quarantined_at: ago(60 * 24 * 4), state: 'deleted', updated_at: ago(60 * 24 * 3) },
+	{ id: 'q-4', agent_id: 'a-1', path: 'C:\\Tools\\nirsoft\\WebBrowserPassView.exe', sha256: '7e3d1c9b5a7f2e4d6c8b0a1f3e5d7c9b2a4f6e8d0c1b3a5f7e9d2c4b6a8f0e1d', size: 412_160, reason: 'Password recovery tool (RMM-F-0020)', quarantined_at: ago(60 * 24 * 6), state: 'restored', updated_at: ago(60 * 24 * 5) }
+].map((q) => {
+	const a = agents.find((x) => x.id === q.agent_id)!;
+	return { ...q, hostname: a.hostname, client_id: a.client_id, client_name: a.client_name };
+});
+const act = (id: string, action: string, status: string, mins: number, o: Record<string, unknown> = {}) => ({
+	id, product: 'rmm', action, status, message: null, created_by_name: 'Dana Admin', created_at: ago(mins), started_at: ago(mins), finished_at: status === 'running' || status === 'sent' ? null : ago(mins - 1),
+	params: {}, result: null, has_download: false, ...o
+});
+securityActions['a-2'] = [
+	{ ...securityActions['a-2'][0], params: {}, result: null, has_download: false },
+	act('sa-9', 'isolate', 'succeeded', 18, { params: { type: 'isolate', allow: [] }, message: 'Network isolated' }),
+	act('sa-8', 'quarantine_file', 'succeeded', 20, { params: { type: 'quarantine_file', path: 'C:\\Users\\jsmith\\Downloads\\Invoice_0614.docm' }, message: 'Quarantined (61 KB)' }),
+	act('sa-7', 'kill_process', 'succeeded', 22, { params: { type: 'kill_process', pid: 6120, tree: true }, message: 'Killed 2 processes' }),
+	act('sa-6', 'collect_triage', 'succeeded', 21, { params: { type: 'collect_triage' }, message: 'Triage package ready (4.2 MB)', has_download: true }),
+	{ ...securityActions['a-2'][1], params: {}, result: null, has_download: false }
+];
+securityActions['a-1'] = [
+	act('sa-12', 'scan_path', 'failed', 40, { params: { type: 'scan_path', path: 'E:\\Shares\\Finance' }, message: 'path not found' }),
+	act('sa-11', 'collect_triage', 'succeeded', 60 * 9, { params: { type: 'collect_triage' }, message: 'Triage package ready (3.8 MB)', has_download: true, created_by_name: 'Terry Tech' }),
+	act('sa-10', 'quick_scan', 'succeeded', 60 * 5, { message: 'Scanned 48,211 files, nothing found', created_by_name: null })
+];
+securityActions['a-3'] = (securityActions['a-3'] ?? []).map((a) => ({ ...a, params: {}, result: null, has_download: false }));
+function agentSecurity(a: Agent) {
+	const s = security[a.id];
+	const z = sensors[a.id];
+	return {
+		supported: a.id !== 'a-7', online: a.online, state: s.state, reported_at: s.reported === null ? null : ago(s.reported), error: null, products: s.products,
+		detections: allDetections.filter((d) => d.agent_id === a.id), actions: securityActions[a.id] ?? [],
+		sensor_supported: a.id !== 'a-7', sensor: z.sensor, sensor_at: z.sensor ? ago(1) : null, content_version: (z.sensor?.content_version as string | null) ?? null,
+		isolated: z.isolated, policy: z.policy, quarantine: quarantine.filter((q) => q.agent_id === a.id && q.state === 'quarantined')
+	};
+}
+function detectionDetail(id: string) {
+	const d = allDetections.find((x) => x.id === id)!;
+	const a = agents.find((x) => x.id === d.agent_id)!;
+	const isD5 = d.id === 'd-5';
+	return {
+		...d, os_family: a.os_family, online: a.online, isolated: sensors[a.id].isolated, context: isD5 ? contextD5 : [], context_unavailable: false,
+		content_version: d.product === 'rmm' ? '2026.06.14.1' : null, notes: d.verdict ? 'Confirmed with the user: opened an invoice from an unknown sender.' : null,
+		verdict_by_name: d.verdict ? 'Dana Admin' : null, verdict_at: d.verdict ? ago(15) : null, quarantine_id: d.id === 'd-6' ? 'q-1' : null,
+		prevalence: d.sha256 === HASH_BEACON || isD5 ? [{ agent_id: 'a-4', hostname: 'acme-pos-07', client_name: 'Acme Corp', first_seen: ago(60 * 3), how: 'Quarantined (RMM-F-0002)' }] : [],
+		actions: isD5 ? securityActions['a-2'].filter((x) => ['sa-6', 'sa-7', 'sa-9'].includes(x.id as string)) : [],
+		alert: isD5 ? { id: 'al-5', title: 'Threat: Office application started an encoded PowerShell command', state: 'open' } : null,
+		rule: isD5 ? { id: 'RMM-B-0007', name: 'Office spawns encoded PowerShell', description: 'A Microsoft Office application started PowerShell with an encoded command, the usual first step of a malicious macro.', kind: 'behaviour', event: 'process', severity: 'high', confidence: 'high', mode: 'alert', mitre: ['T1059.001', 'T1566.001'], digest: 'c0ffee' } : null
+	};
+}
+const rule = (id: string, name: string, kind: 'file' | 'behaviour', event: string | null, severity: string, confidence: string, mode: string, mitre: string[], o: Record<string, unknown> = {}) => ({
+	id, name, description: '', kind, event, severity, confidence, mode, mitre, digest: null, override_mode: null, override_reason: null, effective_mode: mode,
+	first_seen: ago(60 * 24 * 40), stage: 'general', hits_7d: 0, audit_hits_7d: 0, agents_30d: 0, true_positives: 0, false_positives: 0, fp_rate: null, can_block: false,
+	block_blocker: 'only high-confidence rules can block', ...o
+});
+const rules = [
+	rule('RMM-B-0007', 'Office spawns encoded PowerShell', 'behaviour', 'process', 'high', 'high', 'alert', ['T1059.001', 'T1566.001'], { hits_7d: 3, agents_30d: 2, true_positives: 4, false_positives: 0, fp_rate: 0, can_block: true, block_blocker: null }),
+	rule('RMM-F-0002', 'Cobalt Strike beacon', 'file', null, 'severe', 'high', 'block', ['T1071.001'], { hits_7d: 2, agents_30d: 2, true_positives: 2, fp_rate: 0, can_block: true, block_blocker: null }),
+	rule('RMM-B-0031', 'Scheduled task created from a temp folder', 'behaviour', 'process', 'moderate', 'medium', 'audit', ['T1053.005'], { audit_hits_7d: 41, agents_30d: 9, false_positives: 3, true_positives: 1, fp_rate: 0.75 }),
+	rule('RMM-B-0018', 'Credential dumping via comsvcs MiniDump', 'behaviour', 'process', 'severe', 'high', 'alert', ['T1003.001'], { first_seen: ago(60 * 24 * 3), can_block: false, block_blocker: 'it needs 7 days in general content first (audit history)' }),
+	rule('RMM-B-0022', 'Shadow copies deleted', 'behaviour', 'process', 'severe', 'high', 'alert', ['T1490'], { override_mode: 'block', override_reason: 'Ransomware precursor; no legitimate use here', effective_mode: 'block', hits_7d: 1, agents_30d: 1, true_positives: 1, fp_rate: 0, can_block: true, block_blocker: null }),
+	rule('RMM-B-0040', 'Unsigned driver loaded', 'behaviour', 'module', 'moderate', 'low', 'alert', ['T1014'], { override_mode: 'disabled', override_reason: 'Noisy on build servers', effective_mode: 'disabled', false_positives: 12, fp_rate: 1 })
+];
+const contentVersion = (id: string, version: string, stage: string, mins: number, o: Record<string, unknown> = {}) => ({
+	id, version, sha256: Array.from({ length: 64 }, (_, i) => '0123456789abcdef'[(i * 7 + Number(version.replace(/\D/g, '').slice(-3)) * (i % 5 + 1)) % 16]).join(''), description: '', rule_count: 64, hashes: 18_204, stage, stage_reason: null,
+	uploaded_by_name: 'Dana Admin', uploaded_at: ago(mins), stage_changed_at: ago(mins), agents: 0, ...o
+});
+const contentVersions = [
+	contentVersion('cv-4', '2026.06.15.1', 'canary', 90, { description: 'Adds 2 rules for SharePoint web shells; tightens RMM-B-0031.', rule_count: 66, hashes: 18_377, agents: 0 }),
+	contentVersion('cv-3', '2026.06.14.1', 'general', 60 * 26, { description: 'Cobalt Strike beacons, comsvcs MiniDump.', stage_changed_at: ago(60 * 2), stage_reason: 'Soaked 24 h on 1 canary client without problems', agents: 4 }),
+	contentVersion('cv-2', '2026.06.12.1', 'rolled_back', 60 * 24 * 3, { description: 'Broader LOLBin rules.', rule_count: 63, stage_changed_at: ago(60 * 24 * 3 - 120), stage_reason: 'RMM-B-0029 fired on every msiexec install', uploaded_by_name: 'Terry Tech' }),
+	contentVersion('cv-1', '2026.06.10.2', 'retired', 60 * 24 * 5, { description: 'Starter content.', rule_count: 58, hashes: 17_950, stage_changed_at: ago(60 * 2), stage_reason: 'Replaced by 2026.06.14.1', agents: 2 })
+];
+const securityPolicies = [
+	{ id: 'sp-global', client_id: null, client_name: null, site_id: null, site_name: null, sensor_enabled: true, quick_scan_hours: 24, full_scan_days: 7, auto_quarantine: true, prevention: true, canaries: true, telemetry_mb: 256, updated_by_name: 'Dana Admin', updated_at: ago(60 * 24 * 6) },
+	{ id: 'sp-globex', client_id: 'c-globex', client_name: 'Globex', site_id: null, site_name: null, sensor_enabled: true, quick_scan_hours: 12, full_scan_days: 0, auto_quarantine: true, prevention: false, canaries: false, telemetry_mb: 512, updated_by_name: 'Terry Tech', updated_at: ago(60 * 30) },
+	{ id: 'sp-umbrella', client_id: 'c-umbrella', client_name: 'Umbrella Health', site_id: 's-umbrella', site_name: 'Clinic', sensor_enabled: false, quick_scan_hours: 24, full_scan_days: 7, auto_quarantine: true, prevention: false, canaries: false, telemetry_mb: 256, updated_by_name: 'Dana Admin', updated_at: ago(60 * 24 * 2) }
+];
+const exclusions = [
+	{ id: 'ex-1', client_id: null, client_name: null, kind: 'path', value: 'D:\\Backups\\', comment: 'Veeam repository; scanned by the backup server', created_by_name: 'Dana Admin', created_at: ago(60 * 24 * 20) },
+	{ id: 'ex-2', client_id: 'c-acme', client_name: 'Acme Corp', kind: 'sha256', value: '7e3d1c9b5a7f2e4d6c8b0a1f3e5d7c9b2a4f6e8d0c1b3a5f7e9d2c4b6a8f0e1d', comment: 'restored from quarantine', created_by_name: 'Dana Admin', created_at: ago(60 * 24 * 5) },
+	{ id: 'ex-3', client_id: 'c-globex', client_name: 'Globex', kind: 'process', value: 'pg_basebackup', comment: 'Nightly database backups', created_by_name: 'Terry Tech', created_at: ago(60 * 24 * 9) },
+	{ id: 'ex-4', client_id: 'c-acme', client_name: 'Acme Corp', kind: 'rule', value: 'RMM-B-0031', comment: 'false positive (detection d-7)', created_by_name: 'Dana Admin', created_at: ago(60 * 8) }
+];
+const telemetryEvents = [...contextD5].sort((x, y) => Date.parse(y.ts) - Date.parse(x.ts));
+function hunt(body: Record<string, unknown>) {
+	const sha = body.sha256 as string | undefined;
+	if (!sha && !body.text) return { status: 400, body: { error: 'search for something: text or a hash' } };
+	return {
+		status: 200,
+		body: {
+			hits: [
+				{ agent_id: 'a-2', hostname: 'acme-fs01', client_name: 'Acme Corp', truncated: false, events: contextD5.filter((e) => e.kind === 'file' || (e.kind === 'process' && (e.process as { pid: number }).pid === 7012)) },
+				{ agent_id: 'a-1', hostname: 'acme-dc01', client_name: 'Acme Corp', truncated: false, events: [ev(51210, 60 * 3, 'file', 'create', { process: proc(812, 3120, 'msedge.exe', 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe', 'msedge.exe', 60 * 5, 'ACME\\dana'), file: { path: 'C:\\Users\\dana\\Downloads\\upd4412.exe', sha256: HASH_BEACON } })] }
+			],
+			searched: 4, offline: 1, errors: [{ agent_id: 'a-3', hostname: 'acme-web01', error: 'the sensor isn’t running' }]
+		}
+	};
+}
+
+const admin = { id: 'u-1', email: 'dana@northwind.example', name: 'Dana Admin', role: 'admin', totp_enabled: true, mfa_setup_required: false, client_ids: null, preferences: {}, permissions: ['security.read', 'security.respond', 'security.manage'] };
 
 export async function mockApi(p: Page, opts: { signedIn?: boolean } = {}) {
 	const signedIn = opts.signedIn ?? true;
@@ -398,6 +621,10 @@ export async function mockApi(p: Page, opts: { signedIn?: boolean } = {}) {
 		if (path === '/events') return;
 		const q = url.searchParams;
 		const json = (body: unknown, status = 200) => route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) });
+		if (path === '/security/hunt' && route.request().method() === 'POST') {
+			const r = hunt(route.request().postDataJSON() ?? {});
+			return json(r.body, r.status);
+		}
 		if (route.request().method() !== 'GET') return json({ ok: true });
 		let m: RegExpMatchArray | null;
 		if (path === '/settings/public') return json({ company_name: 'Northwind IT' });
@@ -417,6 +644,44 @@ export async function mockApi(p: Page, opts: { signedIn?: boolean } = {}) {
 		if ((m = path.match(/^\/agents\/([^/]+)\/metrics$/))) return json(metricHistory(agents.find((a) => a.id === m![1])!));
 		if (path.match(/^\/agents\/[^/]+\/activity$/)) return json([{ id: 1, ts: ago(300), user_name: 'Dana Admin', action: 'agent.update_offer', target_type: 'agent', target_id: 'a-1', details: { version: '0.4.2' } }, { id: 2, ts: ago(290), user_name: null, action: 'agent.update_completed', target_type: 'agent', target_id: 'a-1', details: { version: '0.4.2' } }]);
 		if ((m = path.match(/^\/agents\/([^/]+)\/patches$/))) return json(agentPatches(agents.find((a) => a.id === m![1])!));
+		if ((m = path.match(/^\/agents\/([^/]+)\/security$/))) {
+			return json(agentSecurity(agents.find((x) => x.id === m![1])!));
+		}
+		if ((m = path.match(/^\/agents\/([^/]+)\/telemetry$/))) {
+			const a = agents.find((x) => x.id === m![1])!;
+			if (!a.online) return json({ error: 'the agent is offline' }, 409);
+			return json({ events: q.get('around') ? telemetryEvents : telemetryEvents.slice(0, 5), truncated: false, error: null });
+		}
+		if ((m = path.match(/^\/security\/detections\/([^/]+)$/))) return json(detectionDetail(m![1]));
+		if (path === '/security/quarantine') {
+			const t = q.get('q')?.toLowerCase();
+			return json(quarantine.filter((x) => (q.get('state') === 'all' || x.state === 'quarantined') && (!q.get('client_id') || x.client_id === q.get('client_id')) && (!t || `${x.path} ${x.hostname} ${x.sha256}`.toLowerCase().includes(t))));
+		}
+		if (path === '/security/prevalence') return json({ sha256: q.get('sha256'), agents: q.get('sha256') === HASH_BEACON ? detectionDetail('d-6').prevalence.concat([{ agent_id: 'a-2', hostname: 'acme-fs01', client_name: 'Acme Corp', first_seen: ago(26), how: 'Detected and quarantined (RMM-F-0002)' }]) : [] });
+		if (path === '/security/rules') return json(rules);
+		if (path === '/security/content') return json({ versions: contentVersions, canary_clients: 1, soak_minutes: 1440, verifies_signatures: false });
+		if (path === '/security/policies') return json(securityPolicies);
+		if (path === '/security/exclusions') return json(exclusions);
+		if (path === '/security/summary') return json(securitySummary(q.get('client_id')));
+		if (path === '/security/agents') {
+			const rank = ['threats', 'unprotected', 'at_risk', 'unknown', 'protected'];
+			let list = agents.filter((a) => !q.get('client_id') || a.client_id === q.get('client_id')).map(securityRow).sort((x, y) => rank.indexOf(x.state) - rank.indexOf(y.state));
+			if (q.get('state')) list = list.filter((r) => q.get('state')!.split(',').includes(r.state));
+			return json(page(list, Number(q.get('limit') ?? 50)));
+		}
+		if (path === '/security/detections') {
+			const all = q.get('view') === 'all';
+			return json(
+				page(
+					allDetections.filter(
+						(d) =>
+							(all || (d.status === 'active' && !d.resolved_at)) && (!q.get('client_id') || d.client_id === q.get('client_id')) &&
+							(q.get('audit') === 'true' || !d.audit) && (!q.get('source') || d.source === q.get('source'))
+					),
+					Number(q.get('limit') ?? 50)
+				)
+			);
+		}
 		if (path === '/patches') {
 			let list = updateGroups();
 			if (q.get('client_id')) list = list.filter((u) => updates.find((x) => x.update_id === u.update_id)!.on.some((id) => agents.find((a) => a.id === id)!.client_id === q.get('client_id')));
@@ -451,7 +716,14 @@ export async function mockApi(p: Page, opts: { signedIn?: boolean } = {}) {
 		if (path === '/scripts') return json(scripts);
 		if ((m = path.match(/^\/scripts\/([^/]+)$/))) return json(scripts.find((s) => s.id === m![1]));
 		if (path === '/audit') return json(page(Array.from({ length: 8 }, (_, i) => ({ id: 100 - i, ts: ago(i * 53), user_name: i % 4 ? 'Dana Admin' : null, action: ['client.create', 'job.create', 'script.update', 'agent.update_offer', 'auth.login', 'site.rename', 'user.create', 'settings.update'][i], target_type: ['client', 'script', 'script', 'agent', null, 'site', 'user', null][i], target_id: i % 2 ? 'x' : null, details: i % 3 ? { name: 'Acme Corp' } : {} }))));
-		if (path === '/users') return json([admin, { ...admin, id: 'u-2', email: 'terry@northwind.example', name: 'Terry Tech', role: 'technician', totp_enabled: false, client_ids: ['c-acme'] }].map((u) => ({ ...u, disabled: false, last_login_at: ago(60), all_clients: u.role === 'admin', client_ids: u.client_ids ?? [] })));
+		if (path === '/users')
+			return json(
+				[
+					{ ...admin, permissions: null },
+					{ ...admin, id: 'u-2', email: 'terry@northwind.example', name: 'Terry Tech', role: 'technician', totp_enabled: false, client_ids: ['c-acme'], permissions: null },
+					{ ...admin, id: 'u-3', email: 'sam@northwind.example', name: 'Sam Security', role: 'readonly', totp_enabled: true, client_ids: null, permissions: ['security.read', 'security.respond', 'security.manage'] }
+				].map((u) => ({ ...u, disabled: false, last_login_at: ago(60), all_clients: u.role === 'admin' || u.client_ids === null, client_ids: u.client_ids ?? [] }))
+			);
 		if (path === '/settings') return json({ company_name: 'Northwind IT', session_idle_hours: null, session_idle_hours_default: 12, require_2fa_all: false, auto_update_agents: true });
 		if (path === '/auth/totp') return json({ enabled: true, required: true, recovery_codes_left: 8 });
 		if (path === '/auth/sessions') return json([{ id: 'x1', created_at: ago(600), last_seen_at: ago(0), expires_at: ago(-6000), user_agent: 'Mozilla/5.0 (X11; Linux x86_64) Chrome/140.0', current: true }]);
