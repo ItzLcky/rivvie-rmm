@@ -21,7 +21,17 @@ mod imp {
             PACKAGED_PATH
         } else {
             if exe != Path::new(BIN_PATH) {
-                std::fs::copy(&exe, BIN_PATH).with_context(|| format!("copying agent to {BIN_PATH} (run as root)"))?;
+                // Copy beside it, then rename over: writing into the binary of a running agent
+                // fails with ETXTBSY, but replacing the directory entry is fine (the old
+                // process keeps its inode until the restart below).
+                let tmp = format!("{BIN_PATH}.install");
+                let _ = std::fs::remove_file(&tmp);
+                std::fs::copy(&exe, &tmp).with_context(|| format!("copying agent to {tmp} (run as root)"))?;
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
+                }
+                std::fs::rename(&tmp, BIN_PATH).with_context(|| format!("installing agent to {BIN_PATH} (run as root)"))?;
             }
             BIN_PATH
         };
@@ -46,7 +56,9 @@ mod imp {
         }
         std::fs::write(UNIT_PATH, unit).with_context(|| format!("writing {UNIT_PATH} (run as root)"))?;
         systemctl(&["daemon-reload"])?;
-        systemctl(&["enable", "--now", "rmm-agent.service"])?;
+        systemctl(&["enable", "rmm-agent.service"])?;
+        // restart, not start: on a reinstall the old binary (and old config) is still running.
+        systemctl(&["restart", "rmm-agent.service"])?;
         println!("rmm-agent service installed and started");
         Ok(())
     }
@@ -127,9 +139,14 @@ mod imp {
 
     pub fn install(config: &Path) -> Result<()> {
         crate::config::prepare_data_dir()?;
-        let exe = install_binary()?;
         let mgr = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE)
             .context("opening service manager (run as Administrator)")?;
+        // Reinstall: the running service holds its .exe open, so stop it before copying.
+        let existing = mgr.open_service(NAME, ServiceAccess::QUERY_STATUS | ServiceAccess::CHANGE_CONFIG | ServiceAccess::START).ok();
+        if existing.is_some() {
+            stop_service()?;
+        }
+        let exe = install_binary()?;
         let info = ServiceInfo {
             name: NAME.into(),
             display_name: "RMM Agent".into(),
@@ -142,7 +159,13 @@ mod imp {
             account_name: None, // LocalSystem
             account_password: None,
         };
-        let svc = mgr.create_service(&info, ServiceAccess::CHANGE_CONFIG | ServiceAccess::START)?;
+        let svc = match existing {
+            Some(svc) => {
+                svc.change_config(&info)?;
+                svc
+            }
+            None => mgr.create_service(&info, ServiceAccess::CHANGE_CONFIG | ServiceAccess::START)?,
+        };
         svc.set_description("Remote monitoring and management agent")?;
         // Equivalent of systemd's Restart=always: restart on crashes and on error exits.
         svc.update_failure_actions(ServiceFailureActions {
@@ -170,7 +193,16 @@ mod imp {
         let exe = std::env::current_exe()?;
         if exe != target {
             std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-            std::fs::copy(&exe, &target).with_context(|| format!("copying agent to {}", target.display()))?;
+            // A remote desktop helper can hold the old .exe for a moment after the service stops.
+            let mut copied = std::fs::copy(&exe, &target).map(|_| ());
+            for _ in 0..20 {
+                if copied.is_ok() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(250));
+                copied = std::fs::copy(&exe, &target).map(|_| ());
+            }
+            copied.with_context(|| format!("copying agent to {}", target.display()))?;
         }
         Ok(target)
     }
