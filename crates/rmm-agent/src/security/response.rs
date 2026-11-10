@@ -231,6 +231,8 @@ pub fn sha256(b: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    // Needs a POSIX shell's job control; Git's sh on Windows spawns differently.
+    #[cfg(unix)]
     #[test]
     fn kills_a_process_tree_children_first() {
         let mut child = std::process::Command::new("sh").args(["-c", "sleep 60 & sleep 60 & wait"]).spawn().unwrap();

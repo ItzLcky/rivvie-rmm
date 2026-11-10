@@ -28,6 +28,10 @@ pub struct Exclusions {
 }
 
 fn path_match(pattern: &str, path: &str) -> bool {
+    // Windows takes either separator; compare them as one.
+    let norm = |s: &str| if cfg!(windows) { s.replace('/', "\\") } else { s.to_string() };
+    let (pattern, path) = (norm(pattern), norm(path));
+    let (pattern, path) = (pattern.as_str(), path.as_str());
     if pattern.contains('*') {
         glob(pattern, path)
     } else {

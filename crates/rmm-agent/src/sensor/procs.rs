@@ -362,8 +362,9 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(200));
         let (started, _) = p.poll();
         let me = started.iter().find(|x| x.pid == child.id()).expect("the new process");
-        assert_eq!(me.name, "sleep");
-        assert!(me.command_line.contains("sleep 5"));
+        // Windows (Git's sleep.exe) names it sleep.exe and lists the full path.
+        assert_eq!(me.name.trim_end_matches(".exe"), "sleep");
+        assert!(me.command_line.ends_with(" 5"), "{}", me.command_line);
         child.kill().unwrap();
         child.wait().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(200));

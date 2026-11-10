@@ -11,6 +11,7 @@ RUN apk add --no-cache musl-dev
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+COPY content ./content
 RUN cargo build --release -p rmm-server
 
 # Agents offered by the "Enroll agents" dialog. Linux is a static musl binary, so it runs on
@@ -27,6 +28,7 @@ RUN apk add --no-cache musl-dev mingw-w64-gcc && rustup target add x86_64-pc-win
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+COPY content ./content
 RUN --mount=type=secret,id=update_key \
     cargo build --release -p rmm-agent -p rmm-sign \
  && cargo build --release -p rmm-agent --target x86_64-pc-windows-gnu \
