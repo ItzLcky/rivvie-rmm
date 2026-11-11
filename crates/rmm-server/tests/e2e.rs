@@ -1119,8 +1119,12 @@ ExecStart=/tmp/x
     assert_eq!(a["status"], "succeeded", "{a}");
     let j = admin.wait_job(&job, 30).await;
     assert_ne!(j["status"], "succeeded", "the job's process was killed: {j}");
+    // Only a sensor started from the binary under test: a dev machine may run an installed agent too.
+    let bin = std::fs::canonicalize(agent_bin()).unwrap();
     let agent_pid = std::fs::read_dir("/proc").unwrap().flatten().filter_map(|e| e.file_name().to_string_lossy().parse::<u32>().ok()).find(|p| {
-        std::fs::read(format!("/proc/{p}/cmdline")).is_ok_and(|c| String::from_utf8_lossy(&c).split('\0').collect::<Vec<_>>().ends_with(&["sensor", ""]))
+        std::fs::read_link(format!("/proc/{p}/exe")).is_ok_and(|exe| exe == bin)
+            && std::fs::read(format!("/proc/{p}/cmdline"))
+                .is_ok_and(|c| String::from_utf8_lossy(&c).split('\0').collect::<Vec<_>>().ends_with(&["sensor", ""]))
     });
     if let Some(sensor_pid) = agent_pid {
         let refused = respond(json!({ "type": "kill_process", "pid": sensor_pid })).await;
@@ -1739,23 +1743,28 @@ async fn monitoring(server: &mut Server, admin: &Api, db: &sqlx::PgPool, dir: &P
 
     // --- retention and rollups run at startup -------------------------------------------------------
     sqlx::query("UPDATE jobs SET finished_at = now() - interval '2 days' WHERE id = $1::uuid").bind(&run_id).execute(db).await.unwrap();
-    sqlx::query(
+    // Checked by its hour: the agent's real samples are rolled up too, and on a busy CI runner
+    // another hour can also peak above 42%.
+    let hour: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
         "INSERT INTO agent_metrics (agent_id, ts, cpu_percent, mem_used, mem_total, disk_max_pct, net_rx_bytes, net_tx_bytes)
-         VALUES ($1::uuid, date_trunc('hour', now()) - interval '90 minutes', 42, 1, 2, 3, 4, 5)",
+         VALUES ($1::uuid, date_trunc('hour', now()) - interval '90 minutes', 42, 1, 2, 3, 4, 5)
+         RETURNING date_trunc('hour', ts)",
     )
     .bind(id1)
-    .execute(db)
+    .fetch_one(db)
     .await
     .unwrap();
     server.restart().await;
     admin.wait_online(id1, true).await;
     let (s, _) = admin.call(reqwest::Method::GET, &format!("/jobs/{run_id}"), None).await;
     assert_eq!(s, StatusCode::NOT_FOUND, "scheduled output past its retention is deleted");
-    let hourly: i64 = sqlx::query_scalar("SELECT count(*) FROM agent_metrics_hourly WHERE agent_id = $1::uuid AND cpu_max >= 42")
-        .bind(id1)
-        .fetch_one(db)
-        .await
-        .unwrap();
+    let hourly: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM agent_metrics_hourly WHERE agent_id = $1::uuid AND hour = $2 AND cpu_max >= 42")
+            .bind(id1)
+            .bind(hour)
+            .fetch_one(db)
+            .await
+            .unwrap();
     assert_eq!(hourly, 1, "the sample was rolled up");
     let week = admin.get(&format!("/agents/{id1}/metrics?hours=168")).await;
     assert!(!week.as_array().unwrap().is_empty(), "long ranges read the rollups");
