@@ -33,16 +33,16 @@
 
 <Tabs.Root {value} onValueChange={(v) => v && onchange(v)} activationMode="manual">
 	<div use:scrollFade class={cx('scroll-fade scrollbar-thin -mx-1 overflow-x-auto px-1', klass)}>
-	<Tabs.List aria-label={label} class="border-border flex w-max min-w-full gap-1 border-b">
+	<Tabs.List aria-label={label} class="border-border flex w-max min-w-full gap-2 border-b">
 		{#each items.filter((i) => !i.hidden) as t (t.value)}
 			<Tabs.Trigger
 				value={t.value}
 				title={t.title}
-				class="text-muted hover:text-fg data-[state=active]:text-fg data-[state=active]:after:bg-accent relative inline-flex h-9 shrink-0 cursor-pointer items-center gap-1.5 px-2.5 text-sm font-medium whitespace-nowrap after:absolute after:inset-x-1 after:-bottom-px after:h-0.5 after:rounded-full [&_svg]:size-4"
+				class="text-muted hover:text-fg data-[state=active]:text-accent data-[state=active]:after:bg-accent group relative inline-flex h-10 shrink-0 cursor-pointer items-center gap-2 px-2 text-sm font-medium whitespace-nowrap transition-colors after:absolute after:inset-x-0 after:-bottom-px after:h-0.5 after:rounded-t-full [&_svg]:size-4"
 			>
 				{#if t.icon}<t.icon />{/if}
 				{t.label}
-				{#if t.count !== undefined}<span class="text-muted text-xs font-normal tabular">{t.count}</span>{/if}
+				{#if t.count !== undefined}<span class="bg-sunken text-muted group-data-[state=active]:bg-accent-soft group-data-[state=active]:text-accent min-w-5 rounded-full px-1.5 text-center text-xs leading-5 font-medium tabular">{t.count}</span>{/if}
 			</Tabs.Trigger>
 		{/each}
 	</Tabs.List>

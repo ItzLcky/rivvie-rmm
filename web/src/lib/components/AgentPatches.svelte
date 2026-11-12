@@ -85,7 +85,7 @@
 			<div class="mb-4 grid gap-4 lg:grid-cols-3">
 				<section class="card p-4" aria-label="Scan">
 					<div class="mb-2 flex items-start justify-between gap-2">
-						<h2 class="text-sm font-semibold">Updates</h2>
+						<h2 class="panel-title">Updates</h2>
 						{#if can('technician')}
 							<Button size="sm" icon={RefreshCw} loading={!!s.scan_requested_at} disabled={!s.online} title={s.online ? undefined : 'The agent is offline'} onclick={scan}>
 								{s.scan_requested_at ? 'Scanning' : 'Scan now'}
@@ -103,7 +103,7 @@
 				</section>
 				<section class="card p-4" aria-label="Policy">
 					<div class="mb-2 flex items-start justify-between gap-2">
-						<h2 class="text-sm font-semibold">Policy</h2>
+						<h2 class="panel-title">Policy</h2>
 						<MoreLink href="/patches?tab=policies">Policies</MoreLink>
 					</div>
 					{#if d.policy}
@@ -118,7 +118,7 @@
 					{/if}
 				</section>
 				<section class="card p-4" aria-label="Maintenance window">
-					<h2 class="mb-2 text-sm font-semibold">Maintenance window</h2>
+					<h2 class="mb-2 panel-title">Maintenance window</h2>
 					<p class="text-sm">{windowLabel(d.window)}</p>
 					<p class="text-muted mt-1 text-xs">
 						{#if !d.window.days?.length}Automatic installs may start whenever updates are eligible.{:else if d.window.open_now}Open now.{:else}Next opens {datetime(d.window.next_start)}.{/if}
@@ -206,8 +206,8 @@
 				</DataTable>
 
 				<section class="card self-start" aria-label="Recent installs">
-					<header class="border-border flex items-center justify-between border-b px-4 py-2.5">
-						<h2 class="text-sm font-semibold">Recent installs</h2>
+					<header class="border-border flex items-center justify-between min-h-12 border-b px-4 py-3">
+						<h2 class="panel-title">Recent installs</h2>
 						<MoreLink href="/patches?tab=history&agent={id}">History</MoreLink>
 					</header>
 					{#if d.runs.length}

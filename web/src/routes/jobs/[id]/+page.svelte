@@ -118,7 +118,7 @@
 
 	<section class="card mb-4 overflow-hidden" aria-label="Output">
 		<header class="border-border flex items-center gap-2 border-b px-3 py-1.5">
-			<h2 class="text-sm font-semibold">Output</h2>
+			<h2 class="panel-title">Output</h2>
 			{#if running}<span class="text-info text-xs">{job.status === 'queued' ? 'waiting for the agent' : live.status === 'live' ? 'streaming' : 'refreshing'}</span>{/if}
 			<div class="ml-auto flex items-center gap-1">
 				{#if !follow && running}<Button size="xs" variant="ghost" icon={ArrowDownToLine} onclick={() => ((follow = true), out?.scrollTo({ top: out.scrollHeight }))}>Follow</Button>{/if}

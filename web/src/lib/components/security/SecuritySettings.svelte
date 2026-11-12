@@ -100,9 +100,9 @@
 
 <!-- Policies -->
 <section class="card mb-6" aria-labelledby="sp-h">
-	<header class="border-border flex flex-wrap items-center gap-x-3 gap-y-2 border-b px-4 py-2.5">
+	<header class="border-border flex flex-wrap items-center gap-x-3 gap-y-2 min-h-12 border-b px-4 py-3">
 		<div class="min-w-0 flex-1">
-			<h2 id="sp-h" class="text-sm font-semibold">Sensor policies</h2>
+			<h2 id="sp-h" class="panel-title">Sensor policies</h2>
 			<p class="text-muted text-xs">The most specific one applies to each agent: site, then client, then MSP-wide.</p>
 		</div>
 		{#if canManage}<Button size="sm" icon={Plus} onclick={() => (editing = { policy: null })}>New policy</Button>{/if}
@@ -172,7 +172,7 @@
 	>
 		{#snippet toolbar()}
 			<div class="min-w-0">
-				<h2 id="ex-h" class="text-sm font-semibold">Exclusions</h2>
+				<h2 id="ex-h" class="panel-title">Exclusions</h2>
 				<p class="text-muted text-xs">Files, hashes, processes and rules our sensor ignores. Narrow ones are safer: an excluded folder is a place malware can hide.</p>
 			</div>
 		{/snippet}
@@ -199,8 +199,8 @@
 
 <!-- Canary clients -->
 <section class="card" aria-labelledby="canary-h">
-	<header class="border-border border-b px-4 py-2.5">
-		<h2 id="canary-h" class="text-sm font-semibold">Canary clients</h2>
+	<header class="border-border min-h-12 border-b px-4 py-3">
+		<h2 id="canary-h" class="panel-title">Canary clients</h2>
 		<p class="text-muted text-xs">New detection content runs on these clients’ agents first, and reaches everyone else after the soak time if nothing goes wrong. Pick a few that are low-risk and well-watched, like your own office.</p>
 	</header>
 	{#if clients.list.length}

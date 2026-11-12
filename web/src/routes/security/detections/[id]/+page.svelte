@@ -167,8 +167,8 @@
 			<div class="min-w-0 space-y-4">
 				<!-- Process tree -->
 				<section class="card" aria-labelledby="tree-h">
-					<header class="border-border border-b px-4 py-2.5">
-						<h2 id="tree-h" class="text-sm font-semibold">Process tree</h2>
+					<header class="border-border min-h-12 border-b px-4 py-3">
+						<h2 id="tree-h" class="panel-title">Process tree</h2>
 						<p class="text-muted text-xs">How the detected process was started, from the oldest ancestor down.</p>
 					</header>
 					{#if d.context_unavailable}
@@ -202,9 +202,9 @@
 
 				<!-- Timeline -->
 				<section class="card" aria-labelledby="timeline-h">
-					<header class="border-border flex flex-wrap items-center gap-x-3 gap-y-2 border-b px-4 py-2.5">
+					<header class="border-border flex flex-wrap items-center gap-x-3 gap-y-2 min-h-12 border-b px-4 py-3">
 						<div class="min-w-0 flex-1">
-							<h2 id="timeline-h" class="text-sm font-semibold">Timeline</h2>
+							<h2 id="timeline-h" class="panel-title">Timeline</h2>
 							<p class="text-muted text-xs">{around ? `The detection’s context plus ${plural(around.events.length, 'event')} from the 10 minutes either side${around.truncated ? ' (more were left out)' : ''}.` : 'What the process tree did around the detection.'}</p>
 						</div>
 						<Button size="sm" icon={History} loading={loadingAround} disabled={!d.online} title={d.online ? undefined : 'The agent is offline; its telemetry stays on the machine'} onclick={() => loadAround(d)}>
@@ -220,8 +220,8 @@
 
 				<!-- Prevalence -->
 				<section class="card" aria-labelledby="prev-h">
-					<header class="border-border border-b px-4 py-2.5">
-						<h2 id="prev-h" class="text-sm font-semibold">Seen elsewhere</h2>
+					<header class="border-border min-h-12 border-b px-4 py-3">
+						<h2 id="prev-h" class="panel-title">Seen elsewhere</h2>
 						<p class="text-muted text-xs">Other machines with the same file, from detections and quarantine. Hunting also asks the agents’ telemetry.</p>
 					</header>
 					{#if !d.sha256}
@@ -249,7 +249,7 @@
 				<!-- Respond -->
 				{#if canRespond}
 					<section class="card p-4" aria-labelledby="respond-h">
-						<h2 id="respond-h" class="mb-1 text-sm font-semibold">Respond</h2>
+						<h2 id="respond-h" class="mb-1 panel-title">Respond</h2>
 						<p class="text-muted mb-3 text-xs">{d.online ? `Each action asks first, then runs on ${d.hostname}.` : `${d.hostname} is offline; responses need the agent connected.`}</p>
 						<div class="grid gap-1.5">
 							{#if triggerProc}
@@ -271,7 +271,7 @@
 
 					<!-- Verdict -->
 					<section class="card p-4" aria-labelledby="verdict-h">
-						<h2 id="verdict-h" class="mb-1 text-sm font-semibold">Verdict</h2>
+						<h2 id="verdict-h" class="mb-1 panel-title">Verdict</h2>
 						{#if d.verdict}
 							<p class="mb-3 text-sm">
 								<Badge tone={verdictTone[d.verdict]}>{verdictLabels[d.verdict]}</Badge>
@@ -306,7 +306,7 @@
 					</section>
 				{:else if d.verdict || d.notes}
 					<section class="card p-4" aria-labelledby="verdict-h">
-						<h2 id="verdict-h" class="mb-2 text-sm font-semibold">Verdict</h2>
+						<h2 id="verdict-h" class="mb-2 panel-title">Verdict</h2>
 						{#if d.verdict}<p class="mb-2 text-sm"><Badge tone={verdictTone[d.verdict]}>{verdictLabels[d.verdict]}</Badge> <span class="text-muted text-xs">{d.verdict_by_name ?? ''}{d.verdict_at ? `, ${ago(d.verdict_at)}` : ''}</span></p>{/if}
 						{#if d.notes}<p class="text-sm break-words whitespace-pre-line">{d.notes}</p>{/if}
 					</section>
@@ -314,7 +314,7 @@
 
 				<!-- Details -->
 				<section class="card p-4" aria-labelledby="details-h">
-					<h2 id="details-h" class="mb-3 text-sm font-semibold">Details</h2>
+					<h2 id="details-h" class="mb-3 panel-title">Details</h2>
 					<dl class="dl">
 						<dt>Found by</dt>
 						<dd>{productLabels[d.product]}{#if d.product === 'rmm'}<span class="text-muted">{' · '}{sourceLabels[d.source]}</span>{/if}</dd>
@@ -341,7 +341,7 @@
 				<!-- Rule -->
 				{#if d.rule || d.rule_id || d.mitre.length}
 					<section class="card p-4" aria-labelledby="rule-h">
-						<h2 id="rule-h" class="mb-1 text-sm font-semibold">{d.rule?.name ?? 'Rule'}</h2>
+						<h2 id="rule-h" class="mb-1 panel-title">{d.rule?.name ?? 'Rule'}</h2>
 						{#if d.rule?.description}<p class="text-muted mb-3 text-sm">{d.rule.description}</p>{/if}
 						<dl class="dl">
 							{#if d.rule_id}<dt>Rule</dt><dd class="font-mono text-xs">{d.rule_id}</dd>{/if}

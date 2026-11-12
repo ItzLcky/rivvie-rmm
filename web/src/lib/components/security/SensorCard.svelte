@@ -30,7 +30,7 @@
 <section class="card p-4" aria-labelledby="sensor-h">
 	<div class="mb-3 flex flex-wrap items-start justify-between gap-2">
 		<div class="min-w-0">
-			<h2 id="sensor-h" class="text-sm font-semibold">RMM sensor</h2>
+			<h2 id="sensor-h" class="panel-title">RMM sensor</h2>
 			<div class="text-muted text-xs">Our own detection and response, built into the agent</div>
 		</div>
 		{@render actions?.()}

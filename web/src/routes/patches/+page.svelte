@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Ban, Check, Clock, Download, Pencil, Plus, RefreshCw, RotateCcw, Search, Trash2 } from '@lucide/svelte';
+	import { Ban, Check, Clock, Download, PackageOpen, Pencil, Plus, RefreshCw, RotateCcw, Search, ShieldAlert, Trash2 } from '@lucide/svelte';
 	import { api } from '#lib/api.js';
 	import { confirmAction } from '#lib/confirm.svelte.js';
 	import { ago, bytes, cx, datetime, ms, num, plural } from '#lib/format.js';
@@ -292,9 +292,9 @@
 						<div class="text-muted text-xs font-medium">Fully patched</div>
 						<div class="mt-1 text-2xl leading-none font-semibold tabular">{pctText(t.compliant, t.scanned)}<span class="text-muted ml-1 text-sm font-normal">{num(t.compliant)} of {num(t.scanned)}</span></div>
 					</div>
-					<Stat label="Missing security updates" value={t.agents_missing_security} tone="danger" />
-					<Stat label="Outstanding updates" value={t.missing} tone="warning" />
-					<Stat label="Restart pending" value={t.reboot_pending} tone="warning" />
+					<Stat label="Missing security updates" icon={ShieldAlert} value={t.agents_missing_security} tone="danger" />
+					<Stat label="Outstanding updates" icon={PackageOpen} value={t.missing} tone="warning" />
+					<Stat label="Restart pending" icon={RotateCcw} value={t.reboot_pending} tone="warning" />
 					<Stat label="Failed installs" value={t.failed} tone="danger" />
 					<Stat label="Installed (30 days)" value={t.installed_30d} />
 				</div>
@@ -347,8 +347,8 @@
 	</Async>
 {:else if tab === 'policies'}
 	<section class="card mb-6" aria-label="Patch policies">
-		<header class="border-border border-b px-4 py-2.5">
-			<h2 class="text-sm font-semibold">Policies</h2>
+		<header class="border-border min-h-12 border-b px-4 py-3">
+			<h2 class="panel-title">Policies</h2>
 			<p class="text-muted text-xs">The most specific one applies to each agent: site, then client, then MSP-wide.</p>
 		</header>
 		<Async res={policies} compact>
@@ -385,8 +385,8 @@
 	</section>
 
 	<section class="card" aria-label="Maintenance windows">
-		<header class="border-border border-b px-4 py-2.5">
-			<h2 class="text-sm font-semibold">Maintenance windows</h2>
+		<header class="border-border min-h-12 border-b px-4 py-3">
+			<h2 class="panel-title">Maintenance windows</h2>
 			<p class="text-muted text-xs">Automatic installs start only inside a site’s window. Sites without one install as soon as updates are eligible.</p>
 		</header>
 		{#snippet siteCell(w: MaintenanceWindow)}<span class="font-medium">{w.site_name}</span>{#if !scoped}<span class="text-muted block text-xs">{w.client_name}</span>{/if}{/snippet}

@@ -1,7 +1,7 @@
 <script lang="ts">
 	import './layout.css';
-	import '@fontsource-variable/inter';
-	import '@fontsource-variable/jetbrains-mono';
+	import '@fontsource-variable/geist';
+	import '@fontsource-variable/geist-mono';
 	import favicon from '#lib/assets/favicon.svg';
 	import { Tooltip } from 'bits-ui';
 	import { goto } from '$app/navigation';
@@ -134,17 +134,20 @@
 	{:else if session.user}
 		<a href="#main" class="bg-accent text-on-accent sr-only z-[80] rounded-md px-3 py-2 focus:not-sr-only focus:fixed focus:top-2 focus:left-2">Skip to content</a>
 		<div class="flex min-h-dvh">
-			<aside class={cx('border-border bg-raised sticky top-0 hidden h-dvh shrink-0 border-r lg:block', prefs.sidebarCollapsed ? 'w-14' : 'w-60')}>
-				<Sidebar />
-			</aside>
-			<Drawer bind:open={drawer} title="Navigation">
+			<!-- The navy column runs the full page height; the rail inside it stays pinned. -->
+			<div class={cx('bg-nav border-nav-border hidden shrink-0 border-r lg:block', prefs.sidebarCollapsed ? 'w-16' : 'w-64')}>
+				<aside class="sticky top-0 h-dvh">
+					<Sidebar />
+				</aside>
+			</div>
+			<Drawer bind:open={drawer} title="Navigation" nav>
 				<Sidebar mobile onnavigate={() => (drawer = false)} />
 			</Drawer>
 			<div class="flex min-w-0 flex-1 flex-col">
 				{#if !session.user.mfa_setup_required}
 					<TopBar onmenu={() => (drawer = true)} onsearch={() => (palette = true)} onshortcuts={() => (shortcuts = true)} />
 				{/if}
-				<main id="main" class="mx-auto w-full max-w-[1600px] min-w-0 flex-1 p-3 sm:p-5 lg:p-6">{@render children()}</main>
+				<main id="main" class="mx-auto w-full max-w-[1600px] min-w-0 flex-1 px-3 py-4 sm:px-6 sm:py-6 lg:px-8 lg:py-7">{@render children()}</main>
 			</div>
 		</div>
 		<CommandPalette bind:open={palette} onrun={openRun} onshortcuts={() => (shortcuts = true)} />

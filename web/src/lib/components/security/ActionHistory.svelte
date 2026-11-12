@@ -13,7 +13,7 @@
 </script>
 
 <section class="card" aria-label={title}>
-	<header class="border-border border-b px-4 py-2.5"><h2 class="text-sm font-semibold">{title}</h2></header>
+	<header class="border-border min-h-12 border-b px-4 py-3"><h2 class="panel-title">{title}</h2></header>
 	{#if actions.length}
 		<ol class="divide-border divide-y">
 			{#each actions as a (a.id)}

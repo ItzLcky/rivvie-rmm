@@ -6,39 +6,60 @@
  * touch this file. Light is the base; [data-theme='dark'] on <html> swaps the values.
  * static/theme.js sets that attribute before first paint from the saved choice (or the OS).
  */
+/*
+ * Design tokens. Components use the role names (bg-surface, text-muted, border-border,
+ * bg-accent...), never raw palette colours, so both themes and later white-labelling only
+ * touch this file. Light is the base; [data-theme='dark'] on <html> swaps the values.
+ * static/theme.js sets that attribute before first paint from the saved choice (or the OS).
+ *
+ * Look: an enterprise console. A deep-navy navigation rail (navy in both themes), white
+ * panels on a cool slate page, one blue accent. Neutrals are all one cool slate family.
+ * Shape rule: controls, buttons and menu items 6px (rounded-md); badges 4px (rounded);
+ * panels 10px (.card, rounded-panel); menus and popovers 8px (rounded-lg); dialogs 12px.
+ */
 :root {
-	--surface: #f6f7f9; /* page background */
-	--raised: #ffffff; /* cards, menus, dialogs */
-	--sunken: #eef0f3; /* inputs' wells, code, table headers */
-	--hover: #eceef2;
-	--border: #e1e4e9;
-	--border-strong: #c9ced6;
-	--fg: #151a22;
-	--muted: #586170; /* secondary text: 6:1 on white */
-	--subtle: #8a929e; /* placeholders and decoration only, not for meaningful text */
-	--accent: #2c5bcc;
-	--accent-hover: #244fb5;
-	--accent-soft: #e7edfb;
+	--surface: #f2f4f7; /* page background */
+	--raised: #ffffff; /* panels, menus, dialogs */
+	--sunken: #f6f7f9; /* table headers, input wells, code */
+	--hover: #eef1f5;
+	--border: #e2e6ec;
+	--border-strong: #c8cfd9;
+	--fg: #0f1b2d;
+	--muted: #546072; /* secondary text: 6.4:1 on white */
+	--subtle: #8792a2; /* placeholders and decoration only, not for meaningful text */
+	--accent: #1660d6;
+	--accent-hover: #114fb4;
+	--accent-soft: #e8effc;
 	--on-accent: #ffffff;
-	--success: #18794a;
-	--success-soft: #e3f4ea;
-	--warning: #9a5a00;
-	--warning-soft: #fdf0d9;
-	--danger: #c03029;
+	--success: #14784a;
+	--success-soft: #e2f3ea;
+	--warning: #985700;
+	--warning-soft: #fcf0dc;
+	--danger: #c22b25;
 	--on-danger: #ffffff;
-	--danger-soft: #fbe6e4;
-	--info: #2667a8;
-	--info-soft: #e3eef9;
-	--focus: #2c5bcc;
-	--overlay: rgb(15 18 24 / 0.45);
-	--shadow: 0 1px 2px rgb(16 24 40 / 0.06), 0 1px 3px rgb(16 24 40 / 0.08);
-	--shadow-lg: 0 12px 32px -8px rgb(16 24 40 / 0.22), 0 4px 8px -4px rgb(16 24 40 / 0.08);
+	--danger-soft: #fbe7e5;
+	--info: #22649f;
+	--info-soft: #e4eef8;
+	--focus: #1660d6;
+	--overlay: rgb(10 20 36 / 0.5);
+	/* Shadows are tinted with the navy of the text, never neutral black. */
+	--shadow: 0 1px 2px rgb(15 27 45 / 0.05), 0 1px 3px rgb(15 27 45 / 0.06);
+	--shadow-lg: 0 16px 36px -10px rgb(15 27 45 / 0.24), 0 4px 10px -4px rgb(15 27 45 / 0.08);
+	/* The navigation rail is dark navy in both themes. */
+	--nav-bg: #0d1b2f;
+	--nav-border: #1a2a42;
+	--nav-fg: #e7ecf3;
+	--nav-muted: #93a1b6;
+	--nav-label: #8a99af;
+	--nav-hover: rgb(255 255 255 / 0.06);
+	--nav-active: rgb(255 255 255 / 0.1);
+	--nav-indicator: #5b9aff;
 	/* Charts get their own roles so series stay distinguishable in both themes. */
-	--chart-1: #2c5bcc;
+	--chart-1: #1660d6;
 	--chart-2: #8a46c8;
 	--chart-3: #0f8a7e;
 	--chart-grid: #e6e9ee;
-	--terminal-bg: #0d1117;
+	--terminal-bg: #0b1320;
 	--terminal-fg: #e6edf3;
 	--syntax-keyword: #a626a4;
 	--syntax-string: #276b2a;
@@ -50,38 +71,46 @@
 }
 
 [data-theme='dark'] {
-	--surface: #0d1015;
-	--raised: #151a21;
-	--sunken: #0a0c10;
-	--hover: #1d232c;
-	--border: #242b35;
-	--border-strong: #343d49;
-	--fg: #e4e8ee;
-	--muted: #9aa3b0;
-	--subtle: #6a7381;
+	--surface: #0a0f17;
+	--raised: #111823;
+	--sunken: #0d131c;
+	--hover: #19212d;
+	--border: #212b39;
+	--border-strong: #313d4e;
+	--fg: #e6ebf2;
+	--muted: #9ba6b5;
+	--subtle: #6a7586;
 	/* Lighter and less saturated than the light accent: bright blue on black is hard to read. */
-	--accent: #7aa2f7;
-	--accent-hover: #93b4fa;
-	--accent-soft: #1b2741;
-	--on-accent: #0b1220;
+	--accent: #6ea3ff;
+	--accent-hover: #8ab5ff;
+	--accent-soft: #15223a;
+	--on-accent: #07111f;
 	--success: #55c48c;
-	--success-soft: #12291e;
+	--success-soft: #10271c;
 	--warning: #e3a84a;
-	--warning-soft: #2e2311;
+	--warning-soft: #2c2210;
 	--danger: #f2756c;
 	--on-danger: #1a0a09;
-	--danger-soft: #331817;
+	--danger-soft: #311716;
 	--info: #6fb0ea;
-	--info-soft: #132536;
-	--focus: #7aa2f7;
-	--overlay: rgb(0 0 0 / 0.6);
-	--shadow: 0 1px 2px rgb(0 0 0 / 0.4);
-	--shadow-lg: 0 16px 40px -8px rgb(0 0 0 / 0.6), 0 4px 10px -4px rgb(0 0 0 / 0.4);
-	--chart-1: #7aa2f7;
+	--info-soft: #122334;
+	--focus: #6ea3ff;
+	--overlay: rgb(2 6 12 / 0.65);
+	--shadow: 0 1px 2px rgb(0 0 0 / 0.35);
+	--shadow-lg: 0 18px 44px -10px rgb(0 0 0 / 0.65), 0 4px 10px -4px rgb(0 0 0 / 0.4);
+	--nav-bg: #0b1422;
+	--nav-border: #18243a;
+	--nav-fg: #e3e9f2;
+	--nav-muted: #8e9cb1;
+	--nav-label: #8494ab;
+	--nav-hover: rgb(255 255 255 / 0.05);
+	--nav-active: rgb(110 163 255 / 0.14);
+	--nav-indicator: #6ea3ff;
+	--chart-1: #6ea3ff;
 	--chart-2: #c39bf0;
 	--chart-3: #4fc7b5;
-	--chart-grid: #222932;
-	--terminal-bg: #0a0c10;
+	--chart-grid: #1f2834;
+	--terminal-bg: #070b12;
 	--terminal-fg: #e4e8ee;
 	--syntax-keyword: #d197f2;
 	--syntax-string: #9ad08b;
@@ -103,8 +132,8 @@
 }
 
 @theme inline {
-	--font-sans: 'Inter Variable', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
-	--font-mono: 'JetBrains Mono Variable', ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace;
+	--font-sans: 'Geist Variable', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+	--font-mono: 'Geist Mono Variable', ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace;
 
 	--color-surface: var(--surface);
 	--color-raised: var(--raised);
@@ -129,6 +158,16 @@
 	--color-info: var(--info);
 	--color-info-soft: var(--info-soft);
 	--color-overlay: var(--overlay);
+	--color-nav: var(--nav-bg);
+	--color-nav-border: var(--nav-border);
+	--color-nav-fg: var(--nav-fg);
+	--color-nav-muted: var(--nav-muted);
+	--color-nav-label: var(--nav-label);
+	--color-nav-hover: var(--nav-hover);
+	--color-nav-active: var(--nav-active);
+	--color-nav-indicator: var(--nav-indicator);
+
+	--radius-panel: 10px;
 
 	--shadow-card: var(--shadow);
 	--shadow-pop: var(--shadow-lg);
@@ -137,7 +176,7 @@
 @layer base {
 	html {
 		-webkit-text-size-adjust: 100%;
-		font-feature-settings: 'cv11', 'ss01';
+		text-rendering: optimizeLegibility;
 	}
 	body {
 		@apply bg-surface text-fg font-sans text-sm antialiased;
@@ -147,6 +186,14 @@
 		outline: 2px solid var(--focus);
 		outline-offset: 2px;
 		border-radius: 4px;
+	}
+	h1,
+	h2,
+	h3 {
+		text-wrap: balance;
+	}
+	p {
+		text-wrap: pretty;
 	}
 	::selection {
 		background: color-mix(in srgb, var(--accent) 30%, transparent);
@@ -171,14 +218,21 @@
 
 @layer components {
 	.card {
-		@apply border-border bg-raised shadow-card rounded-lg border;
+		@apply border-border bg-raised shadow-card rounded-panel border;
+	}
+	/* The title row of a panel: a semibold title on the left, a quiet link or actions right. */
+	.panel-head {
+		@apply border-border flex min-h-12 items-center justify-between gap-3 border-b px-4 py-2.5;
+	}
+	.panel-title {
+		@apply text-fg text-[0.9375rem] font-semibold tracking-tight;
 	}
 	.link {
 		@apply text-accent decoration-accent/40 hover:decoration-accent underline underline-offset-2;
 	}
 	/* Form controls share one look; Input/Select/Textarea components apply these. */
 	.control {
-		@apply border-border-strong bg-raised text-fg placeholder:text-subtle h-8 w-full rounded-md border px-2.5 text-sm transition-colors outline-none;
+		@apply border-border-strong bg-raised text-fg placeholder:text-subtle shadow-card h-8 w-full rounded-md border px-2.5 text-sm transition-[border-color,box-shadow] outline-none hover:border-[color-mix(in_srgb,var(--border-strong)_70%,var(--fg))];
 		@apply focus-visible:border-accent focus-visible:ring-accent/25 focus-visible:ring-3 focus-visible:outline-none;
 		@apply disabled:bg-sunken disabled:text-muted disabled:cursor-not-allowed;
 		@apply aria-invalid:border-danger;
@@ -191,7 +245,7 @@
 		background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23888' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m7 10 5 5 5-5'/%3E%3C/svg%3E");
 	}
 	.label {
-		@apply text-fg mb-1 block text-xs font-medium;
+		@apply text-fg mb-1.5 block text-[0.8125rem] font-medium;
 	}
 	.hint {
 		@apply text-muted mt-1 text-xs;
@@ -207,7 +261,7 @@
 		@apply w-full border-separate border-spacing-0 text-left text-sm;
 	}
 	.table th {
-		@apply border-border bg-sunken text-muted border-b text-xs font-medium whitespace-nowrap;
+		@apply border-border bg-sunken text-muted border-b text-xs font-semibold whitespace-nowrap;
 		padding: var(--row-y) var(--cell-x);
 	}
 	.table td {

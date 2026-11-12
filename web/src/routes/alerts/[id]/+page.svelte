@@ -74,7 +74,7 @@
 
 		<div class="grid gap-4 lg:grid-cols-[minmax(18rem,24rem)_1fr]">
 			<section class="card self-start p-4" aria-label="Details">
-				<h2 class="mb-3 text-sm font-semibold">Details</h2>
+				<h2 class="mb-3 panel-title">Details</h2>
 				<dl class="dl">
 					<dt>Policy</dt><dd>{#if a.policy_id}<a class="link" href="/policies/{a.policy_id}">{a.policy_name}</a>{:else}<span class="text-muted">Deleted</span>{/if}</dd>
 					<dt>Type</dt><dd>{kindLabels[a.kind]}</dd>
@@ -96,8 +96,8 @@
 			<div class="min-w-0 space-y-4">
 				{#if a.kind === 'log'}
 					<section class="card" aria-label="Matched log entries">
-						<header class="border-border flex items-center justify-between border-b px-4 py-2.5">
-							<h2 class="text-sm font-semibold">Matched entries</h2>
+						<header class="border-border flex items-center justify-between min-h-12 border-b px-4 py-3">
+							<h2 class="panel-title">Matched entries</h2>
 							<a class="link text-xs" href="/agents/{a.agent_id}?tab=logs">Event log</a>
 						</header>
 						{#if a.log_events.length}
@@ -121,7 +121,7 @@
 				{/if}
 
 				<section class="card" aria-label="Notifications">
-					<header class="border-border border-b px-4 py-2.5"><h2 class="text-sm font-semibold">Notifications</h2></header>
+					<header class="border-border min-h-12 border-b px-4 py-3"><h2 class="panel-title">Notifications</h2></header>
 					{#if a.notifications.length}
 						<ul class="divide-border divide-y">
 							{#each a.notifications as n (n.id)}

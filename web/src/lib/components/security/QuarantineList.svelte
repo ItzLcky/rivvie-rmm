@@ -74,7 +74,7 @@
 	{/if}
 {/snippet}
 
-{#snippet heading()}<h2 class="text-sm font-semibold">Quarantine</h2>{/snippet}
+{#snippet heading()}<h2 class="panel-title">Quarantine</h2>{/snippet}
 
 <DataTable
 	{id}

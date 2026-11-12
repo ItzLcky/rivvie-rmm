@@ -250,7 +250,7 @@
 		{#snippet agentCell(j: Job)}<a class="hover:text-accent font-medium" href="/agents/{j.agent_id}">{j.hostname}</a>{/snippet}
 		{#snippet statusCell(j: Job)}<JobBadge status={j.status} />{/snippet}
 		{#snippet durCell(j: Job)}{#if j.duration_ms != null}{ms(j.duration_ms)}{:else}<span class="text-muted" aria-label="none">–</span>{/if}{/snippet}
-		<h2 class="mt-6 mb-2 text-sm font-semibold">Recent runs</h2>
+		<h2 class="mt-6 mb-2 panel-title">Recent runs</h2>
 		<DataTable
 			id="schedule-runs"
 			caption="Recent runs"

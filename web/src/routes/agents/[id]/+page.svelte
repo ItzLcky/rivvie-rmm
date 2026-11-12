@@ -252,7 +252,7 @@
 		{#if tab === 'overview'}
 			<div class="grid gap-4 lg:grid-cols-[minmax(18rem,22rem)_1fr]">
 				<section class="card self-start p-4" aria-label="System">
-					<h2 class="mb-3 text-sm font-semibold">System</h2>
+					<h2 class="mb-3 panel-title">System</h2>
 					<dl class="dl">
 						<dt>Client</dt><dd><a class="link" href="/clients/{a.client_id}">{a.client_name}</a><span class="text-subtle mx-1" aria-hidden="true">›</span>{a.site_name}</dd>
 						<dt>OS</dt><dd>{a.os_version || a.os_name}</dd>
@@ -280,7 +280,7 @@
 				<div class="min-w-0 space-y-4">
 					<section class="card p-4" aria-label="Performance">
 						<div class="mb-3 flex flex-wrap items-center justify-between gap-2">
-							<h2 class="text-sm font-semibold">Performance</h2>
+							<h2 class="panel-title">Performance</h2>
 							<Segmented label="Time range" value={range} onchange={(v) => setParams({ range: v === '24h' ? null : v })} options={Object.keys(ranges).map((r) => ({ value: r as Range, label: r }))} />
 						</div>
 						{#if m}
@@ -300,8 +300,8 @@
 
 					<div class="grid gap-4 xl:grid-cols-2">
 						<section class="card" aria-label="Recent jobs">
-							<header class="border-border flex items-center justify-between border-b px-4 py-2.5">
-								<h2 class="text-sm font-semibold">Recent jobs</h2>
+							<header class="border-border flex items-center justify-between min-h-12 border-b px-4 py-3">
+								<h2 class="panel-title">Recent jobs</h2>
 								<MoreLink onclick={() => setParams({ tab: 'jobs' }, { push: true })}>All jobs</MoreLink>
 							</header>
 							{#if recentJobs.data?.items.length}
@@ -323,7 +323,7 @@
 							{/if}
 						</section>
 						<section class="card" aria-label="Volumes">
-							<header class="border-border border-b px-4 py-2.5"><h2 class="text-sm font-semibold">Volumes</h2></header>
+							<header class="border-border min-h-12 border-b px-4 py-3"><h2 class="panel-title">Volumes</h2></header>
 							{#if m?.disks.length}
 								<ul class="divide-border divide-y">
 									{#each m.disks as d (d.mount)}
@@ -347,7 +347,7 @@
 			</div>
 			<div class="grid gap-4 xl:grid-cols-2">
 				<section class="card overflow-x-auto" aria-label="Disks">
-					<header class="border-border border-b px-4 py-2.5"><h2 class="text-sm font-semibold">Disks</h2></header>
+					<header class="border-border min-h-12 border-b px-4 py-3"><h2 class="panel-title">Disks</h2></header>
 					<table class="table">
 						<thead><tr><th>Device</th><th>Mount</th><th>FS</th><th>Type</th><th class="text-right">Size</th></tr></thead>
 						<tbody>
@@ -360,7 +360,7 @@
 					</table>
 				</section>
 				<section class="card overflow-x-auto" aria-label="Network interfaces">
-					<header class="border-border border-b px-4 py-2.5"><h2 class="text-sm font-semibold">Network interfaces</h2></header>
+					<header class="border-border min-h-12 border-b px-4 py-3"><h2 class="panel-title">Network interfaces</h2></header>
 					<table class="table">
 						<thead><tr><th>Name</th><th>MAC</th><th>Addresses</th></tr></thead>
 						<tbody>

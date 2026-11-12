@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { ListX, Plus } from '@lucide/svelte';
+	import { BellRing, CircleSlash, HardDrive, ListX, Plus, Stethoscope, WifiOff } from '@lucide/svelte';
 	import { api } from '#lib/api.js';
 	import { ago, num, osLabels, pct } from '#lib/format.js';
 	import { liveReload } from '#lib/live.svelte.js';
@@ -43,14 +43,17 @@
 	}
 </script>
 
-<PageHeader title={scoped ? scoped.name : 'Dashboard'} description={scoped ? 'Dashboard for this client. Pick “All clients” at the top to see everything.' : undefined} />
+<PageHeader
+	title={scoped ? scoped.name : 'Dashboard'}
+	description={scoped ? 'Dashboard for this client. Pick “All clients” at the top to see everything.' : 'Fleet health across every client, worst first.'}
+/>
 
 <Async {res}>
 	{#snippet skeleton()}
-		<div class="grid grid-cols-2 gap-3 lg:grid-cols-4">
-			{#each Array(4) as _, i (i)}<div class="card space-y-3 p-4"><Skeleton class="h-3 w-24" /><Skeleton class="h-7 w-16" /></div>{/each}
+		<div class="grid grid-cols-2 gap-4 sm:grid-cols-3 xl:grid-cols-5">
+			{#each Array(5) as _, i (i)}<div class="card space-y-4 p-4"><Skeleton class="h-3 w-24" /><Skeleton class="h-7 w-16" /></div>{/each}
 		</div>
-		<div class="mt-4 grid gap-4 xl:grid-cols-[3fr_2fr]">
+		<div class="mt-6 grid gap-6 xl:grid-cols-[3fr_2fr]">
 			<div class="card space-y-3 p-4"><Skeleton class="h-4 w-40" /><Skeleton lines={5} /></div>
 			<div class="card space-y-3 p-4"><Skeleton class="h-4 w-32" /><Skeleton lines={5} /></div>
 		</div>
@@ -66,23 +69,26 @@
 			</div>
 		{:else}
 			<!-- Every number links to the matching filtered list. -->
-			<section aria-label="Needs attention" class="grid grid-cols-2 gap-3 sm:grid-cols-3 xl:grid-cols-5">
-				<Stat label="Open alerts" value={openAlerts(d)} tone={d.alerts.critical ? 'danger' : 'warning'} href={link('/alerts')} />
-				<Stat label="Offline" value={d.agents_total - d.agents_online} of={d.agents_total} tone="warning" href={link('/agents?view=offline')} />
-				<Stat label="Need attention" value={(d.health.attention ?? 0) + (d.health.unhealthy ?? 0)} tone={(d.health.unhealthy ?? 0) ? 'danger' : 'warning'} href={link('/agents?view=attention')} />
-				<Stat label="Failed jobs (24 h)" value={failedCount(d)} tone="danger" href={link('/jobs?status=failed')} />
-				<Stat label="Disks over 90%" value={d.high_disk.length} capped={d.high_disk.length >= 10} tone="danger" href={link('/agents?sort=disk&dir=desc')} />
+			<section aria-label="Needs attention" class="grid grid-cols-2 gap-4 sm:grid-cols-3 xl:grid-cols-5">
+				<Stat label="Open alerts" icon={BellRing} value={openAlerts(d)} tone={d.alerts.critical ? 'danger' : 'warning'} href={link('/alerts')} />
+				<Stat label="Offline" icon={WifiOff} value={d.agents_total - d.agents_online} of={d.agents_total} tone="warning" href={link('/agents?view=offline')} />
+				<Stat label="Need attention" icon={Stethoscope} value={(d.health.attention ?? 0) + (d.health.unhealthy ?? 0)} tone={(d.health.unhealthy ?? 0) ? 'danger' : 'warning'} href={link('/agents?view=attention')} />
+				<Stat label="Failed jobs (24 h)" icon={CircleSlash} value={failedCount(d)} tone="danger" href={link('/jobs?status=failed')} />
+				<Stat label="Disks over 90%" icon={HardDrive} value={d.high_disk.length} capped={d.high_disk.length >= 10} tone="danger" href={link('/agents?sort=disk&dir=desc')} />
 			</section>
 
 			{@const items = feed(d)}
-			<div class="mt-4 grid items-start gap-4 xl:grid-cols-[3fr_2fr]">
+			<div class="mt-6 grid items-start gap-6 xl:grid-cols-[minmax(0,7fr)_minmax(0,5fr)]">
 				<section class="card" aria-label="Problems">
-					<header class="border-border border-b px-4 py-2.5"><h2 class="text-sm font-semibold">Needs a look</h2></header>
+					<header class="panel-head">
+						<h2 class="panel-title">Needs a look</h2>
+						{#if items.length}<span class="text-muted text-xs tabular">{num(items.length)} {items.length === 1 ? 'item' : 'items'}</span>{/if}
+					</header>
 					{#if items.length}
 						<ul class="divide-border divide-y">
 							{#each items as it (it.key)}
 								<li>
-									<a href={it.href} class="hover:bg-hover/60 flex items-center gap-3 px-4 py-2 text-sm">
+									<a href={it.href} class="hover:bg-hover/60 flex items-center gap-3 px-4 py-2.5 text-sm transition-colors">
 										<span class="w-28 shrink-0"><Badge tone={it.tone}>{it.kind}</Badge></span>
 										<span class="min-w-0 flex-1 truncate font-medium">{it.title}</span>
 										<span class="text-muted hidden max-w-48 truncate sm:block">{it.where}</span>
@@ -96,32 +102,32 @@
 					{/if}
 				</section>
 
-				<div class="space-y-4">
+				<div class="space-y-6">
 					{#if !scoped && d.client_health.length}
 						<section class="card">
-							<header class="border-border flex items-center justify-between border-b px-4 py-2.5">
-								<h2 class="text-sm font-semibold">Clients</h2>
+							<header class="panel-head">
+								<h2 class="panel-title">Clients</h2>
 								<MoreLink href="/clients">All clients</MoreLink>
 							</header>
 							<table class="w-full text-sm">
-								<thead class="text-muted text-xs">
+								<thead class="bg-sunken text-muted text-xs">
 									<tr>
-										<th scope="col" class="px-4 py-1.5 text-left font-medium">Client</th>
-										<th scope="col" class="w-14 py-1.5 text-right font-medium">Agents</th>
-										<th scope="col" class="w-14 py-1.5 text-right font-medium">Offline</th>
-										<th scope="col" class="w-24 py-1.5 text-right font-medium">Attention</th>
-										<th scope="col" class="w-24 py-1.5 pr-4 text-right font-medium">Unhealthy</th>
+										<th scope="col" class="px-4 py-2 text-left font-semibold">Client</th>
+										<th scope="col" class="w-14 py-2 text-right font-semibold">Agents</th>
+										<th scope="col" class="w-14 py-2 text-right font-semibold">Offline</th>
+										<th scope="col" class="w-20 py-2 text-right font-semibold">Attention</th>
+										<th scope="col" class="w-24 py-2 pr-4 text-right font-semibold">Unhealthy</th>
 									</tr>
 								</thead>
 								<tbody class="divide-border divide-y border-t border-border">
 									{#each d.client_health as c (c.id)}
 										{@const off = c.agents - c.online}
 										<tr>
-											<td class="max-w-0 truncate px-4 py-2 font-medium"><a href={withClient('/', c.id)} class="hover:text-accent">{c.name}</a></td>
-											<td class="text-muted py-2 text-right tabular">{c.agents || '–'}</td>
-											<td class="py-2 text-right tabular">{#if off}<a class="hover:underline" href={withClient('/agents?view=offline', c.id)}>{off}</a>{:else}<span class="text-muted">–</span>{/if}</td>
-											<td class="py-2 text-right tabular">{#if c.attention}<a class="text-warning font-medium hover:underline" href={withClient('/agents?health=attention', c.id)}>{c.attention}</a>{:else}<span class="text-muted">–</span>{/if}</td>
-											<td class="py-2 pr-4 text-right tabular">{#if c.unhealthy}<a class="text-danger font-medium hover:underline" href={withClient('/agents?health=unhealthy', c.id)}>{c.unhealthy}</a>{:else}<span class="text-muted">–</span>{/if}</td>
+											<td class="max-w-0 truncate px-4 py-2.5 font-medium"><a href={withClient('/', c.id)} class="hover:text-accent">{c.name}</a></td>
+											<td class="text-muted py-2.5 text-right tabular">{c.agents || '–'}</td>
+											<td class="py-2.5 text-right tabular">{#if off}<a class="hover:underline" href={withClient('/agents?view=offline', c.id)}>{off}</a>{:else}<span class="text-muted">–</span>{/if}</td>
+											<td class="py-2.5 text-right tabular">{#if c.attention}<a class="text-warning font-medium hover:underline" href={withClient('/agents?health=attention', c.id)}>{c.attention}</a>{:else}<span class="text-muted">–</span>{/if}</td>
+											<td class="py-2.5 pr-4 text-right tabular">{#if c.unhealthy}<a class="text-danger font-medium hover:underline" href={withClient('/agents?health=unhealthy', c.id)}>{c.unhealthy}</a>{:else}<span class="text-muted">–</span>{/if}</td>
 										</tr>
 									{/each}
 								</tbody>
@@ -129,14 +135,14 @@
 						</section>
 					{/if}
 
-					<section class="card p-4">
-						<h2 class="mb-3 text-sm font-semibold">Operating systems</h2>
-						<ul class="space-y-1.5">
+					<section class="card">
+						<header class="panel-head"><h2 class="panel-title">Operating systems</h2></header>
+						<ul class="space-y-3 p-4">
 							{#each Object.entries(d.by_os).sort((a, b) => b[1] - a[1]) as [os, n] (os)}
 								<li class="flex items-center gap-2 text-sm">
 									<OsIcon {os} />
 									<span class="w-20">{osLabels[os] ?? os}</span>
-									<span class="bg-sunken h-1.5 flex-1 overflow-hidden rounded-full"><span class="bg-subtle block h-full" style="width: {pct(n, d.agents_total)}%"></span></span>
+									<span class="bg-sunken h-2 flex-1 overflow-hidden rounded-full"><span class="bg-accent block h-full rounded-full" style="width: {pct(n, d.agents_total)}%"></span></span>
 									<span class="text-muted w-10 text-right tabular">{num(n)}</span>
 								</li>
 							{/each}

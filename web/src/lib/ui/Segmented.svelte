@@ -21,7 +21,7 @@
 	{#each options as o (o.value)}
 		<ToggleGroup.Item
 			value={o.value}
-			class="text-muted hover:text-fg data-[state=on]:bg-raised data-[state=on]:text-fg data-[state=on]:shadow-card inline-flex cursor-pointer items-center gap-1 rounded px-2.5 font-medium whitespace-nowrap {size === 'sm' ? 'h-6 text-xs' : 'h-7 text-sm'}"
+			class="text-muted hover:text-fg data-[state=on]:bg-raised data-[state=on]:text-fg data-[state=on]:shadow-card inline-flex cursor-pointer items-center gap-1 rounded px-2.5 transition-colors font-medium whitespace-nowrap {size === 'sm' ? 'h-6 text-xs' : 'h-7 text-sm'}"
 		>
 			{o.label}{#if o.count !== undefined}<span class="text-muted tabular">{o.count}</span>{/if}
 		</ToggleGroup.Item>

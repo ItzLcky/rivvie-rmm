@@ -90,7 +90,7 @@
 				</section>
 				<section class="card" aria-label="Output">
 					<header class="border-border flex items-center justify-between border-b px-4 py-2">
-						<h2 class="text-sm font-semibold">Package manager output</h2>
+						<h2 class="panel-title">Package manager output</h2>
 						{#if r.output}<CopyButton text={r.output} label="Copy output" />{/if}
 					</header>
 					{#if r.output}

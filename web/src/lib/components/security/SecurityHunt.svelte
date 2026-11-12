@@ -82,8 +82,8 @@
 </script>
 
 <section class="card mb-4" aria-labelledby="hunt-h">
-	<header class="border-border border-b px-4 py-2.5">
-		<h2 id="hunt-h" class="text-sm font-semibold">Hunt across {scoped ? `${scoped.name}'s agents` : 'the fleet'}</h2>
+	<header class="border-border min-h-12 border-b px-4 py-3">
+		<h2 id="hunt-h" class="panel-title">Hunt across {scoped ? `${scoped.name}'s agents` : 'the fleet'}</h2>
 		<p class="text-muted text-xs">Every online agent running our sensor searches its own telemetry and answers within a few seconds. Offline agents can’t be searched.</p>
 	</header>
 	<form class="flex flex-wrap items-end gap-x-4 gap-y-3 px-4 py-3" onsubmit={hunt}>
@@ -110,8 +110,8 @@
 
 {#if prevalence}
 	<section class="card mb-4" aria-labelledby="prev-h">
-		<header class="border-border border-b px-4 py-2.5">
-			<h2 id="prev-h" class="text-sm font-semibold">Known from detections and quarantine</h2>
+		<header class="border-border min-h-12 border-b px-4 py-3">
+			<h2 id="prev-h" class="panel-title">Known from detections and quarantine</h2>
 			<p class="text-muted text-xs">Where the server has already seen this hash, including offline machines.</p>
 		</header>
 		{#if prevalence.length}
@@ -145,7 +145,7 @@
 	{/if}
 	{#each result.hits as h (h.agent_id)}
 		<section class="card mb-4" aria-label="Matches on {h.hostname}">
-			<header class="border-border flex flex-wrap items-baseline gap-x-3 border-b px-4 py-2.5">
+			<header class="border-border flex flex-wrap items-baseline gap-x-3 min-h-12 border-b px-4 py-3">
 				<h3 class="text-sm font-semibold"><a class="hover:text-accent" href="/agents/{h.agent_id}?tab=security">{h.hostname}</a></h3>
 				<span class="text-muted text-xs">{h.client_name}</span>
 				<span class="text-muted ml-auto text-xs">{plural(h.events.length, 'event')}{h.truncated ? ' (more not shown)' : ''}</span>

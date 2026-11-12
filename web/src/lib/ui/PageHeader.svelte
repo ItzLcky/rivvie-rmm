@@ -28,12 +28,12 @@
 	} = $props();
 </script>
 
-<header class="mb-4">
+<header class="mb-6">
 	{#if crumbs?.length}<Breadcrumbs items={crumbs} />{/if}
 	<div class="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
 		<div class="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
-			<h1 class="truncate text-xl font-semibold tracking-tight">{title}</h1>
-			{#if count != null}<span class="text-muted text-base tabular">{typeof count === 'number' ? num(count) : count}</span>{/if}
+			<h1 class="truncate text-2xl leading-tight font-semibold tracking-tight">{title}</h1>
+			{#if count != null}<span class="bg-sunken border-border text-muted rounded-md border px-2 py-0.5 text-sm font-medium tabular">{typeof count === 'number' ? num(count) : count}</span>{/if}
 			{@render meta?.()}
 		</div>
 		{#if actions || menu?.length}
@@ -43,6 +43,6 @@
 			</div>
 		{/if}
 	</div>
-	{#if subtitle}<div class="text-muted mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-sm">{@render subtitle()}</div>{/if}
-	{#if description}<p class="text-muted mt-1 max-w-3xl text-sm">{description}</p>{/if}
+	{#if subtitle}<div class="text-muted mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-sm">{@render subtitle()}</div>{/if}
+	{#if description}<p class="text-muted mt-1.5 max-w-3xl text-sm leading-relaxed">{description}</p>{/if}
 </header>

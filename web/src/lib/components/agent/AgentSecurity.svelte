@@ -198,7 +198,7 @@
 						<section class="card p-4" aria-label={p.name}>
 							<div class="mb-3 flex flex-wrap items-start justify-between gap-2">
 								<div class="min-w-0">
-									<h2 class="text-sm font-semibold">{p.name}</h2>
+									<h2 class="panel-title">{p.name}</h2>
 									{#if p.version}<div class="text-muted font-mono text-xs">v{p.version}</div>{/if}
 								</div>
 								{#if canRespond && p.actions.length}

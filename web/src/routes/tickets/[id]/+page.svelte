@@ -379,7 +379,7 @@
 			<!-- Sidebar -->
 			<aside class="space-y-4" aria-label="Ticket details">
 				<section class="card p-4" aria-labelledby="props-h">
-					<h2 id="props-h" class="mb-3 text-sm font-semibold">Details</h2>
+					<h2 id="props-h" class="mb-3 panel-title">Details</h2>
 					{#if tech && !t.merged_into}
 						<div class="space-y-3">
 							<Field label="Client" id="tp-client">
@@ -443,8 +443,8 @@
 				</section>
 
 				<section class="card" aria-labelledby="agents-h">
-					<header class="border-border flex items-center justify-between border-b px-4 py-2.5">
-						<h2 id="agents-h" class="text-sm font-semibold">Agents</h2>
+					<header class="border-border flex items-center justify-between min-h-12 border-b px-4 py-3">
+						<h2 id="agents-h" class="panel-title">Agents</h2>
 					</header>
 					{#if t.agents.length}
 						<ul class="divide-border divide-y">
@@ -507,7 +507,7 @@
 
 				{#if t.attachments.length}
 					<section class="card" aria-labelledby="files-h">
-						<header class="border-border border-b px-4 py-2.5"><h2 id="files-h" class="text-sm font-semibold">Attachments</h2></header>
+						<header class="border-border min-h-12 border-b px-4 py-3"><h2 id="files-h" class="panel-title">Attachments</h2></header>
 						<ul class="divide-border divide-y">
 							{#each t.attachments as a (a.id)}
 								<li class="flex items-center gap-2 px-4 py-2 text-sm">

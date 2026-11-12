@@ -35,7 +35,7 @@
 
 		term = new Terminal({
 			cursorBlink: true,
-			fontFamily: "'JetBrains Mono Variable', ui-monospace, Menlo, Consolas, monospace",
+			fontFamily: "'Geist Mono Variable', ui-monospace, Menlo, Consolas, monospace",
 			fontSize: size,
 			scrollback: 5000,
 			theme: { background: css('--terminal-bg'), foreground: css('--terminal-fg'), cursor: css('--accent'), selectionBackground: '#3b4a63' }

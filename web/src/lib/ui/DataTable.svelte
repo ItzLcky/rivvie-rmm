@@ -158,7 +158,7 @@
 
 <div class="card flex min-w-0 flex-col overflow-hidden">
 	{#if toolbar || filters || columns.some((c) => c.hideable !== false)}
-		<div class="border-border flex flex-wrap items-center gap-2 border-b px-3 py-2">
+		<div class="border-border flex flex-wrap items-center gap-2 border-b px-4 py-3">
 			<div class={cx('order-1 flex min-w-0 flex-1 flex-wrap items-center gap-2', filters && 'sm:flex-none')}>{@render toolbar?.()}</div>
 			{#if filters}
 				<Button class="order-2 sm:hidden" icon={ListFilter} aria-expanded={filtersOpen} aria-controls="{id}-filters" onclick={() => (filtersOpen = !filtersOpen)}>
@@ -203,7 +203,7 @@
 	{/if}
 
 	{#if selectable && selected!.size > 0 && bulk}
-		<div class="border-border bg-accent-soft flex flex-wrap items-center gap-2 border-b px-3 py-1.5 text-sm" role="region" aria-label="Bulk actions">
+		<div class="border-border bg-accent-soft flex flex-wrap items-center gap-2 border-b px-4 py-2 text-sm" role="region" aria-label="Bulk actions">
 			<span class="text-accent font-medium">{plural(selected!.size, 'selected', 'selected')}</span>
 			<div class="flex flex-wrap items-center gap-2">{@render bulk(selected!.size)}</div>
 			<button class="text-muted hover:text-fg ml-auto inline-flex items-center gap-1 text-xs" onclick={() => (selected = new Set())}><X class="size-3.5" />Clear</button>
@@ -223,7 +223,7 @@
 						{@const sorted = sort && c.sort && sort.key === c.sort}
 						<th
 							scope="col"
-							class={cx('border-border text-muted border-b text-xs font-medium whitespace-nowrap', c.align === 'right' && 'text-right', c.from && from[c.from], c.class)}
+							class={cx('border-border text-muted border-b text-xs font-semibold whitespace-nowrap', c.align === 'right' && 'text-right', c.from && from[c.from], c.class)}
 							style="padding: var(--row-y) var(--cell-x)"
 							aria-sort={sorted ? (sort!.dir === 'asc' ? 'ascending' : 'descending') : undefined}
 						>

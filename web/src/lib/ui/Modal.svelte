@@ -52,7 +52,7 @@
 				widths[size]
 			)}
 		>
-			<div class="border-border flex items-start justify-between gap-3 border-b px-4 py-3">
+			<div class="border-border flex items-start justify-between gap-3 border-b px-5 py-4">
 				<div class="min-w-0">
 					<Dialog.Title class="truncate text-base font-semibold">{title}</Dialog.Title>
 					{#if description}<Dialog.Description class="text-muted mt-0.5 text-sm">{description}</Dialog.Description>{/if}
@@ -61,9 +61,9 @@
 					{#snippet child({ props })}<IconButton {...props} icon={X} label="Close" size="sm" tooltip={false} />{/snippet}
 				</Dialog.Close>
 			</div>
-			<div class="min-h-0 flex-1 overflow-y-auto p-4">{@render children()}</div>
+			<div class="min-h-0 flex-1 overflow-y-auto p-5">{@render children()}</div>
 			{#if footer}
-				<div class="border-border bg-sunken/50 flex flex-wrap justify-end gap-2 rounded-b-xl border-t px-4 py-3">{@render footer()}</div>
+				<div class="border-border bg-sunken/50 flex flex-wrap justify-end gap-2 rounded-b-xl border-t px-5 py-3">{@render footer()}</div>
 			{/if}
 		</Dialog.Content>
 	</Dialog.Portal>

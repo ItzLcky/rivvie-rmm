@@ -11,25 +11,37 @@
 	import { ticketCounts } from '#lib/servicedesk/tickets.svelte.js';
 	import { isActive, nav } from './nav';
 
-	/** `collapsed` shows icons only; the mobile drawer always renders it expanded. */
+	/**
+	 * The navigation rail: dark navy in both themes. `collapsed` shows icons only; the mobile
+	 * drawer always renders it expanded.
+	 */
 	let { mobile = false, onnavigate }: { mobile?: boolean; onnavigate?: () => void } = $props();
 	const collapsed = $derived(!mobile && !!prefs.sidebarCollapsed);
 	const openAlerts = $derived(alertCounts.critical + alertCounts.warning + alertCounts.info);
 	const groups = $derived(nav.map((g) => ({ ...g, items: g.items.filter((i) => !i.role || can(i.role)) })).filter((g) => g.items.length));
 </script>
 
-<div class={cx('flex h-full flex-col', collapsed ? 'w-14' : 'w-60')}>
-	<a href={withClient('/')} class={cx('flex h-12 shrink-0 items-center gap-2.5 font-semibold tracking-tight', collapsed ? 'justify-center' : 'px-4')} onclick={onnavigate}>
-		<img src={favicon} alt="" class="size-6 shrink-0" />
-		{#if !collapsed}<span class="truncate">{company.name || 'RMM'}</span>{/if}
+<div class={cx('nav-rail bg-nav text-nav-fg flex h-full flex-col', collapsed ? 'w-16' : 'w-64')}>
+	<a
+		href={withClient('/')}
+		class={cx('border-nav-border flex h-14 shrink-0 items-center gap-3 border-b', collapsed ? 'justify-center' : 'px-5')}
+		onclick={onnavigate}
+	>
+		<img src={favicon} alt="" class="size-7 shrink-0" />
+		{#if !collapsed}
+			<span class="min-w-0 leading-tight">
+				<span class="block truncate text-[0.9375rem] font-semibold tracking-tight text-white">{company.name || 'RMM'}</span>
+				<span class="text-nav-muted block truncate text-xs">Remote management</span>
+			</span>
+		{/if}
 	</a>
-	<nav aria-label="Main" class="scrollbar-thin flex-1 overflow-y-auto px-2 pb-3">
+	<nav aria-label="Main" class="nav-scroll flex-1 overflow-y-auto px-3 pt-2 pb-4">
 		{#each groups as g (g.label)}
-			<div class="mt-3 first:mt-1">
+			<div class="mt-5 first:mt-2">
 				{#if collapsed}
-					<div class="bg-border mx-2 mb-2 h-px first:hidden" aria-hidden="true"></div>
+					<div class="bg-nav-border mx-2 mb-3 h-px first:hidden" aria-hidden="true"></div>
 				{:else}
-					<div class="text-muted px-2 pb-1 text-[11px] font-medium tracking-wide uppercase">{g.label}</div>
+					<div class="text-nav-label px-3 pb-1.5 text-[0.6875rem] font-semibold tracking-[0.08em] uppercase">{g.label}</div>
 				{/if}
 				<ul class="space-y-0.5">
 					{#each g.items as item (item.href)}
@@ -44,23 +56,25 @@
 										aria-label={collapsed ? item.label : undefined}
 										onclick={onnavigate}
 										class={cx(
-											'flex h-8 items-center gap-2.5 rounded-md text-sm transition-colors [&_svg]:size-[18px] [&_svg]:shrink-0',
-											collapsed ? 'justify-center' : 'px-2',
-											on ? 'bg-accent-soft text-accent font-medium' : 'text-muted hover:bg-hover hover:text-fg'
+											'relative flex h-9 items-center gap-3 rounded-md text-sm transition-colors duration-150 [&_svg]:size-[18px] [&_svg]:shrink-0',
+											collapsed ? 'justify-center' : 'px-3',
+											on
+												? 'bg-nav-active font-medium text-white before:bg-nav-indicator before:absolute before:top-1.5 before:bottom-1.5 before:-left-3 before:w-[3px] before:rounded-r-full'
+												: 'text-nav-muted hover:bg-nav-hover hover:text-nav-fg'
 										)}
 									>
 										<span class="relative flex">
 											<item.icon />
-											{#if collapsed && item.badge === 'alerts' && openAlerts}<span class={cx('ring-raised absolute -top-0.5 -right-0.5 size-2 rounded-full ring-2', alertCounts.critical ? 'bg-danger' : 'bg-warning')} aria-hidden="true"></span>{/if}
-											{#if collapsed && item.badge === 'tickets' && ticketCounts.unassigned}<span class="ring-raised bg-accent absolute -top-0.5 -right-0.5 size-2 rounded-full ring-2" aria-hidden="true"></span>{/if}
+											{#if collapsed && item.badge === 'alerts' && openAlerts}<span class={cx('ring-nav absolute -top-0.5 -right-0.5 size-2 rounded-full ring-2', alertCounts.critical ? 'bg-[#f2756c]' : 'bg-[#e3a84a]')} aria-hidden="true"></span>{/if}
+											{#if collapsed && item.badge === 'tickets' && ticketCounts.unassigned}<span class="ring-nav bg-nav-indicator absolute -top-0.5 -right-0.5 size-2 rounded-full ring-2" aria-hidden="true"></span>{/if}
 										</span>
 										{#if !collapsed}<span class="truncate">{item.label}</span>{/if}
 										{#if item.badge === 'alerts' && openAlerts}
-											<span class={cx('tabular ml-auto rounded-full px-1.5 text-[11px] leading-[18px] font-semibold', collapsed && 'sr-only', alertCounts.critical ? 'bg-danger-soft text-danger' : 'bg-warning-soft text-warning')}>
+											<span class={cx('tabular ml-auto min-w-5 rounded-full px-1.5 text-center text-[0.6875rem] leading-5 font-semibold', collapsed && 'sr-only', alertCounts.critical ? 'bg-[#e5484d] text-white' : 'bg-[#e3a84a] text-[#1f1400]')}>
 												{openAlerts > 999 ? '999+' : openAlerts}<span class="sr-only"> open</span>
 											</span>
 										{:else if item.badge === 'tickets' && ticketCounts.unassigned}
-											<span class={cx('tabular bg-accent-soft text-accent ml-auto rounded-full px-1.5 text-[11px] leading-[18px] font-semibold', collapsed && 'sr-only')}>
+											<span class={cx('tabular ml-auto min-w-5 rounded-full bg-white/12 px-1.5 text-center text-[0.6875rem] leading-5 font-semibold text-white', collapsed && 'sr-only')}>
 												{ticketCounts.unassigned > 999 ? '999+' : ticketCounts.unassigned}<span class="sr-only"> unassigned</span>
 											</span>
 										{/if}
@@ -74,9 +88,9 @@
 		{/each}
 	</nav>
 	{#if !mobile}
-		<div class={cx('border-border border-t p-2', collapsed && 'flex justify-center')}>
+		<div class={cx('border-nav-border border-t p-3', collapsed && 'flex justify-center px-2')}>
 			<button
-				class={cx('text-muted hover:bg-hover hover:text-fg flex h-8 items-center gap-2.5 rounded-md text-sm [&_svg]:size-[18px]', collapsed ? 'w-10 justify-center' : 'w-full px-2')}
+				class={cx('text-nav-muted hover:bg-nav-hover hover:text-nav-fg flex h-9 items-center gap-3 rounded-md text-sm transition-colors [&_svg]:size-[18px]', collapsed ? 'w-10 justify-center' : 'w-full px-3')}
 				onclick={() => setPref('sidebarCollapsed', !collapsed)}
 				aria-label={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
 			>
@@ -85,3 +99,13 @@
 		</div>
 	{/if}
 </div>
+
+<style>
+	.nav-rail :global(:focus-visible) {
+		outline-color: var(--nav-indicator);
+	}
+	.nav-scroll {
+		scrollbar-width: thin;
+		scrollbar-color: rgb(255 255 255 / 0.15) transparent;
+	}
+</style>

@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
-	import { Contact as ContactIcon, ExternalLink, LifeBuoy, MapPin, Pencil, Plus, Star, Trash2, UserPlus } from '@lucide/svelte';
+	import { CircleSlash, Contact as ContactIcon, ExternalLink, LifeBuoy, MapPin, Monitor, Pencil, Plus, Star, Stethoscope, Trash2, UserPlus } from '@lucide/svelte';
 	import { api } from '#lib/api.js';
 	import { confirmAction } from '#lib/confirm.svelte.js';
 	import { ago, datetime, num, pct, plural } from '#lib/format.js';
@@ -183,9 +183,9 @@
 
 		<!-- Health summary: each number links to the filtered agent list. -->
 		<div class="mb-4 grid grid-cols-3 gap-3">
-			<Stat label="Agents online" value={online} of={total} />
-			<Stat label="Need attention" value={(dash.data?.health.attention ?? 0) + (dash.data?.health.unhealthy ?? 0)} tone={dash.data?.health.unhealthy ? 'danger' : 'warning'} href="/agents?client={c.id}&view=attention" />
-			<Stat label="Failed jobs (24 h)" value={dash.data?.failed_jobs.length ?? 0} capped={(dash.data?.failed_jobs.length ?? 0) >= 10} tone="danger" href="/jobs?client={c.id}&status=failed" />
+			<Stat label="Agents online" icon={Monitor} value={online} of={total} />
+			<Stat label="Need attention" icon={Stethoscope} value={(dash.data?.health.attention ?? 0) + (dash.data?.health.unhealthy ?? 0)} tone={dash.data?.health.unhealthy ? 'danger' : 'warning'} href="/agents?client={c.id}&view=attention" />
+			<Stat label="Failed jobs (24 h)" icon={CircleSlash} value={dash.data?.failed_jobs.length ?? 0} capped={(dash.data?.failed_jobs.length ?? 0) >= 10} tone="danger" href="/jobs?client={c.id}&status=failed" />
 		</div>
 
 		<Tabs
@@ -259,8 +259,8 @@
 			</DataTable>
 		{:else if tab === 'sites'}
 			<section class="card overflow-hidden" aria-label="Sites">
-				<header class="border-border flex items-center justify-between border-b px-4 py-2.5">
-					<h2 class="text-sm font-semibold">Sites</h2>
+				<header class="border-border flex items-center justify-between min-h-12 border-b px-4 py-3">
+					<h2 class="panel-title">Sites</h2>
 					{#if can('admin')}<Button size="sm" icon={Plus} onclick={() => (naming = { kind: 'new-site', value: '' })}>Add site</Button>{/if}
 				</header>
 				{#if c.sites.length}
@@ -303,9 +303,9 @@
 			</TicketTable>
 		{:else if tab === 'contacts'}
 			<section class="card" aria-label="Contacts">
-				<header class="border-border flex items-center justify-between gap-3 border-b px-4 py-2.5">
+				<header class="border-border flex items-center justify-between gap-3 min-h-12 border-b px-4 py-3">
 					<div>
-						<h2 class="text-sm font-semibold">Contacts</h2>
+						<h2 class="panel-title">Contacts</h2>
 						<p class="text-muted text-xs">People at {c.name}. Mail from their address is filed on their tickets.</p>
 					</div>
 					{#if can('technician')}<Button size="sm" icon={Plus} onclick={() => (editingContact = 'new')}>Add contact</Button>{/if}

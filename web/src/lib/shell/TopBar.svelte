@@ -36,11 +36,11 @@
 	const theme = $derived(prefs.theme ?? 'system');
 </script>
 
-<header class="border-border bg-raised/85 sticky top-0 z-30 flex h-12 items-center gap-2 border-b px-2 backdrop-blur sm:px-4">
+<header class="border-border bg-raised sticky top-0 z-30 flex h-14 items-center gap-2 border-b px-2 sm:gap-3 sm:px-6 lg:px-8">
 	<IconButton icon={MenuIcon} label="Open navigation" class="lg:hidden" onclick={onmenu} />
 	<ClientSwitcher />
 	<button
-		class="border-border bg-sunken text-muted hover:border-border-strong hover:text-fg flex h-8 min-w-0 flex-1 items-center gap-2 rounded-md border px-2.5 text-sm transition-colors sm:max-w-md"
+		class="border-border bg-sunken text-muted hover:border-border-strong hover:text-fg flex h-8 min-w-0 flex-1 items-center gap-2.5 rounded-md border px-3 text-sm transition-colors sm:max-w-lg"
 		onclick={onsearch}
 	>
 		<Search class="size-4 shrink-0" />
@@ -61,7 +61,7 @@
 		<Menu
 			label="Account menu"
 			items={[
-				{ heading: `${session.user?.name ?? ''} · ${session.user?.role ?? ''}` },
+				{ heading: `${session.user?.name ?? ''} (${session.user?.role ?? ''})` },
 				{ label: 'Account', icon: UserRound, href: '/account' },
 				{ separator: true },
 				{ heading: 'Theme' },
@@ -74,7 +74,7 @@
 			]}
 		>
 			{#snippet trigger(props)}
-				<button {...props} class="bg-accent-soft text-accent hover:ring-border-strong ml-1 flex size-8 items-center justify-center rounded-full text-xs font-semibold hover:ring-2"><span aria-hidden="true">{initials}</span><span class="sr-only">Account menu</span></button>
+				<button {...props} class="bg-accent text-on-accent hover:ring-accent/30 ml-1 flex size-8 items-center justify-center rounded-full text-xs font-semibold transition-shadow hover:ring-4"><span aria-hidden="true">{initials}</span><span class="sr-only">Account menu</span></button>
 			{/snippet}
 		</Menu>
 	</div>

@@ -82,8 +82,8 @@
 	</div>
 {/snippet}
 {#snippet mitreCell(r: RuleRow)}
-	<span class="flex flex-wrap gap-x-2">
-		{#each r.mitre as t (t)}<a class="link font-mono text-xs" href={mitreUrl(t)} target="_blank" rel="noopener noreferrer">{t}<span class="sr-only"> (opens attack.mitre.org)</span></a>{:else}<span class="text-muted">–</span>{/each}
+	<span class="flex flex-wrap gap-x-3">
+		{#each r.mitre as t (t)}<a class="link inline-flex min-h-6 items-center font-mono text-xs" href={mitreUrl(t)} target="_blank" rel="noopener noreferrer">{t}<span class="sr-only"> (opens attack.mitre.org)</span></a>{:else}<span class="text-muted">–</span>{/each}
 	</span>
 {/snippet}
 {#snippet confCell(r: RuleRow)}<span class="text-muted">{confidenceLabels[r.confidence]}</span>{/snippet}

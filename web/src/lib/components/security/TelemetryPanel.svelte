@@ -60,8 +60,8 @@
 </script>
 
 <section class="card" aria-labelledby="telemetry-h">
-	<header class="border-border border-b px-4 py-2.5">
-		<h2 id="telemetry-h" class="text-sm font-semibold">{title}</h2>
+	<header class="border-border min-h-12 border-b px-4 py-3">
+		<h2 id="telemetry-h" class="panel-title">{title}</h2>
 		<p class="text-muted text-xs">What our sensor recorded on this machine: processes, connections, file, registry and module events. Kept on the machine; searched live.</p>
 	</header>
 	<form class="border-border flex flex-wrap items-end gap-x-4 gap-y-3 border-b px-4 py-3" onsubmit={search}>
