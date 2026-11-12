@@ -7,7 +7,7 @@ Last reviewed 2026-11-11.
 | Phase | Status |
 |---|---|
 | 1. Core | Done |
-| 2. Hardening | Done on Linux; MSI, Job Objects, persisted job results and sealed TOTP secrets added; Windows e2e written, not yet run in CI (see Next) |
+| 2. Hardening | Done on Linux; MSI, Job Objects, persisted job results and sealed TOTP secrets added; Windows e2e passing in CI (see Next) |
 | 3. UI redesign | Done |
 | 4. Monitoring and alerting | Done |
 | 5. Patch management | Done |
@@ -28,7 +28,7 @@ In priority order. Each block should be finished and usable before the next star
 Every Windows feature is compile-checked (clippy via mingw) and unit-tested against recorded output only. Run them all on Windows 10/11 and Server 2019/2022, and keep them running:
 
 - [ ] **Windows e2e in CI.** GitHub's `windows-latest` runners can install a service, run Defender and query Windows Update. Run the real agent as a service there against a server in the job, so regressions show up without a lab.
-  - Written: `crates/rmm-server/tests/e2e_windows.rs` and the `e2e-windows` CI job (server and Postgres on the runner, agent installed from the generated MSI). It covers the MSI install/upgrade/uninstall, the service and its recovery actions, the data-directory ACL, PowerShell and cmd jobs, the Job Object tree kill, results across a service restart and the service list. It compiles (mingw clippy) but **hasn't run yet**: the first CI run will show what breaks.
+  - Written: `crates/rmm-server/tests/e2e_windows.rs` and the `e2e-windows` CI job (server and Postgres on the runner, agent installed from the generated MSI). It covers the MSI install/upgrade/uninstall, the service and its recovery actions, the data-directory ACL, PowerShell and cmd jobs, the Job Object tree kill, results across a service restart and the service list. Passing in CI since 2026-11-12. The first runs found that msiexec rejected the package (version 4 compound file, UTF-8 code page) and that a running job kept the service from stopping; both fixed.
   - Still to add: self-update, ConPTY shells, Event Log watchers, patches, Defender, the sensor.
 - [ ] Install and service: the `C:\ProgramData\RMM` ACL, the Program Files copy, SCM recovery actions, file logging, reinstall over a running service.
 - [ ] Self-update: service stop/start from the detached watchdog, and rollback.
@@ -40,7 +40,7 @@ Every Windows feature is compile-checked (clippy via mingw) and unit-tested agai
 
 ### 2. Before the first real customer
 
-- [x] **MSI installer** with the server URL and token baked in, like the `.deb`/`.rpm`. Built by the server with the `msi` and `cab` crates rather than WiX (`crates/rmm-server/src/api/msi.rs`), so there's no Windows toolchain. Silent install, major upgrades, keeps the enrollment on upgrade/repair (`enroll --keep-existing`), removes the service on uninstall. Checked with msitools; not yet installed on a real Windows host (the Windows e2e above does that).
+- [x] **MSI installer** with the server URL and token baked in, like the `.deb`/`.rpm`. Built by the server with the `msi` and `cab` crates rather than WiX (`crates/rmm-server/src/api/msi.rs`), so there's no Windows toolchain. Silent install, major upgrades, keeps the enrollment on upgrade/repair (`enroll --keep-existing`), removes the service on uninstall. Installed, upgraded and uninstalled on `windows-latest` by the Windows e2e above; not yet on a real (non-CI) Windows host.
 - [x] **Windows Job Objects** for jobs and shells (`crates/rmm-agent/src/winjob.rs`). Jobs: a timeout kills the tree, but what a script leaves running survives it, as on Unix. Shells: kill-on-close, so closing the terminal kills everything started from it. Compile-checked only.
 - [x] **Persist the agent's job buffer to disk** (`job-results` in the state directory): results survive an agent restart, and a job that was running when the agent stopped is reported as `error` with its output instead of `lost`.
 - [x] **Encrypt TOTP secrets at rest** with `RMM_DATA_KEY` (`users.totp_sealed`); plaintext rows are sealed at startup, and the server refuses to start if sealed secrets exist but the key is missing. `RMM_DATA_KEY` is required by both production compose files.
