@@ -316,14 +316,25 @@ pub async fn create_token(
              {windows}"
         );
     }
-    // Bounded tokens can also be baked into Linux packages.
-    let packages = (expires_at.is_some() && max_uses.is_some() && super::agent_binary_exists(&st, "linux-x86_64")).then(|| {
+    // Bounded tokens can also be baked into packages.
+    let bounded = expires_at.is_some() && max_uses.is_some();
+    let packages = (bounded && super::agent_binary_exists(&st, "linux-x86_64")).then(|| {
         let base = format!("{url}/api/agent-packages/linux-x86_64");
         json!({
             "deb": format!("{base}/rmm-agent.deb?token={token}"),
             "rpm": format!("{base}/rmm-agent.rpm?token={token}"),
             "install_deb": format!("curl -fsSLo /tmp/rmm-agent.deb \"{base}/rmm-agent.deb?token={token}\" && sudo apt-get install -y /tmp/rmm-agent.deb"),
             "install_rpm": format!("curl -fsSLo /tmp/rmm-agent.rpm \"{base}/rmm-agent.rpm?token={token}\" && sudo dnf install -y /tmp/rmm-agent.rpm"),
+        })
+    });
+    let windows_packages = (bounded && super::agent_binary_exists(&st, "windows-x86_64")).then(|| {
+        let msi = format!("{url}/api/agent-packages/windows-x86_64/rmm-agent.msi?token={token}");
+        json!({
+            "msi": msi,
+            "install_msi": format!(
+                "$ProgressPreference = 'SilentlyContinue'; Invoke-WebRequest -UseBasicParsing \"{msi}\" -OutFile rmm-agent.msi; \
+                 Start-Process msiexec.exe -Wait -ArgumentList '/i rmm-agent.msi /qn /l*v rmm-agent-install.log'"
+            ),
         })
     });
     Ok(Json(json!({
@@ -333,6 +344,7 @@ pub async fn create_token(
         "max_uses": max_uses,
         "install": { "linux": linux, "windows": windows },
         "packages": packages,
+        "windows_packages": windows_packages,
     })))
 }
 

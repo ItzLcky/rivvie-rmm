@@ -44,15 +44,23 @@ pub async fn login(
         st.limits.login_account.fail(&account_key);
     };
 
-    let row: Option<(uuid::Uuid, String, bool, Option<Vec<u8>>)> =
-        sqlx::query_as("SELECT id, password_hash, disabled, totp_secret FROM users WHERE lower(email) = lower($1)")
+    #[derive(sqlx::FromRow)]
+    struct Login {
+        id: uuid::Uuid,
+        password_hash: String,
+        disabled: bool,
+        totp_secret: Option<Vec<u8>>,
+        totp_sealed: bool,
+    }
+    let row: Option<Login> =
+        sqlx::query_as("SELECT id, password_hash, disabled, totp_secret, totp_sealed FROM users WHERE lower(email) = lower($1)")
             .bind(body.email.trim())
             .fetch_optional(&st.db)
             .await?;
 
-    let hash = row.as_ref().map(|r| r.1.clone()).unwrap_or_else(dummy_hash);
+    let hash = row.as_ref().map(|r| r.password_hash.clone()).unwrap_or_else(dummy_hash);
     let ok = auth::verify_password_async(&body.password, hash).await;
-    let Some((user_id, _, disabled, totp_secret)) = row.filter(|_| ok) else {
+    let Some(Login { id: user_id, disabled, totp_secret, totp_sealed, .. }) = row.filter(|_| ok) else {
         failed();
         auth::audit(&st.db, None, "auth.login_failed", None, json!({ "email": body.email, "ip": ip_key })).await;
         return Err(ApiError::Unauthorized);
@@ -61,6 +69,7 @@ pub async fn login(
         return Err(ApiError::Unauthorized);
     }
     if let Some(secret) = totp_secret {
+        let secret = super::totp::open(&st, &secret, totp_sealed)?;
         let Some(code) = body.code.as_deref().map(str::trim).filter(|c| !c.is_empty()) else {
             return Err(ApiError::MfaRequired("two-factor code required"));
         };

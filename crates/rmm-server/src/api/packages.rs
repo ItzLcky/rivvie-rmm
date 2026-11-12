@@ -1,4 +1,5 @@
-//! `.deb` and `.rpm` agent packages with the server URL and an enrollment token baked in.
+//! `.deb`, `.rpm` and `.msi` agent packages with the server URL and an enrollment token baked in.
+//! The MSI is described in [`super::msi`]; the rest of this is about the Linux packages.
 //!
 //! `GET /api/agent-packages/{platform}/rmm-agent.deb?token=…` (or `.rpm`) builds the package
 //! on the fly around the Linux agent binary in RMM_AGENT_DIR. It contains:
@@ -56,13 +57,11 @@ pub async fn download(
     Path((platform, file)): Path<(String, String)>,
     Query(q): Query<TokenQuery>,
 ) -> ApiResult<impl IntoResponse> {
-    let format = match file.as_str() {
-        "rmm-agent.deb" => Format::Deb,
-        "rmm-agent.rpm" => Format::Rpm,
-        _ => return Err(ApiError::NotFound("package")),
-    };
-    let (deb_arch, rpm_arch) = match platform.as_str() {
-        "linux-x86_64" => ("amd64", "x86_64"),
+    let (format, deb_arch, rpm_arch) = match (platform.as_str(), file.as_str()) {
+        ("linux-x86_64", "rmm-agent.deb") => (Format::Deb, "amd64", "x86_64"),
+        ("linux-x86_64", "rmm-agent.rpm") => (Format::Rpm, "amd64", "x86_64"),
+        ("windows-x86_64", "rmm-agent.msi") => (Format::Msi, "", ""),
+        ("linux-x86_64" | "windows-x86_64", _) => return Err(ApiError::NotFound("package")),
         _ => return Err(ApiError::NotFound("platform")),
     };
     super::downloads::token_site(&st, ip, &q.token).await?;
@@ -74,7 +73,7 @@ pub async fn download(
     .await?;
     if !bounded {
         return Err(ApiError::BadRequest(
-            "packages can only carry a token with an expiry and a use limit; create one under Enroll agents → Linux package".into(),
+            "packages can only carry a token with an expiry and a use limit; create one under Enroll agents → Package".into(),
         ));
     }
     let path = super::agent_binary_path(&st, &platform).ok_or(ApiError::NotFound("agent binary"))?;
@@ -82,10 +81,17 @@ pub async fn download(
     // The signed release's version if there is one; otherwise this server's (same workspace).
     let version = st.releases.get(&st, &platform).map(|r| r.manifest.version.clone()).unwrap_or_else(|| env!("CARGO_PKG_VERSION").into());
     let enroll = enroll_toml(&st.cfg.public_url, &q.token);
+    let (server, token) = (st.cfg.public_url.clone(), q.token.clone());
+    let company = st.company().company_name;
+    let manufacturer = if company.trim().is_empty() { "RMM".to_string() } else { company };
     let (bytes, name) = tokio::task::spawn_blocking(move || -> anyhow::Result<(Vec<u8>, String)> {
         Ok(match format {
             Format::Deb => (deb(&binary, &enroll, &version, deb_arch)?, format!("rmm-agent_{version}_{deb_arch}.deb")),
             Format::Rpm => (rpm(&binary, &enroll, &version, rpm_arch)?, format!("rmm-agent-{version}-1.{rpm_arch}.rpm")),
+            Format::Msi => {
+                let input = super::msi::MsiInput { binary: &binary, server: &server, token: &token, version: &version, manufacturer: &manufacturer };
+                (super::msi::build(&input)?, format!("rmm-agent-{version}-x64.msi"))
+            }
         })
     })
     .await
@@ -104,6 +110,7 @@ pub async fn download(
 enum Format {
     Deb,
     Rpm,
+    Msi,
 }
 
 impl Format {
@@ -111,6 +118,7 @@ impl Format {
         match self {
             Format::Deb => "application/vnd.debian.binary-package",
             Format::Rpm => "application/x-rpm",
+            Format::Msi => "application/x-msi",
         }
     }
 }

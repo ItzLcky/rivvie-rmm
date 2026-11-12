@@ -21,6 +21,7 @@
 	interface NewToken {
 		token: string; expires_at: string | null; max_uses: number | null; install: { linux: string; windows: string };
 		packages: { deb: string; rpm: string; install_deb: string; install_rpm: string } | null;
+		windows_packages: { msi: string; install_msi: string } | null;
 	}
 
 	let { client, site, onclose }: { client: Client; site: Site; onclose: () => void } = $props();
@@ -39,7 +40,7 @@
 			created = await api.post<NewToken>(
 				`/sites/${site.id}/enrollment-tokens`,
 				purpose
-					? { label: label || 'Linux package', purpose, max_uses: maxUses || null, expires_in_hours: expiresHours || null }
+					? { label: label || 'Agent package', purpose, max_uses: maxUses || null, expires_in_hours: expiresHours || null }
 					: { label, max_uses: maxUses || null, expires_in_hours: expiresHours }
 			);
 			await tokens.reload();
@@ -67,15 +68,26 @@
 				<p class="text-success text-sm font-medium">Token created. Copy the commands now: the token isn't shown again.</p>
 				<CodeBlock label="Linux (as root)" code={created.install.linux} />
 				<CodeBlock label="Windows (elevated PowerShell)" code={created.install.windows} />
-				{#if created.packages}
+				{#if created.packages || created.windows_packages}
 					<div class="border-border space-y-3 border-t pt-3">
-						<p class="text-sm">Linux packages with this token baked in: installing one enrolls and starts the agent.</p>
+						<p class="text-sm">Packages with this token baked in: installing one enrolls and starts the agent.</p>
 						<div class="flex flex-wrap gap-2">
-							<Button size="sm" icon={Download} href={created.packages.deb}>.deb</Button>
-							<Button size="sm" icon={Download} href={created.packages.rpm}>.rpm</Button>
+							{#if created.windows_packages}
+								<Button size="sm" icon={Download} href={created.windows_packages.msi}>.msi</Button>
+							{/if}
+							{#if created.packages}
+								<Button size="sm" icon={Download} href={created.packages.deb}>.deb</Button>
+								<Button size="sm" icon={Download} href={created.packages.rpm}>.rpm</Button>
+							{/if}
 						</div>
-						<CodeBlock label="Debian / Ubuntu" code={created.packages.install_deb} />
-						<CodeBlock label="RHEL / Fedora" code={created.packages.install_rpm} />
+						{#if created.windows_packages}
+							<CodeBlock label="Windows (elevated PowerShell)" code={created.windows_packages.install_msi} />
+							<p class="text-muted text-xs">The MSI installs silently with <code>/qn</code>, so it also works from Group Policy, Intune or another RMM.</p>
+						{/if}
+						{#if created.packages}
+							<CodeBlock label="Debian / Ubuntu" code={created.packages.install_deb} />
+							<CodeBlock label="RHEL / Fedora" code={created.packages.install_rpm} />
+						{/if}
 						<p class="text-muted text-xs">
 							Anyone with the package can enroll machines into this site until the token expires or runs out of uses{created.max_uses ? ` (${created.max_uses})` : ''}. Push it with your configuration management, then revoke the token.
 						</p>
@@ -105,7 +117,7 @@
 			</div>
 			<div class="mt-3 flex flex-wrap gap-2">
 				<Button variant="primary" icon={KeyRound} loading={busy === 'token'} onclick={() => create(null)}>Create token</Button>
-				<Button icon={Package} loading={busy === 'package'} onclick={() => create('package')} title="Limited to 50 uses and 30 days unless set above, with .deb/.rpm downloads">Create Linux package</Button>
+				<Button icon={Package} loading={busy === 'package'} onclick={() => create('package')} title="Limited to 50 uses and 30 days unless set above, with .msi, .deb and .rpm downloads">Create package</Button>
 			</div>
 		</section>
 

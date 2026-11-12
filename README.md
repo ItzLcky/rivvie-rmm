@@ -41,7 +41,7 @@ docs/           Roadmap and design notes
 - **Tenancy:** clients → sites → agents. Enrollment tokens are scoped to a site, so an agent lands in the right client automatically.
 - **Enrollment:** `rmm-agent enroll --server URL --token T` swaps a time- and use-limited token for a permanent per-agent secret. The server stores only a SHA-256 of it. Re-enrolling a machine that still has its config keeps its agent record (the agent proves it holds the old secret); a token alone always creates a new record, so a leaked token can't take over existing agents. The agent refuses plain `http://` servers other than localhost unless you pass `--insecure`.
 - **Transport:** the agent dials out, so endpoints need no inbound ports. Everything is multiplexed over one WebSocket: heartbeats (every 30 s), inventory (every 6 h or on demand), script jobs, and PTY streams. The agent reconnects with jittered exponential backoff, and treats 100 s of silence from the server as a dead connection.
-- **Jobs:** sending a script to an offline agent queues it, and it runs on reconnect (queued jobs expire after `RMM_JOB_QUEUE_DAYS`). Output streams into Postgres (capped at 1 MB per stream). Jobs outlive the connection: the agent keeps a copy of each job's output and its result, and resends them after a reconnect or server restart until the server acknowledges them. A job is only marked `lost` when the agent comes back without it (the agent itself restarted) or never comes back. Timeouts kill the whole process tree on Unix, and closing a terminal kills everything started from it.
+- **Jobs:** sending a script to an offline agent queues it, and it runs on reconnect (queued jobs expire after `RMM_JOB_QUEUE_DAYS`). Output streams into Postgres (capped at 1 MB per stream). Jobs outlive the connection: the agent keeps a copy of each job's output and its result, and resends them after a reconnect or server restart until the server acknowledges them. The agent also keeps each job on disk (`job-results` in its state directory) until the server acknowledges it, so results survive an agent restart, crash or self-update too; a job that was still running when the agent stopped is reported as `error` with the output it had produced. A job is only marked `lost` when the agent comes back with no record of it (its state was wiped) or never comes back. Timeouts kill the whole process tree (a process group on Unix, a Job Object on Windows), and closing a terminal kills everything started from it.
 - **Terminal:** xterm.js ↔ server relay ↔ PTY on the agent (bash/zsh on Linux, PowerShell through ConPTY on Windows).
 - **Remote desktop:** view and control the machine's screen from the browser, relayed over the agent's existing socket (no extra ports). Changed areas are sent as JPEG, paced by the browser so slow links get fewer frames rather than lag. Optional consent prompt per client. See [Remote desktop](#remote-desktop).
 - **Per-client access:** admins see every client. Technicians and read-only users see every client by default, or only the clients an admin picks under Company settings → Users. Everything they can reach (agents, sites, tokens, jobs, terminal, dashboard counts) is scoped to those clients, and anything outside them reads as "not found". Scripts are MSP-wide (admins edit them; they run anywhere) or belong to one client (its technicians edit them; they only run on its agents).
@@ -81,14 +81,19 @@ cargo run -p rmm-agent -- --config ./agent.local.toml run
 
 **Tests.** `cargo test` runs the unit tests. The end-to-end test starts the real server against a
 scratch database (created and dropped per run) and drives real agent processes through
-enrollment, jobs across a server restart, lost and expired jobs, per-client access, packages and
-rate limits:
+enrollment, jobs across server and agent restarts, lost and expired jobs, per-client access,
+packages and rate limits:
 
 ```sh
 cargo build -p rmm-agent
 RMM_E2E_DATABASE_URL=postgres://rmm:rmm@localhost:5432/postgres \
   cargo test -p rmm-server --test e2e -- --ignored --nocapture
 ```
+
+`tests/e2e_windows.rs` is the Windows counterpart: it installs the agent from the generated MSI as
+a real service and runs PowerShell and cmd jobs, a Job Object tree kill, a service restart, an
+upgrade and an uninstall. It changes the machine it runs on, so it runs in CI (`windows-latest`)
+or on a throwaway VM; see the file for the command.
 
 The dashboard has visual regression and accessibility tests. Playwright screenshots every page,
 in light and dark, against a mocked API, and runs WCAG 2.2 AA checks with axe. The baselines are
@@ -109,7 +114,7 @@ npm run test:visual:docker -- --update-snapshots    # after an intended UI chang
 ## Deploying
 
 ```sh
-cp deploy/.env.example deploy/.env      # set RMM_DOMAIN and POSTGRES_PASSWORD
+cp deploy/.env.example deploy/.env      # set RMM_DOMAIN, POSTGRES_PASSWORD and RMM_DATA_KEY
 docker compose -f deploy/docker-compose.yml up -d --build
 docker compose -f deploy/docker-compose.yml exec server \
   sh -c 'RMM_PASSWORD=... rmm-server create-user --email you@example.com --name You'
@@ -133,7 +138,7 @@ the sign-in rate limit applies to all users at once.
 
 The `backup` service runs `pg_dump` every `BACKUP_INTERVAL_HOURS` (default 24) and keeps
 `BACKUP_KEEP_DAYS` (default 14) of dumps in `deploy/backups/` (the `rmm-backups` volume in the
-Arcane stack). The dumps contain password hashes, 2FA secrets and agent credential hashes, so
+Arcane stack). The dumps contain password hashes, 2FA secrets (encrypted with `RMM_DATA_KEY`, so keep the key with the backups) and agent credential hashes, so
 they're written mode 0600. Copy them off the host. To restore one into an empty database:
 
 ```sh
@@ -153,12 +158,21 @@ agent, and the install commands it generates download the binary themselves (the
 token authorizes the download), so one pasted command does everything. The server image ships
 a static Linux x86_64 binary and a Windows x64 binary in `RMM_AGENT_DIR`. To install by hand:
 
-For Linux fleets managed with configuration management, **Create Linux package** in the same
-dialog builds a `.deb` and an `.rpm` with the server URL and a dedicated token baked in. Installing
-the package enrolls the machine and starts the service. Reinstalling or upgrading keeps the
-existing enrollment. Anyone holding the package can enroll machines into that site, so its token
-always has an expiry and a use limit (30 days and 50 uses unless you set others). Revoke the token
-once the rollout is done.
+For fleets managed with configuration management, **Create package** in the same dialog builds an
+`.msi`, a `.deb` and an `.rpm` with the server URL and a dedicated token baked in. Installing a
+package enrolls the machine and starts the service. Reinstalling or upgrading keeps the existing
+enrollment (and doesn't spend a token use). Anyone holding the package can enroll machines into
+that site, so its token always has an expiry and a use limit (30 days and 50 uses unless you set
+others). Revoke the token once the rollout is done.
+
+The MSI installs silently (`msiexec /i rmm-agent.msi /qn`), so Group Policy software
+installation, Intune (as a line-of-business app) and other RMMs can push it. It puts the agent in
+`C:\Program Files\RMM` and runs `rmm-agent.exe enroll --keep-existing --install` as SYSTEM; the
+outcome is appended to `C:\ProgramData\RMM\logs\install.log`. Each download is a new version of
+the same product, so installing a newer one replaces the old one. Uninstalling (Apps & features, or
+`msiexec /x`) stops and removes the service but keeps `C:\ProgramData\RMM`, so a reinstall comes
+back as the same agent. `RMM_SERVER` and `RMM_TOKEN` are public properties if you need to override
+them: `msiexec /i rmm-agent.msi RMM_TOKEN=<TOKEN> /qn`.
 
 ```sh
 # Linux (as root): copies itself to /usr/local/bin and installs a systemd unit
@@ -195,6 +209,7 @@ to SYSTEM and Administrators. Windows service logs go to `C:\ProgramData\RMM\log
 | `RMM_MAIL_POLL_SECS` | `60` | How often IMAP support mailboxes are checked |
 | `RMM_TICKET_CLOSE_DAYS` | `7` | Resolved tickets move to Closed after this |
 | `RMM_EMAIL_RAW_DAYS` | `90` | Raw MIME of inbound mail is deleted after this (the ticket keeps the text and attachments) |
+| `RMM_DATA_KEY` | empty (required by the compose files) | 32 bytes, hex or base64 (`openssl rand -hex 32`). Encrypts two-factor secrets and detection context at rest. Secrets stored before it was set are encrypted at the next start. Keep a copy off the server: if it's lost, users with 2FA can't sign in until `rmm-server reset2fa` clears it, and the server refuses to start without it once anything has been encrypted |
 | `RMM_TRUSTED_PROXIES` | empty | Reverse proxies whose `X-Forwarded-For` gives the client IP (for rate limiting and the audit log): comma-separated addresses/CIDRs, or `private` for loopback + RFC 1918 + IPv6 ULA. The bundled compose stack sets `private` for Caddy |
 
 ## Monitoring and alerts
@@ -271,7 +286,7 @@ Watchdog logs: `journalctl -u 'rmm-agent-update-*'` on Linux, `C:\ProgramData\RM
 on Windows.
 
 Updates need the agent running as a service (systemd or the Windows service). Agents installed
-from a `.deb`/`.rpm` update in place, and a later package upgrade replaces the binary again.
+from a `.deb`/`.rpm`/`.msi` update in place, and a later package upgrade replaces the binary again.
 
 ## Patch management
 
@@ -424,7 +439,7 @@ Rules start in **audit** mode (recorded, not alerted). Promote them under **Secu
 
 Response actions (technicians with `security.respond`): kill a process tree, quarantine/restore/delete files, isolate the machine (only the RMM server, DNS and DHCP stay reachable; nftables/iptables, Windows Firewall or pf), and collect a triage package (.tar.gz of processes, connections, autoruns, logs and recent telemetry). Every action is audited. Permissions: `security.read`, `security.respond`, `security.manage`, granted by role or set per user under **Company settings → Users**.
 
-Set `RMM_DATA_KEY` (32 bytes, hex or base64) to encrypt detection context at rest: it contains command lines, which can contain passwords.
+`RMM_DATA_KEY` (see Server configuration) also encrypts detection context at rest: it contains command lines, which can contain passwords.
 
 Limits: the Windows and macOS sensors are compile-checked only and poll for processes (fast short-lived processes can be missed; ETW and Endpoint Security are planned); on Linux the real-time process source needs root. ClamAV's own on-access detections aren't collected yet. See the roadmap for the rest.
 

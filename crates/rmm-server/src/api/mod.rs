@@ -13,6 +13,7 @@ mod auth;
 mod clients;
 mod downloads;
 mod jobs;
+mod msi;
 mod packages;
 mod schedules;
 mod patches;
@@ -27,7 +28,7 @@ mod totp;
 pub(crate) mod users;
 
 pub use jobs::{FAILED as JOB_FAILED, deliver as deliver_job};
-pub use totp::clear as clear_totp;
+pub use totp::{clear as clear_totp, seal_existing as seal_totp_secrets};
 pub use users::create_user as create_user_cli;
 
 pub fn agent_platforms() -> impl Iterator<Item = &'static str> {

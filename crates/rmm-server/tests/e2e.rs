@@ -75,8 +75,16 @@ impl Server {
     }
 
     async fn restart(&mut self) {
+        self.stop();
+        self.start_again().await;
+    }
+
+    fn stop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+
+    async fn start_again(&mut self) {
         self.child = Self::start(&self.db_url, &self.dir, self.port);
         wait_healthy(&self.url()).await;
     }
@@ -330,6 +338,8 @@ async fn end_to_end() {
     std::fs::create_dir_all(dir.join("agents")).unwrap();
     std::fs::write(dir.join("web/200.html"), "<!doctype html><title>e2e</title>").unwrap();
     std::fs::copy(agent_bin(), dir.join("agents/rmm-agent-linux-x86_64")).unwrap();
+    // Only packaged into the MSI here, never run.
+    std::fs::write(dir.join("agents/rmm-agent-windows-x86_64.exe"), b"MZ e2e stand-in").unwrap();
     println!("e2e scratch dir: {}", dir.display());
 
     let result = {
@@ -373,6 +383,16 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
     let setup = admin.post("/auth/totp/setup", json!({ "password": ADMIN_PASSWORD })).await;
     let secret = setup["secret"].as_str().unwrap().to_string();
     admin.post("/auth/totp/enable", json!({ "code": totp(&secret) })).await;
+    let plain_secret = data_encoding::BASE32_NOPAD.decode(secret.as_bytes()).unwrap();
+    let stored_totp = || async {
+        sqlx::query_as::<_, (Vec<u8>, bool)>("SELECT totp_secret, totp_sealed FROM users WHERE email = $1")
+            .bind(ADMIN_EMAIL)
+            .fetch_one(db)
+            .await
+            .unwrap()
+    };
+    let (stored, sealed) = stored_totp().await;
+    assert!(sealed && stored != plain_secret && stored.len() > plain_secret.len(), "TOTP secrets are encrypted at rest");
 
     // --- tenancy -------------------------------------------------------------------------
     let client_a = admin.post("/clients", json!({ "name": "Client A" })).await;
@@ -491,22 +511,62 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
     let survivor = admin.run_script(&id1, "echo before; sleep 6; echo after", 60).await;
     let (api, id) = (&admin, survivor.as_str());
     eventually(10, "survivor job to start", move || async move { (api.job(id).await["stdout"] == "before\n").then_some(()) }).await;
+    // A secret stored in the clear (before RMM_DATA_KEY was set) is encrypted at startup.
+    sqlx::query("UPDATE users SET totp_secret = $2, totp_sealed = false, totp_last_step = NULL WHERE email = $1")
+        .bind(ADMIN_EMAIL)
+        .bind(&plain_secret)
+        .execute(db)
+        .await
+        .unwrap();
     // Housekeeping runs as soon as the server starts. Sessions live in Postgres, so the
     // admin's cookie still works afterwards.
     server.restart().await;
+    let (stored, sealed) = stored_totp().await;
+    assert!(sealed && stored != plain_secret, "plaintext TOTP secrets are encrypted on startup");
+    let fresh = Api::new(&url);
+    let me = fresh.post("/auth/login", json!({ "email": ADMIN_EMAIL, "password": ADMIN_PASSWORD, "code": totp(&secret) })).await;
+    assert_eq!(me["user"]["totp_enabled"], true, "{me}");
     let j = admin.wait_job(&survivor, 90).await;
     assert_eq!(j["status"], "succeeded", "{j}");
     assert_eq!(j["stdout"], "before\nafter\n", "output from before and after the reconnect");
     assert_eq!(admin.job(&stale).await["status"], "expired");
 
-    // --- a job whose agent restarts is lost --------------------------------------------------
-    let doomed = admin.run_script(&id1, "sleep 30", 60).await;
+    // --- a job interrupted by an agent restart reports what it had produced -----------------
+    let doomed = admin.run_script(&id1, "echo started; sleep 30", 60).await;
     let (api, id) = (&admin, doomed.as_str());
-    eventually(10, "doomed job to be sent", move || async move { (api.job(id).await["status"] == "sent").then_some(()) }).await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    eventually(10, "doomed job to start", move || async move { (api.job(id).await["stdout"] == "started\n").then_some(()) }).await;
     a1.kill();
     a1.run(dir);
     let j = admin.wait_job(&doomed, 60).await;
+    assert_eq!(j["status"], "error", "{j}");
+    assert_eq!(j["stdout"], "started\n", "{j}");
+    assert!(j["stderr"].as_str().unwrap().contains("agent stopped while this job was running"), "{j}");
+    admin.wait_online(&id1, true).await;
+
+    // --- a result produced while the server is down survives an agent restart too ----------
+    let late = admin.run_script(&id1, "sleep 2; echo done late", 60).await;
+    let (api, id) = (&admin, late.as_str());
+    eventually(10, "late job to be sent", move || async move { (api.job(id).await["status"] == "sent").then_some(()) }).await;
+    server.stop();
+    tokio::time::sleep(Duration::from_secs(4)).await; // the job finishes with nobody to tell
+    a1.kill();
+    a1.run(dir);
+    server.start_again().await;
+    let j = admin.wait_job(&late, 60).await;
+    assert_eq!(j["status"], "succeeded", "{j}");
+    assert_eq!(j["stdout"], "done late\n", "{j}");
+    admin.wait_online(&id1, true).await;
+
+    // --- a job the agent has no record of is lost ----------------------------------------------
+    let forgotten = admin.run_script(&id1, "sleep 30", 60).await;
+    let (api, id) = (&admin, forgotten.as_str());
+    eventually(10, "forgotten job to be sent", move || async move { (api.job(id).await["status"] == "sent").then_some(()) }).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    a1.kill();
+    // As if the agent was reinstalled with its state wiped.
+    std::fs::remove_dir_all(sensor_dir(dir, "a1", "state").join("job-results")).unwrap();
+    a1.run(dir);
+    let j = admin.wait_job(&forgotten, 60).await;
     assert_eq!(j["status"], "lost", "{j}");
     assert!(j["stderr"].as_str().unwrap().contains("no record of this job"), "{j}");
     admin.wait_online(&id1, true).await;
@@ -784,6 +844,45 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
             println!("{} accepted the .{key}", tool.0);
         }
     }
+
+    // --- Windows MSI with the token baked in ---------------------------------------------------
+    let msi_url = pkg_token["windows_packages"]["msi"].as_str().unwrap();
+    assert!(pkg_token["windows_packages"]["install_msi"].as_str().unwrap().contains("msiexec"));
+    let res = http.get(msi_url).send().await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.headers()["content-type"], "application/x-msi");
+    let body = res.bytes().await.unwrap();
+    assert!(body.starts_with(&[0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]), "compound file magic");
+    let raw = String::from_utf8_lossy(&body);
+    assert!(raw.contains(pkg_token["token"].as_str().unwrap()), "the token is in the Property table");
+    let res = http
+        .get(format!("{url}/api/agent-packages/windows-x86_64/rmm-agent.msi?token={}", unbounded["token"].as_str().unwrap()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST, "unbounded tokens aren't baked into the MSI either");
+
+    // --- what the MSI runs on upgrade/repair: keeps an existing enrollment ------------------------
+    let install_log = dir.join("install.log");
+    let out = Command::new(agent_bin())
+        .arg("--config")
+        .arg(&a1.config)
+        .args(["enroll", "--server", &url, "--token", "", "--keep-existing", "--log-file"])
+        .arg(&install_log)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let log = std::fs::read_to_string(&install_log).unwrap();
+    assert!(log.contains(&format!("ok: already enrolled as {id1}")), "{log}");
+    let out = Command::new(agent_bin())
+        .arg("--config")
+        .arg(dir.join("never-enrolled.toml"))
+        .args(["enroll", "--server", &url, "--token", "not-a-token", "--keep-existing", "--log-file"])
+        .arg(&install_log)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(std::fs::read_to_string(&install_log).unwrap().contains("failed: enrollment rejected"), "failures are logged too");
 
     // --- self-update offer reaches the agent, which refuses an unverifiable build ------------------
     let agent_file = dir.join("agents/rmm-agent-linux-x86_64");

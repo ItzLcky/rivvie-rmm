@@ -231,10 +231,11 @@ async fn serve(db: sqlx::PgPool, args: ServeArgs) -> Result<()> {
     let data_key = match args.data_key.as_deref() {
         Some(k) => Some(crypto::DataKey::parse(k)?),
         None => {
-            warn!("RMM_DATA_KEY isn't set: detection context (command lines) is stored unencrypted");
+            warn!("RMM_DATA_KEY isn't set: two-factor secrets and detection context (command lines) are stored unencrypted");
             None
         }
     };
+    api::seal_totp_secrets(&db, data_key.as_ref()).await.context("encrypting two-factor secrets")?;
     let state = Arc::new(AppState {
         storage,
         company: company.into(),

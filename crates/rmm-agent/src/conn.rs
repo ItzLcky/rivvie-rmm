@@ -74,7 +74,7 @@ pub async fn enroll(server_url: &str, token: &str, previous: Option<&Config>) ->
 
 /// Stay connected until `shutdown` flips to true, reconnecting with backoff.
 pub async fn run_forever(cfg: Config, config_path: std::path::PathBuf, mut shutdown: watch::Receiver<bool>) {
-    let tracker = Arc::new(jobs::Tracker::default());
+    let tracker = Arc::new(jobs::Tracker::open());
     let watchers = Arc::new(LogWatchers::default());
     let patches = Arc::new(patch::Manager::new());
     let sensor = security::supervisor::Supervisor::new();

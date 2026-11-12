@@ -15,6 +15,49 @@ use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 use crate::totp;
 
+/// A TOTP secret as stored: sealed with `RMM_DATA_KEY` when it's set. Returns (bytes, sealed).
+fn seal(st: &AppState, plain: &[u8]) -> (Vec<u8>, bool) {
+    crate::crypto::store(st.cfg.data_key.as_ref(), plain)
+}
+
+/// The plaintext of a stored secret. Startup refuses to run with sealed secrets and no key,
+/// so a failure here means the key changed.
+pub fn open(st: &AppState, stored: &[u8], sealed: bool) -> ApiResult<Vec<u8>> {
+    crate::crypto::load(st.cfg.data_key.as_ref(), stored, sealed)
+        .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("can't decrypt a two-factor secret: RMM_DATA_KEY has changed")))
+}
+
+/// Seals every TOTP secret still stored in the clear (run at startup with a key). Without a
+/// key, sealed secrets can't be checked, so the server refuses to start.
+pub async fn seal_existing(db: &sqlx::PgPool, key: Option<&crate::crypto::DataKey>) -> anyhow::Result<()> {
+    let Some(key) = key else {
+        let (n,): (i64,) = sqlx::query_as("SELECT count(*) FROM users WHERE totp_sealed").fetch_one(db).await?;
+        anyhow::ensure!(
+            n == 0,
+            "{n} user(s) have two-factor secrets encrypted with RMM_DATA_KEY, but it isn't set; \
+             set it again (or clear their 2FA with `rmm-server reset2fa`)"
+        );
+        return Ok(());
+    };
+    type Row = (Uuid, Option<Vec<u8>>, Option<Vec<u8>>);
+    let rows: Vec<Row> =
+        sqlx::query_as("SELECT id, totp_secret, totp_pending FROM users WHERE NOT totp_sealed AND (totp_secret IS NOT NULL OR totp_pending IS NOT NULL)")
+            .fetch_all(db)
+            .await?;
+    for (id, secret, pending) in &rows {
+        sqlx::query("UPDATE users SET totp_secret = $2, totp_pending = $3, totp_sealed = true WHERE id = $1 AND NOT totp_sealed")
+            .bind(id)
+            .bind(secret.as_deref().map(|s| key.seal(s)))
+            .bind(pending.as_deref().map(|s| key.seal(s)))
+            .execute(db)
+            .await?;
+    }
+    if !rows.is_empty() {
+        tracing::info!(users = rows.len(), "encrypted two-factor secrets with RMM_DATA_KEY");
+    }
+    Ok(())
+}
+
 pub enum Factor {
     Totp,
     Recovery { remaining: i64 },
@@ -63,9 +106,10 @@ async fn verify_password(st: &AppState, u: &User, password: &str) -> ApiResult<(
 
 /// Check the code against the user's active secret, auditing a failure.
 async fn verify_own_code(st: &AppState, u: &User, code: &str) -> ApiResult<Factor> {
-    let secret: Option<Vec<u8>> =
-        sqlx::query_scalar("SELECT totp_secret FROM users WHERE id = $1").bind(u.id).fetch_one(&st.db).await?;
+    let (secret, sealed): (Option<Vec<u8>>, bool) =
+        sqlx::query_as("SELECT totp_secret, totp_sealed FROM users WHERE id = $1").bind(u.id).fetch_one(&st.db).await?;
     let secret = secret.ok_or_else(|| ApiError::BadRequest("two-factor authentication is not enabled".into()))?;
+    let secret = open(st, &secret, sealed)?;
     match check_code(&st.db, u.id, &secret, code).await? {
         Some(f) => Ok(f),
         None => {
@@ -126,7 +170,14 @@ pub async fn setup(State(st): State<Arc<AppState>>, u: User, Json(b): Json<Setup
     }
     verify_password(&st, &u, &b.password).await?;
     let secret = totp::new_secret();
-    sqlx::query("UPDATE users SET totp_pending = $2 WHERE id = $1").bind(u.id).bind(&secret).execute(&st.db).await?;
+    // totp_secret is NULL (2FA is off), so the flag only describes the pending secret.
+    let (stored, sealed) = seal(&st, &secret);
+    sqlx::query("UPDATE users SET totp_pending = $2, totp_sealed = $3 WHERE id = $1 AND totp_secret IS NULL")
+        .bind(u.id)
+        .bind(&stored)
+        .bind(sealed)
+        .execute(&st.db)
+        .await?;
     let company = st.company().company_name;
     let issuer = if company.is_empty() { "RMM".to_string() } else { format!("{company} RMM") };
     let uri = totp::otpauth_uri(&secret, &issuer, &u.email);
@@ -144,10 +195,11 @@ pub async fn enable(State(st): State<Arc<AppState>>, u: User, Json(b): Json<Code
     if u.totp_enabled {
         return Err(ApiError::Conflict("two-factor authentication is already on".into()));
     }
-    let pending: Option<Vec<u8>> =
-        sqlx::query_scalar("SELECT totp_pending FROM users WHERE id = $1").bind(u.id).fetch_one(&st.db).await?;
+    let (pending, sealed): (Option<Vec<u8>>, bool) =
+        sqlx::query_as("SELECT totp_pending, totp_sealed FROM users WHERE id = $1").bind(u.id).fetch_one(&st.db).await?;
     let pending = pending.ok_or_else(|| ApiError::BadRequest("start setup first".into()))?;
-    let step = totp::verify(&pending, &b.code, Utc::now().timestamp())
+    let plain = open(&st, &pending, sealed)?;
+    let step = totp::verify(&plain, &b.code, Utc::now().timestamp())
         .ok_or_else(|| ApiError::BadRequest("that code doesn't match; check the time on your phone".into()))?;
 
     let mut tx = st.db.begin().await?;
@@ -211,7 +263,8 @@ pub async fn regenerate_recovery(
 /// Remove a user's 2FA and recovery codes. Shared by self-service disable, admin reset and the CLI.
 pub async fn clear(tx: &mut sqlx::PgConnection, user_id: Uuid) -> ApiResult<u64> {
     let n = sqlx::query(
-        "UPDATE users SET totp_secret = NULL, totp_pending = NULL, totp_last_step = NULL, totp_enabled_at = NULL WHERE id = $1",
+        "UPDATE users SET totp_secret = NULL, totp_pending = NULL, totp_sealed = false, totp_last_step = NULL, totp_enabled_at = NULL
+          WHERE id = $1",
     )
     .bind(user_id)
     .execute(&mut *tx)

@@ -27,6 +27,7 @@ services:
     environment:
       DATABASE_URL: postgres://rmm:${POSTGRES_PASSWORD}@db/rmm
       RMM_PUBLIC_URL: ${RMM_PUBLIC_URL:?set RMM_PUBLIC_URL}
+      RMM_DATA_KEY: ${RMM_DATA_KEY:?set RMM_DATA_KEY (openssl rand -hex 32)}
       RMM_ADMIN_EMAIL: ${RMM_ADMIN_EMAIL:-}
       RMM_ADMIN_PASSWORD: ${RMM_ADMIN_PASSWORD:-}
       # Your reverse proxy's address (or `private` if it's on the same host/Docker network),

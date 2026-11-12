@@ -12,7 +12,10 @@ mod services;
 mod shell;
 mod software;
 mod update;
+#[cfg(windows)]
+mod winjob;
 
+use std::io::Write as _;
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -48,6 +51,14 @@ enum Cmd {
         /// script would cross the network unencrypted; only use this on a trusted lab network.
         #[arg(long)]
         insecure: bool,
+        /// If this machine is already enrolled with this server (or no server is given), keep
+        /// that enrollment and only do `--install`. What the MSI runs, so upgrades and
+        /// repairs keep the agent's identity without spending a token use.
+        #[arg(long)]
+        keep_existing: bool,
+        /// Also append the outcome to this file (the MSI has no console to show it on).
+        #[arg(long)]
+        log_file: Option<PathBuf>,
     },
     /// Run in the foreground (what the service runs).
     Run,
@@ -129,25 +140,44 @@ fn main() -> Result<()> {
     install_crypto();
 
     match cli.cmd {
-        Cmd::Enroll { server, token, from_file, install, insecure } => {
-            let (server, token) = match from_file {
-                Some(path) => {
-                    let f = config::EnrollFile::load(&path)?;
-                    (f.server, f.token)
+        Cmd::Enroll { server, token, from_file, install, insecure, keep_existing, log_file } => {
+            let res = (|| {
+                let (server, token) = match from_file {
+                    Some(path) => {
+                        let f = config::EnrollFile::load(&path)?;
+                        (f.server, f.token)
+                    }
+                    None => (server.unwrap_or_default(), token.unwrap_or_default()),
+                };
+                if keep_existing && let Some(existing) = enrolled_with(&config_path, &server, insecure) {
+                    let msg = format!("already enrolled as {} with {}; keeping it", existing.agent_id, existing.server_url);
+                    println!("{msg}");
+                    if install {
+                        service::install(&config_path)?;
+                    }
+                    return Ok(msg);
                 }
-                None => (server.unwrap_or_default(), token.unwrap_or_default()),
-            };
-            let server = config::normalize_server_url(&server, insecure)?;
-            // Re-enrolling: prove ownership of the existing record so the server keeps it.
-            // Never hand the old secret to a different server.
-            let previous = config::Config::load(&config_path).ok().filter(|c| c.server_url == server);
-            let cfg = runtime()?.block_on(conn::enroll(&server, &token, previous.as_ref()))?;
-            cfg.save(&config_path)?;
-            println!("enrolled as {} (config: {})", cfg.agent_id, config_path.display());
-            if install {
-                service::install(&config_path)?;
+                let server = config::normalize_server_url(&server, insecure)?;
+                anyhow::ensure!(!token.trim().is_empty(), "no enrollment token given");
+                // Re-enrolling: prove ownership of the existing record so the server keeps it.
+                // Never hand the old secret to a different server.
+                let previous = config::Config::load(&config_path).ok().filter(|c| c.server_url == server);
+                let cfg = runtime()?.block_on(conn::enroll(&server, &token, previous.as_ref()))?;
+                cfg.save(&config_path)?;
+                let msg = format!("enrolled as {} (config: {})", cfg.agent_id, config_path.display());
+                println!("{msg}");
+                if install {
+                    service::install(&config_path)?;
+                }
+                Ok(msg)
+            })();
+            if let Some(path) = log_file {
+                append_log(&path, &match &res {
+                    Ok(msg) => format!("ok: {msg}"),
+                    Err(e) => format!("failed: {e:#}"),
+                });
             }
-            Ok(())
+            res.map(|_| ())
         }
         Cmd::Run => {
             let cfg = config::Config::load(&config_path)?;
@@ -173,6 +203,25 @@ fn main() -> Result<()> {
         Cmd::Patches { install, no_refresh } => patch::cli(&install, !no_refresh),
         Cmd::Security { run } => security::cli(run.as_deref()),
         Cmd::Service | Cmd::UpdateWatchdog | Cmd::DesktopHelper | Cmd::Sensor => unreachable!(),
+    }
+}
+
+/// The existing enrollment, if it's with `server` (or `server` is empty).
+fn enrolled_with(config_path: &std::path::Path, server: &str, insecure: bool) -> Option<config::Config> {
+    let existing = config::Config::load(config_path).ok()?;
+    if server.trim().is_empty() {
+        return Some(existing);
+    }
+    let server = config::normalize_server_url(server, insecure).ok()?;
+    (existing.server_url == server).then_some(existing)
+}
+
+fn append_log(path: &std::path::Path, line: &str) {
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "{} rmm-agent {}: {line}", chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true), collect::AGENT_VERSION);
     }
 }
 

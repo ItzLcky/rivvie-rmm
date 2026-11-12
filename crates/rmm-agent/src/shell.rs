@@ -12,6 +12,9 @@ pub struct ShellSession {
     writer: Box<dyn Write + Send>,
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
+    /// Everything started from the terminal, killed when the session closes.
+    #[cfg(windows)]
+    tree: Option<crate::winjob::ProcessTree>,
 }
 
 impl ShellSession {
@@ -32,6 +35,15 @@ impl ShellSession {
 
         let child = pair.slave.spawn_command(cmd).context("spawning shell")?;
         drop(pair.slave);
+        // Assigned before the session is returned, so before anything is typed into it.
+        #[cfg(windows)]
+        let tree = child.as_raw_handle().and_then(|h| match crate::winjob::ProcessTree::new(h, true) {
+            Ok(t) => Some(t),
+            Err(e) => {
+                tracing::warn!(%session_id, "closing this shell will only kill PowerShell itself: {e:#}");
+                None
+            }
+        });
 
         let mut reader = pair.master.try_clone_reader().context("pty reader")?;
         let writer = pair.master.take_writer().context("pty writer")?;
@@ -52,7 +64,13 @@ impl ShellSession {
             let _ = out.blocking_send(AgentMsg::ShellClosed { session_id, reason: Some("shell exited".into()) });
         })?;
 
-        Ok(Self { writer, master: pair.master, child })
+        Ok(Self {
+            writer,
+            master: pair.master,
+            child,
+            #[cfg(windows)]
+            tree,
+        })
     }
 
     pub fn write(&mut self, data: &[u8]) -> Result<()> {
@@ -71,6 +89,12 @@ impl Drop for ShellSession {
         #[cfg(unix)]
         if let Some(pid) = self.child.process_id() {
             kill_session(pid);
+        }
+        // Kill-on-close would do this when the handle drops; terminate first so the shell
+        // goes with its children rather than after them.
+        #[cfg(windows)]
+        if let Some(t) = self.tree.take() {
+            t.kill();
         }
         let _ = self.child.kill();
     }

@@ -4,12 +4,17 @@
 //! [`JOB_OUTPUT_BUFFER`] per stream) and forwards it to whichever connection is current.
 //! After a reconnect the agent resends each job's output and any unacknowledged result,
 //! so a dropped socket or server restart no longer loses the job.
+//!
+//! The tracker also keeps each job on disk ([`Store`]), so an agent restart (crash, reboot,
+//! self-update) doesn't lose finished results either. A job that was still running when the
+//! agent stopped is reported as `error` with the output it had produced.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use rmm_proto::{AgentMsg, Interpreter, JOB_OUTPUT_BUFFER, JobStatus, OutputStream, ScriptJob};
@@ -38,9 +43,42 @@ pub struct Tracker {
     /// The current connection's outbound queue; `None` while disconnected. A plain mutex so
     /// [`Tracker::detach`] never waits behind a send stuck on a dying socket.
     link: std::sync::Mutex<Option<mpsc::Sender<AgentMsg>>>,
+    /// `None` in tests, or when the state directory can't be created.
+    store: Option<Store>,
 }
 
 impl Tracker {
+    /// A tracker backed by the agent's state directory, holding whatever the previous run
+    /// left there.
+    pub fn open() -> Self {
+        match crate::config::state_subdir("job-results") {
+            Ok(dir) => Self::with_store(Store::new(dir)),
+            Err(e) => {
+                warn!("job results won't survive an agent restart: {e:#}");
+                Self::default()
+            }
+        }
+    }
+
+    fn with_store(store: Store) -> Self {
+        let mut jobs = store.load();
+        for id in prune(&mut jobs) {
+            store.remove(id);
+        }
+        if !jobs.is_empty() {
+            info!(jobs = jobs.len(), "loaded job results from the previous run");
+        }
+        Self { jobs: tokio::sync::Mutex::new(jobs), link: Default::default(), store: Some(store) }
+    }
+
+    fn prune(&self, jobs: &mut HashMap<Uuid, Tracked>) {
+        for id in prune(jobs) {
+            if let Some(s) = &self.store {
+                s.remove(id);
+            }
+        }
+    }
+
     fn link(&self) -> Option<mpsc::Sender<AgentMsg>> {
         self.link.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
@@ -65,7 +103,7 @@ impl Tracker {
     /// New connection: resend what each job has produced so far, then stream live.
     pub async fn attach(&self, tx: mpsc::Sender<AgentMsg>) {
         let mut jobs = self.jobs.lock().await;
-        prune(&mut jobs);
+        self.prune(&mut jobs);
         for (&job_id, job) in jobs.iter() {
             let _ = tx.send(AgentMsg::JobSync { job_id, stdout: job.stdout.clone(), stderr: job.stderr.clone() }).await;
             if let Some((done, _)) = &job.finished {
@@ -85,11 +123,14 @@ impl Tracker {
     /// Registers a job; false if it's already known (the server sent it twice).
     async fn start(&self, job_id: Uuid) -> bool {
         let mut jobs = self.jobs.lock().await;
-        prune(&mut jobs);
+        self.prune(&mut jobs);
         if jobs.contains_key(&job_id) {
             return false;
         }
         jobs.insert(job_id, Tracked::default());
+        if let Some(s) = &self.store {
+            s.started(job_id);
+        }
         true
     }
 
@@ -101,7 +142,13 @@ impl Tracker {
                 OutputStream::Stderr => &mut job.stderr,
             };
             let room = JOB_OUTPUT_BUFFER.saturating_sub(buf.len());
-            buf.extend_from_slice(&data[..data.len().min(room)]);
+            let kept = &data[..data.len().min(room)];
+            buf.extend_from_slice(kept);
+            if let Some(s) = &self.store
+                && !kept.is_empty()
+            {
+                s.append(job_id, stream, kept);
+            }
         }
         self.emit(AgentMsg::JobOutput { job_id, stream, data }).await;
         drop(jobs);
@@ -112,6 +159,9 @@ impl Tracker {
         let mut jobs = self.jobs.lock().await;
         if let Some(job) = jobs.get_mut(&job_id) {
             job.finished = Some((msg.clone(), Instant::now()));
+            if let Some(s) = &self.store {
+                s.finished(job_id, &msg, unix_now());
+            }
         }
         self.emit(msg).await;
         drop(jobs);
@@ -122,19 +172,162 @@ impl Tracker {
         let mut jobs = self.jobs.lock().await;
         if jobs.get(&job_id).is_some_and(|j| j.finished.is_some()) {
             jobs.remove(&job_id);
+            if let Some(s) = &self.store {
+                s.remove(job_id);
+            }
         }
     }
 }
 
-/// Drops results nobody acknowledged: too old, or too many (oldest first).
-fn prune(jobs: &mut HashMap<Uuid, Tracked>) {
-    jobs.retain(|_, j| j.finished.as_ref().is_none_or(|(_, at)| at.elapsed() < KEEP_UNACKED));
+/// Drops results nobody acknowledged: too old, or too many (oldest first). Returns the
+/// dropped ids.
+fn prune(jobs: &mut HashMap<Uuid, Tracked>) -> Vec<Uuid> {
+    let mut dropped: Vec<Uuid> = jobs
+        .iter()
+        .filter(|(_, j)| j.finished.as_ref().is_some_and(|(_, at)| at.elapsed() >= KEEP_UNACKED))
+        .map(|(id, _)| *id)
+        .collect();
+    for id in &dropped {
+        jobs.remove(id);
+    }
     let mut done: Vec<(Instant, Uuid)> = jobs.iter().filter_map(|(id, j)| j.finished.as_ref().map(|(_, at)| (*at, *id))).collect();
     if done.len() > MAX_UNACKED {
         done.sort();
         for (_, id) in &done[..done.len() - MAX_UNACKED] {
             jobs.remove(id);
+            dropped.push(*id);
         }
+    }
+    dropped
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+const RESTARTED_NOTE: &str = "\n[rmm-agent] the agent stopped while this job was running; output up to that point is above\n";
+
+/// Each job as a directory under the agent's state directory:
+///
+/// - `started`: unix seconds, written when the job starts;
+/// - `stdout`, `stderr`: appended as output arrives (capped like the in-memory copy);
+/// - `finished.json`: the `JobFinished` message and when, written atomically.
+///
+/// The directory is removed once the server acknowledges the result. Write failures are
+/// logged once and otherwise ignored: the job itself must not fail because the disk is full.
+struct Store {
+    dir: PathBuf,
+    warned: AtomicBool,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoredFinish {
+    at: u64,
+    msg: AgentMsg,
+}
+
+impl Store {
+    fn new(dir: PathBuf) -> Self {
+        Self { dir, warned: AtomicBool::new(false) }
+    }
+
+    fn job_dir(&self, id: Uuid) -> PathBuf {
+        self.dir.join(id.to_string())
+    }
+
+    fn check(&self, what: &str, res: std::io::Result<()>) {
+        if let Err(e) = res
+            && !self.warned.swap(true, Ordering::Relaxed)
+        {
+            warn!("can't save job state ({what}) in {}: {e}; results may not survive an agent restart", self.dir.display());
+        }
+    }
+
+    fn started(&self, id: Uuid) {
+        let d = self.job_dir(id);
+        let res = std::fs::create_dir_all(&d).and_then(|()| std::fs::write(d.join("started"), unix_now().to_string()));
+        self.check("start", res);
+    }
+
+    fn append(&self, id: Uuid, stream: OutputStream, data: &[u8]) {
+        let name = match stream {
+            OutputStream::Stdout => "stdout",
+            OutputStream::Stderr => "stderr",
+        };
+        let res = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.job_dir(id).join(name))
+            .and_then(|mut f| std::io::Write::write_all(&mut f, data));
+        self.check("output", res);
+    }
+
+    fn finished(&self, id: Uuid, msg: &AgentMsg, at: u64) {
+        let d = self.job_dir(id);
+        let body = serde_json::to_vec(&StoredFinish { at, msg: msg.clone() }).unwrap_or_default();
+        let tmp = d.join("finished.json.tmp");
+        let res = std::fs::create_dir_all(&d)
+            .and_then(|()| std::fs::write(&tmp, body))
+            .and_then(|()| std::fs::rename(&tmp, d.join("finished.json")));
+        self.check("result", res);
+    }
+
+    fn remove(&self, id: Uuid) {
+        let _ = std::fs::remove_dir_all(self.job_dir(id));
+    }
+
+    /// Everything the previous run left. Jobs that never finished are closed off as `error`
+    /// (and saved that way, so another restart reports the same thing).
+    fn load(&self) -> HashMap<Uuid, Tracked> {
+        let mut jobs = HashMap::new();
+        let Ok(entries) = std::fs::read_dir(&self.dir) else { return jobs };
+        let now = unix_now();
+        for entry in entries.flatten() {
+            let Some(id) = entry.file_name().to_str().and_then(|n| Uuid::parse_str(n).ok()) else { continue };
+            let d = entry.path();
+            match self.load_one(id, &d, now) {
+                Some(job) => {
+                    jobs.insert(id, job);
+                }
+                None => {
+                    let _ = std::fs::remove_dir_all(&d);
+                }
+            }
+        }
+        jobs
+    }
+
+    fn load_one(&self, id: Uuid, d: &Path, now: u64) -> Option<Tracked> {
+        let read = |name: &str| {
+            let mut b = std::fs::read(d.join(name)).unwrap_or_default();
+            b.truncate(JOB_OUTPUT_BUFFER);
+            b
+        };
+        let mut job = Tracked { stdout: read("stdout"), stderr: read("stderr"), finished: None };
+        let ago = |at: u64| Instant::now().checked_sub(Duration::from_secs(now.saturating_sub(at))).unwrap_or_else(Instant::now);
+        if let Some(f) = std::fs::read(d.join("finished.json")).ok().and_then(|b| serde_json::from_slice::<StoredFinish>(&b).ok()) {
+            if !matches!(&f.msg, AgentMsg::JobFinished { job_id, .. } if *job_id == id) {
+                return None;
+            }
+            job.finished = Some((f.msg, ago(f.at)));
+            return Some(job);
+        }
+        // Started but never finished: the agent stopped mid-job, and the process went with it.
+        let started: u64 = std::fs::read_to_string(d.join("started")).ok()?.trim().parse().ok()?;
+        let room = JOB_OUTPUT_BUFFER.saturating_sub(job.stderr.len());
+        let note = &RESTARTED_NOTE.as_bytes()[..RESTARTED_NOTE.len().min(room)];
+        job.stderr.extend_from_slice(note);
+        self.append(id, OutputStream::Stderr, note);
+        let msg = AgentMsg::JobFinished {
+            job_id: id,
+            status: JobStatus::Error,
+            exit_code: None,
+            duration_ms: now.saturating_sub(started).saturating_mul(1000),
+        };
+        self.finished(id, &msg, now);
+        job.finished = Some((msg, Instant::now()));
+        warn!(job_id = %id, "job was interrupted by an agent restart");
+        Some(job)
     }
 }
 
@@ -174,6 +367,19 @@ async fn execute(job: &ScriptJob, tracker: &Arc<Tracker>) -> Result<(JobStatus, 
     cmd.process_group(0);
 
     let mut child = cmd.spawn().context("spawning interpreter")?;
+    // Windows: the tree goes in a Job Object, the counterpart of the process group. Not
+    // kill-on-close: like on Unix, what a script leaves running in the background survives
+    // it, and only a timeout kills the tree.
+    #[cfg(windows)]
+    let tree = child.raw_handle().and_then(|h| match crate::winjob::ProcessTree::new(h, false) {
+        Ok(t) => Some(t),
+        Err(e) => {
+            warn!(job_id = %job.job_id, "a timeout will only kill the interpreter: {e:#}");
+            None
+        }
+    });
+    #[cfg(not(windows))]
+    let tree = ();
     let stdout = child.stdout.take().expect("piped");
     let stderr = child.stderr.take().expect("piped");
     let pump_out = tokio::spawn(pump(stdout, OutputStream::Stdout, job.job_id, tracker.clone()));
@@ -187,7 +393,7 @@ async fn execute(job: &ScriptJob, tracker: &Arc<Tracker>) -> Result<(JobStatus, 
             (if status.success() { JobStatus::Succeeded } else { JobStatus::Failed }, code)
         }
         Err(_) => {
-            kill_tree(&mut child).await;
+            kill_tree(&mut child, &tree).await;
             (JobStatus::TimedOut, None)
         }
     };
@@ -202,7 +408,12 @@ async fn execute(job: &ScriptJob, tracker: &Arc<Tracker>) -> Result<(JobStatus, 
     Ok(result)
 }
 
-async fn kill_tree(child: &mut tokio::process::Child) {
+#[cfg(windows)]
+type Tree = Option<crate::winjob::ProcessTree>;
+#[cfg(not(windows))]
+type Tree = ();
+
+async fn kill_tree(child: &mut tokio::process::Child, tree: &Tree) {
     #[cfg(unix)]
     if let Some(pid) = child.id() {
         // SAFETY: plain syscall; negative pid targets the process group we created.
@@ -210,7 +421,12 @@ async fn kill_tree(child: &mut tokio::process::Child) {
             libc::kill(-(pid as i32), libc::SIGKILL);
         }
     }
-    // TODO(windows): assign jobs to a Job Object so the whole tree dies with it.
+    #[cfg(windows)]
+    if let Some(t) = tree {
+        t.kill();
+    }
+    #[cfg(not(windows))]
+    let () = tree;
     let _ = child.kill().await;
 }
 
@@ -373,6 +589,81 @@ mod tests {
         assert_eq!(t.running().await, 1);
         t.output(id, OutputStream::Stdout, vec![b'x'; JOB_OUTPUT_BUFFER + 10]).await;
         assert_eq!(t.jobs.lock().await[&id].stdout.len(), JOB_OUTPUT_BUFFER);
+    }
+
+    fn scratch() -> PathBuf {
+        let d = std::env::temp_dir().join(format!("rmm-jobstore-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[tokio::test]
+    async fn results_survive_a_restart_until_acked() {
+        let dir = scratch();
+        let id = Uuid::new_v4();
+        {
+            let t = Tracker::with_store(Store::new(dir.clone()));
+            t.start(id).await;
+            t.output(id, OutputStream::Stdout, b"hello ".to_vec()).await;
+            t.output(id, OutputStream::Stdout, b"world".to_vec()).await;
+            t.output(id, OutputStream::Stderr, b"careful".to_vec()).await;
+            t.finish(finished(id)).await;
+        }
+        // "Restart": a new tracker on the same directory resends everything.
+        let t = Tracker::with_store(Store::new(dir.clone()));
+        assert_eq!(t.ids().await, vec![id]);
+        let (tx, mut rx) = mpsc::channel(16);
+        t.attach(tx).await;
+        match drain(&mut rx).await.as_slice() {
+            [AgentMsg::JobSync { stdout, stderr, .. }, AgentMsg::JobFinished { status: JobStatus::Succeeded, exit_code: Some(0), .. }] => {
+                assert_eq!(stdout, b"hello world");
+                assert_eq!(stderr, b"careful");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        t.ack(id).await;
+        assert!(!dir.join(id.to_string()).exists(), "acked results are deleted");
+        assert!(Tracker::with_store(Store::new(dir.clone())).ids().await.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_job_interrupted_by_a_restart_is_reported_as_error() {
+        let dir = scratch();
+        let id = Uuid::new_v4();
+        {
+            let t = Tracker::with_store(Store::new(dir.clone()));
+            t.start(id).await;
+            t.output(id, OutputStream::Stdout, b"partial".to_vec()).await;
+        }
+        for _ in 0..2 {
+            // Twice: the second load must report the same result, not a fresh one.
+            let t = Tracker::with_store(Store::new(dir.clone()));
+            assert_eq!(t.running().await, 0);
+            let (tx, mut rx) = mpsc::channel(16);
+            t.attach(tx).await;
+            match drain(&mut rx).await.as_slice() {
+                [AgentMsg::JobSync { stdout, stderr, .. }, AgentMsg::JobFinished { status: JobStatus::Error, exit_code: None, .. }] => {
+                    assert_eq!(stdout, b"partial");
+                    assert_eq!(String::from_utf8_lossy(stderr).matches("agent stopped").count(), 1, "{stderr:?}");
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn junk_in_the_store_is_ignored() {
+        let dir = scratch();
+        std::fs::create_dir_all(dir.join("not-a-uuid")).unwrap();
+        let id = Uuid::new_v4();
+        std::fs::create_dir_all(dir.join(id.to_string())).unwrap();
+        std::fs::write(dir.join(id.to_string()).join("finished.json"), b"{garbage").unwrap();
+        let t = Tracker::with_store(Store::new(dir.clone()));
+        assert!(t.ids().await.is_empty());
+        assert!(!dir.join(id.to_string()).exists(), "unreadable job directories are cleaned up");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

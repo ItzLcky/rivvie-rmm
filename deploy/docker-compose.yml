@@ -21,6 +21,8 @@ services:
     environment:
       DATABASE_URL: postgres://rmm:${POSTGRES_PASSWORD}@db/rmm
       RMM_PUBLIC_URL: https://${RMM_DOMAIN:?set RMM_DOMAIN in deploy/.env}
+      # Encrypts 2FA secrets and detection context at rest. Keep a copy outside this host.
+      RMM_DATA_KEY: ${RMM_DATA_KEY:?set RMM_DATA_KEY in deploy/.env (openssl rand -hex 32)}
       # Caddy reaches the server over the compose network; believe its X-Forwarded-For.
       RMM_TRUSTED_PROXIES: private
       RUST_LOG: info
@@ -28,7 +30,7 @@ services:
     volumes: [files:/srv/data]
 
   # Nightly pg_dump (custom format), pruned after BACKUP_KEEP_DAYS. Dumps hold password
-  # hashes, 2FA secrets and agent credential hashes, so they're written mode 0600.
+  # hashes, 2FA secrets (encrypted with RMM_DATA_KEY) and agent credential hashes, so they're written mode 0600.
   # Copy deploy/backups/ somewhere off this host; a backup on the same disk isn't a backup.
   # Restore: see "Backups" in the README.
   backup:

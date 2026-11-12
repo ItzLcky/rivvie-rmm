@@ -63,6 +63,36 @@ jobs:
           name: e2e-logs
           path: /tmp/rmm_e2e_*/*.log
 
+  # The agent installed from the generated MSI as a real Windows service: install, jobs
+  # (PowerShell, cmd), Job Object tree kill, results across a service restart, services,
+  # upgrade over itself, uninstall. See crates/rmm-server/tests/e2e_windows.rs. The runner
+  # image ships PostgreSQL (service disabled; user postgres, password root).
+  e2e-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Start PostgreSQL
+        shell: pwsh
+        run: |
+          $pg = Get-Service -Name postgresql*
+          Set-Service -InputObject $pg -Status Running -StartupType Automatic
+          & "$env:PGBIN\pg_isready.exe" -h localhost -t 60
+      - run: cargo build -p rmm-agent
+      - name: End-to-end (Windows)
+        run: cargo test -p rmm-server --test e2e_windows -- --ignored --nocapture
+        env:
+          RMM_E2E_DATABASE_URL: postgres://postgres:root@localhost:5432/postgres
+      - name: Server, agent and msiexec logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-windows-logs
+          path: |
+            ~/AppData/Local/Temp/rmm_e2e_*/*.log
+            C:/ProgramData/RMM/logs/*.log
+
   web:
     runs-on: ubuntu-latest
     defaults:
