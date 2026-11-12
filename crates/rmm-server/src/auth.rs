@@ -153,7 +153,6 @@ impl User {
 /// Named permissions (the permission sets the roadmap asked for before endpoint response).
 /// Roles grant defaults; an admin can give a user an explicit set instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(clippy::enum_variant_names)] // more areas (billing, tickets) will join security
 pub enum Perm {
     /// See protection state, detections, quarantine and telemetry.
     SecurityRead,
@@ -161,16 +160,26 @@ pub enum Perm {
     SecurityRespond,
     /// Security policies, exclusions, rule modes, content uploads and rollout.
     SecurityManage,
+    /// See rates, contracts, invoices and money in reports.
+    BillingRead,
+    /// Contracts, products, rates, invoice runs, finalising and sending invoices, accounting.
+    BillingManage,
+    /// Approve and reject other people's timesheets.
+    TimeApprove,
 }
 
 impl Perm {
-    pub const ALL: [Perm; 3] = [Perm::SecurityRead, Perm::SecurityRespond, Perm::SecurityManage];
+    pub const ALL: [Perm; 6] =
+        [Perm::SecurityRead, Perm::SecurityRespond, Perm::SecurityManage, Perm::BillingRead, Perm::BillingManage, Perm::TimeApprove];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Perm::SecurityRead => "security.read",
             Perm::SecurityRespond => "security.respond",
             Perm::SecurityManage => "security.manage",
+            Perm::BillingRead => "billing.read",
+            Perm::BillingManage => "billing.manage",
+            Perm::TimeApprove => "time.approve",
         }
     }
 
@@ -182,7 +191,8 @@ impl Perm {
         match self {
             Perm::SecurityRead => true,
             Perm::SecurityRespond => role >= Role::Technician,
-            Perm::SecurityManage => role >= Role::Admin,
+            // Money stays with admins unless someone is given it explicitly.
+            Perm::SecurityManage | Perm::BillingRead | Perm::BillingManage | Perm::TimeApprove => role >= Role::Admin,
         }
     }
 }

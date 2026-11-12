@@ -1,4 +1,7 @@
+mod accounting;
 mod agent_ws;
+mod billing;
+mod pdf;
 mod alerts;
 mod desktop_ws;
 mod api;
@@ -13,7 +16,10 @@ mod patches;
 mod ratelimit;
 mod scheduler;
 mod crypto;
+mod csat;
+mod graph;
 mod security;
+mod sla;
 mod shell_ws;
 mod state;
 mod storage;
@@ -274,6 +280,8 @@ async fn serve(db: sqlx::PgPool, args: ServeArgs) -> Result<()> {
     tokio::spawn(patches::scheduler(state.clone()));
     tokio::spawn(security::rollout_loop(state.clone()));
     tokio::spawn(email::poll_loop(state.clone(), args.mail_poll_secs));
+    tokio::spawn(sla::run(state.clone()));
+    tokio::spawn(accounting::run(state.clone()));
 
     // adapter-static writes the SPA shell as 200.html; every non-file route falls back to it.
     let found: Vec<_> = api::agent_platforms().filter(|id| api::agent_binary_exists(&state, id)).collect();

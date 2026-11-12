@@ -1,6 +1,7 @@
 import type { Component } from 'svelte';
-import { BellRing, Building2, LifeBuoy, CalendarClock, FileCode2, History, LayoutDashboard, ListChecks, Monitor, PackageCheck, Settings, Shield, ShieldCheck } from '@lucide/svelte';
+import { BarChart3, BellRing, BookOpen, CalendarDays, Clock, FileSignature, FolderKanban, Receipt, Building2, LifeBuoy, CalendarClock, FileCode2, History, LayoutDashboard, ListChecks, Monitor, PackageCheck, Settings, Shield, ShieldCheck } from '@lucide/svelte';
 import type { Role } from '#lib/types.js';
+import type { Permission } from '#lib/session.svelte.js';
 
 export interface NavItem {
 	href: string;
@@ -8,6 +9,8 @@ export interface NavItem {
 	icon: Component<{ class?: string }>;
 	/** Minimum role. */
 	role?: Role;
+	/** A named permission it needs (billing pages). */
+	perm?: Permission;
 	/** `g <key>` jumps here. */
 	key?: string;
 	/** Keeps the client switcher's ?client= when followed. */
@@ -25,7 +28,21 @@ export const nav: NavGroup[] = [
 	{ label: 'Overview', items: [{ href: '/', label: 'Dashboard', icon: LayoutDashboard, key: 'd', scoped: true }] },
 	{
 		label: 'Service desk',
-		items: [{ href: '/tickets', label: 'Tickets', icon: LifeBuoy, key: 't', scoped: true, badge: 'tickets' }]
+		items: [
+			{ href: '/tickets', label: 'Tickets', icon: LifeBuoy, key: 't', scoped: true, badge: 'tickets' },
+			{ href: '/schedule', label: 'Schedule', icon: CalendarDays, key: 'w', role: 'technician' },
+			{ href: '/projects', label: 'Projects', icon: FolderKanban, key: 'o', scoped: true },
+			{ href: '/kb', label: 'Knowledge base', icon: BookOpen, key: 'k' }
+		]
+	},
+	{
+		label: 'Business',
+		items: [
+			{ href: '/time', label: 'Time', icon: Clock, key: 'i', role: 'technician' },
+			{ href: '/billing', label: 'Billing', icon: Receipt, key: 'b', perm: 'billing.read', scoped: true },
+			{ href: '/contracts', label: 'Contracts', icon: FileSignature, key: 'n', perm: 'billing.read', scoped: true },
+			{ href: '/reports', label: 'Reports', icon: BarChart3, key: 'r' }
+		]
 	},
 	{
 		label: 'Devices',

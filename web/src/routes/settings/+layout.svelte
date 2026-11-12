@@ -1,15 +1,18 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
-	import { can, session } from '#lib/session.svelte.js';
+	import { allowed, can, session } from '#lib/session.svelte.js';
 	import PageHeader from '#lib/ui/PageHeader.svelte';
 	import Tabs from '#lib/ui/Tabs.svelte';
 	import type { LayoutProps } from './$types';
 
 	let { children }: LayoutProps = $props();
 
+	// Admins see every section; people with billing permissions only the Billing one.
+	const billingOnly = $derived(!can('admin') && allowed('billing.read'));
+	const ok = $derived(can('admin') || (billingOnly && page.url.pathname === '/settings/billing'));
 	$effect(() => {
-		if (session.user && !can('admin')) goto('/');
+		if (session.user && !ok) goto(billingOnly ? '/settings/billing' : '/');
 	});
 </script>
 
@@ -19,13 +22,15 @@
 	class="mb-5"
 	value={page.url.pathname}
 	onchange={(v) => goto(v)}
-	items={[
+	items={billingOnly ? [{ value: '/settings/billing', label: 'Billing' }] : [
 		{ value: '/settings', label: 'General' },
 		{ value: '/settings/users', label: 'Users' },
 		{ value: '/settings/notifications', label: 'Notifications' },
-		{ value: '/settings/service-desk', label: 'Service desk' }
+		{ value: '/settings/service-desk', label: 'Service desk' },
+		{ value: '/settings/sla', label: 'SLAs' },
+		{ value: '/settings/billing', label: 'Billing' }
 	]}
 />
-{#if session.user && can('admin')}
+{#if session.user && ok}
 	{@render children()}
 {/if}

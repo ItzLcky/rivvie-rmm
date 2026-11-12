@@ -61,6 +61,20 @@ pub struct TicketRow {
     alert_policy_id: Option<Uuid>,
     alert_reopens: i32,
     agent_count: i64,
+    team_id: Option<Uuid>,
+    team_name: Option<String>,
+    sla_policy_id: Option<Uuid>,
+    sla_policy_name: Option<String>,
+    respond_by: Option<DateTime<Utc>>,
+    update_by: Option<DateTime<Utc>>,
+    resolve_by: Option<DateTime<Utc>>,
+    /// Waiting on the client (or resolved): the clock is stopped.
+    sla_paused: bool,
+    sla_warned: Vec<String>,
+    sla_breached: Vec<String>,
+    /// The next deadline still running, if any.
+    sla_due: Option<DateTime<Utc>>,
+    csat_rating: Option<String>,
     #[sqlx(default)]
     #[serde(skip)]
     sort_key: String,
@@ -71,11 +85,17 @@ const COLS: &str = "t.id, t.number, t.subject, t.client_id, c.name AS client_nam
      bs.category AS status_category, t.type_id, ty.name AS type_name, t.priority, t.impact, t.urgency, t.source, t.assignee_id,
      ua.name AS assignee_name, t.requester_name, t.requester_email, t.created_at, t.updated_at, t.first_response_at,
      t.resolved_at, t.closed_at, t.merged_into, mt.number AS merged_into_number, t.alert_policy_id, t.alert_reopens,
-     (SELECT count(*) FROM ticket_agents ta WHERE ta.ticket_id = t.id) AS agent_count";
+     (SELECT count(*) FROM ticket_agents ta WHERE ta.ticket_id = t.id) AS agent_count, t.team_id, tm.name AS team_name,
+     t.sla_policy_id, (SELECT name FROM sla_policies WHERE id = t.sla_policy_id) AS sla_policy_name, t.respond_by, t.update_by,
+     t.resolve_by, t.sla_paused_at IS NOT NULL AS sla_paused, t.sla_warned, t.sla_breached,
+     (CASE WHEN bs.category IN ('resolved', 'closed') OR t.sla_paused_at IS NOT NULL OR t.merged_into IS NOT NULL THEN NULL
+           ELSE least(CASE WHEN t.first_response_at IS NULL THEN t.respond_by END,
+                      CASE WHEN t.first_response_at IS NOT NULL THEN t.update_by END, t.resolve_by) END) AS sla_due,
+     (SELECT rating FROM csat_surveys WHERE ticket_id = t.id) AS csat_rating";
 const FROM: &str = "FROM tickets t JOIN boards b ON b.id = t.board_id JOIN board_statuses bs ON bs.id = t.status_id
      LEFT JOIN clients c ON c.id = t.client_id LEFT JOIN sites si ON si.id = t.site_id LEFT JOIN contacts co ON co.id = t.contact_id
      LEFT JOIN ticket_types ty ON ty.id = t.type_id LEFT JOIN users ua ON ua.id = t.assignee_id
-     LEFT JOIN tickets mt ON mt.id = t.merged_into";
+     LEFT JOIN tickets mt ON mt.id = t.merged_into LEFT JOIN teams tm ON tm.id = t.team_id";
 /// `$1` is the user's scope. Triage tickets (no client) only match an unscoped user.
 const VISIBLE: &str = "($1::uuid[] IS NULL OR t.client_id = ANY($1))";
 const CATEGORY_RANK: &str = "(array_position(ARRAY['new','open','waiting_client','waiting_vendor','resolved','closed'], bs.category))";
@@ -89,6 +109,14 @@ const SORT_KEYS: &[SortKey] = &[
     SortKey { name: "status", expr: CATEGORY_RANK, ty: "int" },
     SortKey { name: "assignee", expr: "lower(coalesce(ua.name, '~'))", ty: "text" },
     SortKey { name: "client", expr: "lower(coalesce(c.name, ''))", ty: "text" },
+    // Tickets without a running deadline sort last.
+    SortKey {
+        name: "due",
+        expr: "coalesce(CASE WHEN bs.category IN ('resolved', 'closed') OR t.sla_paused_at IS NOT NULL THEN NULL
+                   ELSE least(CASE WHEN t.first_response_at IS NULL THEN t.respond_by END,
+                              CASE WHEN t.first_response_at IS NOT NULL THEN t.update_by END, t.resolve_by) END, 'infinity')",
+        ty: "timestamptz",
+    },
 ];
 
 /// The ticket's client (None for triage), if `u` may see it.
@@ -130,6 +158,8 @@ pub struct ListQuery {
     agent_id: Option<Uuid>,
     /// Ticket number (`T-10423` or `10423`), or words from the subject, timeline and contact.
     q: Option<String>,
+    /// A team id, or `none`.
+    team: Option<String>,
 }
 
 pub async fn list(
@@ -138,7 +168,7 @@ pub async fn list(
     Query(q): Query<ListQuery>,
     Query(page): Query<PageQuery>,
 ) -> ApiResult<Json<Page<TicketRow>>> {
-    let plan = Plan::new(SORT_KEYS, ("updated", true), &page, "t.id", "uuid", 13)?;
+    let plan = Plan::new(SORT_KEYS, ("updated", true), &page, "t.id", "uuid", 15)?;
     let view = q.view.as_deref().unwrap_or("open");
     let view_sql = match view {
         "open" => "t.merged_into IS NULL AND bs.category NOT IN ('resolved', 'closed')",
@@ -146,6 +176,12 @@ pub async fn list(
         "unassigned" => "t.merged_into IS NULL AND bs.category NOT IN ('resolved', 'closed') AND t.assignee_id IS NULL",
         "waiting" => "bs.category IN ('waiting_client', 'waiting_vendor')",
         "triage" => "t.client_id IS NULL AND t.merged_into IS NULL AND bs.category NOT IN ('resolved', 'closed')",
+        "team" => "t.merged_into IS NULL AND bs.category NOT IN ('resolved', 'closed')
+                   AND t.team_id IN (SELECT team_id FROM team_members WHERE user_id = $10)",
+        "breached" => "t.merged_into IS NULL AND bs.category NOT IN ('resolved', 'closed') AND cardinality(t.sla_breached) > 0",
+        "due_soon" => "t.merged_into IS NULL AND bs.category NOT IN ('resolved', 'closed', 'waiting_client') AND t.sla_paused_at IS NULL
+                       AND least(CASE WHEN t.first_response_at IS NULL THEN t.respond_by END,
+                                 CASE WHEN t.first_response_at IS NOT NULL THEN t.update_by END, t.resolve_by) < now() + interval '4 hours'",
         "done" => "bs.category IN ('resolved', 'closed')",
         "all" => "true",
         other => return Err(ApiError::BadRequest(format!("unknown view {other}"))),
@@ -164,6 +200,11 @@ pub async fn list(
     };
     let search = q.q.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(|s| s.chars().take(200).collect::<String>());
     let number: Option<i64> = search.as_deref().and_then(|s| s.trim_start_matches(['T', 't']).trim_start_matches('-').parse().ok());
+    let (team, no_team) = match q.team.as_deref() {
+        None | Some("") => (None, false),
+        Some("none") => (None, true),
+        Some(id) => (Some(id.parse::<Uuid>().map_err(|_| ApiError::BadRequest("team must be a team id or none".into()))?), false),
+    };
     let filters = format!(
         "{FROM}
           WHERE {VISIBLE} AND {view_sql}
@@ -175,7 +216,8 @@ pub async fn list(
             AND ($8::uuid IS NULL OR t.contact_id = $8)
             AND ($9::uuid IS NULL OR EXISTS (SELECT 1 FROM ticket_agents ta WHERE ta.ticket_id = t.id AND ta.agent_id = $9))
             AND ($11::text IS NULL OR t.number = $12 OR t.search @@ websearch_to_tsquery('simple', $11)
-                 OR t.subject ILIKE '%' || $11 || '%')"
+                 OR t.subject ILIKE '%' || $11 || '%')
+            AND ($13::uuid IS NULL OR t.team_id = $13) AND (NOT $14 OR t.team_id IS NULL)"
     );
     macro_rules! bind_filters {
         ($query:expr) => {
@@ -192,6 +234,8 @@ pub async fn list(
                 .bind(u.id)
                 .bind(&search)
                 .bind(number)
+                .bind(team)
+                .bind(no_team)
         };
     }
     let sql = format!("SELECT {COLS}, {} {filters} {} {} {}", plan.key_select, plan.keyset, plan.order, plan.limit_sql());
@@ -212,12 +256,14 @@ pub struct SummaryQuery {
 /// Open ticket counts for the sidebar and the views' tabs.
 pub async fn summary(State(st): State<Arc<AppState>>, u: User, Query(q): Query<SummaryQuery>) -> ApiResult<Json<Value>> {
     let scope = super::agents::narrow(&u, q.client_id)?;
-    let (open, mine, unassigned, triage, waiting): (i64, i64, i64, i64, i64) = sqlx::query_as(
+    let (open, mine, unassigned, triage, waiting, team, breached): (i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(
         "SELECT count(*),
                 count(*) FILTER (WHERE t.assignee_id = $2),
                 count(*) FILTER (WHERE t.assignee_id IS NULL),
                 count(*) FILTER (WHERE t.client_id IS NULL),
-                count(*) FILTER (WHERE bs.category IN ('waiting_client', 'waiting_vendor'))
+                count(*) FILTER (WHERE bs.category IN ('waiting_client', 'waiting_vendor')),
+                count(*) FILTER (WHERE t.team_id IN (SELECT team_id FROM team_members WHERE user_id = $2)),
+                count(*) FILTER (WHERE cardinality(t.sla_breached) > 0)
            FROM tickets t JOIN board_statuses bs ON bs.id = t.status_id
           WHERE ($1::uuid[] IS NULL OR t.client_id = ANY($1)) AND t.merged_into IS NULL
             AND bs.category NOT IN ('resolved', 'closed')
@@ -228,7 +274,7 @@ pub async fn summary(State(st): State<Arc<AppState>>, u: User, Query(q): Query<S
     .bind(q.client_id)
     .fetch_one(&st.db)
     .await?;
-    Ok(Json(json!({ "open": open, "mine": mine, "unassigned": unassigned, "triage": triage, "waiting": waiting })))
+    Ok(Json(json!({ "open": open, "mine": mine, "unassigned": unassigned, "triage": triage, "waiting": waiting, "team": team, "breached": breached })))
 }
 
 // ---------------------------------------------------------------------------
@@ -296,6 +342,8 @@ pub struct TicketDetail {
     statuses: Vec<StatusRow>,
     /// Where a public reply would be emailed, if anywhere.
     reply_to: Option<String>,
+    /// The satisfaction survey, once sent.
+    csat: Option<Value>,
 }
 
 pub async fn get(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uuid>) -> ApiResult<Json<TicketDetail>> {
@@ -344,7 +392,14 @@ pub async fn get(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uuid>)
         .clone()
         .filter(|e| !e.is_empty())
         .or_else(|| Some(ticket.requester_email.clone()).filter(|e| !e.is_empty()));
-    Ok(Json(TicketDetail { ticket, events, attachments, agents, statuses, reply_to }))
+    let csat: Option<Value> = sqlx::query_scalar(
+        "SELECT jsonb_build_object('email', email, 'sent_at', sent_at, 'rating', rating, 'comment', comment, 'answered_at', answered_at)
+           FROM csat_surveys WHERE ticket_id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&st.db)
+    .await?;
+    Ok(Json(TicketDetail { ticket, events, attachments, agents, statuses, reply_to, csat }))
 }
 
 // ---------------------------------------------------------------------------
@@ -365,6 +420,7 @@ pub struct NewTicketIn {
     impact: Option<i16>,
     urgency: Option<i16>,
     assignee_id: Option<Uuid>,
+    team_id: Option<Uuid>,
     #[serde(default)]
     agent_ids: Vec<Uuid>,
 }
@@ -496,6 +552,7 @@ pub async fn create(State(st): State<Arc<AppState>>, u: User, Json(b): Json<NewT
             body_public: true,
             source: "dashboard",
             assignee_id: b.assignee_id,
+            team_id: b.team_id,
             created_by: Some(u.id),
             author: Author::user(u.id),
             agent_ids: b.agent_ids.clone(),
@@ -504,7 +561,7 @@ pub async fn create(State(st): State<Arc<AppState>>, u: User, Json(b): Json<NewT
     )
     .await
     .map_err(|e| match e {
-        sqlx::Error::Database(d) if d.is_foreign_key_violation() => ApiError::BadRequest("unknown ticket type".into()),
+        sqlx::Error::Database(d) if d.is_foreign_key_violation() => ApiError::BadRequest("unknown ticket type or team".into()),
         sqlx::Error::RowNotFound => ApiError::BadRequest("the board has no status in the New category".into()),
         e => e.into(),
     })?;
@@ -515,6 +572,7 @@ pub async fn create(State(st): State<Arc<AppState>>, u: User, Json(b): Json<NewT
     {
         tracing::warn!("queueing assignment email: {e:#}");
     }
+    tickets::notify_created(&st, created.id).await;
     tickets::announce(&st, created.id).await;
     Ok(Json(fetch(&st, &u, created.id).await?))
 }
@@ -548,6 +606,8 @@ pub struct Patch {
     site_id: Option<Option<Uuid>>,
     #[serde(default, deserialize_with = "some")]
     contact_id: Option<Option<Uuid>>,
+    #[serde(default, deserialize_with = "some")]
+    team_id: Option<Option<Uuid>>,
 }
 
 async fn name_of(db: &mut PgConnection, table: &str, id: Option<Uuid>) -> sqlx::Result<Value> {
@@ -723,6 +783,21 @@ async fn apply(_st: &AppState, u: &User, db: &mut PgConnection, cur: &TicketRow,
         let from = name_of(db, "users", Some(a)).await?;
         change(db, id, &author, "assignee", from, Value::Null).await?;
     }
+    if let Some(t) = p.team_id
+        && t != cur.team_id
+    {
+        if let Some(tid) = t {
+            let exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM teams WHERE id = $1)").bind(tid).fetch_one(&mut *db).await?;
+            if !exists {
+                return Err(ApiError::NotFound("team"));
+            }
+        }
+        sqlx::query("UPDATE tickets SET team_id = $2 WHERE id = $1").bind(id).bind(t).execute(&mut *db).await?;
+        let (from, to) = (name_of(db, "teams", cur.team_id).await?, name_of(db, "teams", t).await?);
+        change(db, id, &author, "team", from, to).await?;
+    }
+    // Priority or client may have changed the SLA.
+    crate::sla::refresh(db, id).await?;
     Ok(notify)
 }
 
@@ -754,6 +829,8 @@ pub struct Bulk {
     priority: Option<i16>,
     #[serde(default, deserialize_with = "some")]
     assignee_id: Option<Option<Uuid>>,
+    #[serde(default, deserialize_with = "some")]
+    team_id: Option<Option<Uuid>>,
 }
 
 pub async fn bulk(State(st): State<Arc<AppState>>, u: User, Json(b): Json<Bulk>) -> ApiResult<Json<Value>> {
@@ -776,7 +853,7 @@ pub async fn bulk(State(st): State<Arc<AppState>>, u: User, Json(b): Json<Bulk>)
             Some(c) => tickets::status_of(&mut tx, cur.board_id, c).await?,
             None => None,
         };
-        let p = Patch { status_id, priority: b.priority, assignee_id: b.assignee_id, ..Default::default() };
+        let p = Patch { status_id, priority: b.priority, assignee_id: b.assignee_id, team_id: b.team_id, ..Default::default() };
         if let Some(a) = apply(&st, &u, &mut tx, &cur, &p).await? {
             notify.push((*id, a));
         }
@@ -837,11 +914,8 @@ pub async fn add_event(State(st): State<Arc<AppState>>, u: User, Path(id): Path<
         }
     }
     if public {
-        // First response counts only for a technician's public reply.
-        sqlx::query("UPDATE tickets SET first_response_at = coalesce(first_response_at, now()) WHERE id = $1")
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
+        // First response (and the update clock) count only a technician's public reply.
+        crate::sla::replied(&mut tx, id).await?;
     }
     if let Some(s) = b.status_id {
         let p = Patch { status_id: Some(s), ..Default::default() };
@@ -909,7 +983,7 @@ pub async fn upload(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uui
     Ok(Json(out))
 }
 
-fn clean_filename(name: &str) -> String {
+pub(crate) fn clean_filename(name: &str) -> String {
     let n: String = name.chars().filter(|c| !c.is_control() && !matches!(c, '/' | '\\')).take(200).collect();
     let n = n.trim().trim_start_matches('.').to_string();
     if n.is_empty() { "attachment".into() } else { n }
@@ -940,14 +1014,20 @@ pub async fn download(
             .await?
             .ok_or(ApiError::NotFound("attachment"))?;
     let bytes = st.storage.get(&key).await?;
-    let inline = matches!(q.inline.as_deref(), Some("1" | "true")) && INLINE_TYPES.contains(&ct.as_str());
+    file_response(bytes, &name, &ct, matches!(q.inline.as_deref(), Some("1" | "true")))
+}
+
+/// A stored file as a download: only safe image types may show inline, everything else is
+/// `application/octet-stream` with a sandboxing CSP.
+pub(crate) fn file_response(bytes: Vec<u8>, name: &str, ct: &str, inline: bool) -> ApiResult<Response> {
+    let inline = inline && INLINE_TYPES.contains(&ct);
     let ascii: String = name.chars().map(|c| if c.is_ascii_alphanumeric() || " ._-()".contains(c) { c } else { '_' }).collect();
     let encoded: String = name
         .bytes()
         .map(|b| if b.is_ascii_alphanumeric() || b"._-".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") })
         .collect();
     let disposition = format!("{}; filename=\"{ascii}\"; filename*=UTF-8''{encoded}", if inline { "inline" } else { "attachment" });
-    let content_type = if inline { ct } else { "application/octet-stream".to_string() };
+    let content_type = if inline { ct.to_string() } else { "application/octet-stream".to_string() };
     let mut res = Response::new(Body::from(bytes));
     let h = res.headers_mut();
     h.insert(header::CONTENT_TYPE, HeaderValue::from_str(&content_type).unwrap_or(HeaderValue::from_static("application/octet-stream")));
@@ -1130,6 +1210,81 @@ pub async fn merge(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uuid
     Ok(Json(fetch(&st, &u, b.into).await?))
 }
 
+#[derive(Deserialize)]
+pub struct SplitIn {
+    /// The timeline entry that becomes the new ticket's request.
+    event_id: i64,
+    subject: Option<String>,
+}
+
+/// Splits a timeline entry (usually a client's message about something else) into a new ticket
+/// for the same client and contact. Its attachments move with it; both tickets note the split.
+pub async fn split(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uuid>, Json(b): Json<SplitIn>) -> ApiResult<Json<TicketRow>> {
+    u.require(Role::Technician)?;
+    let src = fetch(&st, &u, id).await?;
+    #[allow(clippy::type_complexity)]
+    let ev: Option<(String, bool, String, Option<Uuid>, Option<Uuid>, String)> = sqlx::query_as(
+        "SELECT kind, public, body, author_id, author_contact_id, author_name FROM ticket_events WHERE id = $1 AND ticket_id = $2",
+    )
+    .bind(b.event_id)
+    .bind(id)
+    .fetch_optional(&st.db)
+    .await?;
+    let Some((kind, public, body, author_id, author_contact, author_name)) = ev else { return Err(ApiError::NotFound("timeline entry")) };
+    if !matches!(kind.as_str(), "created" | "message" | "reply" | "note") {
+        return Err(ApiError::BadRequest("only messages, replies and notes can be split off".into()));
+    }
+    let subject = match b.subject.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => clean_subject(s)?,
+        None => {
+            let first = body.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("Split from another ticket");
+            clean_subject(&first.chars().take(120).collect::<String>())?
+        }
+    };
+    let mut tx = st.db.begin().await?;
+    let contact = author_contact.or(src.contact_id);
+    let created = tickets::create(
+        &mut tx,
+        NewTicket {
+            client_id: src.client_id,
+            site_id: src.site_id,
+            contact_id: contact.filter(|_| src.client_id.is_some()),
+            board_id: src.board_id,
+            type_id: src.type_id,
+            priority: src.priority,
+            subject,
+            body,
+            body_public: public,
+            source: "dashboard",
+            requester_name: src.requester_name.clone(),
+            requester_email: src.requester_email.clone(),
+            created_by: Some(u.id),
+            author: Author { user_id: author_id, contact_id: author_contact, name: author_name },
+            team_id: src.team_id,
+            ..Default::default()
+        },
+    )
+    .await?;
+    sqlx::query("UPDATE ticket_attachments SET ticket_id = $2, event_id = $3 WHERE event_id = $1")
+        .bind(b.event_id)
+        .bind(created.id)
+        .bind(created.event_id)
+        .execute(&mut *tx)
+        .await?;
+    // Replies to the split-off message's email thread keep landing on the old ticket; new mail
+    // carries the new ticket's tag.
+    let author = Author::user(u.id);
+    tickets::add_event(&mut tx, id, "split", false, &author, "", json!({ "to": created.id, "to_number": created.number, "event_id": b.event_id }))
+        .await?;
+    tickets::add_event(&mut tx, created.id, "split", false, &author, "", json!({ "from": id, "from_number": src.number })).await?;
+    tx.commit().await?;
+    auth::audit(&st.db, Some(u.id), "ticket.split", Some(("ticket", id)), json!({ "into": created.id })).await;
+    tickets::notify_created(&st, created.id).await;
+    tickets::announce(&st, id).await;
+    tickets::announce(&st, created.id).await;
+    Ok(Json(fetch(&st, &u, created.id).await?))
+}
+
 // ---------------------------------------------------------------------------
 // Form data
 // ---------------------------------------------------------------------------
@@ -1142,6 +1297,8 @@ pub struct BoardOut {
     position: i32,
     statuses: Value,
     open_tickets: i64,
+    default_team_id: Option<Uuid>,
+    notify_channel_ids: Vec<Uuid>,
 }
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -1167,7 +1324,8 @@ pub async fn boards(db: &sqlx::PgPool, scope: Option<&[Uuid]>) -> sqlx::Result<V
                                           ORDER BY s.position, s.name) FROM board_statuses s WHERE s.board_id = b.id), '[]') AS statuses,
                 (SELECT count(*) FROM tickets t JOIN board_statuses s ON s.id = t.status_id
                   WHERE t.board_id = b.id AND s.category NOT IN ('resolved', 'closed') AND t.merged_into IS NULL
-                    AND ($1::uuid[] IS NULL OR t.client_id = ANY($1))) AS open_tickets
+                    AND ($1::uuid[] IS NULL OR t.client_id = ANY($1))) AS open_tickets,
+                b.default_team_id, b.notify_channel_ids
            FROM boards b ORDER BY b.position, lower(b.name)",
     )
     .bind(scope)
@@ -1187,7 +1345,8 @@ pub async fn meta(State(st): State<Arc<AppState>>, u: User) -> ApiResult<Json<Va
     )
     .fetch_all(&st.db)
     .await?;
-    Ok(Json(json!({ "boards": boards, "types": types, "technicians": techs, "done_categories": DONE })))
+    let teams = super::desk::teams(&st.db).await?;
+    Ok(Json(json!({ "boards": boards, "types": types, "technicians": techs, "teams": teams, "done_categories": DONE })))
 }
 
 #[cfg(test)]

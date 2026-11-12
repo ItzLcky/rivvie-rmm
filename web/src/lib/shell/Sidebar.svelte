@@ -5,7 +5,7 @@
 	import { cx } from '#lib/format.js';
 	import { prefs, setPref } from '#lib/prefs.svelte.js';
 	import { withClient } from '#lib/scope.svelte.js';
-	import { can, company } from '#lib/session.svelte.js';
+	import { allowed, can, company } from '#lib/session.svelte.js';
 	import Tooltip from '#lib/ui/Tooltip.svelte';
 	import { alertCounts } from '#lib/monitoring/alerts.svelte.js';
 	import { ticketCounts } from '#lib/servicedesk/tickets.svelte.js';
@@ -18,7 +18,7 @@
 	let { mobile = false, onnavigate }: { mobile?: boolean; onnavigate?: () => void } = $props();
 	const collapsed = $derived(!mobile && !!prefs.sidebarCollapsed);
 	const openAlerts = $derived(alertCounts.critical + alertCounts.warning + alertCounts.info);
-	const groups = $derived(nav.map((g) => ({ ...g, items: g.items.filter((i) => !i.role || can(i.role)) })).filter((g) => g.items.length));
+	const groups = $derived(nav.map((g) => ({ ...g, items: g.items.filter((i) => (!i.role || can(i.role)) && (!i.perm || allowed(i.perm))) })).filter((g) => g.items.length));
 </script>
 
 <div class={cx('nav-rail bg-nav text-nav-fg flex h-full flex-col', collapsed ? 'w-16' : 'w-64')}>

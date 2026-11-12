@@ -18,7 +18,12 @@
 	import Modal from '#lib/ui/Modal.svelte';
 	import Select from '#lib/ui/Select.svelte';
 	import Switch from '#lib/ui/Switch.svelte';
+	import Checkbox from '#lib/ui/Checkbox.svelte';
+	import Teams from './Teams.svelte';
+	import Canned from './Canned.svelte';
+	import PortalSettings from './PortalSettings.svelte';
 
+	const channels = resource(() => api.get<{ id: string; name: string; kind: string }[]>('/notification-channels'));
 	const boards = resource(() => api.get<Board[]>('/boards'));
 	const meta = resource(() => ticketMeta(true));
 	const mailboxes = resource(() => api.get<Mailbox[]>('/mailboxes'));
@@ -31,15 +36,22 @@
 
 	// --- boards -------------------------------------------------------------------------------
 	type StatusDraft = { id?: string; name: string; category: StatusCategory };
-	let board = $state<{ id: string | null; name: string; description: string; statuses: StatusDraft[] } | null>(null);
+	let board = $state<{
+		id: string | null; name: string; description: string; statuses: StatusDraft[]; default_team_id: string; notify_channel_ids: string[];
+	} | null>(null);
 	let saving = $state(false);
 	function editBoard(b?: Board) {
 		board = b
-			? { id: b.id, name: b.name, description: b.description, statuses: b.statuses.map((s) => ({ id: s.id, name: s.name, category: s.category })) }
+			? {
+					id: b.id, name: b.name, description: b.description, statuses: b.statuses.map((s) => ({ id: s.id, name: s.name, category: s.category })),
+					default_team_id: b.default_team_id ?? '', notify_channel_ids: [...b.notify_channel_ids]
+				}
 			: {
 					id: null,
 					name: '',
 					description: '',
+					default_team_id: '',
+					notify_channel_ids: [],
 					statuses: [
 						{ name: 'New', category: 'new' },
 						{ name: 'In progress', category: 'open' },
@@ -59,7 +71,7 @@
 		const b = board!;
 		saving = true;
 		try {
-			const body = { name: b.name, description: b.description, statuses: b.statuses };
+			const body = { name: b.name, description: b.description, statuses: b.statuses, default_team_id: b.default_team_id || null, notify_channel_ids: b.notify_channel_ids };
 			if (b.id) await api.put(`/boards/${b.id}`, body);
 			else await api.post('/boards', body);
 			toast.success(`${b.name} saved.`);
@@ -94,9 +106,10 @@
 
 	// --- mailboxes ----------------------------------------------------------------------------
 	type MailboxDraft = {
-		id: string | null; name: string; address: string; kind: 'imap' | 'webhook'; imap_host: string; imap_port: number;
+		id: string | null; name: string; address: string; kind: 'imap' | 'webhook' | 'graph'; imap_host: string; imap_port: number;
 		imap_security: 'tls' | 'none'; imap_username: string; imap_password: string; has_password: boolean; imap_folder: string;
 		board_id: string; auto_reply: boolean; enabled: boolean;
+		graph_tenant: string; graph_client_id: string; graph_secret: string; has_graph_secret: boolean; graph_send: boolean;
 	};
 	let mailbox = $state<MailboxDraft | null>(null);
 	let webhookUrl = $state<{ name: string; url: string } | null>(null);
@@ -106,11 +119,13 @@
 			? {
 					id: m.id, name: m.name, address: m.address, kind: m.kind, imap_host: m.imap_host, imap_port: m.imap_port, imap_security: m.imap_security,
 					imap_username: m.imap_username, imap_password: '', has_password: m.has_password, imap_folder: m.imap_folder, board_id: m.board_id,
-					auto_reply: m.auto_reply, enabled: m.enabled
+					auto_reply: m.auto_reply, enabled: m.enabled, graph_tenant: m.graph_tenant, graph_client_id: m.graph_client_id, graph_secret: '',
+					has_graph_secret: m.has_graph_secret, graph_send: m.graph_send
 				}
 			: {
 					id: null, name: '', address: '', kind: 'imap', imap_host: '', imap_port: 993, imap_security: 'tls', imap_username: '', imap_password: '',
-					has_password: false, imap_folder: 'INBOX', board_id: boards.data?.[0]?.id ?? '', auto_reply: true, enabled: true
+					has_password: false, imap_folder: 'INBOX', board_id: boards.data?.[0]?.id ?? '', auto_reply: true, enabled: true,
+					graph_tenant: '', graph_client_id: '', graph_secret: '', has_graph_secret: false, graph_send: true
 				};
 	}
 	async function saveMailbox(e: SubmitEvent) {
@@ -118,8 +133,8 @@
 		const m = mailbox!;
 		saving = true;
 		try {
-			const { id, has_password: _h, imap_password, ...rest } = m;
-			const body = { ...rest, imap_port: Number(m.imap_port), ...(imap_password ? { imap_password } : {}) };
+			const { id, has_password: _h, has_graph_secret: _g, imap_password, graph_secret, ...rest } = m;
+			const body = { ...rest, imap_port: Number(m.imap_port), ...(imap_password ? { imap_password } : {}), ...(graph_secret ? { graph_secret } : {}) };
 			if (id) {
 				await api.put(`/mailboxes/${id}`, body);
 			} else {
@@ -192,6 +207,10 @@
 		</Async>
 	</section>
 
+	<Teams onchange={refreshMeta} />
+	<Canned />
+	<PortalSettings boards={boards.data ?? []} />
+
 	<section class="card" aria-labelledby="types-h">
 		<header class="border-border flex items-center justify-between gap-3 border-b px-5 py-3">
 			<div>
@@ -225,16 +244,16 @@
 					<ul class="divide-border divide-y">
 						{#each list as m (m.id)}
 							<li class="flex flex-wrap items-center gap-x-3 gap-y-1 px-5 py-3 text-sm">
-								{#if m.kind === 'imap'}<Mail class="text-muted size-4 shrink-0" aria-hidden="true" />{:else}<Webhook class="text-muted size-4 shrink-0" aria-hidden="true" />{/if}
+								{#if m.kind === 'webhook'}<Webhook class="text-muted size-4 shrink-0" aria-hidden="true" />{:else}<Mail class="text-muted size-4 shrink-0" aria-hidden="true" />{/if}
 								<div class="min-w-0 flex-1">
 									<div class="font-medium">{m.name} <span class="text-muted font-normal">{m.address}</span> {#if !m.enabled}<Badge>Disabled</Badge>{/if}</div>
 									<div class="text-muted truncate text-xs">
-										{m.kind === 'imap' ? `IMAP ${m.imap_host}:${m.imap_port}/${m.imap_folder}` : 'Provider webhook'} · into {m.board_name} · {plural(m.received_24h, 'message')} today{m.auto_reply ? ' · acknowledges new tickets' : ''}
+										{m.kind === 'imap' ? `IMAP ${m.imap_host}:${m.imap_port}/${m.imap_folder}` : m.kind === 'graph' ? `Microsoft 365 (Graph)${m.graph_send ? ', sends replies' : ''}` : 'Provider webhook'} · into {m.board_name} · {plural(m.received_24h, 'message')} today{m.auto_reply ? ' · acknowledges new tickets' : ''}
 										{#if m.last_polled_at}{` · checked ${ago(m.last_polled_at)}`}{/if}
 									</div>
 									{#if m.last_error}<div class="text-danger text-xs break-words">{m.last_error}</div>{/if}
 								</div>
-								{#if m.kind === 'imap'}
+								{#if m.kind !== 'webhook'}
 									<Button size="sm" icon={RefreshCw} loading={polling === m.id} onclick={() => poll(m)}>Check now</Button>
 								{:else}
 									<Button size="sm" icon={KeyRound} onclick={() => rotate(m)}>New URL</Button>
@@ -315,6 +334,26 @@
 					{#each categories as c (c.value)}<dt class="font-medium">{c.label}</dt><dd>{c.hint}</dd>{/each}
 				</dl>
 			</fieldset>
+			<div class="grid gap-3 sm:grid-cols-2">
+				<Field label="New tickets go to team" id="bd-team">
+					<Select id="bd-team" class="w-full" bind:value={board.default_team_id} options={[{ value: '', label: 'No team' }, ...(meta.data?.teams ?? []).map((t) => ({ value: t.id, label: t.name }))]} />
+				</Field>
+				<fieldset>
+					<legend class="label">Announce new tickets on</legend>
+					{#if channels.data?.length}
+						<div class="space-y-1.5">
+							{#each channels.data as c (c.id)}
+								<Checkbox
+									checked={board.notify_channel_ids.includes(c.id)}
+									onchange={(on: boolean) => (board!.notify_channel_ids = on ? [...board!.notify_channel_ids, c.id] : board!.notify_channel_ids.filter((x) => x !== c.id))}
+								>{c.name}</Checkbox>
+							{/each}
+						</div>
+					{:else}
+						<p class="hint">No notification channels yet (Company settings → Notifications).</p>
+					{/if}
+				</fieldset>
+			</div>
 		</form>
 		{#snippet footer()}
 			<Button onclick={() => (board = null)}>Cancel</Button>
@@ -349,7 +388,7 @@
 				<Field label="Name" id="mb-name" required><Input id="mb-name" bind:value={mailbox.name} required maxlength={100} placeholder="Support" /></Field>
 				<Field label="Address" id="mb-addr" required hint="Clients write to this; replies come from it."><Input id="mb-addr" type="email" bind:value={mailbox.address} required placeholder="support@example.com" /></Field>
 				<Field label="Receive by" id="mb-kind">
-					<Select id="mb-kind" class="w-full" bind:value={mailbox.kind} disabled={!!mailbox.id} options={[{ value: 'imap', label: 'IMAP' }, { value: 'webhook', label: 'Provider webhook' }]} />
+					<Select id="mb-kind" class="w-full" bind:value={mailbox.kind} disabled={!!mailbox.id} options={[{ value: 'imap', label: 'IMAP' }, { value: 'graph', label: 'Microsoft 365' }, { value: 'webhook', label: 'Provider webhook' }]} />
 				</Field>
 			</div>
 			{#if mailbox.kind === 'imap'}
@@ -367,7 +406,21 @@
 					</Field>
 					<Field label="Folder" id="mb-folder"><Input id="mb-folder" bind:value={mailbox.imap_folder} /></Field>
 				</div>
-				<p class="hint -mt-2">Unread messages are filed every minute and marked read. Microsoft 365 mailboxes need OAuth, which isn't supported yet: forward their mail to a webhook mailbox meanwhile.</p>
+				<p class="hint -mt-2">Unread messages are filed every minute and marked read. For Microsoft 365, choose Microsoft 365 instead: it doesn't need IMAP.</p>
+			{:else if mailbox.kind === 'graph'}
+				<div class="grid gap-3 sm:grid-cols-2">
+					<Field label="Tenant (directory) ID" id="mb-tenant" required><Input id="mb-tenant" bind:value={mailbox.graph_tenant} required autocomplete="off" placeholder="00000000-0000-…" /></Field>
+					<Field label="Application (client) ID" id="mb-client" required><Input id="mb-client" bind:value={mailbox.graph_client_id} required autocomplete="off" /></Field>
+					<Field label="Client secret" id="mb-secret" required={!mailbox.has_graph_secret} hint={mailbox.has_graph_secret ? 'Saved (encrypted). Leave empty to keep it.' : 'Stored encrypted when RMM_DATA_KEY is set.'}>
+						<Input id="mb-secret" type="password" bind:value={mailbox.graph_secret} autocomplete="new-password" placeholder={mailbox.has_graph_secret ? '••••••••' : ''} />
+					</Field>
+					<Field label="Folder" id="mb-gfolder" hint="INBOX, or a folder ID."><Input id="mb-gfolder" bind:value={mailbox.imap_folder} /></Field>
+				</div>
+				<p class="hint -mt-2">
+					Register an app in Entra ID with the Mail.ReadWrite and Mail.Send application permissions (admin consent), and limit it to this mailbox with an application access policy.
+					Unread messages are filed every minute and marked read.
+				</p>
+				<Switch bind:checked={mailbox.graph_send}>Send replies from this mailbox through Microsoft 365</Switch>
 			{:else}
 				<p class="hint">After saving you get a secret URL. Point your provider's inbound webhook at it: raw MIME (message/rfc822), Postmark JSON with “Include raw email content”, or a Mailgun route to the <code>mime</code> URL.</p>
 			{/if}

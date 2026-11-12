@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
-	import { CircleSlash, Contact as ContactIcon, ExternalLink, LifeBuoy, MapPin, Monitor, Pencil, Plus, Star, Stethoscope, Trash2, UserPlus } from '@lucide/svelte';
+	import { CircleSlash, Contact as ContactIcon, ExternalLink, KeyRound, LifeBuoy, MapPin, Monitor, Pencil, Plus, Star, Stethoscope, Trash2, UserPlus } from '@lucide/svelte';
 	import { api } from '#lib/api.js';
 	import { confirmAction } from '#lib/confirm.svelte.js';
 	import { ago, datetime, num, pct, plural } from '#lib/format.js';
@@ -9,12 +9,17 @@
 	import { paged } from '#lib/paged.svelte.js';
 	import { resource } from '#lib/resource.svelte.js';
 	import { loadClients } from '#lib/scope.svelte.js';
-	import { can } from '#lib/session.svelte.js';
+	import { allowed, can } from '#lib/session.svelte.js';
+	import ClientDocs from '#lib/components/work/ClientDocs.svelte';
+	import ClientBilling from '#lib/components/billing/ClientBilling.svelte';
 	import { attempt, toast } from '#lib/toast.svelte.js';
-	import type { AgentSummary, Client, Contact, Dashboard, Site, Ticket } from '#lib/types.js';
+	import type { AgentSummary, Client, Contact, Dashboard, Site, SlaPolicy, Ticket } from '#lib/types.js';
 	import { param, qs, setParams, sortState } from '#lib/url.svelte.js';
 	import Async from '#lib/ui/Async.svelte';
+	import Badge from '#lib/ui/Badge.svelte';
 	import Button from '#lib/ui/Button.svelte';
+	import Menu from '#lib/ui/Menu.svelte';
+	import Select from '#lib/ui/Select.svelte';
 	import DataTable, { type Column } from '#lib/ui/DataTable.svelte';
 	import EmptyState from '#lib/ui/EmptyState.svelte';
 	import Field from '#lib/ui/Field.svelte';
@@ -121,6 +126,24 @@
 		}
 	}
 
+	const slaPolicies = resource(() => (tab === 'settings' && can('admin') ? api.get<SlaPolicy[]>('/sla/policies') : Promise.resolve([] as SlaPolicy[])));
+	let serviceBusy = $state(false);
+	async function setService(c: Client, body: { sla_policy_id: string | null; portal_devices?: boolean }) {
+		serviceBusy = true;
+		if (await attempt(() => api.put(`/clients/${c.id}/service`, body), 'Saved.')) {
+			c.sla_policy_id = body.sla_policy_id;
+			if (body.portal_devices !== undefined) c.portal_devices = body.portal_devices;
+		} else await client.reload();
+		serviceBusy = false;
+	}
+	async function portalInvite(p: Contact) {
+		await attempt(() => api.post(`/contacts/${p.id}/portal-invite`), `Invitation sent to ${p.email}.`);
+	}
+	async function portalReset(p: Contact) {
+		const ok = await confirmAction({ title: `Reset ${p.name}'s portal sign-in?`, message: 'Removes their portal password and two-factor setup and signs them out. They can sign in again with an emailed link.', confirmLabel: 'Reset' });
+		if (ok) await attempt(() => api.del(`/contacts/${p.id}/portal-credentials`), 'Portal sign-in reset.');
+	}
+
 	let consentBusy = $state(false);
 	async function setConsent(c: Client, consent: boolean) {
 		consentBusy = true;
@@ -198,6 +221,8 @@
 				{ value: 'sites', label: 'Sites & enrollment', count: c.sites.length },
 				{ value: 'tickets', label: 'Tickets' },
 				{ value: 'contacts', label: 'Contacts' },
+				{ value: 'docs', label: 'Docs' },
+				{ value: 'billing', label: 'Billing', hidden: !allowed('billing.read') },
 				{ value: 'settings', label: 'Settings', hidden: !can('admin') }
 			]}
 		/>
@@ -320,8 +345,20 @@
 											<div class="font-medium">{p.name}{#if p.is_primary} <Star class="text-warning inline size-3.5 align-[-2px]" aria-label="Primary contact" />{/if}{#if p.job_title}<span class="text-muted font-normal"> · {p.job_title}</span>{/if}</div>
 											<div class="text-muted truncate text-xs">{[p.email, p.phone, p.site_name].filter(Boolean).join(' · ') || 'No contact details'}</div>
 										</div>
+										{#if p.portal_enabled}<Badge tone="info" title={p.portal_last_login_at ? `Last signed in ${ago(p.portal_last_login_at)}` : 'Not signed in yet'}>Portal</Badge>{/if}
 										{#if p.open_tickets}<a class="link text-xs" href="/tickets?client={c.id}&q={encodeURIComponent(p.email || p.name)}">{plural(p.open_tickets, 'open ticket')}</a>{/if}
 										{#if can('technician')}
+											{#if p.portal_enabled}
+												<Menu
+													label="Portal actions for {p.name}"
+													items={[
+														{ label: 'Send portal invitation', onSelect: () => portalInvite(p) },
+														{ label: 'Reset portal password and 2FA', onSelect: () => portalReset(p) }
+													]}
+												>
+													{#snippet trigger(props)}<IconButton {...props} icon={KeyRound} size="sm" label="Portal actions for {p.name}" />{/snippet}
+												</Menu>
+											{/if}
 											<IconButton icon={Pencil} size="sm" label="Edit {p.name}" onclick={() => (editingContact = p)} />
 											<IconButton icon={Trash2} size="sm" variant="danger-ghost" label="Delete {p.name}" onclick={() => deleteContact(p)} />
 										{/if}
@@ -334,6 +371,10 @@
 					{/snippet}
 				</Async>
 			</section>
+		{:else if tab === 'docs'}
+			<ClientDocs clientId={c.id} />
+		{:else if tab === 'billing' && allowed('billing.read')}
+			<ClientBilling clientId={c.id} />
 		{:else if tab === 'settings' && can('admin')}
 			<div class="max-w-2xl space-y-5">
 				<section class="card space-y-3 p-5" aria-labelledby="domains-heading">
@@ -345,6 +386,23 @@
 						<Textarea id="client-domains" rows={3} class="font-mono text-xs" bind:value={domains} spellcheck="false" />
 					</Field>
 					<div class="flex justify-end"><Button variant="primary" loading={domainsBusy} disabled={domains === c.email_domains.join('\n')} onclick={() => saveDomains(c)}>Save</Button></div>
+				</section>
+				<section class="card space-y-4 p-5" aria-labelledby="service-heading">
+					<h2 id="service-heading" class="font-semibold">Service desk</h2>
+					<Field label="SLA policy" id="client-sla" hint="Deadlines on this client's tickets. Changing it recalculates open tickets.">
+						<Select
+							id="client-sla"
+							class="w-full sm:w-72"
+							disabled={serviceBusy}
+							value={c.sla_policy_id ?? ''}
+							onchange={(e) => setService(c, { sla_policy_id: e.currentTarget.value || null })}
+							options={[{ value: '', label: `Default${slaPolicies.data?.find((p) => p.is_default) ? ` (${slaPolicies.data.find((p) => p.is_default)?.name})` : ''}` }, ...(slaPolicies.data ?? []).map((p) => ({ value: p.id, label: p.name }))]}
+						/>
+					</Field>
+					<div>
+						<Switch checked={!!c.portal_devices} disabled={serviceBusy} onchange={(v) => setService(c, { sla_policy_id: c.sla_policy_id ?? null, portal_devices: v })}>Show devices in the client portal</Switch>
+						<p class="hint ml-11.5">Contacts see a read-only list: hostname, online, last seen, missing updates.</p>
+					</div>
 				</section>
 				<section class="card space-y-4 p-5" aria-labelledby="desktop-heading">
 					<h2 id="desktop-heading" class="font-semibold">Remote desktop</h2>

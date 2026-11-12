@@ -31,11 +31,18 @@
 
 	const scoped = $derived(currentClient());
 	const allClients = $derived(session.user?.client_ids === null);
+	let meta = $state<TicketMeta | null>(null);
+	$effect(() => {
+		ticketMeta().then((m) => (meta = m));
+	});
 	const views = $derived([
 		{ value: 'open', label: 'Open', count: !scoped && ticketCounts.loaded ? num(ticketCounts.open) : undefined },
 		{ value: 'mine', label: 'Mine', count: !scoped && ticketCounts.loaded && ticketCounts.mine ? num(ticketCounts.mine) : undefined, hidden: !can('technician') },
 		{ value: 'unassigned', label: 'Unassigned', count: !scoped && ticketCounts.loaded && ticketCounts.unassigned ? num(ticketCounts.unassigned) : undefined },
 		{ value: 'waiting', label: 'Waiting' },
+		{ value: 'team', label: 'My teams', count: !scoped && ticketCounts.team ? num(ticketCounts.team) : undefined, hidden: !meta?.teams?.some((t) => t.member_ids.includes(session.user?.id ?? '')) },
+		{ value: 'breached', label: 'SLA missed', count: !scoped && ticketCounts.breached ? num(ticketCounts.breached) : undefined },
+		{ value: 'due_soon', label: 'Due soon' },
 		{ value: 'triage', label: 'Triage', count: ticketCounts.triage ? num(ticketCounts.triage) : undefined, hidden: !allClients || !!scoped },
 		{ value: 'done', label: 'Resolved & closed' },
 		{ value: 'all', label: 'All' }
@@ -44,20 +51,17 @@
 	const board = $derived(param('board'));
 	const priority = $derived(param('priority'));
 	const assignee = $derived(param('assignee'));
+	const team = $derived(param('team'));
 
-	let meta = $state<TicketMeta | null>(null);
-	$effect(() => {
-		ticketMeta().then((m) => (meta = m));
-	});
 
 	const list = paged<Ticket>(() =>
-		`/tickets${qs({ view, board_id: board, priority, assignee, client_id: clientId(), q: param('q'), sort: sort.key, dir: sort.dir })}`
+		`/tickets${qs({ view, board_id: board, priority, assignee, team, client_id: clientId(), q: param('q'), sort: sort.key, dir: sort.dir })}`
 	);
 	liveReload(() => list.reload(), (e) => e.type === 'ticket', { debounceMs: 1000 });
 
 	let creating = $state(false);
 	let selected = $state(new Set<string>());
-	const filtered = $derived(!!(param('q') || board || priority || assignee));
+	const filtered = $derived(!!(param('q') || board || priority || assignee || team));
 
 	async function applyBulk(patch: { status_category?: StatusCategory; priority?: number; assignee_id?: string | null }, done: string) {
 		const ids = [...selected];
@@ -90,7 +94,7 @@
 		hide={scoped ? ['client'] : []}
 		bind:selected={() => (can('technician') ? selected : undefined), (v) => (selected = v ?? new Set())}
 		matching={list.data ? { total: list.data.total, exact: list.data.total_exact, select: async () => (await list.all()).map((t) => t.id) } : undefined}
-		activeFilters={(board ? 1 : 0) + (priority ? 1 : 0) + (assignee ? 1 : 0)}
+		activeFilters={(board ? 1 : 0) + (priority ? 1 : 0) + (assignee ? 1 : 0) + (team ? 1 : 0)}
 	>
 		{#snippet toolbar()}
 			<Input icon={Search} data-search placeholder="Number, subject or text…" aria-label="Search tickets" class="min-w-0 flex-1 sm:w-72 sm:flex-none" bind:value={q} />
@@ -98,6 +102,15 @@
 		{#snippet filters()}
 			<Select aria-label="Board" class="w-full sm:w-auto" value={board} onchange={(e) => setParams({ board: e.currentTarget.value })} options={[{ value: '', label: 'Any board' }, ...(meta?.boards ?? []).map((b) => ({ value: b.id, label: b.name }))]} />
 			<Select aria-label="Priority" class="w-full sm:w-auto" value={priority} onchange={(e) => setParams({ priority: e.currentTarget.value })} options={[{ value: '', label: 'Any priority' }, ...priorities.map((p) => ({ value: String(p.value), label: p.label }))]} />
+			{#if meta?.teams?.length && view !== 'team'}
+				<Select
+					aria-label="Team"
+					class="w-full sm:w-auto"
+					value={team}
+					onchange={(e) => setParams({ team: e.currentTarget.value })}
+					options={[{ value: '', label: 'Any team' }, { value: 'none', label: 'No team' }, ...meta.teams.map((t) => ({ value: t.id, label: t.name }))]}
+				/>
+			{/if}
 			{#if view !== 'mine' && view !== 'unassigned'}
 				<Select
 					aria-label="Assignee"

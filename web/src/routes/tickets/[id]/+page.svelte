@@ -11,7 +11,12 @@
 		MonitorUp,
 		Paperclip,
 		Play,
+		Scissors,
 		Send,
+		Smile,
+		Frown,
+		Timer,
+		Clock,
 		SquareTerminal,
 		StickyNote,
 		Unlink,
@@ -26,7 +31,10 @@
 	import { categoryOf, levels, priorities, priorityOf, sourceLabels, ticketMeta, ticketNumber } from '#lib/servicedesk/tickets.svelte.js';
 	import { can, session } from '#lib/session.svelte.js';
 	import { attempt, toast } from '#lib/toast.svelte.js';
-	import type { AgentSummary, Contact, Page, Ticket, TicketAgent, TicketAttachment, TicketDetail, TicketEvent, TicketMeta } from '#lib/types.js';
+	import type { AgentSummary, CannedResponse, Contact, Page, Priority, StatusCategory, Ticket, TicketAgent, TicketAttachment, TicketDetail, TicketEvent, TicketMeta } from '#lib/types.js';
+	import { targetLabels, until } from '#lib/servicedesk/sla.js';
+	import SlaBadge from '#lib/components/ticket/SlaBadge.svelte';
+	import TicketTime from '#lib/components/work/TicketTime.svelte';
 	import Async from '#lib/ui/Async.svelte';
 	import Badge from '#lib/ui/Badge.svelte';
 	import Button from '#lib/ui/Button.svelte';
@@ -77,6 +85,8 @@
 		api.get<Page<AgentSummary>>(`/agents?client_id=${c}&limit=500&sort=hostname`).then((p) => res.data?.client_id === c && (clientAgents = p.items));
 	});
 
+	const canned = resource(() => (can('technician') ? api.get<CannedResponse[]>('/canned-responses') : Promise.resolve([])));
+
 	async function patch(body: Record<string, unknown>, done?: string) {
 		if (await attempt(() => api.patch(`/tickets/${id}`, body), done)) await res.reload();
 	}
@@ -89,6 +99,24 @@
 	let uploading = $state(false);
 	let sending = $state(false);
 	let fileInput = $state<HTMLInputElement | null>(null);
+	/** A macro's other actions, applied when the message goes out. */
+	let macro = $state<{ priority: Priority | null; assign: 'me' | 'none' | null } | null>(null);
+
+	async function insertCanned(cid: string) {
+		if (!cid) return;
+		try {
+			const r = await api.get<{ body: string; kind: 'reply' | 'note'; status_category: StatusCategory | null; priority: Priority | null; assign: 'me' | 'none' | null }>(
+				`/tickets/${id}/canned/${cid}`
+			);
+			mode = r.kind;
+			body = body.trim() ? `${body.trimEnd()}\n\n${r.body}` : r.body;
+			const st = r.status_category && res.data?.statuses.find((x) => x.category === r.status_category && x.id !== res.data?.status_id);
+			if (st) thenStatus = st.id;
+			macro = r.priority || r.assign ? { priority: r.priority, assign: r.assign } : null;
+		} catch (err) {
+			toast.error(err);
+		}
+	}
 
 	async function upload(list: FileList | null) {
 		if (!list?.length) return;
@@ -122,6 +150,14 @@
 			body = '';
 			files = [];
 			thenStatus = '';
+			if (macro) {
+				const m = macro;
+				macro = null;
+				await api.patch(`/tickets/${id}`, {
+					...(m.priority ? { priority: m.priority } : {}),
+					...(m.assign ? { assignee_id: m.assign === 'me' ? session.user!.id : null } : {})
+				});
+			}
 			toast.success(mode === 'note' ? 'Note added.' : r.emailed ? 'Reply sent.' : 'Reply added (not emailed: no address).');
 			await res.reload();
 		} catch (err) {
@@ -168,10 +204,27 @@
 		}
 	}
 
+	// --- split ---------------------------------------------------------------------------------
+	async function splitOff(e: TicketEvent) {
+		const ok = await confirmAction({
+			title: 'Split into a new ticket?',
+			message: 'This entry becomes the request of a new ticket for the same client and contact, and its attachments move with it.',
+			confirmLabel: 'Split'
+		});
+		if (!ok) return;
+		try {
+			const n = await api.post<Ticket>(`/tickets/${id}/split`, { event_id: e.id });
+			toast.success(`Split into ${ticketNumber(n.number)}.`);
+			await goto(`/tickets/${n.id}`);
+		} catch (err) {
+			toast.error(err);
+		}
+	}
+
 	// --- timeline -----------------------------------------------------------------------------
 	const fieldLabels: Record<string, string> = {
 		status: 'status', subject: 'subject', priority: 'priority', assignee: 'assignee', client: 'client', site: 'site',
-		contact: 'contact', board: 'board', type: 'type'
+		contact: 'contact', board: 'board', type: 'type', team: 'team'
 	};
 	function changeText(e: TicketEvent): string {
 		const d = e.data as { field: string; from: unknown; to: unknown };
@@ -255,6 +308,9 @@
 										</span>
 										{#if e.kind === 'note'}<Badge tone="warning" icon={StickyNote}>Internal</Badge>{/if}
 										<time class="text-muted ml-auto text-xs" datetime={e.created_at} title={datetime(e.created_at)}>{ago(e.created_at)}</time>
+										{#if tech && !t.merged_into && e.kind !== 'created'}
+											<IconButton size="sm" icon={Scissors} label="Split into a new ticket" onclick={() => splitOff(e)} class="-my-1 -mr-2" />
+										{/if}
 									</header>
 									{#if e.body}<div class="px-4 py-2 text-sm break-words whitespace-pre-wrap">{e.body}</div>{:else if e.kind === 'created'}<p class="text-muted px-4 py-2 text-sm">No description.</p>{/if}
 									{#if attachmentsOf(t, e).length}
@@ -323,6 +379,22 @@
 									{:else if e.kind === 'agent'}
 										<Link2 class="size-3.5 shrink-0" aria-hidden="true" />
 										<span><span class="text-fg">{e.author_name}</span> {e.data.linked ? 'linked' : 'unlinked'} {e.data.hostname ?? 'an agent'}</span>
+									{:else if e.kind === 'sla'}
+										<Timer class={cx('size-3.5 shrink-0', e.data.event === 'sla_breach' ? 'text-danger' : 'text-warning')} aria-hidden="true" />
+										<span class={e.data.event === 'sla_breach' ? 'text-danger' : ''}>{e.body}</span>
+									{:else if e.kind === 'split'}
+										<Scissors class="size-3.5 shrink-0" aria-hidden="true" />
+										{#if e.data.to}
+											<span><span class="text-fg">{e.author_name}</span> split an entry off into <a class="link" href="/tickets/{e.data.to}">{ticketNumber(e.data.to_number as number)}</a></span>
+										{:else}
+											<span><span class="text-fg">{e.author_name}</span> split this off <a class="link" href="/tickets/{e.data.from}">{ticketNumber(e.data.from_number as number)}</a></span>
+										{/if}
+									{:else if e.kind === 'time'}
+										<Clock class="size-3.5 shrink-0" aria-hidden="true" />
+										<span><span class="text-fg">{e.author_name}</span> logged {Math.floor(Number(e.data.minutes) / 60) ? `${Math.floor(Number(e.data.minutes) / 60)} h ` : ''}{Number(e.data.minutes) % 60 ? `${Number(e.data.minutes) % 60} min` : ''} of {e.data.work_type}{e.data.billable ? '' : ' (not billable)'}{#if e.body}: <span class="break-words whitespace-pre-wrap">{e.body}</span>{/if}</span>
+									{:else if e.kind === 'csat'}
+										{#if e.data.rating === 'good'}<Smile class="text-success size-3.5 shrink-0" aria-hidden="true" />{:else}<Frown class="text-danger size-3.5 shrink-0" aria-hidden="true" />{/if}
+										<span><span class="text-fg">{e.author_name}</span> rated the service <strong>{e.data.rating === 'good' ? 'good' : 'bad'}</strong>{#if e.body.includes('\n\n')}: “{e.body.split('\n\n').slice(1).join('\n\n')}”{/if}</span>
 									{/if}
 									<time class="shrink-0 pt-px text-xs" datetime={e.created_at} title={datetime(e.created_at)}>{ago(e.created_at)}</time>
 								</div>
@@ -334,7 +406,21 @@
 				{#if tech && !t.merged_into}
 					<form class="card space-y-3 p-4" onsubmit={send} aria-label="Reply or add a note">
 						<div class="flex flex-wrap items-center justify-between gap-2">
-							<Segmented label="Kind" value={mode} onchange={(v) => (mode = v)} options={[{ value: 'reply', label: 'Reply' }, { value: 'note', label: 'Internal note' }]} />
+							<div class="flex flex-wrap items-center gap-2">
+								<Segmented label="Kind" value={mode} onchange={(v) => (mode = v)} options={[{ value: 'reply', label: 'Reply' }, { value: 'note', label: 'Internal note' }]} />
+								{#if canned.data?.length}
+									<Select
+										aria-label="Insert a canned response"
+										class="h-8 w-auto"
+										value=""
+										onchange={(e) => {
+											insertCanned(e.currentTarget.value);
+											e.currentTarget.value = '';
+										}}
+										options={[{ value: '', label: 'Insert response…' }, ...canned.data.map((c) => ({ value: c.id, label: c.name }))]}
+									/>
+								{/if}
+							</div>
 							<span class="text-muted text-xs">
 								{#if mode === 'reply'}{#if t.reply_to}Emailed to {t.reply_to}{:else}<span class="text-warning">No address: recorded, not emailed</span>{/if}{:else}Only your team sees notes{/if}
 							</span>
@@ -423,6 +509,11 @@
 								<Field label="Type" id="tp-type">
 									<Select id="tp-type" class="w-full" value={t.type_id ?? ''} onchange={(e) => patch({ type_id: e.currentTarget.value || null })} options={[{ value: '', label: 'None' }, ...(meta?.types ?? []).map((x) => ({ value: x.id, label: x.name }))]} />
 								</Field>
+								{#if meta?.teams?.length}
+									<Field label="Team" id="tp-team">
+										<Select id="tp-team" class="w-full" value={t.team_id ?? ''} onchange={(e) => patch({ team_id: e.currentTarget.value || null })} options={[{ value: '', label: 'No team' }, ...meta.teams.map((x) => ({ value: x.id, label: x.name }))]} />
+									</Field>
+								{/if}
 							</div>
 						</div>
 					{/if}
@@ -439,8 +530,57 @@
 						<dt>Opened</dt><dd>{datetime(t.created_at)}</dd>
 						<dt>First reply</dt><dd>{t.first_response_at ? datetime(t.first_response_at) : '–'}</dd>
 						{#if t.resolved_at}<dt>Resolved</dt><dd>{datetime(t.resolved_at)}</dd>{/if}
+						{#if t.csat}
+							<dt>Survey</dt>
+							<dd>
+								{#if t.csat.rating}
+									<Badge tone={t.csat.rating === 'good' ? 'success' : 'danger'} icon={t.csat.rating === 'good' ? Smile : Frown}>{t.csat.rating === 'good' ? 'Good' : 'Bad'}</Badge>
+									{#if t.csat.comment}<span class="text-muted block text-xs break-words">“{t.csat.comment}”</span>{/if}
+								{:else}
+									<span class="text-muted text-xs">Sent {ago(t.csat.sent_at)}, no answer yet</span>
+								{/if}
+							</dd>
+						{/if}
 					</dl>
 				</section>
+
+				{#if tech}
+					<TicketTime ticketId={t.id} clientId={t.client_id} locked={!!t.merged_into || t.status_category === 'closed'} number={t.number} subject={t.subject} />
+				{/if}
+
+				{#if t.sla_policy_id}
+					{@const rows = [
+						{ key: 'respond' as const, by: t.respond_by, met: t.first_response_at },
+						{ key: 'update' as const, by: t.update_by, met: null },
+						{ key: 'resolve' as const, by: t.resolve_by, met: t.resolved_at }
+					].filter((r) => r.by)}
+					<section class="card p-4" aria-labelledby="sla-h">
+						<header class="mb-3 flex items-center justify-between gap-2">
+							<h2 id="sla-h" class="panel-title">Service level</h2>
+							<SlaBadge ticket={t} />
+						</header>
+						<p class="text-muted mb-2 text-xs">{t.sla_policy_name}{#if t.sla_paused} · clock paused{/if}</p>
+						{#if rows.length}
+							<dl class="dl">
+								{#each rows as r (r.key)}
+									{@const missed = t.sla_breached.includes(r.key) || (!!r.met && new Date(r.met) > new Date(r.by!))}
+									<dt>{targetLabels[r.key]}</dt>
+									<dd title={datetime(r.by)}>
+										{#if r.met}
+											<Badge tone={missed ? 'danger' : 'success'}>{missed ? 'Missed' : 'Met'}</Badge>
+										{:else if missed}
+											<Badge tone="danger">Missed</Badge> <span class="text-muted text-xs">due {until(r.by!)}</span>
+										{:else}
+											{datetime(r.by)} <span class="text-muted block text-xs">{t.sla_paused ? 'paused' : until(r.by!)}</span>
+										{/if}
+									</dd>
+								{/each}
+							</dl>
+						{:else}
+							<p class="text-muted text-sm">No targets for {priorityOf(t.priority).short} in this policy.</p>
+						{/if}
+					</section>
+				{/if}
 
 				<section class="card" aria-labelledby="agents-h">
 					<header class="border-border flex items-center justify-between min-h-12 border-b px-4 py-3">

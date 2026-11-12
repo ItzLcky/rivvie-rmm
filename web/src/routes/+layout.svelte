@@ -31,12 +31,19 @@
 	let { children }: LayoutProps = $props();
 
 	// Pages that render without the app shell or a session.
-	const bare = $derived(page.url.pathname === '/login' || page.url.pathname.startsWith('/dev/'));
+	// The client portal and survey pages are for clients, with their own sessions.
+	const bare = $derived(
+		page.url.pathname === '/login' ||
+			page.url.pathname.startsWith('/dev/') ||
+			page.url.pathname === '/portal' ||
+			page.url.pathname.startsWith('/portal/') ||
+			page.url.pathname.startsWith('/feedback/')
+	);
 
 	$effect(() => loadCompany());
 
 	$effect(() => {
-		if (session.loaded || page.url.pathname === '/login') return;
+		if (session.loaded || bare) return;
 		api.get<User>('/auth/me')
 			.then((u) => {
 				session.user = u;

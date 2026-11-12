@@ -13,6 +13,9 @@
 //! the one next to the server binary (`target/debug/rmm-agent`); set `RMM_E2E_AGENT_BIN`
 //! to use another. Linux only: the agent runs bash jobs.
 //!
+//! `RMM_E2E_ONLY=desk` runs only the core and service desk sections (faster while working on
+//! tickets, the portal and billing).
+//!
 //! Optional: `RMM_E2E_IMAP=host:imap_port:smtp_port` of a GreenMail container (user
 //! `imap@local.test`, password `secret`) also tests IMAP polling:
 //! `docker run -d -p 33143:3143 -p 33025:3025 -e GREENMAIL_OPTS='-Dgreenmail.setup.test.all -Dgreenmail.hostname=0.0.0.0
@@ -33,6 +36,13 @@ const ADMIN_EMAIL: &str = "admin@e2e.test";
 const ADMIN_PASSWORD: &str = "e2e-admin-password";
 /// Seed of the key that signs the e2e detection content (agents and server get its public half).
 const CONTENT_SEED: [u8; 32] = [9u8; 32];
+
+/// The mock Microsoft Graph (and sign-in) endpoint the server is pointed at.
+static GRAPH_URL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static GRAPH: std::sync::OnceLock<GraphMock> = std::sync::OnceLock::new();
+/// The QuickBooks Online and Xero stand-in.
+static ACCT_URL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static ACCT: std::sync::OnceLock<AcctMock> = std::sync::OnceLock::new();
 
 fn content_pubkey() -> String {
     hex::encode(ed25519_dalek::SigningKey::from_bytes(&CONTENT_SEED).verifying_key().as_bytes())
@@ -67,6 +77,15 @@ impl Server {
             .env("RMM_UPDATE_PUBKEY", content_pubkey())
             .env("RMM_CONTENT_SOAK_MINUTES", "0")
             .env("RMM_DATA_KEY", "ab".repeat(32))
+            .env("RMM_SLA_SWEEP_SECS", "2")
+            .env("RMM_XERO_AUTH_URL", format!("{}/xero/authorize", ACCT_URL.get().map(String::as_str).unwrap_or("http://127.0.0.1:9")))
+            .env("RMM_XERO_TOKEN_URL", format!("{}/xero/token", ACCT_URL.get().map(String::as_str).unwrap_or("http://127.0.0.1:9")))
+            .env("RMM_XERO_API_URL", format!("{}/xero/api", ACCT_URL.get().map(String::as_str).unwrap_or("http://127.0.0.1:9")))
+            .env("RMM_QBO_AUTH_URL", format!("{}/qbo/authorize", ACCT_URL.get().map(String::as_str).unwrap_or("http://127.0.0.1:9")))
+            .env("RMM_QBO_TOKEN_URL", format!("{}/qbo/token", ACCT_URL.get().map(String::as_str).unwrap_or("http://127.0.0.1:9")))
+            .env("RMM_QBO_API_URL", format!("{}/qbo/api", ACCT_URL.get().map(String::as_str).unwrap_or("http://127.0.0.1:9")))
+            .env("RMM_GRAPH_LOGIN_URL", GRAPH_URL.get().map(String::as_str).unwrap_or("http://127.0.0.1:9"))
+            .env("RMM_GRAPH_URL", GRAPH_URL.get().map(String::as_str).unwrap_or("http://127.0.0.1:9"))
             .env("RUST_LOG", "info,rmm_server=debug")
             .stdout(log.try_clone().unwrap())
             .stderr(log)
@@ -342,6 +361,12 @@ async fn end_to_end() {
     std::fs::write(dir.join("agents/rmm-agent-windows-x86_64.exe"), b"MZ e2e stand-in").unwrap();
     println!("e2e scratch dir: {}", dir.display());
 
+    let (graph_url, graph) = graph_mock().await;
+    let _ = GRAPH_URL.set(graph_url);
+    let _ = GRAPH.set(graph);
+    let (acct_url, acct) = accounting_mock().await;
+    let _ = ACCT_URL.set(acct_url);
+    let _ = ACCT.set(acct);
     let result = {
         let port = free_port();
         let mut server = Server { child: Server::start(&db_url, &dir, port), port, db_url: db_url.clone(), dir: dir.clone() };
@@ -962,12 +987,20 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
     println!("update refused as expected: {}", a["update_detail"]);
     assert!(a["agent_version"] != "99.0.0");
 
-    desktop(&url, &admin, dir, &id1).await;
+    // RMM_E2E_ONLY=desk skips the slow device sections while working on the service desk.
+    let all = std::env::var("RMM_E2E_ONLY").as_deref() != Ok("desk");
+    if all {
+        desktop(&url, &admin, dir, &id1).await;
+    }
     tickets(&url, &admin, &id1, a_id, b_id).await;
-    security(&admin, dir, &id1, &id3).await;
-    sensor(&url, &admin, db, dir, &id1, a_id).await;
-    monitoring(server, &admin, db, dir, &id1, &id3, a_id).await;
-    day_to_day(&admin, &tech, db, dir, &id1, &id3, a_id).await;
+    if all {
+        security(&admin, dir, &id1, &id3).await;
+        sensor(&url, &admin, db, dir, &id1, a_id).await;
+        monitoring(server, &admin, db, dir, &id1, &id3, a_id).await;
+        day_to_day(&admin, &tech, db, dir, &id1, &id3, a_id).await;
+    }
+    portal_and_sla(&url, &admin, db, a_id, b_id).await;
+    billing(&url, &admin, &tech, db, a_id, b_id).await;
 
     // --- rate limits ------------------------------------------------------------------------------
     // Failed sign-ins from one client IP (via the trusted proxy's X-Forwarded-For).
@@ -2446,4 +2479,883 @@ async fn day_to_day(admin: &Api, tech: &Api, db: &sqlx::PgPool, dir: &Path, id1:
 
 fn url_escape(s: &str) -> String {
     s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
+}
+
+// ---------------------------------------------------------------------------------------------
+// Microsoft Graph stand-in
+// ---------------------------------------------------------------------------------------------
+
+#[derive(Clone, Default)]
+struct GraphMock {
+    /// (id, raw MIME, read)
+    inbox: std::sync::Arc<std::sync::Mutex<Vec<(String, String, bool)>>>,
+    /// MIME messages sent through sendMail.
+    sent: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    /// Form fields of token requests.
+    logins: std::sync::Arc<std::sync::Mutex<Vec<std::collections::HashMap<String, String>>>>,
+}
+
+/// The token endpoint and the few mail endpoints the server uses.
+async fn graph_mock() -> (String, GraphMock) {
+    use axum::extract::{Path as P, State as S};
+    use axum::http::{HeaderMap, StatusCode as Code};
+    use axum::routing::{get, patch, post};
+    let mock = GraphMock::default();
+    fn authed(h: &HeaderMap) -> bool {
+        h.get("authorization").and_then(|v| v.to_str().ok()) == Some("Bearer graph-token")
+    }
+    let app = axum::Router::new()
+        .route(
+            "/{tenant}/oauth2/v2.0/token",
+            post(|S(m): S<GraphMock>, P(tenant): P<String>, axum::Form(f): axum::Form<std::collections::HashMap<String, String>>| async move {
+                let ok = tenant == "e2e-tenant" && f.get("client_secret").map(String::as_str) == Some("graph-s3cret");
+                m.logins.lock().unwrap().push(f);
+                if ok {
+                    (Code::OK, axum::Json(json!({ "access_token": "graph-token", "token_type": "Bearer", "expires_in": 3600 })))
+                } else {
+                    (Code::UNAUTHORIZED, axum::Json(json!({ "error": "invalid_client", "error_description": "AADSTS7000215: Invalid client secret." })))
+                }
+            }),
+        )
+        .route(
+            "/v1.0/users/{user}/mailFolders/{folder}/messages",
+            get(|S(m): S<GraphMock>, h: HeaderMap, P((user, folder)): P<(String, String)>| async move {
+                assert_eq!((user.as_str(), folder.as_str()), ("m365@msp.example", "inbox"));
+                if !authed(&h) {
+                    return (Code::UNAUTHORIZED, axum::Json(json!({ "error": { "message": "no token" } })));
+                }
+                let ids: Vec<Value> = m.inbox.lock().unwrap().iter().filter(|x| !x.2).map(|x| json!({ "id": x.0 })).collect();
+                (Code::OK, axum::Json(json!({ "value": ids })))
+            }),
+        )
+        .route(
+            "/v1.0/users/{user}/messages/{id}/$value",
+            get(|S(m): S<GraphMock>, h: HeaderMap, P((_, id)): P<(String, String)>| async move {
+                assert!(authed(&h));
+                m.inbox.lock().unwrap().iter().find(|x| x.0 == id).map(|x| x.1.clone()).unwrap_or_default()
+            }),
+        )
+        .route(
+            "/v1.0/users/{user}/messages/{id}",
+            patch(|S(m): S<GraphMock>, h: HeaderMap, P((_, id)): P<(String, String)>, axum::Json(b): axum::Json<Value>| async move {
+                assert!(authed(&h));
+                assert_eq!(b, json!({ "isRead": true }));
+                for x in m.inbox.lock().unwrap().iter_mut().filter(|x| x.0 == id) {
+                    x.2 = true;
+                }
+                axum::Json(json!({}))
+            }),
+        )
+        .route(
+            "/v1.0/users/{user}/sendMail",
+            post(|S(m): S<GraphMock>, h: HeaderMap, body: String| async move {
+                assert!(authed(&h));
+                assert_eq!(h.get("content-type").unwrap(), "text/plain");
+                let mime = data_encoding::BASE64.decode(body.trim().as_bytes()).expect("base64 MIME");
+                m.sent.lock().unwrap().push(String::from_utf8(mime).unwrap());
+                Code::ACCEPTED
+            }),
+        )
+        .with_state(mock.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (url, mock)
+}
+
+/// The decoded text of a raw message from the SMTP sink.
+fn mail_text(raw: &str) -> String {
+    let m = mail_parser::MessageParser::default().parse(raw.as_bytes()).expect("a MIME message");
+    m.body_text(0).map(|t| t.into_owned()).unwrap_or_default()
+}
+
+/// The 64-hex-digit token after `marker` in `text`.
+fn token_after(text: &str, marker: &str) -> String {
+    let i = text.find(marker).unwrap_or_else(|| panic!("{marker} in {text}")) + marker.len();
+    text[i..].chars().take_while(|c| c.is_ascii_hexdigit()).collect()
+}
+
+async fn portal_form(api: &Api, path: &str, form: reqwest::multipart::Form) -> (StatusCode, Value) {
+    let res = api.http.post(format!("{}{path}", api.base)).multipart(form).send().await.unwrap();
+    let s = res.status();
+    (s, res.json().await.unwrap_or(Value::Null))
+}
+
+/// Roadmap block 4: SLAs, the client portal, the knowledge base, satisfaction surveys, teams,
+/// canned responses, splitting, new-ticket notifications and Microsoft 365 mailboxes.
+async fn portal_and_sla(url: &str, admin: &Api, db: &sqlx::PgPool, a_id: &str, b_id: &str) {
+    let (smtp_port, mail) = smtp_sink().await;
+    admin
+        .call(
+            reqwest::Method::PUT,
+            "/settings/smtp",
+            Some(json!({ "host": "127.0.0.1", "port": smtp_port, "security": "none", "from": "Help Desk <help@msp.example>" })),
+        )
+        .await;
+    let (hook_url, hooks) = webhook_receiver().await;
+    let ch = admin.post("/notification-channels", json!({ "name": "e2e service desk", "kind": "webhook", "config": { "url": hook_url, "secret": "hook-secret" } })).await;
+    let ch_id = ch["id"].as_str().unwrap().to_string();
+    let me = admin.get("/auth/me").await;
+    let admin_id = me["id"].as_str().unwrap().to_string();
+    let meta = admin.get("/tickets/meta").await;
+    let desk = meta["boards"].as_array().unwrap().iter().find(|b| b["name"] == "Service Desk").unwrap().clone();
+    let desk_id = desk["id"].as_str().unwrap().to_string();
+    let status = |cat: &str| desk["statuses"].as_array().unwrap().iter().find(|s| s["category"] == cat).unwrap()["id"].as_str().unwrap().to_string();
+    let secs = |v: &Value| chrono::DateTime::parse_from_rfc3339(v.as_str().unwrap_or_else(|| panic!("a timestamp, got {v}"))).unwrap().timestamp();
+
+    // --- SLA: deadlines from the default policy, moved by priority, paused while waiting -----
+    let (s, v) = admin
+        .call(reqwest::Method::POST, "/sla/calendars", Some(json!({ "name": "Bad", "timezone": "Mars/Olympus", "hours": [[[540, 1020]], [], [], [], [], [], []] })))
+        .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    let cal = admin
+        .post(
+            "/sla/calendars",
+            json!({ "name": "Office", "timezone": "Europe/London", "hours": [[[540, 1020]], [[540, 1020]], [[540, 1020]], [[540, 1020]], [[540, 1020]], [], []],
+                    "holidays": [{ "day": "2026-12-25", "name": "Christmas" }] }),
+        )
+        .await;
+    let cals = admin.get("/sla/calendars").await;
+    assert_eq!(cals[0]["holidays"][0]["name"], "Christmas");
+    // Around the clock, so the test doesn't depend on the time of day.
+    let policy = admin
+        .post(
+            "/sla/policies",
+            json!({ "name": "E2E SLA", "is_default": true, "channel_ids": [ch_id], "targets": [
+                { "priority": 2, "respond_mins": 30, "update_mins": 60, "resolve_mins": 240 },
+                { "priority": 3, "respond_mins": 60, "update_mins": 120, "resolve_mins": 480 } ] }),
+        )
+        .await;
+    let policy_id = policy["id"].as_str().unwrap().to_string();
+    let (s, _) = admin
+        .call(reqwest::Method::POST, "/sla/policies", Some(json!({ "name": "Odd", "targets": [{ "priority": 3, "respond_mins": 600, "resolve_mins": 60 }] })))
+        .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "respond longer than resolve");
+    let t = admin.post("/tickets", json!({ "subject": "SLA clock", "client_id": a_id, "priority": 3, "assignee_id": admin_id })).await;
+    let tid = t["id"].as_str().unwrap().to_string();
+    assert_eq!(t["sla_policy_name"], "E2E SLA");
+    let created = secs(&t["created_at"]);
+    assert!((secs(&t["respond_by"]) - (created + 3600)).abs() <= 2, "{t}");
+    assert!((secs(&t["resolve_by"]) - (created + 8 * 3600)).abs() <= 2);
+    assert!(t["update_by"].is_null(), "the update clock starts with the first response");
+    assert_eq!(t["sla_due"], t["respond_by"]);
+    let (_, t) = admin.call(reqwest::Method::PATCH, &format!("/tickets/{tid}"), Some(json!({ "priority": 2 }))).await;
+    assert!((secs(&t["respond_by"]) - (created + 1800)).abs() <= 2, "a higher priority tightens it: {t}");
+    let (_, t) = admin.call(reqwest::Method::PATCH, &format!("/tickets/{tid}"), Some(json!({ "status_id": status("waiting_client") }))).await;
+    assert_eq!(t["sla_paused"], true);
+    assert!(t["sla_due"].is_null(), "no running deadline while paused");
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    let (_, t) = admin.call(reqwest::Method::PATCH, &format!("/tickets/{tid}"), Some(json!({ "status_id": status("open") }))).await;
+    assert_eq!(t["sla_paused"], false);
+    let paused: i64 = sqlx::query_scalar("SELECT sla_paused_secs FROM tickets WHERE id = $1::uuid").bind(&tid).fetch_one(db).await.unwrap();
+    assert!(paused >= 2, "paused {paused}s");
+    assert!(secs(&t["respond_by"]) >= created + 1800 + 2, "the pause pushes the deadline back: {t}");
+    // Another client's policy can differ; clients without one use the default.
+    let strict = admin.post("/sla/policies", json!({ "name": "Strict", "calendar_id": cal["id"], "targets": [{ "priority": 2, "respond_mins": 5 }] })).await;
+    admin.call(reqwest::Method::PUT, &format!("/clients/{b_id}/service"), Some(json!({ "sla_policy_id": strict["id"] }))).await;
+    let tb = admin.post("/tickets", json!({ "subject": "Strict client", "client_id": b_id, "priority": 2 })).await;
+    assert_eq!(tb["sla_policy_name"], "Strict");
+    let tb4 = admin.post("/tickets", json!({ "subject": "No target", "client_id": b_id, "priority": 4 })).await;
+    assert!(tb4["respond_by"].is_null() && tb4["sla_due"].is_null(), "no target for P4 in that policy");
+
+    // --- SLA: a warning, then a breach, on the channel, the timeline and to the assignee ---------
+    // (Policy changes recompute open tickets in the background; let that finish first.)
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    sqlx::query("UPDATE tickets SET respond_warn_at = now() - interval '1 minute' WHERE id = $1::uuid").bind(&tid).execute(db).await.unwrap();
+    let hook = wait_hook(&hooks, "an SLA warning", |ev, b| ev == "sla_warning" && b["ticket"]["id"] == tid.as_str()).await;
+    assert_eq!(hook["sla"]["target"], "respond");
+    sqlx::query("UPDATE tickets SET respond_by = now() - interval '1 second' WHERE id = $1::uuid").bind(&tid).execute(db).await.unwrap();
+    wait_hook(&hooks, "an SLA breach", |ev, b| ev == "sla_breach" && b["ticket"]["id"] == tid.as_str()).await;
+    let d = admin.get(&format!("/tickets/{tid}")).await;
+    let sla_events = events_of(&d, "sla");
+    assert_eq!(sla_events.len(), 2, "{sla_events:?}");
+    assert_eq!(d["sla_breached"], json!(["respond"]));
+    wait_mail(&mail, "the SLA email to the assignee", |to, data| to.iter().any(|t| t == ADMIN_EMAIL) && data.contains("missed its SLA")).await;
+    let breached = admin.get("/tickets?view=breached").await;
+    assert!(breached["items"].as_array().unwrap().iter().any(|x| x["id"] == tid.as_str()));
+    assert!(admin.get("/tickets/summary").await["breached"].as_i64() >= Some(1));
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(events_of(&admin.get(&format!("/tickets/{tid}")).await, "sla").len(), 2, "each warning and breach once");
+    // The first public reply starts the update clock.
+    admin.post(&format!("/tickets/{tid}/events"), json!({ "kind": "reply", "body": "On it." })).await;
+    let t = admin.get(&format!("/tickets/{tid}")).await;
+    let replied = secs(&t["first_response_at"]);
+    assert!((secs(&t["update_by"]) - (replied + 3600)).abs() <= 2, "{t}");
+    assert_eq!(t["sla_due"], t["update_by"]);
+    let due = admin.get("/tickets?view=open&sort=due&dir=asc&limit=200").await;
+    let dues: Vec<Option<i64>> = due["items"].as_array().unwrap().iter().map(|x| x["sla_due"].as_str().map(|_| secs(&x["sla_due"]))).collect();
+    let running: Vec<i64> = dues.iter().map_while(|d| *d).collect();
+    assert!(running.windows(2).all(|w| w[0] <= w[1]) && dues[running.len()..].iter().all(Option::is_none), "soonest first, none last: {dues:?}");
+    assert!(due["items"].as_array().unwrap().iter().any(|x| x["id"] == tid.as_str()));
+
+    // --- teams, board defaults and new-ticket notifications ---------------------------------------
+    let team = admin.post("/teams", json!({ "name": "Tier 1", "member_ids": [admin_id] })).await;
+    let team_id = team["id"].as_str().unwrap().to_string();
+    let statuses: Vec<Value> = desk["statuses"].as_array().unwrap().iter().map(|s| json!({ "id": s["id"], "name": s["name"], "category": s["category"] })).collect();
+    admin
+        .call(
+            reqwest::Method::PUT,
+            &format!("/boards/{desk_id}"),
+            Some(json!({ "name": "Service Desk", "statuses": statuses, "default_team_id": team_id, "notify_channel_ids": [ch_id] })),
+        )
+        .await;
+    let nt = admin.post("/tickets", json!({ "subject": "Goes to Tier 1", "client_id": a_id })).await;
+    assert_eq!(nt["team_name"], "Tier 1");
+    wait_hook(&hooks, "the new-ticket notification", |ev, b| ev == "ticket_created" && b["ticket"]["id"] == nt["id"]).await;
+    let mine = admin.get("/tickets?view=team").await;
+    assert!(mine["items"].as_array().unwrap().iter().any(|x| x["id"] == nt["id"]));
+    let (_, moved) = admin.call(reqwest::Method::PATCH, &format!("/tickets/{}", nt["id"].as_str().unwrap()), Some(json!({ "team_id": null }))).await;
+    assert!(moved["team_id"].is_null());
+    let unteamed = admin.get("/tickets?team=none").await;
+    assert!(unteamed["items"].as_array().unwrap().iter().any(|x| x["id"] == nt["id"]));
+
+    // --- the portal: invitation, sign-in link, tickets, replies, attachments ----------------------
+    let pat = admin.post("/contacts", json!({ "client_id": a_id, "name": "Pat Portal", "email": "pat@client-a.example", "portal_enabled": true })).await;
+    let pat_id = pat["id"].as_str().unwrap().to_string();
+    let bob = admin.post("/contacts", json!({ "client_id": b_id, "name": "Bob Other", "email": "bob@client-b.example", "portal_enabled": true })).await;
+    admin.post(&format!("/contacts/{pat_id}/portal-invite"), json!({})).await;
+    let invite = wait_mail(&mail, "the portal invitation", |to, data| to.iter().any(|t| t == "pat@client-a.example") && data.contains("invited")).await;
+    let invite_token = token_after(&mail_text(&invite), "/portal/login?token=");
+    assert_eq!(invite_token.len(), 64);
+    let portal = Api::new(url);
+    let (s, _) = portal.call(reqwest::Method::GET, "/portal/me", None).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    portal.post("/portal/auth/verify", json!({ "token": invite_token })).await;
+    let pme = portal.get("/portal/me").await;
+    assert_eq!((pme["contact"]["name"].as_str(), pme["contact"]["client_name"].as_str()), (Some("Pat Portal"), Some("Client A")));
+    let (s, _) = portal.call(reqwest::Method::POST, "/portal/auth/verify", Some(json!({ "token": invite_token }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "a link works once");
+    // Sessions don't cross over: the portal cookie isn't a technician session, and back.
+    let (s, _) = portal.call(reqwest::Method::GET, "/tickets", None).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "portal cookie on the technician API");
+    let (s, _) = admin.call(reqwest::Method::GET, "/portal/me", None).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "technician cookie on the portal");
+    // Asking for a link answers the same whether or not the address has access.
+    portal.post("/portal/auth/link", json!({ "email": "nobody@nowhere.example" })).await;
+    portal.post("/portal/auth/link", json!({ "email": "PAT@client-a.example" })).await;
+    let link = wait_mail(&mail, "the sign-in link", |to, data| to.iter().any(|t| t == "pat@client-a.example") && data.contains("Sign in to")).await;
+    assert_ne!(token_after(&mail_text(&link), "/portal/login?token="), invite_token);
+
+    let form = reqwest::multipart::Form::new()
+        .text("subject", "Laptop won't charge")
+        .text("description", "Since this morning.\nAlso: the projector in room 2 is broken.")
+        .text("urgency", "high")
+        .part("file", reqwest::multipart::Part::bytes(b"charger photo".to_vec()).file_name("charger.jpg").mime_str("image/jpeg").unwrap());
+    let (s, created) = portal_form(&portal, "/portal/tickets", form).await;
+    assert!(s.is_success(), "{s} {created}");
+    let ptid = created["id"].as_str().unwrap().to_string();
+    let pt = admin.get(&format!("/tickets/{ptid}")).await;
+    assert_eq!((pt["source"].as_str(), pt["priority"].as_i64(), pt["contact_id"].as_str()), (Some("portal"), Some(2), Some(pat_id.as_str())));
+    assert_eq!(pt["attachments"].as_array().unwrap().len(), 1);
+    wait_hook(&hooks, "portal tickets announce themselves too", |ev, b| ev == "ticket_created" && b["ticket"]["id"] == ptid.as_str()).await;
+    admin.post(&format!("/tickets/{ptid}/events"), json!({ "kind": "note", "body": "Internal: order a charger." })).await;
+    admin.post(&format!("/tickets/{ptid}/events"), json!({ "kind": "reply", "body": "Which model is it?", "status_id": status("waiting_client") })).await;
+    let view = portal.get(&format!("/portal/tickets/{ptid}")).await;
+    let bodies: Vec<&str> = view["events"].as_array().unwrap().iter().map(|e| e["body"].as_str().unwrap()).collect();
+    assert!(bodies.contains(&"Which model is it?") && !bodies.iter().any(|b| b.contains("Internal")), "{bodies:?}");
+    assert_eq!(view["events"].as_array().unwrap().iter().find(|e| e["body"] == "Which model is it?").unwrap()["author_kind"], "staff");
+    let aid = view["attachments"][0]["id"].as_str().unwrap();
+    let res = portal.http.get(format!("{}/portal/tickets/{ptid}/attachments/{aid}", portal.base)).send().await.unwrap();
+    assert_eq!(res.headers()["content-type"], "application/octet-stream");
+    assert_eq!(res.bytes().await.unwrap().as_ref(), b"charger photo");
+    let list = portal.get("/portal/tickets").await;
+    assert!(list.as_array().unwrap().iter().any(|x| x["id"] == ptid.as_str()));
+    assert!(!list.as_array().unwrap().iter().any(|x| x["id"] == tid.as_str()), "not Pat's ticket, and Pat isn't primary");
+    let (s, _) = portal.call(reqwest::Method::GET, &format!("/portal/tickets/{tid}"), None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    // Pat answers: the ticket is back to work and the assignee hears about it.
+    admin.call(reqwest::Method::PATCH, &format!("/tickets/{ptid}"), Some(json!({ "assignee_id": admin_id }))).await;
+    let form = reqwest::multipart::Form::new()
+        .text("body", "A ThinkPad T14.\n\nAnd separately: the room 2 projector shows no picture.")
+        .part("file", reqwest::multipart::Part::bytes(b"projector".to_vec()).file_name("projector.png").mime_str("image/png").unwrap());
+    let (s, _) = portal_form(&portal, &format!("/portal/tickets/{ptid}/messages"), form).await;
+    assert!(s.is_success());
+    let pt = admin.get(&format!("/tickets/{ptid}")).await;
+    assert_eq!(pt["status_category"], "open");
+    let msg = events_of(&pt, "message").into_iter().last().unwrap();
+    assert_eq!(msg["author_contact_id"], pat_id.as_str());
+    wait_mail(&mail, "the assignee hears about the portal reply", |to, data| to.iter().any(|t| t == ADMIN_EMAIL) && data.contains("new reply")).await;
+    // Another client's contact sees none of it.
+    admin.post(&format!("/contacts/{}/portal-invite", bob["id"].as_str().unwrap()), json!({})).await;
+    let bmail = wait_mail(&mail, "Bob's invitation", |to, _| to.iter().any(|t| t == "bob@client-b.example")).await;
+    let other = Api::new(url);
+    other.post("/portal/auth/verify", json!({ "token": token_after(&mail_text(&bmail), "/portal/login?token=") })).await;
+    let (s, _) = other.call(reqwest::Method::GET, &format!("/portal/tickets/{ptid}"), None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    let (s, _) = other.call(reqwest::Method::GET, &format!("/portal/tickets/{ptid}/attachments/{aid}"), None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    assert!(other.get("/portal/tickets?state=all").await.as_array().unwrap().iter().all(|x| x["id"] != ptid.as_str()));
+
+    // --- split the unrelated part off; canned responses -----------------------------------------------
+    let split = admin.post(&format!("/tickets/{ptid}/split"), json!({ "event_id": msg["id"], "subject": "Room 2 projector" })).await;
+    assert_eq!((split["subject"].as_str(), split["contact_id"].as_str()), (Some("Room 2 projector"), Some(pat_id.as_str())));
+    let sd = admin.get(&format!("/tickets/{}", split["id"].as_str().unwrap())).await;
+    assert_eq!(sd["attachments"][0]["name"], "projector.png", "the message's attachment moves with it");
+    assert_eq!(events_of(&sd, "split")[0]["data"]["from_number"], pt["number"]);
+    assert_eq!(admin.get(&format!("/tickets/{ptid}")).await["attachments"].as_array().unwrap().len(), 1);
+    let canned = admin
+        .post("/canned-responses", json!({ "name": "Need info", "body": "Hi {{contact.first_name}}, could you send a photo for {{ticket.number}}? {{oops}}", "status_category": "waiting_client" }))
+        .await;
+    let r = admin.get(&format!("/tickets/{ptid}/canned/{}", canned["id"].as_str().unwrap())).await;
+    assert_eq!(r["body"], format!("Hi Pat, could you send a photo for T-{}? {{{{oops}}}}", pt["number"]));
+    assert_eq!(r["status_category"], "waiting_client");
+
+    // --- password and TOTP sign-in for contacts -----------------------------------------------------
+    let (s, _) = portal.call(reqwest::Method::POST, "/portal/account/password", Some(json!({ "password": "short" }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    portal.post("/portal/account/password", json!({ "password": "portal-password-1" })).await;
+    let setup = portal.post("/portal/account/totp/setup", json!({})).await;
+    let psecret = setup["secret"].as_str().unwrap().to_string();
+    portal.post("/portal/account/totp/enable", json!({ "code": totp(&psecret) })).await;
+    let (sealed,): (bool,) = sqlx::query_as("SELECT totp_sealed FROM contact_credentials WHERE contact_id = $1::uuid").bind(&pat_id).fetch_one(db).await.unwrap();
+    assert!(sealed, "contact TOTP secrets are encrypted at rest too");
+    sqlx::query("UPDATE contact_credentials SET totp_last_step = NULL WHERE contact_id = $1::uuid").bind(&pat_id).execute(db).await.unwrap();
+    portal.post("/portal/auth/logout", json!({})).await;
+    let (s, _) = portal.call(reqwest::Method::GET, "/portal/me", None).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    let (s, v) = portal.call(reqwest::Method::POST, "/portal/auth/login", Some(json!({ "email": "pat@client-a.example", "password": "portal-password-1" }))).await;
+    assert_eq!((s, v["mfa_required"].as_bool()), (StatusCode::UNAUTHORIZED, Some(true)));
+    let (s, _) = portal.call(reqwest::Method::POST, "/portal/auth/login", Some(json!({ "email": "pat@client-a.example", "password": "wrong-password-1" }))).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    let code = totp(&psecret);
+    portal.post("/portal/auth/login", json!({ "email": "pat@client-a.example", "password": "portal-password-1", "code": code })).await;
+    assert_eq!(portal.get("/portal/me").await["totp_enabled"], true);
+    let again = Api::new(url);
+    let (s, _) = again.call(reqwest::Method::POST, "/portal/auth/login", Some(json!({ "email": "pat@client-a.example", "password": "portal-password-1", "code": code }))).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "a TOTP code works once");
+
+    // --- knowledge base and devices -------------------------------------------------------------------
+    let public = admin.post("/kb", json!({ "title": "Reset your password", "body": "Press Ctrl+Alt+Del, then Change a password.", "category": "Accounts", "public": true })).await;
+    let internal = admin.post("/kb", json!({ "title": "Domain controller rebuild", "body": "Internal runbook.", "category": "Runbooks" })).await;
+    let only_b = admin.post("/kb", json!({ "title": "Client B VPN", "body": "For B only.", "public": true, "client_id": b_id })).await;
+    let kb = portal.get("/portal/kb").await;
+    let titles: Vec<&str> = kb.as_array().unwrap().iter().map(|a| a["title"].as_str().unwrap()).collect();
+    assert_eq!(titles, vec!["Reset your password"]);
+    assert!(portal.get("/portal/kb?q=password").await.as_array().unwrap().len() == 1);
+    for hidden in [&internal, &only_b] {
+        let (s, _) = portal.call(reqwest::Method::GET, &format!("/portal/kb/{}", hidden["id"].as_str().unwrap()), None).await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+    }
+    assert_eq!(portal.get(&format!("/portal/kb/{}", public["id"].as_str().unwrap())).await["body"], "Press Ctrl+Alt+Del, then Change a password.");
+    assert_eq!(admin.get("/kb?q=runbook").await.as_array().unwrap().len(), 1);
+    let (s, _) = portal.call(reqwest::Method::GET, "/portal/devices", None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "off until the client allows it");
+    admin.call(reqwest::Method::PUT, &format!("/clients/{a_id}/service"), Some(json!({ "sla_policy_id": null, "portal_devices": true }))).await;
+    let devices = portal.get("/portal/devices").await;
+    assert!(!devices.as_array().unwrap().is_empty() && devices[0]["hostname"].is_string(), "{devices}");
+
+    // --- satisfaction survey on resolve -----------------------------------------------------------------
+    admin.call(reqwest::Method::PUT, "/settings/service-desk", Some(json!({ "portal_board_id": desk_id, "portal_welcome": "Welcome!", "csat_enabled": true }))).await;
+    assert_eq!(portal.get("/portal/me").await["welcome"], "Welcome!");
+    admin.call(reqwest::Method::PATCH, &format!("/tickets/{ptid}"), Some(json!({ "status_id": status("resolved") }))).await;
+    let survey = wait_mail(&mail, "the survey", |to, data| to.iter().any(|t| t == "pat@client-a.example") && data.contains("How did we do")).await;
+    let stoken = token_after(&mail_text(&survey), "/feedback/");
+    let http = reqwest::Client::new();
+    let fb: Value = http.get(format!("{url}/api/feedback/{stoken}")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(fb["number"], pt["number"]);
+    let res = http.post(format!("{url}/api/feedback/{stoken}")).json(&json!({ "rating": "good", "comment": "Quick fix" })).send().await.unwrap();
+    assert!(res.status().is_success());
+    let res = http.post(format!("{url}/api/feedback/{}", "0".repeat(64))).json(&json!({ "rating": "good" })).send().await.unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    let pt = admin.get(&format!("/tickets/{ptid}")).await;
+    assert_eq!((pt["csat"]["rating"].as_str(), pt["csat_rating"].as_str()), (Some("good"), Some("good")));
+    assert_eq!(events_of(&pt, "csat")[0]["body"], "Satisfaction: Good\n\nQuick fix");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let surveys = mail.lock().unwrap().iter().filter(|(to, d)| to.iter().any(|t| t == "pat@client-a.example") && d.contains("How did we do")).count();
+    assert_eq!(surveys, 1, "one survey per ticket");
+    // Pat can resolve their own ticket from the portal, and a later message reopens it.
+    portal.post(&format!("/portal/tickets/{}/resolve", split["id"].as_str().unwrap()), json!({})).await;
+    assert_eq!(admin.get(&format!("/tickets/{}", split["id"].as_str().unwrap())).await["status_category"], "resolved");
+
+    // --- turning portal access off ends the session ------------------------------------------------------
+    let mut pat_in = pat.clone();
+    pat_in["portal_enabled"] = false.into();
+    let (s, _) = admin.call(reqwest::Method::PUT, &format!("/contacts/{pat_id}"), Some(pat_in)).await;
+    assert!(s.is_success());
+    let (s, _) = portal.call(reqwest::Method::GET, "/portal/me", None).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+
+    // --- Microsoft 365 mailbox over Graph: poll, file, reply through sendMail ----------------------------
+    let graph = GRAPH.get().unwrap();
+    let (s, v) = admin
+        .call(reqwest::Method::POST, "/mailboxes", Some(json!({ "name": "M365", "address": "m365@msp.example", "kind": "graph", "board_id": desk_id })))
+        .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "needs the tenant and app: {v}");
+    let mb = admin
+        .post(
+            "/mailboxes",
+            json!({ "name": "M365", "address": "m365@msp.example", "kind": "graph", "board_id": desk_id, "graph_tenant": "e2e-tenant",
+                    "graph_client_id": "e2e-client", "graph_secret": "graph-s3cret" }),
+        )
+        .await;
+    let mb_id = mb["id"].as_str().unwrap().to_string();
+    assert_eq!((mb["has_graph_secret"].as_bool(), mb.get("graph_secret")), (Some(true), None));
+    let (stored, sealed): (Vec<u8>, bool) =
+        sqlx::query_as("SELECT graph_secret, graph_secret_sealed FROM mailboxes WHERE id = $1::uuid").bind(&mb_id).fetch_one(db).await.unwrap();
+    assert!(sealed && stored != b"graph-s3cret", "the client secret is encrypted at rest");
+    graph.inbox.lock().unwrap().push((
+        "AAMk-1".into(),
+        "From: Gail <gail@client-a.example>\r\nTo: m365@msp.example\r\nSubject: VPN drops\r\nMessage-ID: <graph-1@client-a.example>\r\n\r\nEvery hour.\r\n".into(),
+        false,
+    ));
+    let r = admin.post(&format!("/mailboxes/{mb_id}/poll"), json!({})).await;
+    assert_eq!((r["ok"].as_bool(), r["filed"].as_i64()), (Some(true), Some(1)), "{r}");
+    assert!(graph.inbox.lock().unwrap()[0].2, "marked read");
+    assert_eq!(graph.logins.lock().unwrap()[0].get("scope").map(String::as_str), Some("https://graph.microsoft.com/.default"));
+    let r = admin.post(&format!("/mailboxes/{mb_id}/poll"), json!({})).await;
+    assert_eq!(r["filed"], 0);
+    let gt = admin.get("/tickets?view=all&q=VPN%20drops").await["items"][0].clone();
+    assert_eq!(gt["client_id"], a_id, "filed by the sender's domain");
+    let gid = gt["id"].as_str().unwrap();
+    admin.post(&format!("/tickets/{gid}/events"), json!({ "kind": "reply", "body": "Try the new client." })).await;
+    let sent = eventually(30, "the reply sent through Graph", || async { graph.sent.lock().unwrap().first().cloned() }).await;
+    assert!(sent.contains("m365@msp.example") && sent.contains(&format!("[T-{}]", gt["number"])), "{sent}");
+    assert!(header(&sent, "In-Reply-To").is_some_and(|h| h.contains("graph-1@client-a.example")), "{sent}");
+    // A bad secret is reported on the mailbox.
+    admin
+        .call(
+            reqwest::Method::PUT,
+            &format!("/mailboxes/{mb_id}"),
+            Some(json!({ "name": "M365", "address": "m365@msp.example", "kind": "graph", "board_id": desk_id, "graph_tenant": "e2e-tenant",
+                         "graph_client_id": "e2e-client", "graph_secret": "wrong" })),
+        )
+        .await;
+    let r = admin.post(&format!("/mailboxes/{mb_id}/poll"), json!({})).await;
+    assert!(r["error"].as_str().unwrap_or_default().contains("Invalid client secret"), "{r}");
+    admin.call(reqwest::Method::DELETE, &format!("/mailboxes/{mb_id}"), None).await;
+    admin.call(reqwest::Method::DELETE, &format!("/sla/policies/{policy_id}"), None).await;
+    println!("portal, SLA, CSAT, teams, canned responses, split, Graph: ok");
+}
+
+// ---------------------------------------------------------------------------------------------
+// QuickBooks Online and Xero stand-ins
+// ---------------------------------------------------------------------------------------------
+
+#[derive(Clone, Default)]
+struct AcctMock {
+    /// Documents created, as (provider/kind, body).
+    docs: std::sync::Arc<std::sync::Mutex<Vec<(String, Value)>>>,
+    /// External ids marked paid.
+    paid: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+async fn accounting_mock() -> (String, AcctMock) {
+    use axum::extract::{Path as P, Query as Q, State as S};
+    use axum::http::{HeaderMap, StatusCode as Code};
+    use axum::routing::{get, post};
+    use std::collections::HashMap;
+    let mock = AcctMock::default();
+    fn basic(h: &HeaderMap, user: &str, pass: &str) -> bool {
+        let want = format!("Basic {}", data_encoding::BASE64.encode(format!("{user}:{pass}").as_bytes()));
+        h.get("authorization").and_then(|v| v.to_str().ok()) == Some(want.as_str())
+    }
+    fn bearer(h: &HeaderMap, tok: &str) -> bool {
+        h.get("authorization").and_then(|v| v.to_str().ok()) == Some(format!("Bearer {tok}").as_str())
+    }
+    let token = |user: &'static str, pass: &'static str, code: &'static str, access: &'static str| {
+        move |h: HeaderMap, axum::Form(f): axum::Form<HashMap<String, String>>| async move {
+            let ok = basic(&h, user, pass)
+                && match f.get("grant_type").map(String::as_str) {
+                    Some("authorization_code") => f.get("code").map(String::as_str) == Some(code) && f.contains_key("redirect_uri"),
+                    Some("refresh_token") => f.contains_key("refresh_token"),
+                    _ => false,
+                };
+            if ok {
+                (Code::OK, axum::Json(json!({ "access_token": access, "refresh_token": "refresh", "expires_in": 3600, "token_type": "Bearer" })))
+            } else {
+                (Code::BAD_REQUEST, axum::Json(json!({ "error": "invalid_grant" })))
+            }
+        }
+    };
+    let app = axum::Router::new()
+        .route("/xero/token", post(token("xero-id", "xero-secret", "xero-code", "xero-token")))
+        .route("/qbo/token", post(token("qbo-id", "qbo-secret", "qbo-code", "qbo-token")))
+        .route(
+            "/xero/api/connections",
+            get(|h: HeaderMap| async move {
+                assert!(bearer(&h, "xero-token"));
+                axum::Json(json!([{ "tenantId": "tenant-1", "tenantName": "Demo MSP Ltd" }]))
+            }),
+        )
+        .route(
+            "/xero/api/api.xro/2.0/Contacts",
+            get(|h: HeaderMap| async move {
+                assert_eq!(h.get("xero-tenant-id").unwrap(), "tenant-1");
+                axum::Json(json!({ "Contacts": [] }))
+            })
+            .post(|S(m): S<AcctMock>, h: HeaderMap, axum::Json(b): axum::Json<Value>| async move {
+                assert!(bearer(&h, "xero-token"));
+                m.docs.lock().unwrap().push(("xero/contact".into(), b.clone()));
+                axum::Json(json!({ "Contacts": [{ "ContactID": format!("contact-{}", b["Contacts"][0]["Name"].as_str().unwrap()) }] }))
+            }),
+        )
+        .route(
+            "/xero/api/api.xro/2.0/Invoices",
+            post(|S(m): S<AcctMock>, h: HeaderMap, axum::Json(b): axum::Json<Value>| async move {
+                assert!(bearer(&h, "xero-token"));
+                let id = format!("xinv-{}", b["Invoices"][0]["InvoiceNumber"].as_str().unwrap());
+                m.docs.lock().unwrap().push(("xero/invoice".into(), b));
+                axum::Json(json!({ "Invoices": [{ "InvoiceID": id }] }))
+            }),
+        )
+        .route(
+            "/xero/api/api.xro/2.0/Invoices/{id}",
+            get(|S(m): S<AcctMock>, P(id): P<String>| async move {
+                let paid = m.paid.lock().unwrap().contains(&id);
+                axum::Json(json!({ "Invoices": [{ "InvoiceID": id, "Status": if paid { "PAID" } else { "AUTHORISED" } }] }))
+            }),
+        )
+        .route(
+            "/qbo/api/v3/company/{realm}/query",
+            get(|h: HeaderMap, P(realm): P<String>, Q(q): Q<HashMap<String, String>>| async move {
+                assert!(bearer(&h, "qbo-token") && realm == "realm-9");
+                assert!(q["query"].starts_with("select Id from Customer where DisplayName = "), "{q:?}");
+                axum::Json(json!({ "QueryResponse": {} }))
+            }),
+        )
+        .route(
+            "/qbo/api/v3/company/{realm}/{kind}",
+            post(|S(m): S<AcctMock>, P((_, kind)): P<(String, String)>, axum::Json(b): axum::Json<Value>| async move {
+                m.docs.lock().unwrap().push((format!("qbo/{kind}"), b));
+                let key = match kind.as_str() {
+                    "customer" => "Customer",
+                    "creditmemo" => "CreditMemo",
+                    _ => "Invoice",
+                };
+                axum::Json(json!({ key: { "Id": format!("q{}", m.docs.lock().unwrap().len()) } }))
+            }),
+        )
+        .with_state(mock.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (url, mock)
+}
+
+/// The `state` an authorize URL carries.
+fn state_of(url: &str) -> String {
+    reqwest::Url::parse(url).unwrap().query_pairs().find(|(k, _)| k == "state").unwrap().1.to_string()
+}
+
+/// Roadmap block 6: time, timesheets, contracts and coverage, the invoice run, finalising,
+/// PDFs, sending, accounting sync, the portal's invoices, projects, scheduling, client
+/// documentation and reports.
+async fn billing(url: &str, admin: &Api, tech: &Api, db: &sqlx::PgPool, a_id: &str, b_id: &str) {
+    use chrono::Datelike;
+    let (smtp_port, mail) = smtp_sink().await;
+    admin
+        .call(
+            reqwest::Method::PUT,
+            "/settings/smtp",
+            Some(json!({ "host": "127.0.0.1", "port": smtp_port, "security": "none", "from": "Help Desk <help@msp.example>" })),
+        )
+        .await;
+    let today = chrono::Utc::now().date_naive();
+    let month_start = today.with_day(1).unwrap();
+    let month_end = (month_start + chrono::Months::new(1)) - chrono::Days::new(1);
+    let admin_id = admin.get("/auth/me").await["id"].as_str().unwrap().to_string();
+
+    // --- settings, rates, and what technicians can't see ---------------------------------------
+    admin
+        .call(
+            reqwest::Method::PUT,
+            "/settings/billing",
+            Some(json!({ "currency": "usd", "company_address": "1 Main Street\nSpringfield", "invoice_prefix": "INV-", "invoice_terms_days": 14,
+                         "invoice_footer": "Bank transfer to 12-34-56", "default_rate": 10000 })),
+        )
+        .await;
+    assert_eq!(admin.get("/settings/billing").await["next_number"], "INV-1001");
+    let types = admin.get("/work-types").await;
+    let wt = |n: &str| types.as_array().unwrap().iter().find(|t| t["name"] == n).unwrap()["id"].as_str().unwrap().to_string();
+    let (remote, onsite, internal) = (wt("Remote support"), wt("Onsite"), wt("Internal"));
+    let mut list: Vec<Value> = types.as_array().unwrap().iter().map(|t| json!({ "id": t["id"], "name": t["name"], "rate": t["rate"], "billable": t["billable"] })).collect();
+    for t in &mut list {
+        if t["name"] == "Remote support" {
+            t["rate"] = 12000.into();
+        }
+    }
+    admin.call(reqwest::Method::PUT, "/work-types", Some(json!({ "types": list }))).await;
+    assert!(tech.get("/work-types").await.as_array().unwrap().iter().all(|t| t["rate"].is_null()), "technicians don't see rates");
+    for path in ["/invoices", "/contracts", "/billing/rates"] {
+        let (s, _) = tech.call(reqwest::Method::GET, path, None).await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "{path}");
+    }
+    let (s, _) = tech.call(reqwest::Method::PUT, "/work-types", Some(json!({ "types": [] }))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+
+    // --- contracts ------------------------------------------------------------------------------
+    let devices_a = admin.get(&format!("/agents?client_id={a_id}&limit=1")).await["total"].as_i64().unwrap();
+    let managed = admin
+        .post(
+            "/contracts",
+            json!({ "client_id": a_id, "name": "Managed workstations", "kind": "per_device", "start_date": month_start, "unit_price": 2500,
+                    "covered_work_type_ids": [remote], "rate_overrides": [{ "work_type_id": onsite, "rate": 20000 }] }),
+        )
+        .await;
+    assert_eq!(managed["devices"], devices_a);
+    let mid = month_start + chrono::Days::new(15);
+    admin
+        .post("/contracts", json!({ "client_id": a_id, "name": "Backup service", "kind": "recurring", "start_date": mid, "unit_price": 3000,
+                                    "items": [{ "description": "Cloud storage (TB)", "quantity_milli": 2000, "unit_price": 1000 }] }))
+        .await;
+    let block = admin
+        .post(
+            "/contracts",
+            json!({ "client_id": b_id, "name": "10 hours a month", "kind": "block_hours", "start_date": month_start, "unit_price": 90000,
+                    "block_minutes": 600, "overage_rate": 15000, "low_balance_minutes": 120, "manager_id": admin_id }),
+        )
+        .await;
+    let block_id = block["id"].as_str().unwrap().to_string();
+    let (s, _) = admin.call(reqwest::Method::POST, "/contracts", Some(json!({ "client_id": b_id, "name": "x", "kind": "block_hours", "start_date": month_start }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "block hours need hours");
+
+    // The block is bought on the first run, before any time is approved against it.
+    let run_b = admin.post("/invoices/run", json!({ "from": month_start, "to": month_end, "client_ids": [b_id] })).await;
+    assert_eq!(run_b["created"].as_array().unwrap().len(), 1);
+    let first_b = run_b["created"][0].as_str().unwrap().to_string();
+    let inv = admin.get(&format!("/invoices/{first_b}")).await;
+    assert_eq!((inv["total"].as_i64(), inv["lines"][0]["kind"].as_str()), (Some(90000), Some("block")));
+    assert_eq!(admin.get(&format!("/contracts/{block_id}")).await["balance_minutes"], 600);
+
+    // --- time: by hand, the timer, a ticket note; technicians don't see money -----------------
+    let ta = admin.post("/tickets", json!({ "subject": "Billing: printer", "client_id": a_id })).await;
+    let ta_id = ta["id"].as_str().unwrap().to_string();
+    let tb = admin.post("/tickets", json!({ "subject": "Billing: server move", "client_id": b_id })).await;
+    let tb_id = tb["id"].as_str().unwrap().to_string();
+    admin.post("/time", json!({ "ticket_id": ta_id, "minutes": 90, "work_type_id": remote, "note": "Reinstalled the driver.", "public": true })).await;
+    admin.post("/time", json!({ "ticket_id": ta_id, "minutes": 60, "work_type_id": onsite, "note": "Site visit" })).await;
+    admin.post("/time", json!({ "minutes": 30, "work_type_id": internal, "note": "Team meeting" })).await;
+    let td = admin.get(&format!("/tickets/{ta_id}")).await;
+    assert_eq!(events_of(&td, "time").len(), 2);
+    assert!(events_of(&td, "reply").iter().any(|e| e["body"] == "Reinstalled the driver."), "the note went out as a reply too");
+    assert!(td["first_response_at"].is_string());
+    let started = tech.post("/time/timer/start", json!({ "ticket_id": tb_id, "work_type_id": remote })).await;
+    assert!(started["ended_at"].is_null());
+    assert_eq!(tech.get("/time/timer").await["id"], started["id"]);
+    let stopped = tech.post("/time/timer/stop", json!({ "note": "Quick look" })).await;
+    assert_eq!(stopped["minutes"], 1, "at least a minute");
+    tech.post("/time", json!({ "ticket_id": tb_id, "minutes": 540, "work_type_id": remote, "note": "Moved the server" })).await;
+    tech.post("/time", json!({ "ticket_id": tb_id, "minutes": 119, "work_type_id": remote, "note": "Cabling" })).await;
+    let mine = tech.get("/time").await;
+    assert_eq!(mine.as_array().unwrap().len(), 3);
+    assert!(mine.as_array().unwrap().iter().all(|e| e["rate"].is_null() && e["amount"].is_null()));
+    let (s, _) = tech.call(reqwest::Method::GET, &format!("/time?user_id={admin_id}"), None).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "others' time needs time.approve");
+
+    // --- timesheets: submit locks the week; reject reopens it; approve resolves coverage --------
+    let week = tech.post("/timesheets/submit", json!({ "week": today })).await;
+    assert_eq!(week["status"], "submitted");
+    assert_eq!(week["minutes"], 660);
+    let entry = mine[0]["id"].as_str().unwrap().to_string();
+    let (s, _) = tech.call(reqwest::Method::PUT, &format!("/time/{entry}"), Some(json!({ "note": "late edit" }))).await;
+    assert_eq!(s, StatusCode::CONFLICT, "a submitted week is locked");
+    let pending = admin.get("/timesheets/pending").await;
+    let sheet = pending.as_array().unwrap().iter().find(|t| t["user_name"] == "Tech").unwrap()["id"].as_str().unwrap().to_string();
+    admin.post(&format!("/timesheets/{sheet}/reject"), json!({ "note": "Split the cabling" })).await;
+    let (s, _) = tech.call(reqwest::Method::PUT, &format!("/time/{entry}"), Some(json!({ "note": "Cabling and patching" }))).await;
+    assert!(s.is_success(), "editable again after a rejection");
+    tech.post("/timesheets/submit", json!({ "week": today })).await;
+    admin.post(&format!("/timesheets/{sheet}/approve"), json!({})).await;
+    admin.post("/timesheets/submit", json!({ "week": today })).await;
+    let mine_sheet = admin.get("/timesheets").await["timesheet"]["id"].as_str().unwrap().to_string();
+    admin.post(&format!("/timesheets/{mine_sheet}/approve"), json!({})).await;
+    let entries = admin.get(&format!("/time?ticket_id={tb_id}")).await;
+    let cov: Vec<(String, i64)> = entries.as_array().unwrap().iter().map(|e| (e["coverage"].as_str().unwrap().to_string(), e["amount"].as_i64().unwrap())).collect();
+    // 1 + 540 + 119 = 660 minutes against a 600-minute bank: 60 minutes over at 150.00/h.
+    assert_eq!(cov.iter().map(|c| c.1).sum::<i64>(), 15000, "{cov:?}");
+    assert!(cov.iter().all(|c| c.0 == "block"));
+    assert_eq!(admin.get(&format!("/contracts/{block_id}")).await["balance_minutes"], 0);
+    wait_mail(&mail, "the low-balance warning", |to, data| to.iter().any(|t| t == ADMIN_EMAIL) && data.contains("running low")).await;
+    let a_entries = admin.get(&format!("/time?ticket_id={ta_id}")).await;
+    let by_type = |n: &str| a_entries.as_array().unwrap().iter().find(|e| e["work_type_name"] == n).unwrap().clone();
+    assert_eq!((by_type("Remote support")["coverage"].as_str(), by_type("Remote support")["amount"].as_i64()), (Some("covered"), Some(0)));
+    assert_eq!((by_type("Onsite")["coverage"].as_str(), by_type("Onsite")["rate"].as_i64()), (Some("billable"), Some(20000)), "the contract's rate");
+
+    // --- products sold on a ticket ------------------------------------------------------------
+    let charger = admin.post("/products", json!({ "sku": "CHG-65", "name": "65W charger", "cost": 2000, "price": 4500 })).await;
+    let (s, _) = tech.call(reqwest::Method::POST, "/charges", Some(json!({ "ticket_id": ta_id, "product_id": charger["id"], "unit_price": 1 }))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "technicians sell at the catalog price");
+    tech.post("/charges", json!({ "ticket_id": ta_id, "product_id": charger["id"] })).await;
+    assert!(tech.get(&format!("/charges?ticket_id={ta_id}")).await[0]["unit_price"].is_null());
+
+    // --- the invoice run ------------------------------------------------------------------------
+    let run = admin.post("/invoices/run", json!({ "from": month_start, "to": month_end })).await;
+    let created: Vec<String> = run["created"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();
+    let invoices = admin.get("/invoices?status=draft").await;
+    let draft_of = |client: &str| invoices.as_array().unwrap().iter().find(|i| i["client_id"] == client && created.contains(&i["id"].as_str().unwrap().to_string())).unwrap()["id"].as_str().unwrap().to_string();
+    let inv_a = draft_of(a_id);
+    let inv_b = draft_of(b_id);
+    let a = admin.get(&format!("/invoices/{inv_a}")).await;
+    let lines = a["lines"].as_array().unwrap();
+    let line = |k: &str| lines.iter().filter(|l| l["kind"] == k).cloned().collect::<Vec<_>>();
+    assert_eq!(line("devices")[0]["details"]["devices"], devices_a, "{a}");
+    assert_eq!(line("devices")[0]["amount"], devices_a * 2500);
+    let backup = line("recurring");
+    assert_eq!(backup.len(), 2, "fee and item");
+    assert!(backup.iter().all(|l| l["description"].as_str().unwrap().contains("prorated")), "{backup:?}");
+    assert_eq!(line("time").len(), 1, "covered time isn't billed");
+    assert_eq!(line("time")[0]["amount"], 20000);
+    assert_eq!(line("product")[0]["amount"], 4500);
+    let b = admin.get(&format!("/invoices/{inv_b}")).await;
+    assert_eq!(b["lines"].as_array().unwrap().iter().map(|l| l["kind"].as_str().unwrap()).collect::<Vec<_>>(), vec!["overage"], "the block was billed already");
+    assert_eq!(b["total"], 15000);
+    let again = admin.post("/invoices/run", json!({ "from": month_start, "to": month_end })).await;
+    assert!(again["created"].as_array().unwrap().is_empty(), "nothing is billed twice");
+    admin.call(reqwest::Method::DELETE, &format!("/invoices/{first_b}"), None).await;
+    assert_eq!(admin.get(&format!("/contracts/{block_id}")).await["balance_minutes"], -600, "deleting the draft takes its purchase back");
+    let rerun = admin.post("/invoices/run", json!({ "from": month_start, "to": month_end, "client_ids": [b_id] })).await;
+    assert_eq!(rerun["created"].as_array().unwrap().len(), 1, "and its cycle can be billed again");
+    let rerun_b = rerun["created"][0].as_str().unwrap().to_string();
+    admin.call(reqwest::Method::DELETE, &format!("/invoices/{rerun_b}"), None).await;
+    // Editing a draft: a manual discount, and taking the product off (it goes back to unbilled).
+    let r = admin.post(&format!("/invoices/{inv_a}/lines"), json!({ "description": "Loyalty discount", "quantity_milli": -1000, "unit_price": 1000 })).await;
+    let product_line = line("product")[0]["id"].as_str().unwrap().to_string();
+    let r2 = admin.call(reqwest::Method::DELETE, &format!("/invoices/{inv_a}/lines/{product_line}"), None).await.1;
+    assert_eq!(r2["total"].as_i64().unwrap(), r["total"].as_i64().unwrap() - 4500);
+    assert_eq!(admin.get(&format!("/charges?client_id={a_id}&unbilled=true")).await.as_array().unwrap().len(), 1);
+    let total_a = r2["total"].as_i64().unwrap();
+
+    // --- finalise: gapless numbers, a frozen PDF ----------------------------------------------------
+    let f = admin.post(&format!("/invoices/{inv_a}/finalise"), json!({})).await;
+    assert_eq!(f["number"], "INV-1001");
+    let (s, _) = admin.call(reqwest::Method::PATCH, &format!("/invoices/{inv_a}"), Some(json!({ "notes": "x" }))).await;
+    assert_eq!(s, StatusCode::CONFLICT, "finalised invoices don't change");
+    assert_eq!(admin.post(&format!("/invoices/{inv_b}/finalise"), json!({})).await["number"], "INV-1002");
+    let res = admin.http.get(format!("{}/invoices/{inv_a}/pdf", admin.base)).send().await.unwrap();
+    assert_eq!(res.headers()["content-type"], "application/pdf");
+    let pdf = res.bytes().await.unwrap();
+    assert!(pdf.starts_with(b"%PDF-1.4"));
+    let text = String::from_utf8_lossy(&pdf);
+    assert!(text.contains("(INV-1001)") && text.contains("(Client A)") && text.contains("Loyalty discount"), "PDF content");
+
+    // --- send to the billing contact, with the PDF ----------------------------------------------
+    let payer = admin
+        .post("/contacts", json!({ "client_id": a_id, "name": "Paula Payer", "email": "paula@client-a.example", "is_billing": true, "portal_enabled": true }))
+        .await;
+    let sent = admin.post(&format!("/invoices/{inv_a}/send"), json!({})).await;
+    assert_eq!(sent["to"], json!(["paula@client-a.example"]));
+    let raw = wait_mail(&mail, "the invoice email", |to, _| to.iter().any(|t| t == "paula@client-a.example")).await;
+    let m = mail_parser::MessageParser::default().parse(raw.as_bytes()).unwrap();
+    let att = m.attachments().next().expect("the PDF is attached");
+    assert_eq!(att.attachment_name(), Some("INV-1001.pdf"));
+    assert!(att.decoded().starts_with(b"%PDF"));
+    assert_eq!(admin.get(&format!("/invoices/{inv_a}")).await["status"], "sent");
+
+    // --- the portal: billing contacts see invoices ------------------------------------------------
+    admin.post(&format!("/contacts/{}/portal-invite", payer["id"].as_str().unwrap()), json!({})).await;
+    let invite = wait_mail(&mail, "Paula's invitation", |to, data| to.iter().any(|t| t == "paula@client-a.example") && data.contains("invited")).await;
+    let portal = Api::new(url);
+    portal.post("/portal/auth/verify", json!({ "token": token_after(&mail_text(&invite), "/portal/login?token=") })).await;
+    assert_eq!(portal.get("/portal/me").await["invoices"], true);
+    let pinv = portal.get("/portal/invoices").await;
+    assert_eq!(pinv[0]["number"], "INV-1001");
+    assert_eq!(pinv[0]["total"], total_a);
+    let res = portal.http.get(format!("{}/portal/invoices/{inv_a}/pdf", portal.base)).send().await.unwrap();
+    assert!(res.status().is_success() && res.bytes().await.unwrap().starts_with(b"%PDF"));
+    let (s, _) = portal.call(reqwest::Method::GET, &format!("/portal/invoices/{inv_b}/pdf"), None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "another client's invoice");
+
+    // --- Xero: connect over OAuth, push, pull payment -------------------------------------------
+    let acct = ACCT.get().unwrap();
+    admin.call(reqwest::Method::PUT, "/billing/accounting/xero", Some(json!({ "client_id": "xero-id", "client_secret": "xero-secret", "settings": { "account_code": "200" } }))).await;
+    let c = admin.post("/billing/accounting/xero/connect", json!({})).await;
+    let auth = c["url"].as_str().unwrap();
+    assert!(auth.contains("/xero/authorize?") && auth.contains("client_id=xero-id") && auth.contains("offline_access"), "{auth}");
+    let noredirect = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
+    let bad = noredirect.get(format!("{url}/api/billing/accounting/xero/callback?code=xero-code&state=forged")).send().await.unwrap();
+    assert!(bad.headers()["location"].to_str().unwrap().contains("accounting_error"));
+    let ok = noredirect.get(format!("{url}/api/billing/accounting/xero/callback?code=xero-code&state={}", state_of(auth))).send().await.unwrap();
+    assert_eq!(ok.headers()["location"], "/settings/billing?connected=xero");
+    let conns = admin.get("/billing/accounting").await;
+    let xero = conns.as_array().unwrap().iter().find(|c| c["provider"] == "xero").unwrap();
+    assert_eq!((xero["connected"].as_bool(), xero["tenant_name"].as_str()), (Some(true), Some("Demo MSP Ltd")));
+    let (sealed,): (bool,) = sqlx::query_as("SELECT sealed FROM accounting_connections WHERE provider = 'xero'").fetch_one(db).await.unwrap();
+    assert!(sealed, "tokens and the secret are encrypted at rest");
+    let sync = admin.post("/billing/accounting/sync", json!({})).await;
+    assert_eq!(sync["pushed"], 2, "{sync}");
+    let pushed = acct.docs.lock().unwrap().iter().find(|(k, b)| k == "xero/invoice" && b["Invoices"][0]["InvoiceNumber"] == "INV-1001").cloned().unwrap().1;
+    let x = &pushed["Invoices"][0];
+    assert_eq!((x["Type"].as_str(), x["Contact"]["ContactID"].as_str(), x["CurrencyCode"].as_str()), (Some("ACCREC"), Some("contact-Client A"), Some("USD")));
+    let sum: f64 = x["LineItems"].as_array().unwrap().iter().map(|l| l["LineAmount"].as_f64().unwrap()).sum();
+    assert!((sum * 100.0 - total_a as f64).abs() < 0.5, "line amounts add up to the total");
+    assert_eq!(admin.get(&format!("/invoices/{inv_a}")).await["external"]["id"], "xinv-INV-1001");
+    acct.paid.lock().unwrap().push("xinv-INV-1001".into());
+    let sync = admin.post("/billing/accounting/sync", json!({})).await;
+    assert_eq!((sync["pushed"].as_i64(), sync["paid"].as_i64()), (Some(0), Some(1)), "{sync}");
+    assert_eq!(admin.get(&format!("/invoices/{inv_a}")).await["status"], "paid");
+
+    // --- a credit note, through QuickBooks (connecting it disconnects Xero) -----------------------------
+    let cn = admin.post(&format!("/invoices/{inv_b}/credit"), json!({})).await;
+    let cn_id = cn["id"].as_str().unwrap().to_string();
+    let cnd = admin.get(&format!("/invoices/{cn_id}")).await;
+    assert_eq!((cnd["kind"].as_str(), cnd["total"].as_i64(), cnd["credit_of_number"].as_str()), (Some("credit_note"), Some(-15000), Some("INV-1002")));
+    assert_eq!(admin.post(&format!("/invoices/{cn_id}/finalise"), json!({})).await["number"], "INV-1003");
+    admin.call(reqwest::Method::PUT, "/billing/accounting/qbo", Some(json!({ "client_id": "qbo-id", "client_secret": "qbo-secret", "settings": { "item_id": "7" } }))).await;
+    let c = admin.post("/billing/accounting/qbo/connect", json!({})).await;
+    let ok = noredirect
+        .get(format!("{url}/api/billing/accounting/qbo/callback?code=qbo-code&state={}&realmId=realm-9", state_of(c["url"].as_str().unwrap())))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.headers()["location"], "/settings/billing?connected=qbo");
+    let conns = admin.get("/billing/accounting").await;
+    assert!(conns.as_array().unwrap().iter().all(|c| c["connected"] == (c["provider"] == "qbo")), "one provider at a time: {conns}");
+    let sync = admin.post("/billing/accounting/sync", json!({})).await;
+    assert_eq!(sync["pushed"], 1, "{sync}");
+    let memo = acct.docs.lock().unwrap().iter().find(|(k, _)| k == "qbo/creditmemo").cloned().expect("a credit memo").1;
+    assert_eq!(memo["DocNumber"], "INV-1003");
+    assert_eq!(memo["Line"][0]["Amount"].as_f64(), Some(150.0), "credit memos are positive there");
+    assert_eq!(memo["Line"][0]["SalesItemLineDetail"]["ItemRef"]["value"], "7");
+    let void = admin.call(reqwest::Method::POST, &format!("/invoices/{inv_a}/void"), None).await.0;
+    assert_eq!(void, StatusCode::CONFLICT, "a paid invoice can't be voided");
+
+    // --- projects, scheduling, client documentation -----------------------------------------------
+    let p = admin.post("/projects", json!({ "client_id": a_id, "name": "Office move", "budget_minutes": 600, "status": "active" })).await;
+    let pid = p["id"].as_str().unwrap().to_string();
+    let task = admin.post(&format!("/projects/{pid}/tasks"), json!({ "phase": "Prep", "title": "Label the cables", "estimate_minutes": 120 })).await;
+    let tt = admin.post(&format!("/projects/{pid}/tasks/{}/ticket", task["id"].as_str().unwrap()), json!({})).await;
+    let tt_id = tt["ticket_id"].as_str().unwrap().to_string();
+    // (This week's timesheet is approved; last week's is still open.)
+    let last_week = chrono::Utc::now() - chrono::Duration::days(8);
+    admin.post("/time", json!({ "ticket_id": tt_id, "minutes": 45, "work_type_id": onsite, "started_at": last_week })).await;
+    admin.post("/time", json!({ "project_id": pid, "minutes": 15, "work_type_id": onsite, "started_at": last_week })).await;
+    let (s, _) = admin.call(reqwest::Method::POST, "/time", Some(json!({ "project_id": pid, "minutes": 15, "work_type_id": onsite }))).await;
+    assert_eq!(s, StatusCode::CONFLICT, "this week is approved");
+    let pd = admin.get(&format!("/projects/{pid}")).await;
+    assert_eq!((pd["logged_minutes"].as_i64(), pd["estimate_minutes"].as_i64()), (Some(60), Some(120)));
+    assert_eq!(pd["task_list"][0]["status"], "doing");
+    assert_eq!(pd["burn"][0]["minutes"], 60);
+    let tomorrow = chrono::Utc::now() + chrono::Duration::days(1);
+    let sch = admin
+        .post("/schedule", json!({ "user_id": admin_id, "starts_at": tomorrow, "ends_at": tomorrow + chrono::Duration::hours(2), "ticket_id": tt_id }))
+        .await;
+    assert_eq!(sch["overlaps"], 0);
+    let cal = admin.get(&format!("/schedule?from={}&to={}", url_escape(&chrono::Utc::now().to_rfc3339()), url_escape(&(tomorrow + chrono::Duration::days(1)).to_rfc3339()))).await;
+    assert!(cal.as_array().unwrap().iter().any(|e| e["ticket_id"] == tt_id.as_str() && e["project_name"].is_null()));
+    let doc = admin.post(&format!("/clients/{a_id}/docs"), json!({ "title": "Network", "category": "Infrastructure", "body": "VLAN 10: staff" })).await;
+    let doc_id = doc["id"].as_str().unwrap().to_string();
+    admin.call(reqwest::Method::PUT, &format!("/docs/{doc_id}"), Some(json!({ "title": "Network", "category": "Infrastructure", "body": "VLAN 10: staff\nVLAN 20: guests" }))).await;
+    let d = admin.get(&format!("/docs/{doc_id}")).await;
+    assert_eq!((d["revisions"].as_i64(), d["body"].as_str()), (Some(1), Some("VLAN 10: staff\nVLAN 20: guests")));
+    let old = admin.get(&format!("/docs/{doc_id}/revisions/{}", d["history"][0]["id"])).await;
+    assert_eq!(old["body"], "VLAN 10: staff");
+
+    // --- reports ----------------------------------------------------------------------------------
+    let desk = admin.get(&format!("/reports/service-desk?from={month_start}&to={month_end}")).await;
+    assert!(desk["opened"].as_i64() >= Some(3) && desk["sla"]["respond"]["total"].is_number(), "{desk}");
+    let util = admin.get(&format!("/reports/utilisation?from={month_start}&to={month_end}")).await;
+    let t = util["technicians"].as_array().unwrap().iter().find(|t| t["name"] == "Tech").unwrap().clone();
+    assert_eq!(t["logged_minutes"], 660);
+    let prof = admin.get(&format!("/reports/profitability?from={month_start}&to={month_end}")).await;
+    let pa = prof["clients"].as_array().unwrap().iter().find(|c| c["client_id"] == a_id).unwrap().clone();
+    assert_eq!(pa["revenue"], total_a);
+    let (s, _) = tech.call(reqwest::Method::GET, "/reports/profitability", None).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    let res = admin.http.get(format!("{}/reports/qbr/{a_id}?from={month_start}&to={month_end}", admin.base)).send().await.unwrap();
+    assert_eq!(res.headers()["content-type"], "application/pdf");
+    let qbr = res.bytes().await.unwrap();
+    assert!(String::from_utf8_lossy(&qbr).contains("(Quarterly business review)"));
+    let ov = admin.get("/billing/overview").await;
+    assert!(ov["currencies"].as_array().unwrap().iter().any(|c| c["currency"] == "USD"), "{ov}");
+    println!("time, contracts, invoices, accounting, projects, schedule, docs, reports: ok");
 }

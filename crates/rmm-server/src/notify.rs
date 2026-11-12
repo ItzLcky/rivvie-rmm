@@ -131,22 +131,24 @@ pub async fn worker(st: Arc<AppState>) {
 
 async fn drain(st: &AppState) -> anyhow::Result<usize> {
     // Claim with a lease: a crash mid-send retries after it expires instead of losing the row.
-    let due: Vec<(i64, Uuid, Option<Uuid>, String, i32)> = sqlx::query_as(
+    #[allow(clippy::type_complexity)]
+    let due: Vec<(i64, Uuid, Option<Uuid>, String, i32, Option<Uuid>, Value)> = sqlx::query_as(
         "UPDATE notifications SET attempts = attempts + 1, next_attempt_at = now() + interval '10 minutes'
           WHERE id IN (SELECT id FROM notifications WHERE status = 'pending' AND next_attempt_at <= now()
                         ORDER BY id LIMIT $1 FOR UPDATE SKIP LOCKED)
-          RETURNING id, channel_id, alert_id, event, attempts",
+          RETURNING id, channel_id, alert_id, event, attempts, ticket_id, data",
     )
     .bind(BATCH)
     .fetch_all(&st.db)
     .await?;
     let n = due.len();
-    for (id, channel_id, alert_id, event, attempts) in due {
+    for (id, channel_id, alert_id, event, attempts, ticket_id, data) in due {
         let result = async {
             let channel = load_channel(st, channel_id).await?.ok_or_else(|| "channel was deleted".to_string())?;
-            let msg = match alert_id {
-                Some(a) => render(st, a, &event).await?,
-                None => test_message(st),
+            let msg = match (alert_id, ticket_id) {
+                (Some(a), _) => render(st, a, &event).await?,
+                (None, Some(t)) => render_ticket(st, t, &event, &data).await?,
+                (None, None) => test_message(st),
             };
             deliver(st, &channel, &msg).await
         }
@@ -309,6 +311,84 @@ async fn render(st: &AppState, alert_id: Uuid, event: &str) -> Result<Message, S
         "url": url,
     });
     Ok(Message { event: event.into(), subject, text, headline, severity: a.severity, facts, url, payload })
+}
+
+#[derive(sqlx::FromRow)]
+struct TicketCtx {
+    number: i64,
+    subject: String,
+    priority: i16,
+    client_name: Option<String>,
+    board_name: String,
+    status_name: String,
+    assignee_name: Option<String>,
+    requester: Option<String>,
+    source: String,
+    created_at: DateTime<Utc>,
+}
+
+/// SLA warnings and breaches, and new tickets on a board.
+async fn render_ticket(st: &AppState, ticket_id: Uuid, event: &str, data: &Value) -> Result<Message, String> {
+    let t: TicketCtx = sqlx::query_as(
+        "SELECT t.number, t.subject, t.priority, c.name AS client_name, b.name AS board_name, s.name AS status_name,
+                u.name AS assignee_name, coalesce(co.name, nullif(t.requester_name, ''), nullif(t.requester_email, '')) AS requester,
+                t.source, t.created_at
+           FROM tickets t JOIN boards b ON b.id = t.board_id JOIN board_statuses s ON s.id = t.status_id
+           LEFT JOIN clients c ON c.id = t.client_id LEFT JOIN users u ON u.id = t.assignee_id LEFT JOIN contacts co ON co.id = t.contact_id
+          WHERE t.id = $1",
+    )
+    .bind(ticket_id)
+    .fetch_optional(&st.db)
+    .await
+    .map_err(|e| e.to_string())?
+    .ok_or_else(|| "ticket was deleted".to_string())?;
+    let url = format!("{}/tickets/{ticket_id}", st.cfg.public_url);
+    let target = data["target"].as_str().unwrap_or("resolve");
+    let due = data["due"].as_str().and_then(|d| DateTime::parse_from_rfc3339(d).ok()).map(|d| d.with_timezone(&Utc));
+    let (status, severity) = match event {
+        "sla_breach" => (format!("{} target missed", crate::sla::target_label(target)), "critical"),
+        "sla_warning" => (format!("{} due soon", crate::sla::target_label(target)), "warning"),
+        _ => ("New ticket".to_string(), if t.priority <= 2 { "warning" } else { "info" }),
+    };
+    let headline = format!("{status}: T-{} {}", t.number, t.subject);
+    let mut facts = vec![
+        ("Ticket".to_string(), format!("T-{}", t.number)),
+        ("Client".to_string(), t.client_name.clone().unwrap_or_else(|| "Triage".into())),
+        ("Priority".to_string(), format!("P{}", t.priority)),
+        ("Board".to_string(), t.board_name.clone()),
+        ("Status".to_string(), t.status_name.clone()),
+        ("Assignee".to_string(), t.assignee_name.clone().unwrap_or_else(|| "Unassigned".into())),
+    ];
+    if let Some(r) = &t.requester {
+        facts.push(("Requester".to_string(), r.clone()));
+    }
+    if let Some(d) = due {
+        facts.push(("Due".to_string(), d.format("%Y-%m-%d %H:%M UTC").to_string()));
+    }
+    let width = facts.iter().map(|(k, _)| k.chars().count()).max().unwrap_or(0) + 2;
+    let text = format!(
+        "{headline}\n\n{}\n\n{url}\n",
+        facts.iter().map(|(k, v)| format!("{:width$}{v}", format!("{k}:"))).collect::<Vec<_>>().join("\n")
+    );
+    let payload = json!({
+        "event": event,
+        "ticket": {
+            "id": ticket_id, "number": t.number, "subject": t.subject, "priority": t.priority, "client": t.client_name,
+            "board": t.board_name, "status": t.status_name, "assignee": t.assignee_name, "source": t.source, "created_at": t.created_at,
+        },
+        "sla": if event.starts_with("sla_") { json!({ "target": target, "due": due }) } else { Value::Null },
+        "url": url,
+    });
+    Ok(Message {
+        event: event.into(),
+        subject: format!("[{}] {headline}", brand(st)),
+        text,
+        headline,
+        severity: severity.into(),
+        facts,
+        url,
+        payload,
+    })
 }
 
 fn test_message(st: &AppState) -> Message {

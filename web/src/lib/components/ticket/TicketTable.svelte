@@ -7,6 +7,7 @@
 	import Pagination from '#lib/ui/Pagination.svelte';
 	import PriorityBadge from './PriorityBadge.svelte';
 	import TicketStatus from './TicketStatus.svelte';
+	import SlaBadge from './SlaBadge.svelte';
 
 	/** A paged ticket list: the Tickets page, and the Tickets tabs of clients, contacts and agents. */
 	let {
@@ -64,6 +65,8 @@
 {/snippet}
 {#snippet priorityCell(t: Ticket)}<PriorityBadge priority={t.priority} />{/snippet}
 {#snippet statusCell(t: Ticket)}<TicketStatus name={t.status_name} category={t.status_category} />{/snippet}
+{#snippet slaCell(t: Ticket)}<SlaBadge ticket={t} />{/snippet}
+{#snippet teamCell(t: Ticket)}<span class="text-muted">{t.team_name ?? '–'}</span>{/snippet}
 {#snippet boardCell(t: Ticket)}<span class="text-muted">{t.board_name}</span>{/snippet}
 {#snippet assigneeCell(t: Ticket)}{#if t.assignee_name}{t.assignee_name}{:else}<span class="text-muted">Unassigned</span>{/if}{/snippet}
 {#snippet updatedCell(t: Ticket)}<span class="text-muted whitespace-nowrap" title={datetime(t.updated_at)}>{ago(t.updated_at)}</span>{/snippet}
@@ -91,7 +94,9 @@
 		{ id: 'subject', label: 'Subject', sort: 'subject', cell: subjectCell, hideable: false },
 		{ id: 'priority', label: 'Priority', sort: 'priority', cell: priorityCell, class: 'w-20' },
 		{ id: 'status', label: 'Status', sort: 'status', cell: statusCell, from: 'sm' },
+		{ id: 'sla', label: 'SLA', sort: 'due', cell: slaCell, from: 'md' },
 		{ id: 'board', label: 'Board', cell: boardCell, from: 'xl', defaultHidden: true },
+		{ id: 'team', label: 'Team', cell: teamCell, from: 'xl', defaultHidden: true },
 		...(hide.includes('assignee') ? [] : [{ id: 'assignee', label: 'Assignee', sort: 'assignee', cell: assigneeCell, from: 'md' } as Column<Ticket>]),
 		{ id: 'created', label: 'Opened', sort: 'created', cell: createdCell, from: 'lg', defaultHidden: true },
 		{ id: 'updated', label: 'Updated', sort: 'updated', cell: updatedCell, from: 'sm' }

@@ -52,10 +52,14 @@ pub struct Mailbox {
     pub board_id: Uuid,
     pub auto_reply: bool,
     pub enabled: bool,
+    pub graph_tenant: String,
+    pub graph_client_id: String,
+    pub graph_secret: Option<Vec<u8>>,
+    pub graph_secret_sealed: bool,
 }
 
 pub const MAILBOX_COLS: &str = "id, name, address, kind, imap_host, imap_port, imap_security, imap_username, imap_password, imap_folder,
-     board_id, auto_reply, enabled";
+     board_id, auto_reply, enabled, graph_tenant, graph_client_id, graph_secret, graph_secret_sealed";
 
 // ---------------------------------------------------------------------------
 // Parsing helpers
@@ -274,6 +278,7 @@ pub async fn receive(st: &AppState, mb: &Mailbox, raw: &[u8]) -> Result<Outcome>
     let body: String = strip_quoted(&text).chars().take(MAX_BODY_CHARS).collect();
 
     let mut tx = st.db.begin().await?;
+    let mut client_message = false;
     if claim("received", None).execute(&mut *tx).await?.rows_affected() == 0 {
         return Ok(Outcome::Duplicate);
     }
@@ -326,6 +331,7 @@ pub async fn receive(st: &AppState, mb: &Mailbox, raw: &[u8]) -> Result<Outcome>
             };
             let author = Author { contact_id: contact, name: display_name(&from_name, &from), ..Default::default() };
             let ev = tickets::add_event(&mut tx, id, "message", true, &author, &body, json!({ "email_id": email_id, "from": from })).await?;
+            client_message = true;
             // The client answered: back to work.
             if matches!(category.as_str(), "resolved" | "waiting_client") {
                 let board: Uuid = sqlx::query_scalar("SELECT board_id FROM tickets WHERE id = $1").bind(id).fetch_one(&mut *tx).await?;
@@ -421,11 +427,16 @@ pub async fn receive(st: &AppState, mb: &Mailbox, raw: &[u8]) -> Result<Outcome>
     tx.commit().await?;
     info!(mailbox = %mb.name, %from, ?outcome, "inbound email filed");
 
-    if let Outcome::Created(id) = &outcome
-        && mb.auto_reply
-        && let Err(e) = queue_acknowledgement(st, *id, &from, &message_id).await
-    {
-        warn!(ticket = %id, "queueing acknowledgement: {e}");
+    if let Outcome::Created(id) = &outcome {
+        tickets::notify_created(st, *id).await;
+        if mb.auto_reply
+            && let Err(e) = queue_acknowledgement(st, *id, &from, &message_id).await
+        {
+            warn!(ticket = %id, "queueing acknowledgement: {e}");
+        }
+    }
+    if client_message && let Err(e) = queue_client_message(st, ticket_id, &display_name(&from_name, &from)).await {
+        warn!(ticket = %ticket_id, "telling the assignee about a reply: {e:#}");
     }
     tickets::announce(st, ticket_id).await;
     Ok(outcome)
@@ -462,10 +473,11 @@ pub async fn resolve_sender(db: &mut sqlx::PgConnection, from: &str) -> sqlx::Re
 // Outbound
 // ---------------------------------------------------------------------------
 
-/// Where replies go: the ticket's mailbox, else the first enabled one.
-async fn reply_address(db: &sqlx::PgPool, ticket_mailbox: Option<Uuid>) -> sqlx::Result<Option<String>> {
-    sqlx::query_scalar(
-        "SELECT address FROM mailboxes WHERE enabled AND (id = $1 OR $1 IS NULL OR NOT EXISTS (SELECT 1 FROM mailboxes WHERE id = $1 AND enabled))
+/// Where replies go (and, for a Graph mailbox, what sends them): the ticket's mailbox, else
+/// the first enabled one.
+async fn reply_mailbox(db: &sqlx::PgPool, ticket_mailbox: Option<Uuid>) -> sqlx::Result<Option<(Uuid, String)>> {
+    sqlx::query_as(
+        "SELECT id, address FROM mailboxes WHERE enabled AND (id = $1 OR $1 IS NULL OR NOT EXISTS (SELECT 1 FROM mailboxes WHERE id = $1 AND enabled))
           ORDER BY (id = $1) DESC NULLS LAST, created_at LIMIT 1",
     )
     .bind(ticket_mailbox)
@@ -473,6 +485,7 @@ async fn reply_address(db: &sqlx::PgPool, ticket_mailbox: Option<Uuid>) -> sqlx:
     .await
 }
 
+#[derive(Default)]
 struct Outgoing<'a> {
     ticket_id: Option<Uuid>,
     event_id: Option<i64>,
@@ -483,6 +496,27 @@ struct Outgoing<'a> {
     in_reply_to: Option<String>,
     references: Vec<String>,
     purpose: &'a str,
+    /// The support mailbox it goes out from: a Graph mailbox that sends sends it itself.
+    mailbox_id: Option<Uuid>,
+    /// Stored files to attach: (name, content type, storage key).
+    files: Vec<(String, String, String)>,
+}
+
+
+/// Whether mail from this mailbox goes out through Microsoft Graph.
+async fn sends_via_graph(db: &sqlx::PgPool, mailbox: Option<Uuid>) -> sqlx::Result<bool> {
+    let Some(m) = mailbox else { return Ok(false) };
+    Ok(sqlx::query_scalar("SELECT kind = 'graph' AND graph_send AND enabled FROM mailboxes WHERE id = $1")
+        .bind(m)
+        .fetch_optional(db)
+        .await?
+        .unwrap_or(false))
+}
+
+/// Whether there's any way to send mail: the SMTP server, or a Graph mailbox for replies.
+pub fn smtp_configured(st: &AppState) -> bool {
+    let c = st.company();
+    !c.smtp_host.trim().is_empty() && !c.smtp_from.trim().is_empty()
 }
 
 /// Inserts into the outbox (or records a failure straight away when there's no mail server).
@@ -490,11 +524,11 @@ async fn enqueue(st: &AppState, o: Outgoing<'_>) -> Result<Uuid> {
     let id = Uuid::new_v4();
     let message_id = format!("{}@{}", Uuid::new_v4().simple(), id_domain(st));
     let c = st.company();
-    let configured = !c.smtp_host.trim().is_empty() && !c.smtp_from.trim().is_empty();
+    let configured = smtp_configured(st) || sends_via_graph(&st.db, o.mailbox_id).await?;
     sqlx::query(
         "INSERT INTO email_messages (id, direction, ticket_id, event_id, message_id, in_reply_to, \"references\", from_addr, to_addrs,
-                                     reply_to, subject, body, status, purpose, last_error)
-         VALUES ($1, 'out', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+                                     reply_to, subject, body, status, purpose, last_error, mailbox_id, files)
+         VALUES ($1, 'out', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
     )
     .bind(id)
     .bind(o.ticket_id)
@@ -510,6 +544,8 @@ async fn enqueue(st: &AppState, o: Outgoing<'_>) -> Result<Uuid> {
     .bind(if configured { "pending" } else { "failed" })
     .bind(o.purpose)
     .bind((!configured).then_some("no mail server: set one up under Company settings → Notifications"))
+    .bind(o.mailbox_id)
+    .bind(serde_json::Value::Array(o.files.iter().map(|(n, c, k)| json!({ "name": n, "content_type": c, "key": k })).collect()))
     .execute(&st.db)
     .await?;
     if configured {
@@ -552,6 +588,7 @@ pub async fn queue_reply(st: &AppState, ticket_id: Uuid, event_id: i64, body: &s
     .await?;
     let Some(to) = c.recipient else { return Ok(None) };
     let (in_reply_to, references) = thread_of(&st.db, ticket_id).await?;
+    let mailbox = reply_mailbox(&st.db, c.mailbox_id).await?;
     let prefix = if in_reply_to.is_some() { "Re: " } else { "" };
     let brand = brand(st);
     let text = format!(
@@ -567,10 +604,12 @@ pub async fn queue_reply(st: &AppState, ticket_id: Uuid, event_id: i64, body: &s
             to: vec![to],
             subject: format!("{prefix}{} [T-{}]", c.subject, c.number),
             body: text,
-            reply_to: reply_address(&st.db, c.mailbox_id).await?,
+            reply_to: mailbox.as_ref().map(|m| m.1.clone()),
             in_reply_to,
             references,
             purpose: "reply",
+            mailbox_id: mailbox.map(|m| m.0),
+            files: vec![],
         },
     )
     .await?;
@@ -592,6 +631,7 @@ async fn queue_acknowledgement(st: &AppState, ticket_id: Uuid, to: &str, in_repl
     let (number, subject, mailbox): (i64, String, Option<Uuid>) =
         sqlx::query_as("SELECT number, subject, mailbox_id FROM tickets WHERE id = $1").bind(ticket_id).fetch_one(&st.db).await?;
     let brand = brand(st);
+    let mailbox = reply_mailbox(&st.db, mailbox).await?;
     enqueue(
         st,
         Outgoing {
@@ -603,10 +643,40 @@ async fn queue_acknowledgement(st: &AppState, ticket_id: Uuid, to: &str, in_repl
                 "{REPLY_MARKER}\n\nThanks, we've received your request and opened ticket T-{number}. \
                  We'll be in touch soon. To add anything, reply to this email.\n\n{brand}\n"
             ),
-            reply_to: reply_address(&st.db, mailbox).await?,
+            reply_to: mailbox.as_ref().map(|m| m.1.clone()),
             in_reply_to: Some(in_reply_to.to_string()),
             references: vec![in_reply_to.to_string()],
             purpose: "auto_reply",
+            mailbox_id: mailbox.map(|m| m.0),
+            files: vec![],
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+/// Emails a technician about a ticket: `subject` and `lead` get the ticket's number and
+/// subject appended, and the body links to it. A no-op without a mail server.
+async fn queue_staff(st: &AppState, ticket_id: Uuid, user_id: Uuid, subject: &str, lead: &str, purpose: &str) -> Result<()> {
+    if !smtp_configured(st) {
+        return Ok(()); // nothing to do without a mail server, and no point recording failures
+    }
+    let row: Option<(String, i64, String)> = sqlx::query_as(
+        "SELECT u.email, t.number, t.subject FROM users u, tickets t WHERE u.id = $1 AND t.id = $2 AND NOT u.disabled",
+    )
+    .bind(user_id)
+    .bind(ticket_id)
+    .fetch_optional(&st.db)
+    .await?;
+    let Some((email, number, ticket_subject)) = row else { return Ok(()) };
+    enqueue(
+        st,
+        Outgoing {
+            to: vec![email],
+            subject: format!("[{}] T-{number} {subject}: {ticket_subject}", brand(st)),
+            body: format!("{lead}\n\nT-{number}: {ticket_subject}\n\n{}/tickets/{ticket_id}\n", st.cfg.public_url),
+            purpose,
+            ..Default::default()
         },
     )
     .await?;
@@ -615,36 +685,116 @@ async fn queue_acknowledgement(st: &AppState, ticket_id: Uuid, to: &str, in_repl
 
 /// Tells a technician a ticket was assigned to them.
 pub async fn queue_assigned(st: &AppState, ticket_id: Uuid, user_id: Uuid, by: &str) -> Result<()> {
-    let c = st.company();
-    if c.smtp_host.trim().is_empty() || c.smtp_from.trim().is_empty() {
-        return Ok(()); // nothing to do without a mail server, and no point recording failures
+    queue_staff(st, ticket_id, user_id, "assigned to you", &format!("{by} assigned this ticket to you."), "assigned").await
+}
+
+/// Tells the assignee the client wrote (by email or in the portal).
+pub async fn queue_client_message(st: &AppState, ticket_id: Uuid, from: &str) -> Result<()> {
+    let assignee: Option<Uuid> =
+        sqlx::query_scalar("SELECT assignee_id FROM tickets WHERE id = $1").bind(ticket_id).fetch_optional(&st.db).await?.flatten();
+    match assignee {
+        Some(a) => queue_staff(st, ticket_id, a, "new reply", &format!("{from} replied."), "client_message").await,
+        None => Ok(()),
     }
-    let (email, number, subject): (String, i64, String) = sqlx::query_as(
-        "SELECT u.email, t.number, t.subject FROM users u, tickets t WHERE u.id = $1 AND t.id = $2 AND NOT u.disabled",
-    )
-    .bind(user_id)
-    .bind(ticket_id)
-    .fetch_one(&st.db)
-    .await?;
+}
+
+/// Tells the assignee about SLA warnings and breaches on their ticket.
+pub async fn queue_sla(st: &AppState, ticket_id: Uuid, user_id: Uuid, events: &[(&str, bool)]) -> Result<()> {
+    let breached = events.iter().any(|(_, b)| *b);
+    let lines: Vec<String> = events
+        .iter()
+        .map(|(k, b)| format!("{}: {}", crate::sla::target_label(k), if *b { "missed" } else { "75% of the time used" }))
+        .collect();
+    let subject = if breached { "missed its SLA" } else { "SLA warning" };
+    queue_staff(st, ticket_id, user_id, subject, &lines.join("\n"), "sla").await
+}
+
+/// A portal sign-in link or invitation.
+pub async fn queue_portal_link(st: &AppState, to: &str, name: &str, url: &str, invite: bool) -> Result<()> {
+    let brand = brand(st);
+    let (subject, lead) = if invite {
+        (format!("You're invited to the {brand} support portal"), format!("Hello {name},\n\n{brand} invited you to its support portal, where you can open tickets, follow them and reply."))
+    } else {
+        (format!("Sign in to {brand} support"), format!("Hello {name},\n\nUse this link to sign in to the {brand} support portal."))
+    };
+    let mailbox = reply_mailbox(&st.db, None).await?;
     enqueue(
         st,
         Outgoing {
-            ticket_id: None,
-            event_id: None,
-            to: vec![email],
-            subject: format!("[{}] T-{number} assigned to you: {subject}", brand(st)),
-            body: format!("{by} assigned ticket T-{number} to you.\n\n{subject}\n\n{}/tickets/{ticket_id}\n", st.cfg.public_url),
-            reply_to: None,
-            in_reply_to: None,
-            references: vec![],
-            purpose: "assigned",
+            to: vec![to.to_string()],
+            subject,
+            body: format!(
+                "{lead}\n\n{url}\n\nThe link works once and expires in {} minutes. If you didn't ask for it, ignore this email.\n\n{brand}\n",
+                crate::api::PORTAL_LINK_MINUTES
+            ),
+            purpose: "portal_link",
+            mailbox_id: mailbox.map(|m| m.0),
+            ..Default::default()
         },
     )
     .await?;
     Ok(())
 }
 
-fn brand(st: &AppState) -> String {
+/// An invoice (or credit note) with its PDF, to the client's billing contacts.
+pub async fn queue_invoice(st: &AppState, to: Vec<String>, subject: String, body: String, pdf: (String, String)) -> Result<Uuid> {
+    let mailbox = reply_mailbox(&st.db, None).await?;
+    enqueue(
+        st,
+        Outgoing {
+            to,
+            subject,
+            body,
+            reply_to: mailbox.as_ref().map(|m| m.1.clone()),
+            purpose: "invoice",
+            mailbox_id: mailbox.map(|m| m.0),
+            files: vec![(pdf.0, "application/pdf".into(), pdf.1)],
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+/// Tells an account manager a block-hours contract is running low.
+pub async fn queue_staff_note(st: &AppState, user_id: Uuid, subject: &str, body: &str) -> Result<()> {
+    if !smtp_configured(st) {
+        return Ok(());
+    }
+    let email: Option<String> =
+        sqlx::query_scalar("SELECT email FROM users WHERE id = $1 AND NOT disabled").bind(user_id).fetch_optional(&st.db).await?;
+    let Some(email) = email else { return Ok(()) };
+    enqueue(st, Outgoing { to: vec![email], subject: format!("[{}] {subject}", brand(st)), body: body.into(), purpose: "low_balance", ..Default::default() })
+        .await?;
+    Ok(())
+}
+
+/// "How did we do?" after a ticket is resolved, with one-click links.
+pub async fn queue_survey(st: &AppState, ticket_id: Uuid, to: &str, token: &str) -> Result<()> {
+    let (number, subject, mailbox): (i64, String, Option<Uuid>) =
+        sqlx::query_as("SELECT number, subject, mailbox_id FROM tickets WHERE id = $1").bind(ticket_id).fetch_one(&st.db).await?;
+    let brand = brand(st);
+    let base = format!("{}/feedback/{token}", st.cfg.public_url);
+    let mailbox = reply_mailbox(&st.db, mailbox).await?;
+    enqueue(
+        st,
+        Outgoing {
+            ticket_id: Some(ticket_id),
+            to: vec![to.to_string()],
+            subject: format!("How did we do? {subject} [T-{number}]"),
+            body: format!(
+                "We've resolved ticket T-{number}: {subject}\n\nHow did we do? One click is enough:\n\nGood: {base}?rating=good\nBad:  {base}?rating=bad\n\nThanks,\n{brand}\n"
+            ),
+            reply_to: mailbox.as_ref().map(|m| m.1.clone()),
+            purpose: "survey",
+            mailbox_id: mailbox.map(|m| m.0),
+            ..Default::default()
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+pub(crate) fn brand(st: &AppState) -> String {
     let n = st.company().company_name;
     if n.trim().is_empty() { "Support".into() } else { n }
 }
@@ -662,6 +812,8 @@ struct OutRow {
     body: String,
     purpose: Option<String>,
     attempts: i32,
+    mailbox_id: Option<Uuid>,
+    files: serde_json::Value,
 }
 
 const OUTBOX_BATCH: i64 = 20;
@@ -672,7 +824,7 @@ pub async fn drain_outbox(st: &AppState) -> Result<usize> {
         "UPDATE email_messages SET attempts = attempts + 1, next_attempt_at = now() + interval '10 minutes'
           WHERE id IN (SELECT id FROM email_messages WHERE direction = 'out' AND status = 'pending' AND next_attempt_at <= now()
                         ORDER BY created_at LIMIT $1 FOR UPDATE SKIP LOCKED)
-          RETURNING id, event_id, message_id, in_reply_to, \"references\", to_addrs, reply_to, subject, body, purpose, attempts",
+          RETURNING id, event_id, message_id, in_reply_to, \"references\", to_addrs, reply_to, subject, body, purpose, attempts, mailbox_id, files",
     )
     .bind(OUTBOX_BATCH)
     .fetch_all(&st.db)
@@ -710,7 +862,24 @@ async fn send(st: &AppState, r: &OutRow) -> Result<(), String> {
     use lettre::message::header::{ContentType, HeaderName, HeaderValue};
     use lettre::message::Mailbox as LMailbox;
 
-    let (mailer, from) = crate::notify::mailer(st)?;
+    // A Graph mailbox sends its own mail, from its own address.
+    let graph: Option<Mailbox> = match r.mailbox_id {
+        Some(m) => sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT {MAILBOX_COLS} FROM mailboxes WHERE id = $1 AND kind = 'graph' AND graph_send AND enabled"
+        )))
+        .bind(m)
+        .fetch_optional(&st.db)
+        .await
+        .map_err(|e| e.to_string())?,
+        None => None,
+    };
+    let (mailer, from) = match &graph {
+        Some(mb) => (None, mb.address.parse::<LMailbox>().map_err(|_| format!("{} is not an email address", mb.address))?),
+        None => {
+            let (m, f) = crate::notify::mailer(st)?;
+            (Some(m), f)
+        }
+    };
     let from = LMailbox::new(Some(brand(st)), from.email);
     let mut b = lettre::Message::builder().from(from).subject(&r.subject).message_id(Some(format!("<{}>", r.message_id)));
     for t in &r.to_addrs {
@@ -727,11 +896,11 @@ async fn send(st: &AppState, r: &OutRow) -> Result<(), String> {
     }
     if r.purpose.as_deref() == Some("auto_reply") {
         b = b.raw_header(HeaderValue::new(HeaderName::new_from_ascii_str("Auto-Submitted"), "auto-replied".into()));
-    } else if r.purpose.as_deref() == Some("assigned") {
+    } else if matches!(r.purpose.as_deref(), Some("assigned" | "client_message" | "sla" | "portal_link" | "survey" | "invoice" | "low_balance")) {
         b = b.raw_header(HeaderValue::new(HeaderName::new_from_ascii_str("Auto-Submitted"), "auto-generated".into()));
     }
     // A reply's attachments go with it, up to a total that mail servers accept.
-    let files: Vec<(String, String, String)> = match r.event_id {
+    let mut files: Vec<(String, String, String)> = match r.event_id {
         Some(ev) => sqlx::query_as("SELECT name, content_type, storage_key FROM ticket_attachments WHERE event_id = $1 ORDER BY created_at")
             .bind(ev)
             .fetch_all(&st.db)
@@ -739,6 +908,11 @@ async fn send(st: &AppState, r: &OutRow) -> Result<(), String> {
             .map_err(|e| e.to_string())?,
         None => vec![],
     };
+    for f in r.files.as_array().into_iter().flatten() {
+        if let (Some(n), Some(c), Some(k)) = (f["name"].as_str(), f["content_type"].as_str(), f["key"].as_str()) {
+            files.push((n.into(), c.into(), k.into()));
+        }
+    }
     let email = if files.is_empty() {
         b.header(ContentType::TEXT_PLAIN).body(r.body.clone()).map_err(|e| e.to_string())?
     } else {
@@ -761,8 +935,14 @@ async fn send(st: &AppState, r: &OutRow) -> Result<(), String> {
         }
         b.multipart(parts).map_err(|e| e.to_string())?
     };
-    use lettre::AsyncTransport;
-    mailer.send(email).await.map(drop).map_err(|e| format!("SMTP: {e}"))
+    match (mailer, graph) {
+        (Some(m), _) => {
+            use lettre::AsyncTransport;
+            m.send(email).await.map(drop).map_err(|e| format!("SMTP: {e}"))
+        }
+        (None, Some(mb)) => crate::graph::send(st, &mb, &email.formatted()).await,
+        (None, None) => Err("no way to send mail".into()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -776,7 +956,7 @@ pub async fn poll_loop(st: Arc<AppState>, secs: u32) {
     loop {
         tick.tick().await;
         let boxes: Vec<Mailbox> = match sqlx::query_as(sqlx::AssertSqlSafe(format!(
-            "SELECT {MAILBOX_COLS} FROM mailboxes WHERE enabled AND kind = 'imap'"
+            "SELECT {MAILBOX_COLS} FROM mailboxes WHERE enabled AND kind IN ('imap', 'graph')"
         )))
         .fetch_all(&st.db)
         .await
@@ -795,7 +975,10 @@ pub async fn poll_loop(st: Arc<AppState>, secs: u32) {
 
 /// Polls one mailbox and records the outcome on it. Returns how many messages were filed.
 pub async fn poll_now(st: &AppState, mb: &Mailbox) -> Result<usize, String> {
-    let res = tokio::time::timeout(Duration::from_secs(120), poll(st, mb)).await.unwrap_or_else(|_| Err(anyhow::anyhow!("timed out")));
+    let work = async {
+        if mb.kind == "graph" { crate::graph::poll(st, mb).await } else { poll(st, mb).await }
+    };
+    let res = tokio::time::timeout(Duration::from_secs(120), work).await.unwrap_or_else(|_| Err(anyhow::anyhow!("timed out")));
     let err = res.as_ref().err().map(|e| format!("{e:#}"));
     if let Some(e) = &err {
         warn!(mailbox = %mb.name, "polling mailbox: {e}");

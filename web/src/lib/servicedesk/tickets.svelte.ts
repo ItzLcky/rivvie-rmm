@@ -40,7 +40,7 @@ export const sourceLabels: Record<string, string> = { dashboard: 'Dashboard', em
 export const ticketNumber = (n: number) => `T-${n}`;
 
 /** Open ticket counts for the sidebar and the list's tabs, kept fresh by live ticket events. */
-export const ticketCounts = $state<TicketSummary & { loaded: boolean }>({ open: 0, mine: 0, unassigned: 0, triage: 0, waiting: 0, loaded: false });
+export const ticketCounts = $state<TicketSummary & { loaded: boolean }>({ open: 0, mine: 0, unassigned: 0, triage: 0, waiting: 0, team: 0, breached: 0, loaded: false });
 
 async function loadCounts() {
 	try {

@@ -23,8 +23,12 @@
 		job_title: c?.job_title ?? '',
 		site_id: c?.site_id ?? '',
 		notes: c?.notes ?? '',
-		is_primary: c?.is_primary ?? false
+		is_primary: c?.is_primary ?? false,
+		portal_enabled: c?.portal_enabled ?? false,
+		portal_all_tickets: c?.portal_all_tickets ?? false,
+		is_billing: c?.is_billing ?? false
 	});
+	let invite = $state(!c);
 	let busy = $state(false);
 	// svelte-ignore state_referenced_locally
 	const sites = $derived(clients.list.find((x) => x.id === clientId)?.sites ?? []);
@@ -33,9 +37,13 @@
 		e.preventDefault();
 		busy = true;
 		try {
-			const body = { ...f, client_id: clientId, site_id: f.site_id || null, portal_enabled: c?.portal_enabled ?? false };
+			const body = { ...f, client_id: clientId, site_id: f.site_id || null };
 			const saved = c ? await api.put<Contact>(`/contacts/${c.id}`, body) : await api.post<Contact>('/contacts', body);
-			toast.success(`${saved.name} saved.`);
+			const newlyEnabled = saved.portal_enabled && (!c?.portal_enabled || c.email !== saved.email);
+			if (newlyEnabled && invite) {
+				await api.post(`/contacts/${saved.id}/portal-invite`);
+				toast.success(`${saved.name} saved and invited to the portal.`);
+			} else toast.success(`${saved.name} saved.`);
 			onsaved(saved);
 			onclose();
 		} catch (err) {
@@ -66,6 +74,19 @@
 		{/if}
 		<Field label="Notes" id="ct-notes"><Textarea id="ct-notes" rows={3} bind:value={f.notes} /></Field>
 		<Switch bind:checked={f.is_primary}>Primary contact (preselected on new tickets)</Switch>
+		<Switch bind:checked={f.is_billing}>Billing contact (invoices are emailed to them, and shown in their portal)</Switch>
+		<fieldset class="border-border space-y-2 border-t pt-3">
+			<legend class="sr-only">Client portal</legend>
+			<Switch bind:checked={f.portal_enabled} disabled={!f.email.trim()}>Client portal access{#if !f.email.trim()}<span class="text-muted"> (needs an email)</span>{/if}</Switch>
+			{#if f.portal_enabled}
+				<div class="space-y-2 pl-11.5">
+					<Switch bind:checked={f.portal_all_tickets} disabled={f.is_primary}>Sees every ticket of the client{#if f.is_primary}<span class="text-muted"> (primary contacts always do)</span>{/if}</Switch>
+					{#if !c?.portal_enabled || c.email !== f.email.trim().toLowerCase()}
+						<Switch bind:checked={invite}>Email an invitation when saved</Switch>
+					{/if}
+				</div>
+			{/if}
+		</fieldset>
 	</form>
 	{#snippet footer()}
 		<Button onclick={onclose}>Cancel</Button>

@@ -40,11 +40,13 @@ pub struct Company {
     pub smtp_username: String,
     pub smtp_password: String,
     pub smtp_from: String,
+    /// Satisfaction surveys on resolve.
+    pub csat_enabled: bool,
 }
 
 impl Company {
     pub const COLUMNS: &str = "company_name, session_idle_hours, require_2fa_all, auto_update_agents,
-        smtp_host, smtp_port, smtp_security, smtp_username, smtp_password, smtp_from";
+        smtp_host, smtp_port, smtp_security, smtp_username, smtp_password, smtp_from, csat_enabled";
 
     pub async fn load(db: &PgPool) -> sqlx::Result<Self> {
         sqlx::query_as(sqlx::AssertSqlSafe(format!("SELECT {} FROM company_settings", Self::COLUMNS))).fetch_one(db).await

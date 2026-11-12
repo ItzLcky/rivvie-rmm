@@ -796,8 +796,8 @@ export async function mockApi(p: Page, opts: { signedIn?: boolean } = {}) {
 		if ((m = path.match(/^\/schedules\/([^/]+)$/))) return json(schedules.find((x) => x.id === m![1]));
 		if (path.match(/^\/agents\/[^/]+\/services$/)) return json({ services, services_at: ago(3), alerting: ['nginx.service'] });
 		if (path.match(/^\/agents\/[^/]+\/log-events$/)) return json(logEvents);
-		if (path === '/tickets/summary') return json({ open: 4, mine: 1, unassigned: 2, triage: 1, waiting: 1 });
-		if (path === '/tickets/meta') return json({ boards, types: ticketTypes, technicians: [{ id: 'u-1', name: 'Dana Admin', email: admin.email, client_ids: null }, { id: 'u-2', name: 'Terry Tech', email: 'terry@northwind.example', client_ids: ['c-acme', 'c-globex'] }] });
+		if (path === '/tickets/summary') return json({ open: 4, mine: 1, unassigned: 2, triage: 1, waiting: 1, team: 0, breached: 0 });
+		if (path === '/tickets/meta') return json({ boards, types: ticketTypes, technicians: [{ id: 'u-1', name: 'Dana Admin', email: admin.email, client_ids: null }, { id: 'u-2', name: 'Terry Tech', email: 'terry@northwind.example', client_ids: ['c-acme', 'c-globex'] }], teams: [] });
 		if (path === '/tickets') return json(page(ticketList(q), Number(q.get('limit') ?? 50)));
 		if ((m = path.match(/^\/tickets\/([^/]+)$/))) return json(ticketDetail(tickets.find((t) => t.id === m![1])!));
 		if (path === '/contacts') return json(contacts.filter((c) => !q.get('client_id') || c.client_id === q.get('client_id')));
@@ -805,6 +805,26 @@ export async function mockApi(p: Page, opts: { signedIn?: boolean } = {}) {
 		if (path === '/mailboxes') return json(mailboxes);
 		if (path === '/mailboxes/inbound') return json(inboundMail);
 		if (path === '/search') return json({ agents: agents.filter((a) => a.hostname.includes(q.get('q') ?? '')).slice(0, 5).map((a) => ({ id: a.id, hostname: a.hostname, os_family: a.os_family, online: a.online, client_name: a.client_name, site_name: a.site_name })), clients: [], sites: [], scripts: [], tickets: [] });
+		if (path === '/canned-responses' || path === '/teams' || path === '/charges' || path === '/products' || path === '/sla/policies' || path === '/sla/calendars') return json([]);
+		if (path === '/time/timer') return json(null);
+		if (path === '/work-types')
+			return json([
+				{ id: 'wt-1', name: 'Remote support', rate: null, billable: true, active: true, position: 0 },
+				{ id: 'wt-2', name: 'Onsite', rate: null, billable: true, active: true, position: 1 }
+			]);
+		if (path === '/time')
+			return json(
+				q.get('ticket_id') === 't-1'
+					? [
+							{
+								id: 'te-1', user_id: 'u-1', user_name: 'Dana Admin', client_id: 'c-acme', client_name: 'Acme Corp', ticket_id: 't-1', ticket_number: 10401,
+								ticket_subject: 'Printer on the second floor prints blank pages', project_id: null, project_name: null, work_type_id: 'wt-1',
+								work_type_name: 'Remote support', started_at: ago(240), ended_at: ago(215), minutes: 25, billable: true, note: 'Restarted the spooler.',
+								coverage: null, contract_name: null, rate: null, amount: null, invoiced: false, week_start: '2026-06-15', week_status: 'open'
+							}
+						]
+					: []
+			);
 		return json({ error: `no mock for ${path}` }, 404);
 	});
 }

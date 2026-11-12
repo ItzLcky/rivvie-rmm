@@ -38,13 +38,16 @@ pub struct ContactRow {
     notes: String,
     is_primary: bool,
     portal_enabled: bool,
+    portal_all_tickets: bool,
+    portal_last_login_at: Option<DateTime<Utc>>,
+    is_billing: bool,
     open_tickets: i64,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
 
 const CONTACT_SELECT: &str = "SELECT co.id, co.client_id, c.name AS client_name, co.site_id, si.name AS site_name, co.name, co.email,
-       co.phone, co.job_title, co.notes, co.is_primary, co.portal_enabled,
+       co.phone, co.job_title, co.notes, co.is_primary, co.portal_enabled, co.portal_all_tickets, co.portal_last_login_at, co.is_billing,
        (SELECT count(*) FROM tickets t JOIN board_statuses bs ON bs.id = t.status_id
          WHERE t.contact_id = co.id AND bs.category NOT IN ('resolved', 'closed') AND t.merged_into IS NULL) AS open_tickets,
        co.created_at, co.updated_at
@@ -103,6 +106,11 @@ pub struct ContactIn {
     is_primary: bool,
     #[serde(default)]
     portal_enabled: bool,
+    #[serde(default)]
+    portal_all_tickets: bool,
+    /// Invoices are emailed to billing contacts (and they see them in the portal).
+    #[serde(default)]
+    is_billing: bool,
 }
 
 impl ContactIn {
@@ -153,8 +161,8 @@ pub async fn create_contact(State(st): State<Arc<AppState>>, u: User, Json(mut b
         sqlx::query("UPDATE contacts SET is_primary = false WHERE client_id = $1").bind(b.client_id).execute(&mut *tx).await?;
     }
     sqlx::query(
-        "INSERT INTO contacts (id, client_id, site_id, name, email, phone, job_title, notes, is_primary, portal_enabled)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+        "INSERT INTO contacts (id, client_id, site_id, name, email, phone, job_title, notes, is_primary, portal_enabled, portal_all_tickets, is_billing)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
     )
     .bind(id)
     .bind(b.client_id)
@@ -166,6 +174,8 @@ pub async fn create_contact(State(st): State<Arc<AppState>>, u: User, Json(mut b
     .bind(&b.notes)
     .bind(b.is_primary)
     .bind(b.portal_enabled)
+    .bind(b.portal_all_tickets)
+    .bind(b.is_billing)
     .execute(&mut *tx)
     .await
     .map_err(contact_conflict)?;
@@ -187,7 +197,7 @@ pub async fn update_contact(State(st): State<Arc<AppState>>, u: User, Path(id): 
     }
     sqlx::query(
         "UPDATE contacts SET site_id = $2, name = $3, email = $4, phone = $5, job_title = $6, notes = $7, is_primary = $8,
-                portal_enabled = $9, updated_at = now() WHERE id = $1",
+                portal_enabled = $9, portal_all_tickets = $10, is_billing = $11, updated_at = now() WHERE id = $1",
     )
     .bind(id)
     .bind(b.site_id)
@@ -198,9 +208,16 @@ pub async fn update_contact(State(st): State<Arc<AppState>>, u: User, Path(id): 
     .bind(&b.notes)
     .bind(b.is_primary)
     .bind(b.portal_enabled)
+    .bind(b.portal_all_tickets)
+    .bind(b.is_billing)
     .execute(&mut *tx)
     .await
     .map_err(contact_conflict)?;
+    if !b.portal_enabled || b.email != cur.email {
+        // Access removed or moved to another address: end their portal sessions.
+        sqlx::query("DELETE FROM contact_sessions WHERE contact_id = $1").bind(id).execute(&mut *tx).await?;
+        sqlx::query("UPDATE contact_login_links SET used_at = now() WHERE contact_id = $1 AND used_at IS NULL").bind(id).execute(&mut *tx).await?;
+    }
     // The name and email are part of their tickets' search text.
     sqlx::query("UPDATE tickets SET contact_id = contact_id WHERE contact_id = $1").bind(id).execute(&mut *tx).await?;
     tx.commit().await?;
@@ -282,6 +299,12 @@ pub struct BoardIn {
     description: String,
     /// In display order. Must include a New, a Resolved and a Closed status.
     statuses: Vec<StatusIn>,
+    /// New tickets go to this team.
+    #[serde(default)]
+    default_team_id: Option<Uuid>,
+    /// New tickets are announced on these notification channels.
+    #[serde(default)]
+    notify_channel_ids: Vec<Uuid>,
 }
 
 fn clean(s: &str, what: &str, max: usize) -> ApiResult<String> {
@@ -313,6 +336,23 @@ impl BoardIn {
             if !self.statuses.iter().any(|s| s.category == need) {
                 return Err(ApiError::BadRequest(format!("a board needs a status in the {need} category")));
             }
+        }
+        Ok(())
+    }
+
+    async fn check_refs(&self, db: &mut sqlx::PgConnection) -> ApiResult<()> {
+        if let Some(t) = self.default_team_id {
+            let ok: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM teams WHERE id = $1)").bind(t).fetch_one(&mut *db).await?;
+            if !ok {
+                return Err(ApiError::NotFound("team"));
+            }
+        }
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM notification_channels WHERE id = ANY($1)")
+            .bind(&self.notify_channel_ids)
+            .fetch_one(&mut *db)
+            .await?;
+        if n as usize != self.notify_channel_ids.len() {
+            return Err(ApiError::BadRequest("unknown notification channel".into()));
         }
         Ok(())
     }
@@ -380,10 +420,16 @@ pub async fn create_board(State(st): State<Arc<AppState>>, u: User, Json(b): Jso
     b.validate()?;
     let id = Uuid::new_v4();
     let mut tx = st.db.begin().await?;
-    sqlx::query("INSERT INTO boards (id, name, description, position) VALUES ($1, $2, $3, (SELECT coalesce(max(position), -1) + 1 FROM boards))")
+    b.check_refs(&mut tx).await?;
+    sqlx::query(
+        "INSERT INTO boards (id, name, description, position, default_team_id, notify_channel_ids)
+         VALUES ($1, $2, $3, (SELECT coalesce(max(position), -1) + 1 FROM boards), $4, $5)",
+    )
         .bind(id)
         .bind(clean(&b.name, "name", 100)?)
         .bind(b.description.trim())
+        .bind(b.default_team_id)
+        .bind(&b.notify_channel_ids)
         .execute(&mut *tx)
         .await
         .map_err(board_conflict)?;
@@ -397,10 +443,13 @@ pub async fn update_board(State(st): State<Arc<AppState>>, u: User, Path(id): Pa
     u.require(Role::Admin)?;
     b.validate()?;
     let mut tx = st.db.begin().await?;
-    let n = sqlx::query("UPDATE boards SET name = $2, description = $3 WHERE id = $1")
+    b.check_refs(&mut tx).await?;
+    let n = sqlx::query("UPDATE boards SET name = $2, description = $3, default_team_id = $4, notify_channel_ids = $5 WHERE id = $1")
         .bind(id)
         .bind(clean(&b.name, "name", 100)?)
         .bind(b.description.trim())
+        .bind(b.default_team_id)
+        .bind(&b.notify_channel_ids)
         .execute(&mut *tx)
         .await
         .map_err(board_conflict)?
@@ -504,6 +553,11 @@ pub struct MailboxRow {
     board_name: String,
     auto_reply: bool,
     enabled: bool,
+    graph_tenant: String,
+    graph_client_id: String,
+    /// The Graph client secret is never sent back either.
+    has_graph_secret: bool,
+    graph_send: bool,
     last_polled_at: Option<DateTime<Utc>>,
     last_error: Option<String>,
     received_24h: i64,
@@ -512,6 +566,7 @@ pub struct MailboxRow {
 
 const MAILBOX_SELECT: &str = "SELECT m.id, m.name, m.address, m.kind, m.imap_host, m.imap_port, m.imap_security, m.imap_username,
        m.imap_password <> '' AS has_password, m.imap_folder, m.board_id, b.name AS board_name, m.auto_reply, m.enabled,
+       m.graph_tenant, m.graph_client_id, m.graph_secret IS NOT NULL AS has_graph_secret, m.graph_send,
        m.last_polled_at, m.last_error,
        (SELECT count(*) FROM email_messages e WHERE e.mailbox_id = m.id AND e.created_at > now() - interval '24 hours') AS received_24h,
        m.created_at
@@ -549,6 +604,14 @@ pub struct MailboxIn {
     auto_reply: bool,
     #[serde(default = "yes")]
     enabled: bool,
+    #[serde(default)]
+    graph_tenant: String,
+    #[serde(default)]
+    graph_client_id: String,
+    /// Omit (or null) to keep the stored secret.
+    graph_secret: Option<String>,
+    #[serde(default = "yes")]
+    graph_send: bool,
 }
 
 fn yes() -> bool {
@@ -572,6 +635,14 @@ impl MailboxIn {
                 }
                 if self.imap_port.is_some_and(|p| !(1..=65535).contains(&p)) {
                     return Err(ApiError::BadRequest("port must be 1-65535".into()));
+                }
+            }
+            "graph" => {
+                self.graph_tenant = self.graph_tenant.trim().to_string();
+                self.graph_client_id = self.graph_client_id.trim().to_string();
+                let ok = |s: &str| !s.is_empty() && s.len() <= 100 && s.chars().all(|c| c.is_ascii_alphanumeric() || "-._".contains(c));
+                if !ok(&self.graph_tenant) || !ok(&self.graph_client_id) {
+                    return Err(ApiError::BadRequest("Microsoft 365 mailboxes need the tenant (directory) ID and the app's client ID".into()));
                 }
             }
             other => return Err(ApiError::BadRequest(format!("unknown mailbox type {other}"))),
@@ -598,10 +669,22 @@ pub async fn create_mailbox(State(st): State<Arc<AppState>>, u: User, Json(mut b
     b.validate(&st).await?;
     let id = Uuid::new_v4();
     let token = (b.kind == "webhook").then(auth::random_token);
+    let secret = b.graph_secret.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    if b.kind == "graph" && secret.is_none() {
+        return Err(ApiError::BadRequest("enter the app's client secret".into()));
+    }
+    let (secret, sealed) = match secret {
+        Some(s) => {
+            let (v, sealed) = crate::crypto::store(st.cfg.data_key.as_ref(), s.as_bytes());
+            (Some(v), sealed)
+        }
+        None => (None, false),
+    };
     sqlx::query(
         "INSERT INTO mailboxes (id, name, address, kind, imap_host, imap_port, imap_security, imap_username, imap_password, imap_folder,
-                                webhook_token_hash, board_id, auto_reply, enabled)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+                                webhook_token_hash, board_id, auto_reply, enabled, graph_tenant, graph_client_id, graph_secret,
+                                graph_secret_sealed, graph_send)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)",
     )
     .bind(id)
     .bind(&b.name)
@@ -617,6 +700,11 @@ pub async fn create_mailbox(State(st): State<Arc<AppState>>, u: User, Json(mut b
     .bind(b.board_id)
     .bind(b.auto_reply)
     .bind(b.enabled)
+    .bind(&b.graph_tenant)
+    .bind(&b.graph_client_id)
+    .bind(secret)
+    .bind(sealed)
+    .bind(b.graph_send)
     .execute(&st.db)
     .await
     .map_err(mailbox_conflict)?;
@@ -635,9 +723,12 @@ pub async fn update_mailbox(State(st): State<Arc<AppState>>, u: User, Path(id): 
         return Err(ApiError::BadRequest("a mailbox's type can't change; create a new one".into()));
     }
     b.validate(&st).await?;
+    let secret = b.graph_secret.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(|s| crate::crypto::store(st.cfg.data_key.as_ref(), s.as_bytes()));
     sqlx::query(
         "UPDATE mailboxes SET name = $2, address = $3, imap_host = $4, imap_port = $5, imap_security = $6, imap_username = $7,
                 imap_password = coalesce($8, imap_password), imap_folder = $9, board_id = $10, auto_reply = $11, enabled = $12,
+                graph_tenant = $13, graph_client_id = $14, graph_secret = coalesce($15, graph_secret),
+                graph_secret_sealed = CASE WHEN $15::bytea IS NULL THEN graph_secret_sealed ELSE $16 END, graph_send = $17,
                 last_error = NULL
           WHERE id = $1",
     )
@@ -653,6 +744,11 @@ pub async fn update_mailbox(State(st): State<Arc<AppState>>, u: User, Path(id): 
     .bind(b.board_id)
     .bind(b.auto_reply)
     .bind(b.enabled)
+    .bind(&b.graph_tenant)
+    .bind(&b.graph_client_id)
+    .bind(secret.as_ref().map(|s| s.0.clone()))
+    .bind(secret.as_ref().is_some_and(|s| s.1))
+    .bind(b.graph_send)
     .execute(&st.db)
     .await
     .map_err(mailbox_conflict)?;
@@ -678,8 +774,8 @@ pub async fn poll_mailbox(State(st): State<Arc<AppState>>, u: User, Path(id): Pa
         .fetch_optional(&st.db)
         .await?
         .ok_or(ApiError::NotFound("mailbox"))?;
-    if mb.kind != "imap" {
-        return Err(ApiError::BadRequest("only IMAP mailboxes are polled".into()));
+    if mb.kind == "webhook" {
+        return Err(ApiError::BadRequest("webhook mailboxes aren't polled".into()));
     }
     Ok(Json(match crate::email::poll_now(&st, &mb).await {
         Ok(n) => json!({ "ok": true, "filed": n }),

@@ -209,6 +209,7 @@ to SYSTEM and Administrators. Windows service logs go to `C:\ProgramData\RMM\log
 | `RMM_S3_BUCKET` | empty | Store those files in an S3-compatible bucket instead. With `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `RMM_S3_REGION` (default `us-east-1`), and `RMM_S3_ENDPOINT` for MinIO and other non-AWS stores (path-style URLs then; `RMM_S3_PATH_STYLE` overrides) |
 | `RMM_MAIL_POLL_SECS` | `60` | How often IMAP support mailboxes are checked |
 | `RMM_TICKET_CLOSE_DAYS` | `7` | Resolved tickets move to Closed after this |
+| `RMM_PUBLIC_URL` callbacks | | QuickBooks and Xero redirect to `<RMM_PUBLIC_URL>/api/billing/accounting/qbo/callback` (or `/xero/callback`): register that in the provider's developer portal. For the QuickBooks sandbox set `RMM_QBO_API_URL=https://sandbox-quickbooks.api.intuit.com` |
 | `RMM_EMAIL_RAW_DAYS` | `90` | Raw MIME of inbound mail is deleted after this (the ticket keeps the text and attachments) |
 | `RMM_DATA_KEY` | empty (required by the compose files) | 32 bytes, hex or base64 (`openssl rand -hex 32`). Encrypts two-factor secrets and detection context at rest. Secrets stored before it was set are encrypted at the next start. Keep a copy off the server: if it's lost, users with 2FA can't sign in until `rmm-server reset2fa` clears it, and the server refuses to start without it once anything has been encrypted |
 | `RMM_TRUSTED_PROXIES` | empty | Reverse proxies whose `X-Forwarded-For` gives the client IP (for rate limiting and the audit log): comma-separated addresses/CIDRs, or `private` for loopback + RFC 1918 + IPv6 ULA. The bundled compose stack sets `private` for Caddy |
@@ -365,8 +366,9 @@ and support mailboxes are under Company settings → Service desk.
   the same alert on the same agent adds to its open ticket; a return after it was resolved reopens
   it. Optionally the ticket resolves itself when the alert clears, unless a person has worked it
   or the alert has come back three times.
-- **Email:** support mailboxes receive mail over IMAP (polled every minute, messages marked read)
-  or a provider webhook (`POST /api/inbound/email/<secret>`: raw MIME, Postmark JSON with the raw
+- **Email:** support mailboxes receive mail over IMAP (polled every minute, messages marked read),
+  Microsoft 365 over Graph (an Entra app with Mail.ReadWrite and Mail.Send; replies are sent through
+  the mailbox too, since basic-auth SMTP is usually off there), or a provider webhook (`POST /api/inbound/email/<secret>`: raw MIME, Postmark JSON with the raw
   email, or a Mailgun `mime` route). Replies thread by the `[T-10423]` subject tag, then by
   `In-Reply-To`/`References`; quoted history is stripped. Senders are matched to contacts by
   address, then to clients by their email domains; unknown senders land in **Triage** (visible only
@@ -377,11 +379,67 @@ and support mailboxes are under Company settings → Service desk.
 - **Contacts** belong to a client (Clients → a client → Contacts). They're never created from mail
   automatically.
 - Search covers ticket numbers, subjects, every timeline entry and contact names (Postgres full
-  text), in the Tickets list and the command palette. Bulk actions: assign, status, priority; and
-  merge duplicates from a ticket's menu.
+  text), in the Tickets list and the command palette. Bulk actions: assign, status, priority, team;
+  merge duplicates from a ticket's menu, or split one message off into a new ticket.
+- **Teams** (Company settings → Service desk): tickets can belong to a team as well as a person,
+  boards can default new tickets to one, and members get a "My teams" view. Boards can also announce
+  new tickets on notification channels.
+- **Canned responses and macros:** saved replies with `{{contact.first_name}}`, `{{ticket.number}}`
+  and similar variables, inserted from the reply box; a macro also sets the status, priority or
+  assignee when the reply goes out. Shared ones are managed by admins, everyone can keep their own.
+- **SLAs** (Company settings → SLAs): policies with first-response, update and resolution targets per
+  priority, in business hours (a time zone, opening hours and holidays) or around the clock. The
+  default policy covers clients without one of their own, a client can have its own, and an active
+  contract's policy comes first. Deadlines are stored on the ticket (so the list sorts by them and has
+  "SLA missed" and "Due soon" views); the clock stops while a ticket waits on the client or sits
+  resolved. At 75% of a target, and again on a breach, the policy's notification channels and the
+  assignee hear about it, and the timeline records it.
+- **Satisfaction surveys:** when switched on, each resolved ticket's contact gets one email with
+  Good / Bad links (no sign-in); answers show on the ticket and in reports.
 
-Not yet: Microsoft 365 mailboxes (they need OAuth or Graph; forward their mail to a webhook mailbox
-meanwhile), SLAs, time tracking and billing, and the client portal. See the roadmap.
+### Client portal
+
+Contacts with portal access (on the client's Contacts tab, which can also send an invitation) sign in
+at `/portal` with a one-time link emailed to them, or a password they set, optionally with a TOTP
+code. Portal sessions are separate from technician sessions (their own table and a cookie scoped to
+`/api/portal`), and everything is limited to the contact's client. Contacts see and reply to their
+tickets (primary contacts, and contacts allowed to, see all of the client's), open new requests with
+attachments, mark a ticket resolved, read public knowledge base articles, and, when the client allows
+it, a read-only list of the client's devices. Billing contacts also see the client's invoices.
+
+## Time and billing
+
+Billing pages and amounts need the `billing.read` / `billing.manage` permissions (admins by default;
+give them to others under Users → Permissions). Technicians log time without seeing rates.
+
+- **Time:** a timer or entries by hand, on a ticket, a project or a client, with a work type (remote,
+  onsite, after hours, …) and a billable flag. Time on a ticket is noted on its timeline, and the note
+  can go out as a reply. Technicians submit a week; someone with `time.approve` approves or rejects
+  it. Submitted weeks are locked, and billed time is locked for good.
+- **Rates**, first match wins: the contract's rate for the work type, the technician's work role, the
+  work type's rate, the technician's own rate, the company default.
+- **Contracts** per client: per device (counted from the enrolled agents on the run date, optionally
+  only workstations or servers), per user, block hours (a bank bought each cycle, drawn down by
+  approved time; the rest bills at the overage rate; the account manager is warned when it runs low),
+  time and materials, and flat recurring fees with items. Monthly, quarterly or annual cycles aligned
+  to the calendar, prorated by day for contracts starting or ending mid-cycle. Covered work types are
+  free on per-device, per-user and recurring contracts.
+- **Invoices** (Billing): the invoice run makes a draft per client with the cycles due, device and
+  user counts (snapshotted on the line), approved billable time and products sold on tickets.
+  Nothing is billed twice; deleting a draft gives it all back. Drafts can be edited; finalising gives
+  them a number without gaps (from a locked counter) and a PDF that never changes, and they can be
+  emailed to the client's billing contacts with the PDF attached. Corrections are credit notes.
+  Money is integer minor units with a currency per client (the company's by default).
+- **Accounting:** connect QuickBooks Online or Xero (Company settings → Billing) over OAuth; finalised
+  invoices and credit notes are pushed with their customers, and payments come back, every 10
+  minutes or on demand. Tax comes from the accounting system's defaults.
+- **Projects** with tasks (which can become tickets), a budget in hours and a burn-down from the time
+  logged on the project and its tickets; a **schedule** of who works on what, when; **client
+  documentation** pages with their history (Clients → a client → Docs); and **reports**: service desk
+  volume, backlog age, response and resolution times, SLA attainment and satisfaction; utilisation;
+  client profitability; and a quarterly business review PDF per client.
+
+Not built: a password vault (it would need its own security review first).
 
 ## Remote desktop
 

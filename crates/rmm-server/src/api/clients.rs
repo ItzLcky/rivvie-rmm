@@ -31,14 +31,18 @@ pub struct ClientOut {
     email_domains: Vec<String>,
     /// Gets new detection content before everyone else.
     security_canary: bool,
+    /// null: the default SLA policy.
+    sla_policy_id: Option<Uuid>,
+    /// The client portal lists the client's devices.
+    portal_devices: bool,
     sites: Vec<SiteRow>,
 }
 
 /// Clients (all visible ones, or just `only`) with their sites and agent counts.
 async fn load(st: &AppState, u: &User, only: Option<Uuid>) -> ApiResult<Vec<ClientOut>> {
     #[allow(clippy::type_complexity)]
-    let clients: Vec<(Uuid, String, DateTime<Utc>, bool, Vec<String>, bool)> = sqlx::query_as(
-        "SELECT id, name, created_at, desktop_consent, email_domains, security_canary FROM clients
+    let clients: Vec<(Uuid, String, DateTime<Utc>, bool, Vec<String>, bool, Option<Uuid>, bool)> = sqlx::query_as(
+        "SELECT id, name, created_at, desktop_consent, email_domains, security_canary, sla_policy_id, portal_devices FROM clients
           WHERE ($1::uuid[] IS NULL OR id = ANY($1)) AND ($2::uuid IS NULL OR id = $2) ORDER BY lower(name)",
     )
     .bind(u.scope())
@@ -60,13 +64,15 @@ async fn load(st: &AppState, u: &User, only: Option<Uuid>) -> ApiResult<Vec<Clie
     let mut out: Vec<ClientOut> =
         clients
         .into_iter()
-        .map(|(id, name, created_at, desktop_consent, email_domains, security_canary)| ClientOut {
+        .map(|(id, name, created_at, desktop_consent, email_domains, security_canary, sla_policy_id, portal_devices)| ClientOut {
             id,
             name,
             created_at,
             desktop_consent,
             email_domains,
             security_canary,
+            sla_policy_id,
+            portal_devices,
             sites: vec![],
         })
         .collect();

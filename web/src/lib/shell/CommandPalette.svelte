@@ -8,7 +8,7 @@
 	import { setPref } from '#lib/prefs.svelte.js';
 	import { recentAgents } from '#lib/recent.js';
 	import { currentClient, withClient } from '#lib/scope.svelte.js';
-	import { can } from '#lib/session.svelte.js';
+	import { allowed, can } from '#lib/session.svelte.js';
 	import type { SearchResults } from '#lib/types.js';
 	import { qs } from '#lib/url.svelte.js';
 	import OsIcon from '#lib/components/OsIcon.svelte';
@@ -74,7 +74,7 @@
 			{ id: 'keys', label: 'Keyboard shortcuts', icon: Keyboard, hint: '?', run: () => ((open = false), onshortcuts()) }
 		].filter((a) => a.show !== false)
 	);
-	const pages = nav.flatMap((g) => g.items).filter((i) => !i.role || can(i.role));
+	const pages = nav.flatMap((g) => g.items).filter((i) => (!i.role || can(i.role)) && (!i.perm || allowed(i.perm)));
 
 	const q = $derived(query.trim().toLowerCase());
 	const matches = (s: string) => !q || s.toLowerCase().includes(q);

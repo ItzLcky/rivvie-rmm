@@ -8,28 +8,37 @@ use crate::state::AppState;
 pub mod access;
 mod agents;
 mod alerts;
+mod billing;
 mod channels;
 mod auth;
 mod clients;
+mod desk;
 mod downloads;
+mod kb;
 mod jobs;
 mod msi;
 mod mutes;
 mod packages;
 mod schedules;
 mod patches;
+mod pm;
+pub(crate) mod portal;
+mod reports;
 mod search;
 mod scripts;
 mod security;
 mod servicedesk;
 mod services;
 mod settings;
+pub(crate) mod sla;
 pub(crate) mod tickets;
+mod time;
 mod tools;
 mod totp;
 pub(crate) mod users;
 
 pub use jobs::{FAILED as JOB_FAILED, deliver as deliver_job};
+pub use portal::PORTAL_LINK_MINUTES;
 pub use totp::{clear as clear_totp, seal_existing as seal_totp_secrets};
 pub use users::create_user as create_user_cli;
 
@@ -186,6 +195,98 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/mailboxes/{id}/poll", post(servicedesk::poll_mailbox))
         .route("/mailboxes/{id}/rotate-token", post(servicedesk::rotate_mailbox_token))
         .route("/inbound/email/{token}", post(servicedesk::inbound))
+        .route("/tickets/{id}/split", post(tickets::split))
+        .route("/tickets/{id}/canned/{cid}", get(desk::render_canned))
+        .route("/teams", get(desk::list_teams).post(desk::create_team))
+        .route("/teams/{id}", axum::routing::put(desk::update_team).delete(desk::remove_team))
+        .route("/canned-responses", get(desk::list_canned).post(desk::create_canned))
+        .route("/canned-responses/{id}", axum::routing::put(desk::update_canned).delete(desk::remove_canned))
+        .route("/settings/service-desk", get(desk::get_settings).put(desk::update_settings))
+        .route("/sla/calendars", get(sla::calendars).post(sla::create_calendar))
+        .route("/sla/calendars/{id}", axum::routing::put(sla::update_calendar).delete(sla::remove_calendar))
+        .route("/sla/policies", get(sla::policies).post(sla::create_policy))
+        .route("/sla/policies/{id}", axum::routing::put(sla::update_policy).delete(sla::remove_policy))
+        .route("/clients/{id}/service", axum::routing::put(sla::set_client))
+        .route("/kb", get(kb::list).post(kb::create))
+        .route("/kb/{id}", get(kb::get).put(kb::update).delete(kb::remove))
+        .route("/contacts/{id}/portal-invite", post(portal::invite))
+        .route("/contacts/{id}/portal-credentials", delete(portal::reset_credentials))
+        .route("/feedback/{token}", get(portal::feedback).post(portal::answer_feedback))
+        .route("/portal/info", get(portal::public_info))
+        .route("/portal/auth/link", post(portal::request_link))
+        .route("/portal/auth/verify", post(portal::verify))
+        .route("/portal/auth/login", post(portal::login))
+        .route("/portal/auth/logout", post(portal::logout))
+        .route("/portal/me", get(portal::me))
+        .route("/portal/account/password", post(portal::set_password))
+        .route("/portal/account/totp/setup", post(portal::totp_setup))
+        .route("/portal/account/totp/enable", post(portal::totp_enable))
+        .route("/portal/account/totp/disable", post(portal::totp_disable))
+        .route("/portal/tickets", get(portal::tickets).post(portal::create_ticket))
+        .route("/portal/tickets/{id}", get(portal::ticket))
+        .route("/portal/tickets/{id}/messages", post(portal::add_message))
+        .route("/portal/tickets/{id}/resolve", post(portal::resolve))
+        .route("/portal/tickets/{id}/attachments/{aid}", get(portal::download))
+        .route("/portal/kb", get(portal::kb))
+        .route("/portal/kb/{id}", get(portal::kb_article))
+        .route("/portal/devices", get(portal::devices))
+        .route("/portal/invoices", get(portal::invoices))
+        .route("/portal/invoices/{id}/pdf", get(portal::invoice_pdf))
+        .route("/time", get(time::list).post(time::create))
+        .route("/time/{id}", axum::routing::put(time::update).delete(time::remove))
+        .route("/time/timer", get(time::timer))
+        .route("/time/timer/start", post(time::start))
+        .route("/time/timer/stop", post(time::stop))
+        .route("/timesheets", get(time::week))
+        .route("/timesheets/submit", post(time::submit))
+        .route("/timesheets/pending", get(time::pending))
+        .route("/timesheets/{id}/approve", post(time::approve))
+        .route("/timesheets/{id}/reject", post(time::reject))
+        .route("/work-types", get(billing::work_types).put(billing::save_work_types))
+        .route("/work-roles", get(billing::work_roles).post(billing::create_work_role))
+        .route("/work-roles/{id}", axum::routing::put(billing::update_work_role).delete(billing::remove_work_role))
+        .route("/billing/rates", get(billing::user_rates))
+        .route("/users/{id}/rates", axum::routing::put(billing::set_user_rates))
+        .route("/products", get(billing::products).post(billing::create_product))
+        .route("/products/{id}", axum::routing::put(billing::update_product).delete(billing::remove_product))
+        .route("/contracts", get(billing::contracts).post(billing::create_contract))
+        .route("/contracts/{id}", get(billing::contract).put(billing::update_contract).delete(billing::remove_contract))
+        .route("/contracts/{id}/bank", post(billing::adjust_bank))
+        .route("/charges", get(billing::charges).post(billing::create_charge))
+        .route("/charges/{id}", delete(billing::remove_charge))
+        .route("/invoices", get(billing::invoices).post(billing::create_invoice))
+        .route("/invoices/run", post(billing::run))
+        .route("/invoices/{id}", get(billing::invoice).patch(billing::update_invoice).delete(billing::remove_invoice))
+        .route("/invoices/{id}/lines", post(billing::add_line))
+        .route("/invoices/{id}/lines/{lid}", axum::routing::put(billing::update_line).delete(billing::remove_line))
+        .route("/invoices/{id}/pdf", get(billing::pdf))
+        .route("/invoices/{id}/finalise", post(billing::finalise))
+        .route("/invoices/{id}/send", post(billing::send))
+        .route("/invoices/{id}/paid", post(billing::mark_paid))
+        .route("/invoices/{id}/void", post(billing::void))
+        .route("/invoices/{id}/credit", post(billing::credit))
+        .route("/settings/billing", get(billing::get_settings).put(billing::update_settings))
+        .route("/clients/{id}/billing", get(billing::get_client_billing).put(billing::set_client_billing))
+        .route("/billing/accounting", get(billing::accounting).delete(billing::disconnect_accounting))
+        .route("/billing/accounting/sync", post(billing::sync_accounting))
+        .route("/billing/accounting/{provider}", axum::routing::put(billing::save_accounting))
+        .route("/billing/accounting/{provider}/connect", post(billing::connect_accounting))
+        .route("/billing/accounting/{provider}/callback", get(billing::accounting_callback))
+        .route("/billing/overview", get(reports::billing_overview))
+        .route("/schedule", get(pm::schedule).post(pm::create_schedule))
+        .route("/schedule/{id}", axum::routing::put(pm::update_schedule).delete(pm::remove_schedule))
+        .route("/projects", get(pm::projects).post(pm::create_project))
+        .route("/projects/{id}", get(pm::project).put(pm::update_project).delete(pm::remove_project))
+        .route("/projects/{id}/tasks", post(pm::create_task))
+        .route("/projects/{id}/tasks/{tid}", axum::routing::put(pm::update_task).delete(pm::remove_task))
+        .route("/projects/{id}/tasks/{tid}/ticket", post(pm::task_ticket))
+        .route("/clients/{id}/docs", get(pm::docs).post(pm::create_doc))
+        .route("/docs/{id}", get(pm::doc).put(pm::update_doc).delete(pm::remove_doc))
+        .route("/docs/{id}/revisions/{rev}", get(pm::revision))
+        .route("/reports/service-desk", get(reports::service_desk))
+        .route("/reports/utilisation", get(reports::utilisation))
+        .route("/reports/profitability", get(reports::profitability))
+        .route("/reports/qbr/{id}", get(reports::qbr))
         .route("/agents/{id}/processes", get(tools::processes))
         .route("/agents/{id}/processes/{pid}/kill", post(tools::kill))
         .route("/agents/{id}/files", get(tools::list))

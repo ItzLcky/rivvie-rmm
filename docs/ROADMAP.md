@@ -12,7 +12,7 @@ Last reviewed 2026-11-12.
 | 4. Monitoring and alerting | Done |
 | 5. Patch management | Done |
 | 6. Remote desktop | v1 done (X11 and Windows GDI) |
-| 7. PSA | Milestones 1-2 done (service desk, email, alert → ticket); 3-7 to do |
+| 7. PSA | Milestones 1-7 done (blocks 4 and 6 below); password vault not built |
 | 8. Endpoint protection | Milestones 1-7 done; Windows and macOS sensor untested |
 
 What's built works end to end on Linux and is covered by unit tests, the e2e suite (`crates/rmm-server/tests/e2e.rs`) and the Playwright visual and accessibility tests. The biggest gap is that **no Windows code path has run on a real Windows host.** Windows is where most MSP fleets are, so that comes first.
@@ -44,7 +44,7 @@ Every Windows feature is compile-checked (clippy via mingw) and unit-tested agai
 - [x] **Windows Job Objects** for jobs and shells (`crates/rmm-agent/src/winjob.rs`). Jobs: a timeout kills the tree, but what a script leaves running survives it, as on Unix. Shells: kill-on-close, so closing the terminal kills everything started from it. Compile-checked only.
 - [x] **Persist the agent's job buffer to disk** (`job-results` in the state directory): results survive an agent restart, and a job that was running when the agent stopped is reported as `error` with its output instead of `lost`.
 - [x] **Encrypt TOTP secrets at rest** with `RMM_DATA_KEY` (`users.totp_sealed`); plaintext rows are sealed at startup, and the server refuses to start if sealed secrets exist but the key is missing. `RMM_DATA_KEY` is required by both production compose files.
-- [ ] **Attachments and uploads over 8 MB**: a per-route body limit or chunked upload, instead of the global request limit.
+- [ ] **Attachments and uploads over 8 MB** (agent file uploads stream since block 3; ticket and portal attachments are still under the 8 MB request limit): a per-route body limit or chunked upload, instead of the global request limit.
 - [ ] **Load test the server**: simulate 1,000 and 10,000 agents (metrics, heartbeats, jobs, SSE clients) and record CPU, memory, Postgres size per agent per day, and alert evaluation time. Sets the honest per-node limit and tells us whether horizontal scaling (below) is urgent.
 - [ ] **Server observability**: a Prometheus `/metrics` endpoint (connected agents, hub queue depths, outbox backlog, alert eval duration, request latency) and JSON logs.
 - [ ] **Upgrade path**: a CI job that migrates a database built by the previous release and runs the e2e suite against it. Document backup → upgrade → rollback in the README.
@@ -65,11 +65,12 @@ Small items from earlier phases that technicians notice quickly. Done 2026-11-12
 
 ### 4. PSA milestones 3-4: portal and SLAs
 
-See [design/psa.md](design/psa.md) for the data model and details.
+Done 2026-11-12 (migration `0016_portal_sla.sql`); covered by unit tests and the e2e suite (`portal_and_sla`). See [design/psa.md](design/psa.md).
 
-- [ ] **Client portal** (`/portal`): separate contact auth (magic link; password + TOTP optional), view/reply/open tickets with attachments, public KB articles, optional device status list per client.
-- [ ] **SLA engine**: policies per priority, business calendars and holidays, `respond_by`/`update_by`/`resolve_by` stored on the ticket, pause in `waiting_client`, 75% warnings and breaches through notification channels.
-- [ ] Left over from milestones 1-2: Microsoft Graph mailboxes (or IMAP XOAUTH2), since basic-auth IMAP is off in M365; teams for assignment; split a reply into a new ticket; canned responses and macros; CSAT survey; per-board new-ticket notifications.
+- [x] **Client portal** (`/portal`): contact sign-in by emailed one-time link, or a password plus optional TOTP; sessions in their own table with a cookie scoped to `/api/portal`, so neither session type reaches the other's API. Tickets (own, or all of the client's for primary contacts), replies and new requests with attachments, "mark resolved", public KB articles (all clients or one), and a device status list when the client allows it. Invitations and credential resets from the client's Contacts tab.
+- [x] **SLA engine**: policies with respond / update / resolve targets per priority, business calendars (time zone, opening hours, holidays) or around the clock, default and per-client policies (an active contract's first). Deadlines and 75% points are stored on the ticket; the clock pauses in Waiting on client and Resolved; warnings and breaches go to the policy's channels, the assignee and the timeline. List sorting by due, "SLA missed" and "Due soon" views.
+- [x] Left over from milestones 1-2: Microsoft 365 mailboxes over Graph (receive and send; app secret sealed with `RMM_DATA_KEY`), teams (assignment, board defaults, "My teams"), split a message into a new ticket, canned responses and macros with variables, CSAT surveys (one-click links, results on the ticket and in reports), per-board new-ticket notifications.
+- Not run against real Microsoft 365 or real mail clients' rendering yet: the Graph flow is tested against a stand-in of the token, list, `$value`, mark-read and `sendMail` endpoints.
 
 ### 5. Platform: API, SSO and organisation
 
@@ -81,9 +82,12 @@ See [design/psa.md](design/psa.md) for the data model and details.
 
 ### 6. PSA milestones 5-7: time, contracts and billing
 
-- [ ] Time entries, timer, work types and rates, contract types and coverage, timesheet approval. Add the billing permission sets first.
-- [ ] Invoice runs with device counts from the RMM, finalisation, PDFs, QuickBooks Online/Xero sync. Decide currency per client before the invoice tables.
-- [ ] Scheduling, projects, client documentation, reporting and QBR PDFs. The password vault, if built, comes last with its own security review.
+Done 2026-11-12 (migration `0017_billing.sql`); covered by unit tests and the e2e suite (`billing`).
+
+- [x] Permission sets `billing.read`, `billing.manage`, `time.approve` (admins by default); technicians log time and sell catalog items without seeing rates. Time entries and a timer on tickets, projects or clients; work types and roles; rate lookup (contract override → work role → work type → technician → company); contract types per device (agent count snapshotted, workstations/servers), per user, block hours (bank, overage, low-balance warning), time and materials, recurring with items; covered work types; weekly timesheets with submit / approve / reject.
+- [x] Invoice runs (calendar-aligned cycles, prorated by day, each cycle billed once), draft editing, finalisation with gapless numbers and a stored PDF (our own small PDF writer, no dependency), email to billing contacts with the PDF, paid / void, credit notes. Currency per client (company default). QuickBooks Online and Xero: OAuth connect, push invoices, credit notes and customers, pull payment status every 10 minutes.
+- [x] Scheduling (who, when, linked to a ticket or project), projects with phases and tasks (task → ticket) and budget burn-down, client documentation with revisions, reports (service desk, utilisation, profitability) and a QBR PDF per client. Billing contacts see invoices in the portal.
+- Not done: the password vault (needs its own design and security review), tax calculation (left to the accounting system by design), payment links. QuickBooks and Xero are tested against stand-ins of their OAuth and API endpoints, not the real services: try a QuickBooks sandbox company and a Xero demo organisation before relying on it.
 
 ### 7. Reach: more devices and platforms
 
@@ -102,6 +106,7 @@ Worth doing, but not until the above is in place:
 - **Patches:** Arch security data (`arch-audit`), Ubuntu Pro/ESM, Windows feature-update targeting.
 - **Remote desktop:** clipboard sync and file drop; remote cursor shape; H.264 with hardware encoders and DXGI capture; WebRTC peer-to-peer with TURN fallback; session recording to object storage, a "being watched" indicator and view-only sessions.
 - **Endpoint protection:** ETW on Windows instead of polling; ClamAV on-access detections and the XProtect Remediator log; mass-encryption detection beyond decoys (fanotify, minifilter/ETW file events); rollback of Run keys, services and scheduled tasks; a measured performance budget on low-end hardware and an adversary-emulation lab run; a licensed hash/threat-intel feed; ingesting detections from other EDRs.
+- **PSA:** a password vault (envelope encryption, reveal with audit and 2FA, its own security review); two-way calendar sync for the schedule; Stripe payment links on invoices; per-client purge of closed tickets for GDPR requests.
 - **Integrations:** HaloPSA, ConnectWise Manage and Autotask sync for MSPs keeping their own PSA; asset warranty lookups; M365 licence counts for per-user contracts.
 
 ## Done

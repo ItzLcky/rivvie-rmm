@@ -61,6 +61,10 @@ export interface Client {
 	email_domains: string[];
 	/** Gets new security content first (canary ring). */
 	security_canary?: boolean;
+	/** null: the default SLA policy. */
+	sla_policy_id?: string | null;
+	/** The client portal lists this client's devices. */
+	portal_devices?: boolean;
 }
 
 export type Interpreter = 'bash' | 'sh' | 'powershell' | 'cmd' | 'python';
@@ -250,10 +254,14 @@ export type Priority = 1 | 2 | 3 | 4;
 export type StatusCategory = 'new' | 'open' | 'waiting_client' | 'waiting_vendor' | 'resolved' | 'closed';
 export type TicketSource = 'dashboard' | 'email' | 'alert' | 'portal' | 'api';
 export interface BoardStatus { id: string; name: string; category: StatusCategory; position: number }
-export interface Board { id: string; name: string; description: string; position: number; statuses: BoardStatus[]; open_tickets: number }
+export interface Board {
+	id: string; name: string; description: string; position: number; statuses: BoardStatus[]; open_tickets: number;
+	default_team_id: string | null; notify_channel_ids: string[];
+}
+export interface Team { id: string; name: string; member_ids: string[]; open_tickets: number }
 export interface TicketType { id: string; name: string; position: number }
 export interface Technician { id: string; name: string; email: string; client_ids: string[] | null }
-export interface TicketMeta { boards: Board[]; types: TicketType[]; technicians: Technician[] }
+export interface TicketMeta { boards: Board[]; types: TicketType[]; technicians: Technician[]; teams: Team[] }
 
 export interface Ticket {
 	id: string; number: number; subject: string; client_id: string | null; client_name: string | null; site_id: string | null; site_name: string | null;
@@ -263,8 +271,16 @@ export interface Ticket {
 	requester_name: string; requester_email: string; created_at: string; updated_at: string; first_response_at: string | null;
 	resolved_at: string | null; closed_at: string | null; merged_into: string | null; merged_into_number: number | null;
 	alert_policy_id: string | null; alert_reopens: number; agent_count: number;
+	team_id: string | null; team_name: string | null;
+	sla_policy_id: string | null; sla_policy_name: string | null; respond_by: string | null; update_by: string | null; resolve_by: string | null;
+	/** Waiting on the client (or resolved): the clock is stopped. */
+	sla_paused: boolean; sla_warned: SlaTarget[]; sla_breached: SlaTarget[];
+	/** The next deadline still running. */
+	sla_due: string | null;
+	csat_rating: 'good' | 'bad' | null;
 }
-export type TicketEventKind = 'created' | 'reply' | 'message' | 'note' | 'change' | 'alert' | 'job' | 'session' | 'merge' | 'agent';
+export type SlaTarget = 'respond' | 'update' | 'resolve';
+export type TicketEventKind = 'created' | 'reply' | 'message' | 'note' | 'change' | 'alert' | 'job' | 'session' | 'merge' | 'agent' | 'sla' | 'split' | 'csat' | 'time';
 export interface TicketEvent {
 	id: number; kind: TicketEventKind; public: boolean; author_id: string | null; author_contact_id: string | null;
 	author_kind: 'user' | 'contact' | 'system'; author_name: string; body: string; data: Record<string, unknown>; created_at: string;
@@ -279,19 +295,40 @@ export interface TicketDetail extends Ticket {
 	events: TicketEvent[]; attachments: TicketAttachment[]; agents: TicketAgent[]; statuses: BoardStatus[];
 	/** Where a public reply is emailed, if anywhere. */
 	reply_to: string | null;
+	csat: { email: string; sent_at: string; rating: 'good' | 'bad' | null; comment: string; answered_at: string | null } | null;
 }
-export interface TicketSummary { open: number; mine: number; unassigned: number; triage: number; waiting: number }
+export interface TicketSummary { open: number; mine: number; unassigned: number; triage: number; waiting: number; team: number; breached: number }
+
+export interface CannedResponse {
+	id: string; name: string; body: string; kind: 'reply' | 'note'; status_category: StatusCategory | null; priority: Priority | null;
+	assign: 'me' | 'none' | null; owner_id: string | null; updated_at: string;
+}
+export interface SlaTargets { priority: Priority; respond_mins: number | null; update_mins: number | null; resolve_mins: number | null }
+export interface SlaPolicy {
+	id: string; name: string; calendar_id: string | null; calendar_name: string | null; is_default: boolean; channel_ids: string[];
+	notify_assignee: boolean; targets: SlaTargets[]; clients: number; open_tickets: number;
+}
+/** Monday first; [start, end] minutes from local midnight. */
+export type WeekHours = [number, number][][];
+export interface BusinessCalendar { id: string; name: string; timezone: string; hours: WeekHours; holidays: { day: string; name: string }[]; policies: number }
+export interface KbArticle {
+	id: string; title: string; category: string; public: boolean; client_id: string | null; client_name: string | null; body?: string | null;
+	excerpt: string; updated_by_name: string | null; created_at: string; updated_at: string;
+}
+export interface DeskSettings { portal_board_id: string | null; portal_welcome: string; csat_enabled: boolean }
 
 export interface Contact {
 	id: string; client_id: string; client_name: string; site_id: string | null; site_name: string | null; name: string; email: string;
 	phone: string; job_title: string; notes: string; is_primary: boolean; portal_enabled: boolean; open_tickets: number;
+	portal_all_tickets: boolean; portal_last_login_at: string | null; is_billing: boolean;
 	created_at: string; updated_at: string;
 }
 
 export interface Mailbox {
-	id: string; name: string; address: string; kind: 'imap' | 'webhook'; imap_host: string; imap_port: number; imap_security: 'tls' | 'none';
+	id: string; name: string; address: string; kind: 'imap' | 'webhook' | 'graph'; imap_host: string; imap_port: number; imap_security: 'tls' | 'none';
 	imap_username: string; has_password: boolean; imap_folder: string; board_id: string; board_name: string; auto_reply: boolean;
 	enabled: boolean; last_polled_at: string | null; last_error: string | null; received_24h: number; created_at: string;
+	graph_tenant: string; graph_client_id: string; has_graph_secret: boolean; graph_send: boolean;
 	/** Only right after creating a webhook mailbox (or rotating its token). */
 	webhook_url?: string;
 }

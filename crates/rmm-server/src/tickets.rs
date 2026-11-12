@@ -111,13 +111,13 @@ pub async fn status_of(db: &mut PgConnection, board_id: Uuid, category: &str) ->
 /// `closed_at` in step with the category, and records the change. Returns false when it was
 /// already there.
 pub async fn set_status(db: &mut PgConnection, ticket_id: Uuid, status_id: Uuid, author: &Author) -> sqlx::Result<bool> {
-    let old: Option<(Uuid, String)> = sqlx::query_as(
-        "SELECT t.status_id, s.name FROM tickets t JOIN board_statuses s ON s.id = t.status_id WHERE t.id = $1 FOR UPDATE OF t",
+    let old: Option<(Uuid, String, String)> = sqlx::query_as(
+        "SELECT t.status_id, s.name, s.category FROM tickets t JOIN board_statuses s ON s.id = t.status_id WHERE t.id = $1 FOR UPDATE OF t",
     )
     .bind(ticket_id)
     .fetch_optional(&mut *db)
     .await?;
-    let Some((old_id, old_name)) = old else { return Ok(false) };
+    let Some((old_id, old_name, old_category)) = old else { return Ok(false) };
     if old_id == status_id {
         return Ok(false);
     }
@@ -134,6 +134,7 @@ pub async fn set_status(db: &mut PgConnection, ticket_id: Uuid, status_id: Uuid,
     .bind(&category)
     .execute(&mut *db)
     .await?;
+    crate::sla::status_changed(db, ticket_id, &old_category, &category).await?;
     add_event(
         db,
         ticket_id,
@@ -165,6 +166,8 @@ pub struct NewTicket {
     pub body_public: bool,
     pub source: &'static str,
     pub assignee_id: Option<Uuid>,
+    /// None: the board's default team.
+    pub team_id: Option<Uuid>,
     pub requester_name: String,
     pub requester_email: String,
     pub mailbox_id: Option<Uuid>,
@@ -192,9 +195,10 @@ pub async fn create(db: &mut PgConnection, t: NewTicket) -> sqlx::Result<Created
     let number: i64 = sqlx::query_scalar(
         "INSERT INTO tickets (id, client_id, site_id, contact_id, board_id, status_id, type_id, priority, impact, urgency, subject,
                               source, assignee_id, requester_name, requester_email, mailbox_id, created_by, touched_at,
-                              alert_policy_id, alert_agent_id, alert_key)
+                              alert_policy_id, alert_agent_id, alert_key, team_id)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
-                 CASE WHEN $17::uuid IS NULL THEN NULL ELSE now() END, $18, $19, $20)
+                 CASE WHEN $17::uuid IS NULL THEN NULL ELSE now() END, $18, $19, $20,
+                 coalesce($21, (SELECT default_team_id FROM boards WHERE id = $5)))
          RETURNING number",
     )
     .bind(id)
@@ -217,6 +221,7 @@ pub async fn create(db: &mut PgConnection, t: NewTicket) -> sqlx::Result<Created
     .bind(alert_policy)
     .bind(alert_agent)
     .bind(alert_key)
+    .bind(t.team_id)
     .fetch_one(&mut *db)
     .await?;
     let event_id = add_event(db, id, "created", t.body_public, &t.author, &t.body, json!({ "source": t.source })).await?;
@@ -228,7 +233,27 @@ pub async fn create(db: &mut PgConnection, t: NewTicket) -> sqlx::Result<Created
             .execute(&mut *db)
             .await?;
     }
+    crate::sla::refresh(db, id).await?;
     Ok(Created { id, number, event_id })
+}
+
+/// A new ticket: tell its board's notification channels. Call after the creating transaction
+/// commits.
+pub async fn notify_created(st: &AppState, ticket_id: Uuid) {
+    let res = sqlx::query(
+        "INSERT INTO notifications (channel_id, ticket_id, event)
+         SELECT c.id, t.id, 'ticket_created' FROM tickets t JOIN boards b ON b.id = t.board_id
+           JOIN notification_channels c ON c.id = ANY(b.notify_channel_ids) AND c.enabled
+          WHERE t.id = $1",
+    )
+    .bind(ticket_id)
+    .execute(&st.db)
+    .await;
+    match res {
+        Ok(r) if r.rows_affected() > 0 => st.notify_wake.notify_one(),
+        Ok(_) => {}
+        Err(e) => warn!(%ticket_id, "queueing new-ticket notifications: {e}"),
+    }
 }
 
 /// Tells dashboards the ticket changed.
@@ -315,6 +340,7 @@ pub async fn alert_opened(st: &AppState, alert_id: Uuid) {
         let mut tx = st.db.begin().await?;
         let author = Author::system("Alert");
         let data = json!({ "alert_id": alert_id, "state": "opened", "agent_id": c.agent_id });
+        let mut new_ticket = None;
         let ticket = match alert_ticket(&mut tx, c.policy_id, c.agent_id, &c.key).await? {
             Some((id, cat, reopens)) if cat == "resolved" => {
                 let board = board_of(&mut tx, id).await?;
@@ -354,10 +380,14 @@ pub async fn alert_opened(st: &AppState, alert_id: Uuid) {
                 .await?;
                 add_event(&mut tx, created.id, "alert", false, &author, "", data).await?;
                 info!(ticket = created.number, %alert_id, "alert opened a ticket");
+                new_ticket = Some(created.id);
                 created.id
             }
         };
         tx.commit().await?;
+        if let Some(t) = new_ticket {
+            notify_created(st, t).await;
+        }
         Ok(Some(ticket))
     }
     .await;

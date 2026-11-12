@@ -91,14 +91,17 @@
 
 	const roles: Record<string, string> = { admin: 'Admin', technician: 'Technician', readonly: 'Read-only' };
 
-	// Endpoint security permissions: the role's defaults, or an explicit set.
+	// Named permissions (security, billing, time approval): the role's defaults, or an explicit set.
 	const perms = [
 		{ value: 'security.read', label: 'See protection', hint: 'Protection state, detections, quarantine and telemetry' },
 		{ value: 'security.respond', label: 'Respond', hint: 'Scans, kill, quarantine and restore, isolate, triage, verdicts' },
-		{ value: 'security.manage', label: 'Manage', hint: 'Security policies, exclusions, rule modes and content rollout' }
+		{ value: 'security.manage', label: 'Manage', hint: 'Security policies, exclusions, rule modes and content rollout' },
+		{ value: 'billing.read', label: 'See billing', hint: 'Rates, contracts, invoices and money in reports' },
+		{ value: 'billing.manage', label: 'Manage billing', hint: 'Contracts, products, rates, invoice runs and accounting' },
+		{ value: 'time.approve', label: 'Approve time', hint: 'Approve and reject timesheets' }
 	];
 	const roleDefaults: Record<string, string[]> = {
-		admin: ['security.read', 'security.respond', 'security.manage'],
+		admin: ['security.read', 'security.respond', 'security.manage', 'billing.read', 'billing.manage', 'time.approve'],
 		technician: ['security.read', 'security.respond'],
 		readonly: ['security.read']
 	};
