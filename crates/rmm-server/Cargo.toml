@@ -36,6 +36,7 @@ flate2 = "1"
 rpm = { version = "0.30", default-features = false, features = ["payload", "gzip-compression"] }
 msi = "0.11"
 cab = "0.6"
+cfb = "0.16"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
 lettre = { version = "0.11", default-features = false, features = ["tokio1-rustls", "smtp-transport", "builder", "hostname", "ring", "rustls-native-certs"] }
 croner = "4"

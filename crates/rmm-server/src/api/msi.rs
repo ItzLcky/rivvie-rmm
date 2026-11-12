@@ -21,7 +21,7 @@
 use std::io::{Cursor, Write};
 
 use anyhow::Context;
-use msi::{Column, Insert, Package, PackageType, Value};
+use msi::{CodePage, Column, Insert, Package, PackageType, Value};
 
 /// Fixed for the product family: every package upgrades every other one.
 const UPGRADE_CODE: &str = "{5A9D78D5-1751-45F5-BB90-D6D799EB8E90}";
@@ -101,8 +101,12 @@ pub fn build(input: &MsiInput) -> anyhow::Result<Vec<u8>> {
     let cab = cabinet(input.binary).context("building the cabinet")?;
 
     let mut pkg = Package::create(PackageType::Installer, Cursor::new(Vec::new()))?;
+    // The crate defaults to UTF-8, which Windows Installer doesn't support as a database code
+    // page. Characters outside Windows-1252 (only possible in the manufacturer) become '?'.
+    pkg.set_database_codepage(CodePage::Windows1252);
     {
         let si = pkg.summary_info_mut();
+        si.set_codepage(CodePage::Windows1252);
         si.set_title("Installation Database");
         si.set_subject("RMM Agent");
         si.set_author(input.manufacturer);
@@ -332,7 +336,30 @@ pub fn build(input: &MsiInput) -> anyhow::Result<Vec<u8>> {
         w.write_all(&cab)?;
     }
     pkg.flush()?;
-    Ok(pkg.into_inner()?.into_inner())
+    as_v3(&pkg.into_inner()?.into_inner())
+}
+
+/// Rewrites a compound file as version 3 (512-byte sectors). `cfb` creates version 4 by
+/// default, which msitools reads but msiexec rejects with 1620 ("could not be opened").
+fn as_v3(v4: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let mut src = cfb::CompoundFile::open(Cursor::new(v4))?;
+    let mut dst = cfb::CompoundFile::create_with_version(cfb::Version::V3, Cursor::new(Vec::new()))?;
+    let entries: Vec<(std::path::PathBuf, bool, uuid::Uuid)> =
+        src.walk().filter(|e| !e.is_root()).map(|e| (e.path().to_path_buf(), e.is_storage(), *e.clsid())).collect();
+    dst.set_storage_clsid("/", *src.root_entry().clsid())?;
+    // walk() is pre-order, so a storage is created before anything inside it.
+    for (path, is_storage, clsid) in entries {
+        if is_storage {
+            dst.create_storage(&path)?;
+            dst.set_storage_clsid(&path, clsid)?;
+        } else {
+            let mut data = Vec::new();
+            std::io::Read::read_to_end(&mut src.open_stream(&path)?, &mut data)?;
+            dst.create_stream(&path)?.write_all(&data)?;
+        }
+    }
+    dst.flush()?;
+    Ok(dst.into_inner().into_inner())
 }
 
 #[cfg(test)]
@@ -362,7 +389,13 @@ mod tests {
     #[test]
     fn package_reads_back() {
         let bytes = sample();
+        // What msiexec needs: a version 3 compound file (512-byte sectors), Windows-1252.
+        assert_eq!(u16::from_le_bytes([bytes[0x1a], bytes[0x1b]]), 3, "major version");
+        assert_eq!(u16::from_le_bytes([bytes[0x1e], bytes[0x1f]]), 9, "sector shift");
         let mut pkg = Package::open(Cursor::new(bytes)).unwrap();
+        assert_eq!(pkg.package_type(), PackageType::Installer);
+        assert_eq!(pkg.database_codepage(), CodePage::Windows1252);
+        assert_eq!(pkg.summary_info().codepage(), CodePage::Windows1252);
         assert_eq!(pkg.summary_info().arch(), Some("x64"));
 
         let props: std::collections::HashMap<String, String> = pkg
