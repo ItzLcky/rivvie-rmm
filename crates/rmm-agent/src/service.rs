@@ -261,16 +261,11 @@ mod imp {
 
     fn service_body() -> Result<()> {
         crate::install_crypto();
-        let (tx, rx) = tokio::sync::watch::channel(false);
-        let status = service_control_handler::register(NAME, move |ctrl| match ctrl {
-            ServiceControl::Stop | ServiceControl::Shutdown => {
-                let _ = tx.send(true);
-                ServiceControlHandlerResult::NoError
-            }
-            ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
-            _ => ServiceControlHandlerResult::NotImplemented,
-        })?;
-        let set = |state, accept| {
+        fn set(
+            status: service_control_handler::ServiceStatusHandle,
+            state: ServiceState,
+            accept: ServiceControlAccept,
+        ) -> windows_service::Result<()> {
             status.set_service_status(ServiceStatus {
                 service_type: ServiceType::OWN_PROCESS,
                 current_state: state,
@@ -280,14 +275,37 @@ mod imp {
                 wait_hint: Duration::from_secs(10),
                 process_id: None,
             })
-        };
-        set(ServiceState::Running, ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN)?;
+        }
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let handle = std::sync::Arc::new(std::sync::OnceLock::new());
+        let in_handler = handle.clone();
+        let status = service_control_handler::register(NAME, move |ctrl| match ctrl {
+            ServiceControl::Stop | ServiceControl::Shutdown => {
+                // StopPending before anything else (and so before Stopped): left at Running
+                // while shutting down, Stop-Service/Restart-Service give up with "stop failed".
+                if let Some(&status) = in_handler.get() {
+                    let _ = set(status, ServiceState::StopPending, ServiceControlAccept::empty());
+                }
+                let _ = tx.send(true);
+                ServiceControlHandlerResult::NoError
+            }
+            ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
+            _ => ServiceControlHandlerResult::NotImplemented,
+        })?;
+        let _ = handle.set(status);
+        set(status, ServiceState::Running, ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN)?;
 
         let config_path = CONFIG.get().expect("config path set").clone();
         let cfg = crate::config::Config::load(&config_path)?;
-        crate::runtime()?.block_on(crate::conn::run_forever(cfg, config_path, rx));
+        let rt = crate::runtime()?;
+        rt.block_on(crate::conn::run_forever(cfg, config_path, rx));
+        // Dropping the runtime would wait for blocking tasks, and on Windows a child's output
+        // pipe is read on one: a running job would hold the stop until it ended. Dropping the
+        // job tasks kills their process trees (kill-on-close Job Objects), which ends those
+        // reads anyway; the timeout is for anything else.
+        rt.shutdown_timeout(Duration::from_secs(5));
 
-        set(ServiceState::Stopped, ServiceControlAccept::empty())?;
+        set(status, ServiceState::Stopped, ServiceControlAccept::empty())?;
         Ok(())
     }
 }

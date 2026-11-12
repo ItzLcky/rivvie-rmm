@@ -367,11 +367,12 @@ async fn execute(job: &ScriptJob, tracker: &Arc<Tracker>) -> Result<(JobStatus, 
     cmd.process_group(0);
 
     let mut child = cmd.spawn().context("spawning interpreter")?;
-    // Windows: the tree goes in a Job Object, the counterpart of the process group. Not
-    // kill-on-close: like on Unix, what a script leaves running in the background survives
-    // it, and only a timeout kills the tree.
+    // Windows: the tree goes in a Job Object, the counterpart of the process group. It's
+    // kill-on-close while the script runs, so an agent that stops mid-job takes the tree with
+    // it (as systemd does on Linux), and released once the script exits: like on Unix, what
+    // a script leaves running in the background survives it. A timeout kills the tree.
     #[cfg(windows)]
-    let tree = child.raw_handle().and_then(|h| match crate::winjob::ProcessTree::new(h, false) {
+    let tree = child.raw_handle().and_then(|h| match crate::winjob::ProcessTree::new(h, true) {
         Ok(t) => Some(t),
         Err(e) => {
             warn!(job_id = %job.job_id, "a timeout will only kill the interpreter: {e:#}");
@@ -389,6 +390,10 @@ async fn execute(job: &ScriptJob, tracker: &Arc<Tracker>) -> Result<(JobStatus, 
     let result = match tokio::time::timeout(timeout, child.wait()).await {
         Ok(status) => {
             let status = status?;
+            #[cfg(windows)]
+            if let Some(Err(e)) = tree.as_ref().map(|t| t.release()) {
+                warn!(job_id = %job.job_id, "processes the script left running may be killed: {e:#}");
+            }
             let code = status.code();
             (if status.success() { JobStatus::Succeeded } else { JobStatus::Failed }, code)
         }

@@ -29,23 +29,37 @@ impl ProcessTree {
     /// processes outlive the handle (a script may start something meant to keep running)
     /// and only [`ProcessTree::kill`] stops them.
     pub fn new(process: RawHandle, kill_on_close: bool) -> Result<Self> {
-        // SAFETY: plain Win32 calls on handles we own; `info` outlives the call that reads it.
+        // SAFETY: plain Win32 calls on handles we own.
         unsafe {
             let job = CreateJobObjectW(None, PCWSTR::null()).context("CreateJobObjectW")?;
             let tree = Self { job };
             if kill_on_close {
-                let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-                info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-                SetInformationJobObject(
-                    job,
-                    JobObjectExtendedLimitInformation,
-                    (&raw const info).cast(),
-                    size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-                )
-                .context("SetInformationJobObject")?;
+                tree.set_kill_on_close(true)?;
             }
             AssignProcessToJobObject(job, HANDLE(process)).context("AssignProcessToJobObject")?;
             Ok(tree)
+        }
+    }
+
+    /// Lets whatever is still in the tree outlive this handle (see [`ProcessTree::new`]).
+    pub fn release(&self) -> Result<()> {
+        self.set_kill_on_close(false)
+    }
+
+    fn set_kill_on_close(&self, on: bool) -> Result<()> {
+        let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        if on {
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        }
+        // SAFETY: `info` outlives the call that reads it; the handle is valid until drop.
+        unsafe {
+            SetInformationJobObject(
+                self.job,
+                JobObjectExtendedLimitInformation,
+                (&raw const info).cast(),
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+            .context("SetInformationJobObject")
         }
     }
 
