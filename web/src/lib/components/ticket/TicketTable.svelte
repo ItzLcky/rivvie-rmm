@@ -20,6 +20,7 @@
 		filters,
 		activeFilters = 0,
 		bulk,
+		matching,
 		empty
 	}: {
 		id: string;
@@ -43,6 +44,7 @@
 		filters?: Snippet;
 		activeFilters?: number;
 		bulk?: Snippet<[number]>;
+		matching?: { total: number; exact: boolean; select: () => Promise<string[]> };
 		empty?: Snippet;
 	} = $props();
 </script>
@@ -82,6 +84,7 @@
 	{filters}
 	{activeFilters}
 	{bulk}
+	{matching}
 	{empty}
 	columns={[
 		{ id: 'number', label: 'No.', sort: 'number', cell: numberCell, class: 'w-24', from: 'sm' },

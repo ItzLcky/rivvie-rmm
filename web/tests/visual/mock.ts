@@ -41,7 +41,8 @@ function agent(i: number, host: string, siteId: string, os: 'linux' | 'windows',
 		site_id: s.id, site_name: s.name, client_id: c.id, client_name: c.name,
 		last_metrics: health === 'unknown' ? null : metrics(online ? ago(0) : ago(37 + i * 90), cpu, mem, [['/', disk], ['/var', Math.max(5, disk - 30)]]),
 		update_state: null, update_version: null, update_detail: null, update_at: null,
-		health, disk_max_pct: health === 'unknown' ? 0 : disk, failed_jobs_24h: failed, open_alerts: 0
+		health, disk_max_pct: health === 'unknown' ? 0 : disk, failed_jobs_24h: failed, open_alerts: 0,
+		patches_overdue: 0, patches_failed: 0, reboot_pending: false, reboot_pending_since: null as string | null, alerts_muted: false
 	};
 }
 const agents: Agent[] = [
@@ -55,6 +56,9 @@ const agents: Agent[] = [
 ];
 // One machine enrolled in the last week, so the "New" view has something to count.
 agents[6].enrolled_at = ago(60 * 24 * 2);
+// Patch state that counts against health, and a snoozed machine.
+Object.assign(agents[2], { patches_overdue: 2, patches_failed: 1, reboot_pending: true, reboot_pending_since: ago(60 * 30) });
+agents[3].alerts_muted = true;
 
 // --- monitoring -----------------------------------------------------------------------------
 const policies = [
@@ -64,7 +68,11 @@ const policies = [
 	{ id: 'p-svc', name: 'Core services', kind: 'service', params: { services: ['nginx', 'Spooler'], auto_only: true, exclude: ['sppsvc'] }, severity: 'warning', client_id: null, client_name: null, site_id: null, site_name: null, os_family: null, channel_ids: ['ch-slack'], notify_resolved: true, enabled: true, open_alerts: 1 },
 	{ id: 'p-job', name: 'Backup script fails', kind: 'job_failed', params: { script_id: 's-disk' }, severity: 'warning', client_id: null, client_name: null, site_id: null, site_name: null, os_family: 'linux', channel_ids: ['ch-hook'], notify_resolved: true, enabled: true, open_alerts: 1 },
 	{ id: 'p-log', name: 'Kernel OOM killer', kind: 'log', params: { min_level: 'error', sources: ['kernel'], channels: [], event_ids: [], pattern: 'out of memory' }, severity: 'info', client_id: 'c-globex', client_name: 'Globex', site_id: null, site_name: null, os_family: 'linux', channel_ids: [], notify_resolved: true, enabled: false, open_alerts: 0 }
-].map((p, i) => ({ ...p, created_at: ago(60 * 24 * (30 - i)), updated_at: ago(60 * (20 - i)) }));
+].map((p, i) => ({
+	...p, created_at: ago(60 * 24 * (30 - i)), updated_at: ago(60 * (20 - i)),
+	renotify_minutes: p.id === 'p-off' ? 240 : null,
+	excluded: p.id === 'p-off' ? [{ id: 'a-4', hostname: 'acme-pos-07' }] : ([] as { id: string; hostname: string }[])
+}));
 const pol = (id: string) => policies.find((p) => p.id === id)!;
 function alert(i: number, policyId: string, agentIdx: number, title: string, opened: number, extra: Record<string, unknown> = {}) {
 	const a = agents[agentIdx];
@@ -72,7 +80,7 @@ function alert(i: number, policyId: string, agentIdx: number, title: string, ope
 	return {
 		id: `al-${i}`, policy_id: p.id, policy_name: p.name, agent_id: a.id, hostname: a.hostname, client_id: a.client_id, client_name: a.client_name, site_name: a.site_name,
 		kind: p.kind, severity: p.severity, title, details: {}, occurrences: 1, state: 'open', opened_at: ago(opened), last_seen_at: ago(1),
-		acknowledged_at: null, acknowledged_by_name: null, resolved_at: null, resolved_by_name: null, resolution: null, ...extra
+		acknowledged_at: null, acknowledged_by_name: null, resolved_at: null, resolved_by_name: null, resolution: null, suppressed: false, ...extra
 	};
 }
 const alerts = [
@@ -116,12 +124,33 @@ const schedules = [
 	{ id: 'sc-2', name: 'Clear print queue', script_id: 's-spool', script_name: 'Restart print spooler', interpreter: 'powershell', client_id: 'c-acme', client_name: 'Acme Corp', site_id: 's-acme-wh', site_name: 'Warehouse', os_family: 'windows', cron: '30 6 * * 1-5', timezone: 'America/Chicago', args: [], timeout_secs: 120, retain_days: 7, enabled: true, next_run_at: ago(-60 * 21), last_run_at: ago(60 * 3), last_run: { succeeded: 1, queued: 1 } },
 	{ id: 'sc-3', name: 'Weekly update check', script_id: 's-upd', script_name: 'Pending updates', interpreter: 'python', client_id: null, client_name: null, site_id: null, site_name: null, os_family: null, cron: '0 3 * * 0', timezone: 'UTC', args: ['--security'], timeout_secs: 600, retain_days: 90, enabled: false, next_run_at: ago(-60 * 24 * 3), last_run_at: null, last_run: {} }
 ].map((s, i) => ({ ...s, created_by_name: 'Dana Admin', created_at: ago(60 * 24 * (40 - i)), updated_at: ago(60 * 24 * (5 - i)) }));
+const mutes = [
+	{ id: 'm-1', client_id: null, site_id: null, agent_id: 'a-4', owner_client_id: 'c-acme', target_name: 'acme-pos-07', starts_at: null, ends_at: ago(-60 * 3), days: null, start_time: null, minutes: null, tz: 'UTC', reason: 'Replacing the till', created_by_name: 'Terry Tech', created_at: ago(60), active: true, ended: false },
+	{ id: 'm-2', client_id: null, site_id: 's-acme-wh', agent_id: null, owner_client_id: 'c-acme', target_name: 'Acme Corp › Warehouse', starts_at: null, ends_at: null, days: [6, 0], start_time: '22:00:00', minutes: 360, tz: 'America/Chicago', reason: 'Weekend patching', created_by_name: 'Dana Admin', created_at: ago(60 * 24 * 9), active: false, ended: false }
+];
+const processes = [
+	[1, null, 'systemd', 'root', 0.1, 14, true, '/sbin/init splash'],
+	[812, 1, 'sshd', 'root', 0, 9, false, 'sshd: /usr/sbin/sshd -D [listener] 0 of 10-100 startups'],
+	[1204, 1, 'nginx', 'root', 0.4, 12, false, 'nginx: master process /usr/sbin/nginx -g daemon on; master_process on;'],
+	[1205, 1204, 'nginx', 'www-data', 3.2, 48, false, 'nginx: worker process'],
+	[2210, 1, 'postgres', 'postgres', 7.9, 412, false, '/usr/lib/postgresql/16/bin/postgres -D /var/lib/postgresql/16/main'],
+	[3120, 1, 'php-fpm8.2', 'www-data', 41.5, 920, false, 'php-fpm: pool www'],
+	[4410, 1, 'rmm-agent', 'root', 0.2, 11, true, '/usr/local/bin/rmm-agent --config /etc/rmm/agent.toml run']
+].map(([pid, ppid, name, user, cpu, mb, prot, cmd]) => ({ pid, ppid, name, user, cpu, mem: (mb as number) * 2 ** 20, protected: prot, cmd, exe: null, started_at: ago(60 * 24 * 3 - (pid as number) / 100) }));
+function listing(path: string) {
+	if (!path) return { path: '', parent: null, truncated: false, entries: [{ name: '/', path: '/', dir: true, symlink: false, size: 0, modified: null, error: null }] };
+	const entries = [
+		['nginx', true, 0, 60 * 24 * 12], ['postgresql', true, 0, 60 * 24 * 2], ['auth.log', false, 482_113, 3], ['syslog', false, 18_442_901, 1],
+		['syslog.1', false, 52_118_004, 60 * 24], ['dpkg.log', false, 1_204_551, 60 * 30], ['kern.log', false, 88_120, 60 * 5]
+	].map(([name, dir, size, mins]) => ({ name, path: `${path.replace(/\/$/, '')}/${name}`, dir, symlink: false, size, modified: ago(mins as number), error: null }));
+	return { path, parent: path === '/' ? '' : path.replace(/\/[^/]+$/, '') || '/', truncated: false, entries };
+}
 const detail = (a: Agent) => ({
 	...a,
 	kernel_version: a.os_family === 'windows' ? '10.0.20348' : '6.8.0-45-generic',
 	machine_id: 'm-' + a.id,
 	// globex-db01 runs an agent build without remote desktop.
-	capabilities: a.id === 'a-6' ? ['patch'] : ['patch', 'desktop'],
+	capabilities: a.id === 'a-6' ? ['patch'] : ['patch', 'desktop', 'tools'],
 	inventory_at: ago(12),
 	inventory: {
 		collected_at: ago(12), cpu_brand: 'Intel(R) Xeon(R) Silver 4314 CPU @ 2.40GHz', cpu_cores_physical: 16, cpu_cores_logical: 32, mem_total: 64 * 2 ** 30,
@@ -744,6 +773,20 @@ export async function mockApi(p: Page, opts: { signedIn?: boolean } = {}) {
 			return json({ ...a, notifications: deliveries.filter((d) => d.alert_id === a.id).map(({ channel_id, alert_id, alert_title, hostname, next_attempt_at, ...d }) => ({ ...d, channel_kind: channels.find((c) => c.id === channel_id)!.kind })), log_events: [] });
 		}
 		if (path === '/alert-policies') return json(policies);
+		if ((m = path.match(/^\/agents\/([^/]+)\/alert-policies$/))) {
+			const a = agents.find((x) => x.id === m![1])!;
+			return json(
+				policies
+					.filter((p) => (!p.client_id || p.client_id === a.client_id) && (!p.site_id || p.site_id === a.site_id) && (!p.os_family || p.os_family === a.os_family))
+					.map((p) => ({ id: p.id, name: p.name, kind: p.kind, severity: p.severity, enabled: p.enabled, level: p.site_id ? 'site' : p.client_id ? 'client' : 'msp', excluded: p.excluded.some((x) => x.id === a.id), editable: true, open_alerts: alerts.filter((al) => al.policy_id === p.id && al.agent_id === a.id && al.state !== 'resolved').length }))
+			);
+		}
+		if (path === '/alert-mutes') {
+			const list = mutes.filter((x) => (!q.get('client_id') || x.owner_client_id === q.get('client_id')) && (!q.get('agent_id') || x.agent_id === q.get('agent_id') || x.site_id === agents.find((a) => a.id === q.get('agent_id'))?.site_id));
+			return json(list);
+		}
+		if ((m = path.match(/^\/agents\/([^/]+)\/processes$/))) return json({ processes });
+		if ((m = path.match(/^\/agents\/([^/]+)\/files$/))) return json(listing(q.get('path') ?? ''));
 		if ((m = path.match(/^\/alert-policies\/([^/]+)$/))) return json(pol(m![1]));
 		if (path === '/notification-channels') return json(channels);
 		if (path === '/notifications') return json(deliveries);

@@ -2,7 +2,7 @@
 	import { goto } from '$app/navigation';
 	import { untrack } from 'svelte';
 	import { page } from '$app/state';
-	import { BellRing, Save, Trash2 } from '@lucide/svelte';
+	import { BellRing, Save, Trash2, X } from '@lucide/svelte';
 	import { api } from '#lib/api.js';
 	import { confirmAction } from '#lib/confirm.svelte.js';
 	import { cx, datetime } from '#lib/format.js';
@@ -35,6 +35,9 @@
 		minutes: number; threshold: number; services: string; auto_only: boolean; exclude: string; script_id: string;
 		min_level: LogLevel; channels: string; sources: string; event_ids: string; pattern: string;
 		unprotected: boolean; realtime_off: boolean; sensor_down: boolean; sig_check: boolean; sig_hours: number; threats: 'off' | 'active' | 'any';
+		stale_check: boolean; stale_hours: number;
+		patch_failed: boolean; reboot_check: boolean; reboot_hours: number;
+		renotify: boolean; renotify_minutes: number;
 	};
 	const defaults: Record<PolicyKind, Partial<Draft>> = {
 		offline: { minutes: 10 },
@@ -44,13 +47,15 @@
 		service: {},
 		job_failed: {},
 		log: {},
-		security: {}
+		security: {},
+		patch: {}
 	};
 	const blank = (kind: PolicyKind, client: string | null): Draft => ({
 		name: '', kind, severity: 'warning', client_id: client, site_id: null, os_family: null, channel_ids: [], notify_resolved: true, enabled: true,
 		ticket_board_id: null, ticket_priority: 3, ticket_auto_resolve: true,
 		minutes: 10, threshold: 90, services: '', auto_only: false, exclude: '', script_id: '', min_level: 'error', channels: '', sources: '', event_ids: '', pattern: '',
 		unprotected: true, realtime_off: false, sensor_down: true, sig_check: true, sig_hours: 72, threats: 'active',
+		stale_check: false, stale_hours: 24, patch_failed: true, reboot_check: true, reboot_hours: 72, renotify: false, renotify_minutes: 240,
 		...defaults[kind]
 	});
 	const list = (s: string) => s.split(/[\n,]/).map((x) => x.trim()).filter(Boolean);
@@ -66,7 +71,10 @@
 			script_id: (q.script_id as string) ?? '', min_level: (q.min_level as LogLevel) ?? 'error', channels: text(q.channels).replaceAll('\n', ', '),
 			sources: text(q.sources), event_ids: Array.isArray(q.event_ids) ? q.event_ids.join(', ') : '', pattern: (q.pattern as string) ?? '',
 			unprotected: !!q.unprotected, realtime_off: !!q.realtime_off, sensor_down: !!q.sensor_down, sig_check: q.signature_max_age_hours != null,
-			sig_hours: Number(q.signature_max_age_hours ?? 72), threats: (q.threats as Draft['threats']) ?? 'active'
+			sig_hours: Number(q.signature_max_age_hours ?? 72), threats: (q.threats as Draft['threats']) ?? 'active',
+			stale_check: q.stale_hours != null, stale_hours: Number(q.stale_hours ?? 24),
+			patch_failed: q.failed !== false, reboot_check: q.reboot_hours != null, reboot_hours: Number(q.reboot_hours ?? 72),
+			renotify: p.renotify_minutes != null, renotify_minutes: p.renotify_minutes ?? 240
 		};
 	}
 	function params(d: Draft): Record<string, unknown> {
@@ -88,8 +96,11 @@
 				};
 			case 'security':
 				return {
-					unprotected: d.unprotected, realtime_off: d.realtime_off, sensor_down: d.sensor_down, signature_max_age_hours: d.sig_check ? Number(d.sig_hours) : null, threats: d.threats
+					unprotected: d.unprotected, realtime_off: d.realtime_off, sensor_down: d.sensor_down, signature_max_age_hours: d.sig_check ? Number(d.sig_hours) : null, threats: d.threats,
+					stale_hours: d.stale_check ? Number(d.stale_hours) : null
 				};
+			case 'patch':
+				return { failed: d.patch_failed, reboot_hours: d.reboot_check ? Number(d.reboot_hours) : null };
 		}
 	}
 
@@ -149,7 +160,8 @@
 		const body = {
 			name: d.name, kind: d.kind, params: params(d), severity: d.severity, client_id: d.client_id, site_id: d.client_id ? d.site_id : null,
 			os_family: d.os_family, channel_ids: d.channel_ids, notify_resolved: d.notify_resolved, enabled: d.enabled,
-			ticket_board_id: d.ticket_board_id, ticket_priority: d.ticket_priority, ticket_auto_resolve: d.ticket_auto_resolve
+			ticket_board_id: d.ticket_board_id, ticket_priority: d.ticket_priority, ticket_auto_resolve: d.ticket_auto_resolve,
+			renotify_minutes: d.renotify ? Number(d.renotify_minutes) : null
 		};
 		busy = true;
 		try {
@@ -178,6 +190,11 @@
 			danger: true
 		});
 		if (ok && (await attempt(() => api.del(`/alert-policies/${p.id}`), `${p.name} deleted.`))) await goto('/policies');
+	}
+	async function include(agent: { id: string; hostname: string }) {
+		await attempt(async () => {
+			policy = await api.del<Policy>(`/alert-policies/${policy!.id}/exclusions/${agent.id}`);
+		}, `${agent.hostname} is covered by this policy again.`);
 	}
 	function toggleChannel(id: string, on: boolean) {
 		if (!draft) return;
@@ -298,10 +315,39 @@
 						{/if}
 					</div>
 				</div>
+				<div class="-mt-1">
+					<Switch bind:checked={draft.stale_check}>The agent stops reporting its protection state</Switch>
+					{#if draft.stale_check}
+						<div class="mt-2 ml-11.5 flex items-center gap-2">
+							<span class="text-muted text-sm">Online, but no report for</span>
+							<Input id="p-stale" type="number" min="2" max="168" class="w-24" aria-label="Hours without a report" bind:value={draft.stale_hours} />
+							<span class="text-muted text-sm">hours</span>
+						</div>
+					{/if}
+					<p class="hint ml-11.5">Agents report at least hourly while online, so a long silence means the security check on the machine is stuck or broken.</p>
+				</div>
 				<Field label="Threats" id="p-threats" hint={draft.threats === 'any' ? 'Raises an alert for each new detection, even one the antivirus already quarantined. These stay open until someone resolves them.' : draft.threats === 'active' ? 'One alert per threat the antivirus hasn’t dealt with; it clears once the threat is quarantined or removed.' : undefined}>
 					<Select id="p-threats" class="max-w-80" bind:value={draft.threats} options={[{ value: 'active', label: 'Alert on active threats' }, { value: 'any', label: 'Alert on every detection' }, { value: 'off', label: 'Don’t alert on threats' }]} />
 				</Field>
 				<p class="hint -mt-2">Agents report Microsoft Defender and other Windows Security Center products, ClamAV, XProtect and our own sensor. The <a class="link" href="/security">Security</a> page shows every agent's state.</p>
+			{:else if draft.kind === 'patch'}
+				<div class="space-y-3">
+					<div>
+						<Switch bind:checked={draft.patch_failed}>An update fails to install</Switch>
+						<p class="hint ml-11.5">One alert per agent, listing the updates. It clears once they install, or once someone declines them.</p>
+					</div>
+					<div>
+						<Switch bind:checked={draft.reboot_check}>A restart to finish updates stays pending</Switch>
+						{#if draft.reboot_check}
+							<div class="mt-2 ml-11.5 flex items-center gap-2">
+								<span class="text-muted text-sm">For more than</span>
+								<Input id="p-reboot" type="number" min="1" max="8760" class="w-24" aria-label="Hours a restart may stay pending" bind:value={draft.reboot_hours} />
+								<span class="text-muted text-sm">hours</span>
+							</div>
+						{/if}
+					</div>
+				</div>
+				<p class="hint -mt-1">Missing security updates (over a week old) and restarts pending over a day already count against an agent's health without a policy.</p>
 			{/if}
 
 			<div>
@@ -330,6 +376,23 @@
 					<Select id="p-os" bind:value={draft.os_family} options={[{ value: null, label: 'Any' }, { value: 'linux', label: 'Linux' }, { value: 'windows', label: 'Windows' }, { value: 'macos', label: 'macOS' }]} />
 				</Field>
 			</div>
+			{#if policy}
+				<div class="border-border border-t pt-3">
+					<span class="label">Except these agents</span>
+					{#if policy.excluded.length}
+						<ul class="mt-1 flex flex-wrap gap-1.5">
+							{#each policy.excluded as x (x.id)}
+								<li class="border-border bg-sunken inline-flex items-center gap-1 rounded-md border py-0.5 pr-1 pl-2 text-sm">
+									<a class="hover:text-accent" href="/agents/{x.id}?tab=alerts">{x.hostname}</a>
+									{#if editable}<button type="button" class="text-muted hover:text-fg hover:bg-hover inline-flex size-6 items-center justify-center rounded" aria-label="Cover {x.hostname} again" onclick={() => include(x)}><X class="size-3.5" /></button>{/if}
+								</li>
+							{/each}
+						</ul>
+					{:else}
+						<p class="text-muted text-sm">None. To leave one machine out, open its Alerts tab.</p>
+					{/if}
+				</div>
+			{/if}
 		</fieldset>
 
 		<fieldset class="card space-y-3 p-4" disabled={!editable}>
@@ -348,6 +411,16 @@
 				{/each}
 			</div>
 			<Switch bind:checked={draft.notify_resolved}>Also notify when the alert clears</Switch>
+			<div>
+				<Switch bind:checked={draft.renotify}>Remind while it stays open</Switch>
+				{#if draft.renotify}
+					<div class="mt-2 ml-11.5 flex items-center gap-2">
+						<span class="text-muted text-sm">Every</span>
+						<Select id="p-renotify" class="w-40" aria-label="Reminder interval" bind:value={draft.renotify_minutes} options={[15, 30, 60, 120, 240, 480, 720, 1440, 4320].map((m) => ({ value: m, label: m < 60 ? `${m} minutes` : m < 1440 ? `${m / 60} hour${m === 60 ? '' : 's'}` : `${m / 1440} day${m === 1440 ? '' : 's'}` }))} />
+					</div>
+				{/if}
+				<p class="hint ml-11.5">Until someone acknowledges or resolves it. Nothing is sent during a maintenance window.</p>
+			</div>
 			<div class="border-border border-t pt-3">
 				<Switch bind:checked={draft.enabled}>Policy enabled</Switch>
 				<p class="hint ml-11.5">Disabling closes its open alerts without notifications.</p>

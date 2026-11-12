@@ -53,19 +53,97 @@ pub struct Opts<'a> {
     pub env: &'a [(&'a str, &'a str)],
     /// Write the command and its output to the log.
     pub log: bool,
+    /// Keep it running if the agent stops (an install mustn't die halfway through because
+    /// the agent restarted). On Linux under systemd it runs in its own transient scope, out
+    /// of the agent service's cgroup, and writes to files instead of pipes.
+    pub detach: bool,
 }
 
 impl Default for Opts<'_> {
     fn default() -> Self {
-        Opts { timeout: Duration::from_secs(600), env: &[], log: true }
+        Opts { timeout: Duration::from_secs(600), env: &[], log: true, detach: false }
+    }
+}
+
+/// `systemd-run`, when commands can be moved into their own scope: systemd is running and
+/// we're root.
+fn scope_runner() -> Option<&'static str> {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: plain syscall.
+        let root = unsafe { libc::geteuid() } == 0;
+        if root && std::path::Path::new("/run/systemd/system").is_dir() && which("systemd-run") {
+            return Some("systemd-run");
+        }
+    }
+    None
+}
+
+/// Reads a file another process is still writing: at the end it waits for more until
+/// `done` is set, then returns what's left.
+struct Tail {
+    file: std::fs::File,
+    done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Read for Tail {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            // Checked before reading, so the last read after `done` sees everything written.
+            let done = self.done.load(std::sync::atomic::Ordering::Acquire);
+            let n = self.file.read(buf)?;
+            if n > 0 || done {
+                return Ok(n);
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
 }
 
 /// Runs `program args`, killing it after `opts.timeout`. Calls `on_line` with each stdout
 /// line as it arrives. A non-zero exit is not an error here; callers decide.
 pub fn run(log: &Log, program: &str, args: &[&str], opts: Opts, on_line: &mut dyn FnMut(&str)) -> Result<Output> {
-    let mut cmd = Command::new(program);
-    cmd.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let scope = if opts.detach { scope_runner() } else { None };
+    // Output files for a detached command: pipes would break (and SIGPIPE it) when the agent
+    // goes away. Removed when this returns; a command that outlives the agent keeps writing
+    // to the unlinked files, which is harmless.
+    let files = opts.detach.then(|| {
+        let base = std::env::temp_dir().join(format!("rmm-patch-{}", uuid::Uuid::new_v4().simple()));
+        (base.with_extension("out"), base.with_extension("err"))
+    });
+    struct Cleanup(Option<(std::path::PathBuf, std::path::PathBuf)>);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            if let Some((o, e)) = &self.0 {
+                let _ = std::fs::remove_file(o);
+                let _ = std::fs::remove_file(e);
+            }
+        }
+    }
+    let _cleanup = Cleanup(files.clone());
+    let mut cmd = match scope {
+        Some(runner) => {
+            let mut c = Command::new(runner);
+            let unit = format!("rmm-patch-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
+            c.args(["--scope", "--quiet", "--collect", "--unit", &unit, "--description", "RMM agent: installing updates", "--"]);
+            c.arg(program);
+            c
+        }
+        None => Command::new(program),
+    };
+    cmd.args(args).stdin(Stdio::null());
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let tails = match &files {
+        Some((out, err)) => {
+            let (wo, we) = (std::fs::File::create(out)?, std::fs::File::create(err)?);
+            cmd.stdout(wo).stderr(we);
+            Some((Tail { file: std::fs::File::open(out)?, done: done.clone() }, Tail { file: std::fs::File::open(err)?, done: done.clone() }))
+        }
+        None => {
+            cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+            None
+        }
+    };
     // Untranslated output: the parsers expect English.
     cmd.env("LC_ALL", "C").env("LANG", "C");
     for (k, v) in opts.env {
@@ -86,8 +164,10 @@ pub fn run(log: &Log, program: &str, args: &[&str], opts: Opts, on_line: &mut dy
         log.push(&format!("$ {program} {}\n", args.join(" ")));
     }
     let mut child = cmd.spawn().with_context(|| format!("starting {program}"))?;
-    let stdout = child.stdout.take().expect("piped");
-    let mut stderr = child.stderr.take().expect("piped");
+    let (stdout, mut stderr): (Box<dyn Read + Send>, Box<dyn Read + Send>) = match tails {
+        Some((o, e)) => (Box::new(o), Box::new(e)),
+        None => (Box::new(child.stdout.take().expect("piped")), Box::new(child.stderr.take().expect("piped"))),
+    };
 
     let (line_tx, line_rx) = std::sync::mpsc::channel::<String>();
     let out_thread = std::thread::spawn(move || {
@@ -131,6 +211,7 @@ pub fn run(log: &Log, program: &str, args: &[&str], opts: Opts, on_line: &mut dy
             consume(&line, &mut stdout_text, log, opts.log, on_line);
         }
     };
+    done.store(true, std::sync::atomic::Ordering::Release);
     // A grandchild that kept the pipes open mustn't hang us: wait briefly for the readers.
     let reader_deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -227,6 +308,18 @@ mod tests {
         assert_eq!(out.reason(), "oops");
         let text = log.text();
         assert!(text.starts_with("$ sh -c") && text.contains("oops") && text.contains("[exit 3]"), "{text}");
+    }
+
+    #[test]
+    fn detached_output_comes_through_files() {
+        // Without root/systemd this runs normally; either way the output must arrive.
+        let log = Log::default();
+        let mut lines = vec![];
+        let opts = Opts { detach: true, ..Default::default() };
+        let out = run(&log, "sh", &["-c", "echo one; sleep 0.3; echo two; echo bad >&2; exit 2"], opts, &mut |l| lines.push(l.to_string())).unwrap();
+        assert_eq!(lines, ["one", "two"]);
+        assert_eq!(out.code, Some(2));
+        assert_eq!(out.reason(), "bad");
     }
 
     #[test]

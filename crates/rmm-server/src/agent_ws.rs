@@ -210,7 +210,7 @@ async fn run_session(
     if let Some(old) = state.hub.register(agent_id, AgentHandle { conn_id, tx: tx.clone() }) {
         debug!(%agent_id, old = %old.conn_id, "replacing stale connection");
     }
-    sqlx::query("UPDATE agents SET online = true, last_seen_at = now(), agent_version = $2 WHERE id = $1")
+    sqlx::query("UPDATE agents SET online = true, last_seen_at = now(), connected_at = now(), agent_version = $2 WHERE id = $1")
         .bind(agent_id)
         .bind(&agent_version)
         .execute(&state.db)
@@ -534,6 +534,7 @@ async fn on_message(
         AgentMsg::TriageChunk { request_id, offset, data, done: _ } => {
             crate::security::ingest_triage_chunk(state, agent_id, request_id, offset, data).await?
         }
+        AgentMsg::ToolReply { request_id, reply } => state.hub.complete_tool(agent_id, request_id, reply),
         AgentMsg::Pong { .. } => {}
         AgentMsg::Enroll { .. } | AgentMsg::Auth { .. } => {}
     }

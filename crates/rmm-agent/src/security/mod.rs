@@ -41,6 +41,9 @@ use uuid::Uuid;
 
 /// How often the state is re-read. Only changes are sent.
 const POLL: Duration = Duration::from_secs(300);
+/// An unchanged state is resent this often (the server's "stopped reporting" check allows
+/// at least two hours).
+const KEEPALIVE: Duration = Duration::from_secs(3600);
 /// Finished results are resent after reconnects for this long.
 const KEEP_FINISHED: Duration = Duration::from_secs(3600);
 
@@ -203,6 +206,7 @@ impl Manager {
     /// Sends the state now, then again whenever it changes, until the connection closes.
     pub async fn watch(self: Arc<Self>, tx: mpsc::Sender<AgentMsg>) {
         let mut last: Option<Report> = None;
+        let mut sent_at = tokio::time::Instant::now();
         let mut tick = tokio::time::interval(POLL);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
@@ -215,12 +219,15 @@ impl Manager {
             let p = self.provider.clone();
             let Ok(mut report) = tokio::task::spawn_blocking(move || p.status()).await else { continue };
             report.products.extend(self.sensor.product());
-            if !forced && last.as_ref() == Some(&report) {
+            // Unchanged reports still go out now and then, so the server can tell a quiet
+            // machine from one that stopped reporting.
+            if !forced && last.as_ref() == Some(&report) && sent_at.elapsed() < KEEPALIVE {
                 continue;
             }
             if tx.send(AgentMsg::SecurityStatus(report.clone())).await.is_err() {
                 return;
             }
+            sent_at = tokio::time::Instant::now();
             last = Some(report);
         }
     }

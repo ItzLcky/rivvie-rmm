@@ -1,6 +1,6 @@
 # Roadmap
 
-Last reviewed 2026-11-11.
+Last reviewed 2026-11-12.
 
 ## Where things stand
 
@@ -52,16 +52,16 @@ Every Windows feature is compile-checked (clippy via mingw) and unit-tested agai
 
 ### 3. Day-to-day gaps MSPs will hit first
 
-Small items from earlier phases that technicians notice quickly:
+Small items from earlier phases that technicians notice quickly. Done 2026-11-12 (migration `0015_day_to_day.sql`); covered by unit tests, the e2e suite and the visual tests.
 
-- [ ] Maintenance windows / snooze per agent for alerts, re-notify while an alert stays open, and per-agent policy overrides (exclude one machine from a client-wide policy).
-- [ ] Patches in health and alerts: missing critical updates and pending restarts count against health; alert on failed installs. Approvals that also cover agents reporting the update later.
-- [ ] Alert when an agent stops reporting its protection state.
-- [ ] Run package managers in their own systemd scope, so restarting the agent mid-install doesn't kill dpkg.
-- [ ] Agent page: 13 tabs now. Move them to a side sub-nav before adding more.
-- [ ] Bulk actions on every row matching a filter, not just the rows on screen.
-- [ ] Process list with kill, outside of a detection (the sensor can already kill a tree; there's no general process view).
-- [ ] File browser and transfer: upload/download over the agent socket in chunks.
+- [x] Maintenance windows / snooze per agent for alerts, re-notify while an alert stays open, and per-agent policy overrides (exclude one machine from a client-wide policy). `alert_mutes` (one-off or weekly, per client, site or agent); alerts opened during one are `suppressed` (no notifications, tickets or health) and announced when it ends. Policies have `renotify_minutes` and `excluded_agents`.
+- [x] Patches in health and alerts: missing critical updates (over a week) and pending restarts (over a day) count against health; a `patch` alert policy for failed installs and long-pending restarts. Approvals made for a client, site or everything stand for agents reporting the update later (`patch_approvals`).
+- [x] Alert when an agent stops reporting its protection state (`stale_hours` on the security policy; agents now resend an unchanged state hourly).
+- [x] Run package managers in their own systemd scope, so restarting the agent mid-install doesn't kill dpkg. Output goes to files, not pipes. Not yet run as root under systemd: unit-tested for the file output only.
+- [x] Agent page: a grouped side sub-nav instead of the tab strip (a scrolling strip on phones).
+- [x] Bulk actions on every row matching a filter: "Select all N matching" on the agents, alerts and tickets lists (up to 5,000, sent to the bulk endpoints in batches).
+- [x] Process list with kill, outside of a detection (agent's Processes section; the agent's own and system processes are protected).
+- [x] File browser and transfer: browse, download (streamed) and upload (no 8 MB limit, written next to the target and moved into place when complete) over the agent socket in 512 KB pieces. New agent capability `tools`.
 
 ### 4. PSA milestones 3-4: portal and SLAs
 

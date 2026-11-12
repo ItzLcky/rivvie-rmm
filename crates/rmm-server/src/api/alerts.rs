@@ -45,6 +45,8 @@ pub struct AlertRow {
     resolved_at: Option<DateTime<Utc>>,
     resolved_by_name: Option<String>,
     resolution: Option<String>,
+    /// Opened during a maintenance window or snooze: nobody was notified (yet).
+    suppressed: bool,
     #[sqlx(default)]
     #[serde(skip)]
     sort_key: String,
@@ -57,7 +59,7 @@ fn alert_cols() -> String {
     format!(
         "al.id, al.policy_id, p.name AS policy_name, al.agent_id, a.hostname, s.client_id, c.name AS client_name, s.name AS site_name,
          al.kind, al.severity, al.title, al.details, al.occurrences, {STATE} AS state, al.opened_at, al.last_seen_at,
-         al.acknowledged_at, ua.name AS acknowledged_by_name, al.resolved_at, ur.name AS resolved_by_name, al.resolution"
+         al.acknowledged_at, ua.name AS acknowledged_by_name, al.resolved_at, ur.name AS resolved_by_name, al.resolution, al.suppressed"
     )
 }
 const ALERT_FROM: &str = "FROM alerts al JOIN agents a ON a.id = al.agent_id JOIN sites s ON s.id = a.site_id
@@ -350,6 +352,10 @@ pub struct PolicyRow {
     ticket_priority: i16,
     /// Resolve the ticket when the alert clears, if nobody has worked it.
     ticket_auto_resolve: bool,
+    /// Remind the channels this often while an alert stays open and unacknowledged.
+    renotify_minutes: Option<i32>,
+    /// Agents left out: `[{id, hostname}]` (those the user can see).
+    excluded: Value,
     open_alerts: i64,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
@@ -357,7 +363,10 @@ pub struct PolicyRow {
 
 const POLICY_SELECT: &str = "SELECT p.id, p.name, p.kind, p.params, p.severity, p.client_id, c.name AS client_name, p.site_id,
        si.name AS site_name, p.os_family, p.channel_ids, p.notify_resolved, p.enabled, p.ticket_board_id, p.ticket_priority,
-       p.ticket_auto_resolve,
+       p.ticket_auto_resolve, p.renotify_minutes,
+       (SELECT coalesce(jsonb_agg(jsonb_build_object('id', xa.id, 'hostname', xa.hostname) ORDER BY lower(xa.hostname)), '[]')
+          FROM agents xa JOIN sites xs ON xs.id = xa.site_id
+         WHERE xa.id = ANY(p.excluded_agents) AND ($1::uuid[] IS NULL OR xs.client_id = ANY($1))) AS excluded,
        (SELECT count(*) FROM alerts al WHERE al.policy_id = p.id AND al.resolved_at IS NULL) AS open_alerts,
        p.created_at, p.updated_at
   FROM alert_policies p LEFT JOIN clients c ON c.id = p.client_id LEFT JOIN sites si ON si.id = p.site_id";
@@ -407,6 +416,7 @@ pub struct PolicyIn {
     ticket_priority: i16,
     #[serde(default)]
     ticket_auto_resolve: bool,
+    renotify_minutes: Option<i32>,
 }
 
 fn p3() -> i16 {
@@ -452,6 +462,9 @@ impl PolicyIn {
         let rule = Rule::parse(&self.kind, &params).map_err(ApiError::BadRequest)?;
         rule.validate().map_err(ApiError::BadRequest)?;
         check_target(st, u, self.client_id, self.site_id, self.os_family.as_deref()).await?;
+        if self.renotify_minutes.is_some_and(|m| !(15..=10080).contains(&m)) {
+            return Err(ApiError::BadRequest("reminders must be every 15 minutes to 7 days".into()));
+        }
         if !(1..=4).contains(&self.ticket_priority) {
             return Err(ApiError::BadRequest("ticket priority must be 1-4".into()));
         }
@@ -504,8 +517,8 @@ pub async fn create_policy(State(st): State<Arc<AppState>>, u: User, Json(b): Js
     let id = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO alert_policies (id, name, kind, params, severity, client_id, site_id, os_family, channel_ids, notify_resolved, enabled, created_by,
-                                     ticket_board_id, ticket_priority, ticket_auto_resolve)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
+                                     ticket_board_id, ticket_priority, ticket_auto_resolve, renotify_minutes)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
     )
     .bind(id)
     .bind(b.name.trim())
@@ -522,6 +535,7 @@ pub async fn create_policy(State(st): State<Arc<AppState>>, u: User, Json(b): Js
     .bind(b.ticket_board_id)
     .bind(b.ticket_priority)
     .bind(b.ticket_auto_resolve)
+    .bind(b.renotify_minutes)
     .execute(&st.db)
     .await?;
     auth::audit(&st.db, Some(u.id), "policy.create", Some(("policy", id)), json!({ "name": b.name.trim(), "kind": rule.kind() })).await;
@@ -546,7 +560,7 @@ pub async fn update_policy(
     sqlx::query(
         "UPDATE alert_policies SET name = $2, params = $3, severity = $4, client_id = $5, site_id = $6, os_family = $7,
                 channel_ids = $8, notify_resolved = $9, enabled = $10, ticket_board_id = $11, ticket_priority = $12,
-                ticket_auto_resolve = $13, updated_at = now()
+                ticket_auto_resolve = $13, renotify_minutes = $14, updated_at = now()
           WHERE id = $1",
     )
     .bind(id)
@@ -562,6 +576,7 @@ pub async fn update_policy(
     .bind(b.ticket_board_id)
     .bind(b.ticket_priority)
     .bind(b.ticket_auto_resolve)
+    .bind(b.renotify_minutes)
     .execute(&st.db)
     .await?;
     // Open alerts take the new severity.
@@ -583,4 +598,89 @@ pub async fn remove_policy(State(st): State<Arc<AppState>>, u: User, Path(id): P
     auth::audit(&st.db, Some(u.id), "policy.delete", Some(("policy", id)), json!({ "name": current.name })).await;
     crate::alerts::policy_changed(&st, id).await;
     Ok(Json(json!({ "ok": true })))
+}
+
+// ---------------------------------------------------------------------------
+// Per-agent exclusions
+// ---------------------------------------------------------------------------
+
+/// Leaves one agent out of a policy (`excluded: true`) or puts it back. The policy's open
+/// alerts on that agent close quietly.
+async fn set_excluded(st: &Arc<AppState>, u: &User, policy_id: Uuid, agent_id: Uuid, excluded: bool) -> ApiResult<PolicyRow> {
+    let p = fetch_policy(st, u, policy_id).await?;
+    // Changing who a policy covers is editing it; the agent must be one the user can manage.
+    super::scripts::may_edit(u, p.client_id)?;
+    super::access::agent(st, u, agent_id).await?;
+    let sql = if excluded {
+        "UPDATE alert_policies SET excluded_agents = array_append(excluded_agents, $2), updated_at = now()
+          WHERE id = $1 AND NOT ($2 = ANY(excluded_agents))"
+    } else {
+        "UPDATE alert_policies SET excluded_agents = array_remove(excluded_agents, $2), updated_at = now() WHERE id = $1"
+    };
+    sqlx::query(sql).bind(policy_id).bind(agent_id).execute(&st.db).await?;
+    // Agents that were deleted don't need to stay listed.
+    sqlx::query(
+        "UPDATE alert_policies SET excluded_agents = ARRAY(SELECT x FROM unnest(excluded_agents) x WHERE EXISTS (SELECT 1 FROM agents WHERE id = x))
+          WHERE id = $1",
+    )
+    .bind(policy_id)
+    .execute(&st.db)
+    .await?;
+    auth::audit(
+        &st.db,
+        Some(u.id),
+        if excluded { "policy.exclude_agent" } else { "policy.include_agent" },
+        Some(("agent", agent_id)),
+        json!({ "policy": policy_id, "name": p.name }),
+    )
+    .await;
+    crate::alerts::policy_changed(st, policy_id).await;
+    fetch_policy(st, u, policy_id).await
+}
+
+pub async fn exclude(State(st): State<Arc<AppState>>, u: User, Path((id, agent_id)): Path<(Uuid, Uuid)>) -> ApiResult<Json<PolicyRow>> {
+    Ok(Json(set_excluded(&st, &u, id, agent_id, true).await?))
+}
+
+pub async fn include(State(st): State<Arc<AppState>>, u: User, Path((id, agent_id)): Path<(Uuid, Uuid)>) -> ApiResult<Json<PolicyRow>> {
+    Ok(Json(set_excluded(&st, &u, id, agent_id, false).await?))
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+pub struct CoveringPolicy {
+    id: Uuid,
+    name: String,
+    kind: String,
+    severity: String,
+    enabled: bool,
+    /// "msp", "client" or "site": where it's set.
+    level: String,
+    excluded: bool,
+    /// The user may edit it (and so exclude the agent from it).
+    #[sqlx(default)]
+    editable: bool,
+    open_alerts: i64,
+}
+
+/// The alert policies whose client/site/OS cover this agent, excluded or not.
+pub async fn for_agent(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uuid>) -> ApiResult<Json<Vec<CoveringPolicy>>> {
+    super::access::agent(&st, &u, id).await?;
+    let mut rows: Vec<CoveringPolicy> = sqlx::query_as(
+        "SELECT p.id, p.name, p.kind, p.severity, p.enabled,
+                CASE WHEN p.site_id IS NOT NULL THEN 'site' WHEN p.client_id IS NOT NULL THEN 'client' ELSE 'msp' END AS level,
+                a.id = ANY(p.excluded_agents) AS excluded,
+                (SELECT count(*) FROM alerts al WHERE al.policy_id = p.id AND al.agent_id = a.id AND al.resolved_at IS NULL) AS open_alerts
+           FROM alert_policies p, agents a JOIN sites s ON s.id = a.site_id
+          WHERE a.id = $1 AND (p.client_id IS NULL OR p.client_id = s.client_id) AND (p.site_id IS NULL OR p.site_id = a.site_id)
+            AND (p.os_family IS NULL OR p.os_family = a.os_family)
+          ORDER BY p.enabled DESC, lower(p.name)",
+    )
+    .bind(id)
+    .fetch_all(&st.db)
+    .await?;
+    for r in &mut rows {
+        let client: Option<Uuid> = sqlx::query_scalar("SELECT client_id FROM alert_policies WHERE id = $1").bind(r.id).fetch_one(&st.db).await?;
+        r.editable = super::scripts::may_edit(&u, client).is_ok();
+    }
+    Ok(Json(rows))
 }

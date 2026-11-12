@@ -68,7 +68,7 @@ impl PatchProvider for Dnf {
         args.extend(ids.iter().map(String::as_str));
         let total = ids.len().max(1);
         let mut done = 0usize;
-        let out = cmd::run(log, self.bin, &args, Opts { timeout: Duration::from_secs(3 * 3600), ..Default::default() }, &mut |line| {
+        let out = cmd::run(log, self.bin, &args, Opts { timeout: Duration::from_secs(3 * 3600), detach: true, ..Default::default() }, &mut |line| {
             if let Some((stage, msg, pct)) = progress_line(line, total, &mut done) {
                 progress(stage, msg, pct);
             }

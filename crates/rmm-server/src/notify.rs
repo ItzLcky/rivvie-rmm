@@ -260,7 +260,14 @@ async fn render(st: &AppState, alert_id: Uuid, event: &str) -> Result<Message, S
 
     let resolved = event == "resolved";
     let url = format!("{}/agents/{}?tab=alerts", st.cfg.public_url, a.agent_id);
-    let status = if resolved { "Resolved".to_string() } else { a.severity.to_uppercase() };
+    let reminder = event == "reminder";
+    let status = if resolved {
+        "Resolved".to_string()
+    } else if reminder {
+        format!("Still open, {}", a.severity.to_uppercase())
+    } else {
+        a.severity.to_uppercase()
+    };
     let headline = format!("{}: {} on {}", status, a.title, a.hostname);
     let subject = format!("[{}] {headline}", brand(st));
     let mut facts = vec![
@@ -282,7 +289,13 @@ async fn render(st: &AppState, alert_id: Uuid, event: &str) -> Result<Message, S
     let width = facts.iter().map(|(k, _)| k.chars().count()).max().unwrap_or(0) + 2;
     let text = format!(
         "{}\n\n{}\n\n{url}\n",
-        if resolved { format!("Resolved: {}", a.title) } else { a.title.clone() },
+        if resolved {
+            format!("Resolved: {}", a.title)
+        } else if reminder {
+            format!("Still open (since {}): {}", a.opened_at.format("%Y-%m-%d %H:%M UTC"), a.title)
+        } else {
+            a.title.clone()
+        },
         facts.iter().map(|(k, v)| format!("{:width$}{v}", format!("{k}:"))).collect::<Vec<_>>().join("\n"),
     );
     let payload = json!({

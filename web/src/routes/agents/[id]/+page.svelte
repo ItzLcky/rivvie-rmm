@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
-	import { CloudDownload, Copy, LifeBuoy, MonitorUp, Play, RefreshCw, Search, SquareTerminal, Trash2 } from '@lucide/svelte';
+	import { BellOff, CloudDownload, Copy, LifeBuoy, MonitorUp, Play, RefreshCw, Search, SquareTerminal, Trash2 } from '@lucide/svelte';
 	import { api } from '#lib/api.js';
 	import { confirmAction } from '#lib/confirm.svelte.js';
 	import { ago, bytes, datetime, duration, ms, num, pct } from '#lib/format.js';
@@ -23,7 +23,7 @@
 	import Segmented from '#lib/ui/Segmented.svelte';
 	import Skeleton from '#lib/ui/Skeleton.svelte';
 	import Spinner from '#lib/ui/Spinner.svelte';
-	import Tabs from '#lib/ui/Tabs.svelte';
+	import SubNav from '#lib/ui/SubNav.svelte';
 	import Chart from '#lib/components/Chart.svelte';
 	import HealthBadge from '#lib/components/HealthBadge.svelte';
 	import JobBadge from '#lib/components/JobBadge.svelte';
@@ -32,6 +32,9 @@
 	import Status from '#lib/components/Status.svelte';
 	import UsageBar from '#lib/components/UsageBar.svelte';
 	import AgentAlerts from '#lib/components/agent/AgentAlerts.svelte';
+	import AgentFiles from '#lib/components/agent/AgentFiles.svelte';
+	import AgentProcesses from '#lib/components/agent/AgentProcesses.svelte';
+	import MuteDialog from '#lib/components/MuteDialog.svelte';
 	import AgentLogs from '#lib/components/agent/AgentLogs.svelte';
 	import AgentSecurity from '#lib/components/agent/AgentSecurity.svelte';
 	import AgentServices from '#lib/components/agent/AgentServices.svelte';
@@ -81,6 +84,7 @@
 
 	let running = $state(false);
 	let ticketing = $state(false);
+	let snoozing = $state(false);
 	/** Terminal or desktop opened from a ticket: the session is recorded there. */
 	const fromTicket = $derived(param('ticket'));
 
@@ -158,6 +162,13 @@
 			'service.restart': `Restarted ${d.service}${d.ok ? '' : ` (failed: ${d.message})`}`,
 			'agent.patch_install': `Started installing ${d.updates} update${Number(d.updates) === 1 ? '' : 's'}`,
 			'agent.patch_cancel': 'Cancelled a queued install',
+			'agent.process_kill': `${d.ok ? 'Killed' : 'Tried to kill'} ${d.name ? `${d.name} (${r.details.pid})` : `process ${r.details.pid}`}${r.details.tree ? ' and its children' : ''}${d.ok ? '' : `: ${d.message}`}`,
+			'agent.file_download': `Downloaded ${d.path}`,
+			'agent.file_upload': `${d.ok ? 'Uploaded' : 'Failed to upload'} ${d.path}${d.ok ? '' : `: ${d.error}`}`,
+			'alert.mute': r.details.ends_at ? `Snoozed alerts until ${datetime(String(r.details.ends_at))}${d.reason ? ` (${d.reason})` : ''}` : `Added an alert maintenance window${d.reason ? ` (${d.reason})` : ''}`,
+			'alert.unmute': 'Ended an alert snooze or maintenance window',
+			'policy.exclude_agent': `Excluded from the alert policy ${d.name}`,
+			'policy.include_agent': `Covered by the alert policy ${d.name} again`,
 			'security.quick_scan': `Started a quick scan (${productLabels[d.product as ProductKind] ?? d.product})`,
 			'security.full_scan': `Started a full scan (${productLabels[d.product as ProductKind] ?? d.product})`,
 			'security.update_signatures': `Started a signature update (${productLabels[d.product as ProductKind] ?? d.product})`,
@@ -207,6 +218,7 @@
 			menu={[
 				...(can('technician') ? [{ label: 'New ticket for this agent', icon: LifeBuoy, onSelect: () => (ticketing = true) }] : []),
 				...(can('technician') ? [{ label: 'Refresh inventory', icon: RefreshCw, onSelect: refreshInventory, disabled: !a.online }] : []),
+				...(can('technician') ? [{ label: 'Snooze alerts…', icon: BellOff, onSelect: () => (snoozing = true) }] : []),
 				...(can('admin') && release && release.version !== a.agent_version ? [{ label: `Update agent to v${release.version}`, icon: CloudDownload, onSelect: update, disabled: !a.online }] : []),
 				{ label: 'Copy agent ID', icon: Copy, onSelect: () => navigator.clipboard?.writeText(a.id).then(() => toast.success('Agent ID copied.')) },
 				...(can('admin') ? [{ separator: true } as const, { label: 'Remove agent…', icon: Trash2, onSelect: remove, danger: true }] : [])
@@ -216,6 +228,7 @@
 				<Status online={a.online} size="md" />
 				<HealthBadge health={a.health} agent={a} />
 				<OsBadge os={a.os_family} name={a.os_version || a.os_name} />
+				{#if a.alerts_muted}<Badge tone="neutral" icon={BellOff} title="A maintenance window or snooze is holding this agent's alerts back">Alerts muted</Badge>{/if}
 				<span>{a.client_name} › {a.site_name}</span>
 			{/snippet}
 			{#snippet actions()}
@@ -227,27 +240,42 @@
 			{/snippet}
 		</PageHeader>
 
-		<Tabs
+		<div class="lg:grid lg:grid-cols-[11rem_minmax(0,1fr)] lg:gap-6">
+		<SubNav
 			label="Agent sections"
-			class="mb-4"
+			class="mb-4 lg:sticky lg:top-4 lg:mb-0 lg:self-start"
 			value={tab}
+			first="overview"
 			onchange={(v) => setParams({ tab: v === 'overview' ? null : v }, { push: true })}
-			items={[
-				{ value: 'overview', label: 'Overview' },
-				{ value: 'inventory', label: 'Hardware & network' },
-				{ value: 'software', label: 'Software', count: inv ? num(inv.software.length) : undefined },
-				{ value: 'alerts', label: 'Alerts', count: a.open_alerts ? num(a.open_alerts) : undefined },
-				{ value: 'tickets', label: 'Tickets' },
-				{ value: 'services', label: 'Services' },
-				{ value: 'logs', label: 'Event log' },
-				{ value: 'patches', label: 'Patches' },
-				{ value: 'security', label: 'Security' },
-				{ value: 'jobs', label: 'Jobs' },
-				{ value: 'activity', label: 'Activity' },
-				{ value: 'terminal', label: 'Terminal', hidden: !can('technician') },
-				{ value: 'desktop', label: 'Desktop', hidden: !can('technician'), title: 'Remote desktop' }
+			groups={[
+				{ items: [
+					{ value: 'overview', label: 'Overview' },
+					{ value: 'alerts', label: 'Alerts', count: a.open_alerts ? num(a.open_alerts) : undefined },
+					{ value: 'tickets', label: 'Tickets' },
+					{ value: 'activity', label: 'Activity' }
+				] },
+				{ label: 'Inventory', items: [
+					{ value: 'inventory', label: 'Hardware & network' },
+					{ value: 'software', label: 'Software', count: inv ? num(inv.software.length) : undefined }
+				] },
+				{ label: 'Monitoring', items: [
+					{ value: 'services', label: 'Services' },
+					{ value: 'processes', label: 'Processes', hidden: !can('technician') },
+					{ value: 'logs', label: 'Event log' }
+				] },
+				{ label: 'Management', items: [
+					{ value: 'patches', label: 'Patches', count: a.patches_overdue || a.patches_failed ? num(a.patches_overdue + a.patches_failed) : undefined, title: a.patches_overdue || a.patches_failed ? 'Overdue security updates and failed installs' : undefined },
+					{ value: 'security', label: 'Security' },
+					{ value: 'jobs', label: 'Jobs' },
+					{ value: 'files', label: 'Files', hidden: !can('technician') }
+				] },
+				{ label: 'Remote', items: [
+					{ value: 'terminal', label: 'Terminal', hidden: !can('technician') },
+					{ value: 'desktop', label: 'Remote desktop', hidden: !can('technician') }
+				] }
 			]}
 		/>
+		<div class="min-w-0">
 
 		{#if tab === 'overview'}
 			<div class="grid gap-4 lg:grid-cols-[minmax(18rem,22rem)_1fr]">
@@ -434,7 +462,11 @@
 				{#snippet footer()}{#if jobs.data?.next}<p class="text-muted px-3 py-2 text-xs">Showing the latest 200. <a class="link" href="/jobs?q={encodeURIComponent(a.hostname)}">See all in Jobs</a></p>{/if}{/snippet}
 			</DataTable>
 		{:else if tab === 'alerts'}
-			<AgentAlerts agentId={a.id} />
+			<AgentAlerts agentId={a.id} hostname={a.hostname} onchange={() => agent.reload()} />
+		{:else if tab === 'processes'}
+			<AgentProcesses agent={a} />
+		{:else if tab === 'files'}
+			<AgentFiles agent={a} />
 		{:else if tab === 'tickets'}
 			<TicketTable id="agent-tickets" caption="Tickets about {a.hostname}" list={tickets} sort={ticketSort} hide={['client']}>
 				{#snippet toolbar()}
@@ -496,7 +528,11 @@
 			{/if}
 		{/if}
 
+		</div>
+		</div>
+
 		{#if running}<RunScript agents={[a]} onclose={() => (running = false)} />{/if}
+		{#if snoozing}<MuteDialog target={{ agent_id: a.id, name: a.hostname }} onclose={() => (snoozing = false)} onsaved={() => agent.reload()} />{/if}
 		{#if ticketing}<NewTicket onclose={() => (ticketing = false)} initial={{ clientId: a.client_id, agents: [a] }} />{/if}
 	{/snippet}
 </Async>

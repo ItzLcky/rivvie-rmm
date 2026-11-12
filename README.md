@@ -45,7 +45,8 @@ docs/           Roadmap and design notes
 - **Terminal:** xterm.js ↔ server relay ↔ PTY on the agent (bash/zsh on Linux, PowerShell through ConPTY on Windows).
 - **Remote desktop:** view and control the machine's screen from the browser, relayed over the agent's existing socket (no extra ports). Changed areas are sent as JPEG, paced by the browser so slow links get fewer frames rather than lag. Optional consent prompt per client. See [Remote desktop](#remote-desktop).
 - **Per-client access:** admins see every client. Technicians and read-only users see every client by default, or only the clients an admin picks under Company settings → Users. Everything they can reach (agents, sites, tokens, jobs, terminal, dashboard counts) is scoped to those clients, and anything outside them reads as "not found". Scripts are MSP-wide (admins edit them; they run anywhere) or belong to one client (its technicians edit them; they only run on its agents).
-- **Alerting:** alert policies, per client or site (and optionally one OS), raise alerts for agents that are offline, CPU, memory or disk held over a threshold, a stopped or failed service, a failed script, or a log entry that matches. Offline and threshold policies are checked every minute; the others act as agents report. An alert stays open until its condition clears (or someone resolves it), and open alerts feed the health model. See [Monitoring and alerts](#monitoring-and-alerts).
+- **Alerting:** alert policies, per client or site (and optionally one OS, minus agents you leave out), raise alerts for agents that are offline, CPU, memory or disk held over a threshold, a stopped or failed service, a failed script, a log entry that matches, failed patch installs and restarts left pending. Offline and threshold policies are checked every minute; the others act as agents report. An alert stays open until its condition clears (or someone resolves it), reminds its channels while nobody acknowledges it, and feeds the health model. Maintenance windows and snoozes hold alerts back during planned work. See [Monitoring and alerts](#monitoring-and-alerts).
+- **Processes and files:** technicians see an agent's processes live and kill them (or a whole tree), and browse its file system, downloading and uploading files of any size in pieces over the agent's socket. Kills and transfers are audited.
 - **Schedules:** saved scripts run on a cron timetable, in any time zone, on every agent of a client or site. Each schedule keeps its runs' output for as many days as you choose.
 - **Patch management:** agents scan for OS updates (Windows Update Agent, apt, dnf/yum, pacman, softwareupdate) when they connect and every `RMM_PATCH_SCAN_HOURS`. Patch policies approve updates by category or severity and can install them during each site's maintenance window, with a reboot policy. Technicians approve, decline and install from the Patches page or an agent's Patches tab, and the Compliance tab shows how many agents per client are fully patched. See [Patch management](#patch-management).
 - **Endpoint protection:** agents report the antivirus the machine already has (Microsoft Defender and other Windows Security Center products, ClamAV, XProtect), and can run our own sensor: telemetry, behaviour rules and file scanning from signed content rolled out to canary clients first, quarantine, network isolation, triage packages and fleet-wide hunting. Technicians start scans and signature updates from the Security page or an agent's Security tab, and alert policies raise alerts for protection that's off or out of date and for threats. See [Endpoint protection](#endpoint-protection).
@@ -225,6 +226,18 @@ critical alerts make an agent *unhealthy*, warnings make it *need attention*.
 | Service stopped | a watched service is stopped or failed. Watch names (`nginx`, `Spooler`, `php*-fpm`), every automatic service, or both, minus exclusions | it runs again |
 | Failed job | a script fails, errors or times out (any script, or one) | the same script next succeeds on that agent |
 | Event log match | a journal entry (Linux) or Event Log entry (Windows) matches the level, sources, event IDs and regular expression | someone resolves it |
+| Patches | an update failed to install (one alert per agent), or a restart to finish updates has been pending for N hours | the updates install or are declined; the restart happens |
+| Antivirus | no product on, real-time off, signatures older than N hours, a threat, our sensor down, or an online agent that hasn't reported its protection state for N hours (agents resend it at least hourly) | the condition goes away |
+
+**Leaving one agent out.** A policy covers every agent of its client or site; the agent's Alerts tab
+lists the policies that cover it and can exclude it from any of them (its open alerts from that
+policy close quietly). The policy page lists its excluded agents.
+
+**Maintenance windows and snoozes** hold alerts back for a client, a site or one agent: a one-off
+period (snooze an agent from its page before planned work) or a weekly window (Alert policies →
+Maintenance windows, e.g. weekend patching). Alerts that open meanwhile are recorded but marked
+muted: nobody is notified, no ticket opens, and they don't count against health. Any still open
+when the window ends are announced then, as if they had just opened.
 
 Agents report their services (systemd units, Windows services) once a minute when something changed,
 and technicians can start, stop and restart them from the agent's Services tab. Log watchers run on
@@ -234,11 +247,12 @@ are kept for 30 days on the agent's Event log tab.
 **Notifications** go to channels set up by an admin under Company settings → Notifications: email
 (through the SMTP server set there), a generic webhook, Slack incoming webhooks, or Teams Workflows
 webhooks (Adaptive Cards). A policy notifies its channels when an alert opens and, optionally, when
-it clears. Deliveries are queued in Postgres and retried (after 1, 5 and 30 minutes, then every 2
+it clears, and can remind them every 15 minutes to 3 days while the alert stays open and
+unacknowledged (not during a maintenance window). Deliveries are queued in Postgres and retried (after 1, 5 and 30 minutes, then every 2
 hours, 5 attempts in all), so a mail server outage delays them rather than losing them. The delivery
 log is on the same settings page.
 
-A webhook receives a JSON body like this, with `X-RMM-Event: opened|resolved|test`, and, when the
+A webhook receives a JSON body like this, with `X-RMM-Event: opened|resolved|reminder|test`, and, when the
 channel has a secret, `X-RMM-Signature: sha256=<hex HMAC-SHA256 of the body with the secret>`:
 
 ```json
@@ -308,8 +322,14 @@ critical, definitions, rollups, updates, drivers, feature updates) or by vendor 
 (critical, important, moderate, low; only Windows and RHEL/Fedora rate updates). There is one
 MSP-wide policy, which by default approves security, critical and definition updates and installs
 nothing on its own. Clients and sites can have their own, and the most specific one applies,
-whole. A person's approve or decline overrides the policy for that update on that agent until
-someone resets it. Declined updates don't count against compliance.
+whole. A person's approve or decline overrides the policy until someone resets it. Made for a
+client, a site or everything (rather than picked agents), it also covers agents that report the
+update later; resetting the scope hands the update back to the policy. Declined updates don't count
+against compliance.
+
+**Health.** Security or critical updates missing for more than a week, updates that failed to
+install, and a restart pending for more than a day make an agent *need attention*. A `patch` alert
+policy turns failed installs and long-pending restarts into alerts.
 
 **Installing.** With **Install automatically** on, the server starts installs for approved
 updates (after the policy's deferral, counted from when the update was first seen) while the
@@ -318,7 +338,9 @@ eligible. Installing by hand from the dashboard starts right away, ignoring wind
 deferrals. The reboot policy (never, if required, always) decides whether the agent restarts the
 machine afterwards, with a one-minute warning. Failed updates are retried automatically up to
 three times. Agents report results after reconnects, like job results. After every install the
-agent rescans, so the dashboard shows what is really installed.
+agent rescans, so the dashboard shows what is really installed. On Linux under systemd the
+package manager runs in its own transient scope (`systemd-run --scope`) and writes to files rather
+than pipes, so restarting or updating the agent mid-install doesn't kill dpkg or rpm halfway.
 
 Limits: Debian/Ubuntu/Arch don't publish severities, so approve those by category (Arch has no
 security tags either: include **Updates** in the policy for Arch machines). On Apple silicon,

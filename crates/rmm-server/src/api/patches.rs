@@ -374,10 +374,50 @@ pub async fn approval(State(st): State<Arc<AppState>>, u: User, Json(b): Json<Ap
     if let Some(c) = b.client_id {
         super::access::client(&u, c)?;
     }
-    if let Some(s) = b.site_id {
-        super::access::site(&st, &u, s).await?;
-    }
+    let site_client = match b.site_id {
+        Some(s) => Some(super::access::site(&st, &u, s).await?),
+        None => None,
+    };
     let manual = b.decision != "pending";
+    // Unless it's for chosen agents, the decision stands for the whole scope, including
+    // agents that report these updates later. It replaces narrower decisions inside the scope.
+    if b.agent_ids.is_none() {
+        let scopes: Vec<(Option<Uuid>, Option<Uuid>)> = match (b.site_id, b.client_id.or(site_client), u.scope()) {
+            (Some(site), client, _) => vec![(client, Some(site))],
+            (None, Some(client), _) => vec![(Some(client), None)],
+            (None, None, None) => vec![(None, None)],
+            (None, None, Some(clients)) => clients.iter().map(|c| (Some(*c), None)).collect(),
+        };
+        let mut tx = st.db.begin().await?;
+        for (client, site) in &scopes {
+            sqlx::query(
+                "DELETE FROM patch_approvals
+                  WHERE update_id = ANY($1)
+                    AND CASE WHEN $3::uuid IS NOT NULL THEN site_id = $3
+                             WHEN $2::uuid IS NOT NULL THEN client_id = $2
+                             ELSE true END",
+            )
+            .bind(&b.update_ids)
+            .bind(client)
+            .bind(site)
+            .execute(&mut *tx)
+            .await?;
+            if manual {
+                sqlx::query(
+                    "INSERT INTO patch_approvals (update_id, client_id, site_id, decision, decided_by)
+                     SELECT unnest($1::text[]), $2, $3, $4, $5",
+                )
+                .bind(&b.update_ids)
+                .bind(client)
+                .bind(site)
+                .bind(&b.decision)
+                .bind(u.id)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+        tx.commit().await?;
+    }
     let agents: Vec<Uuid> = sqlx::query_scalar(
         "UPDATE patches p
             SET approval = $1, approval_manual = $2, approved_by = CASE WHEN $2 THEN $3::uuid END,
@@ -403,9 +443,13 @@ pub async fn approval(State(st): State<Arc<AppState>>, u: User, Json(b): Json<Ap
     agents.sort();
     agents.dedup();
     if !manual {
-        core::apply_policies(&st.db, Some(&agents)).await?;
+        core::apply_policies(&mut *st.db.acquire().await?, Some(&agents)).await?;
     }
     publish_agents(&st, &agents).await?;
+    // A declined update no longer counts as a failed install.
+    for a in &agents {
+        crate::alerts::patches_changed(&st, *a).await;
+    }
     auth::audit(
         &st.db,
         Some(u.id),
@@ -813,7 +857,7 @@ async fn scope_agents(st: &AppState, client_id: Option<Uuid>, site_id: Option<Uu
 
 async fn after_policy_change(st: &AppState, client_id: Option<Uuid>, site_id: Option<Uuid>) -> ApiResult<()> {
     let agents = scope_agents(st, client_id, site_id).await?;
-    core::apply_policies(&st.db, agents.as_deref()).await?;
+    core::apply_policies(&mut *st.db.acquire().await?, agents.as_deref()).await?;
     // The MSP-wide policy can touch every agent; pages showing them refetch on their own.
     if let Some(a) = &agents {
         publish_agents(st, a).await?;

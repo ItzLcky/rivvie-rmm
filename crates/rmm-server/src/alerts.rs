@@ -92,6 +92,23 @@ pub struct SecurityRule {
     /// was stopped).
     #[serde(default)]
     pub sensor_down: bool,
+    /// The agent is online but hasn't reported its protection state for this long.
+    #[serde(default)]
+    pub stale_hours: Option<i32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PatchRule {
+    /// Updates whose last install failed (and that nobody declined since).
+    #[serde(default = "yes")]
+    pub failed: bool,
+    /// A restart has been pending for this long. None = don't check.
+    #[serde(default)]
+    pub reboot_hours: Option<i32>,
+}
+
+fn yes() -> bool {
+    true
 }
 
 /// What a policy checks: `kind` and `params` columns together.
@@ -109,6 +126,7 @@ pub enum Rule {
     },
     Log(LogRule),
     Security(SecurityRule),
+    Patch(PatchRule),
 }
 
 impl Rule {
@@ -126,6 +144,7 @@ impl Rule {
             Rule::JobFailed { .. } => "job_failed",
             Rule::Log(_) => "log",
             Rule::Security(_) => "security",
+            Rule::Patch(_) => "patch",
         }
     }
 
@@ -171,7 +190,25 @@ impl Rule {
                 if r.signature_max_age_hours.is_some_and(|h| !(1..=8760).contains(&h)) {
                     return Err("signature age must be 1-8760 hours".into());
                 }
-                if !r.unprotected && !r.realtime_off && r.signature_max_age_hours.is_none() && r.threats == ThreatAlerts::Off && !r.sensor_down {
+                if r.stale_hours.is_some_and(|h| !(2..=168).contains(&h)) {
+                    return Err("the reporting limit must be 2-168 hours".into());
+                }
+                if !r.unprotected
+                    && !r.realtime_off
+                    && r.signature_max_age_hours.is_none()
+                    && r.threats == ThreatAlerts::Off
+                    && !r.sensor_down
+                    && r.stale_hours.is_none()
+                {
+                    return Err("pick at least one thing to alert on".into());
+                }
+                Ok(())
+            }
+            Rule::Patch(r) => {
+                if r.reboot_hours.is_some_and(|h| !(1..=8760).contains(&h)) {
+                    return Err("restart pending must be 1-8760 hours".into());
+                }
+                if !r.failed && r.reboot_hours.is_none() {
                     return Err("pick at least one thing to alert on".into());
                 }
                 Ok(())
@@ -193,28 +230,34 @@ pub struct Policy {
     pub os_family: Option<String>,
     pub channel_ids: Vec<Uuid>,
     pub notify_resolved: bool,
+    pub excluded_agents: Vec<Uuid>,
 }
 
-pub const POLICY_COLS: &str = "p.id, p.name, p.kind, p.params, p.severity, p.client_id, p.site_id, p.os_family, p.channel_ids, p.notify_resolved";
+pub const POLICY_COLS: &str =
+    "p.id, p.name, p.kind, p.params, p.severity, p.client_id, p.site_id, p.os_family, p.channel_ids, p.notify_resolved, p.excluded_agents";
 
 impl Policy {
     fn rule(&self) -> Option<Rule> {
         Rule::parse(&self.kind, &self.params).inspect_err(|e| warn!(policy = %self.id, "{e}")).ok()
     }
 
-    fn covers(&self, client_id: Uuid, site_id: Uuid, os: &str) -> bool {
-        self.client_id.is_none_or(|c| c == client_id)
+    fn covers(&self, agent_id: Uuid, client_id: Uuid, site_id: Uuid, os: &str) -> bool {
+        !self.excluded_agents.contains(&agent_id)
+            && self.client_id.is_none_or(|c| c == client_id)
             && self.site_id.is_none_or(|s| s == site_id)
             && self.os_family.as_deref().is_none_or(|o| o == os)
     }
 }
 
-/// `$n` client, `$n+1` site, `$n+2` OS: the agents (`a`, site `s`) a policy covers.
+/// `$n` client, `$n+1` site, `$n+2` OS, `$n+3` excluded agents: the agents (`a`, site `s`)
+/// a policy covers.
 fn scope_sql(n: usize) -> String {
     format!(
-        "(${n}::uuid IS NULL OR s.client_id = ${n}) AND (${m}::uuid IS NULL OR a.site_id = ${m}) AND (${o}::text IS NULL OR a.os_family = ${o})",
+        "(${n}::uuid IS NULL OR s.client_id = ${n}) AND (${m}::uuid IS NULL OR a.site_id = ${m}) AND (${o}::text IS NULL OR a.os_family = ${o})
+         AND NOT (a.id = ANY(${x}::uuid[]))",
         m = n + 1,
-        o = n + 2
+        o = n + 2,
+        x = n + 3
     )
 }
 
@@ -224,7 +267,7 @@ async fn policies_for(st: &AppState, agent_id: Uuid, kind: &str) -> sqlx::Result
         "SELECT {POLICY_COLS} FROM alert_policies p, agents a JOIN sites s ON s.id = a.site_id
           WHERE a.id = $1 AND p.enabled AND p.kind = $2
             AND (p.client_id IS NULL OR p.client_id = s.client_id) AND (p.site_id IS NULL OR p.site_id = a.site_id)
-            AND (p.os_family IS NULL OR p.os_family = a.os_family)"
+            AND (p.os_family IS NULL OR p.os_family = a.os_family) AND NOT (a.id = ANY(p.excluded_agents))"
     )))
     .bind(agent_id)
     .bind(kind)
@@ -245,13 +288,15 @@ pub async fn load_policy(st: &AppState, id: Uuid) -> sqlx::Result<Option<Policy>
 // ---------------------------------------------------------------------------
 
 /// Announces alerts that just opened or resolved: live events, and notifications unless
-/// `notify` is false.
+/// `notify` is false. Alerts held back by a mute (`suppressed`) only get the live event: they
+/// are announced properly if they're still open when the mute ends ([`unsuppress`]).
 async fn announce(st: &AppState, ids: &[Uuid], event: &'static str, channels: &[Uuid], notify: bool) {
     if ids.is_empty() {
         return;
     }
-    let rows: Vec<(Uuid, Uuid, Uuid)> = match sqlx::query_as(
-        "SELECT al.id, al.agent_id, s.client_id FROM alerts al JOIN agents a ON a.id = al.agent_id JOIN sites s ON s.id = a.site_id
+    let rows: Vec<(Uuid, Uuid, Uuid, bool)> = match sqlx::query_as(
+        "SELECT al.id, al.agent_id, s.client_id, al.suppressed FROM alerts al JOIN agents a ON a.id = al.agent_id
+           JOIN sites s ON s.id = a.site_id
           WHERE al.id = ANY($1)",
     )
     .bind(ids)
@@ -262,10 +307,15 @@ async fn announce(st: &AppState, ids: &[Uuid], event: &'static str, channels: &[
         Err(e) => return warn!("announcing alerts: {e}"),
     };
     let state = if event == "opened" { "open" } else { "resolved" };
-    for (id, agent_id, client_id) in rows {
+    let mut woke = false;
+    for (id, agent_id, client_id, suppressed) in rows {
         st.hub.publish(Event::Alert { id, agent_id, client_id, state: state.into() });
+        if suppressed {
+            continue;
+        }
         if notify {
             crate::notify::enqueue(st, id, event, channels).await;
+            woke |= !channels.is_empty();
         }
         // Tickets follow the alert even when notifications are off.
         if event == "opened" {
@@ -274,9 +324,57 @@ async fn announce(st: &AppState, ids: &[Uuid], event: &'static str, channels: &[
             crate::tickets::alert_resolved(st, id).await;
         }
     }
-    if notify && !channels.is_empty() {
+    if woke {
         st.notify_wake.notify_one();
     }
+}
+
+/// Alerts held back by a mute that has ended and are still open: announce them now.
+pub async fn unsuppress(st: &AppState) -> sqlx::Result<()> {
+    let rows: Vec<(Uuid, Option<Uuid>)> = sqlx::query_as(
+        "UPDATE alerts SET suppressed = false, last_notified_at = now()
+          WHERE suppressed AND resolved_at IS NULL AND NOT agent_muted(agent_id, now())
+          RETURNING id, policy_id",
+    )
+    .fetch_all(&st.db)
+    .await?;
+    for (id, policy_id) in rows {
+        let channels = match policy_id {
+            Some(pid) => sqlx::query_scalar("SELECT channel_ids FROM alert_policies WHERE id = $1")
+                .bind(pid)
+                .fetch_optional(&st.db)
+                .await?
+                .unwrap_or_default(),
+            None => vec![],
+        };
+        info!(alert = %id, "mute ended with the alert still open");
+        announce(st, &[id], "opened", &channels, true).await;
+    }
+    Ok(())
+}
+
+/// Open, unacknowledged alerts whose policy asks for reminders: notify again.
+async fn remind(st: &AppState) -> sqlx::Result<()> {
+    let rows: Vec<(Uuid, Vec<Uuid>)> = sqlx::query_as(
+        "UPDATE alerts al SET last_notified_at = now()
+           FROM alert_policies p
+          WHERE p.id = al.policy_id AND p.renotify_minutes IS NOT NULL AND p.enabled
+            AND al.resolved_at IS NULL AND al.acknowledged_at IS NULL AND NOT al.suppressed
+            AND coalesce(al.last_notified_at, al.opened_at) < now() - make_interval(mins => p.renotify_minutes)
+            AND NOT agent_muted(al.agent_id, now())
+          RETURNING al.id, p.channel_ids",
+    )
+    .fetch_all(&st.db)
+    .await?;
+    let mut woke = false;
+    for (id, channels) in &rows {
+        crate::notify::enqueue(st, *id, "reminder", channels).await;
+        woke |= !channels.is_empty();
+    }
+    if woke {
+        st.notify_wake.notify_one();
+    }
+    Ok(())
 }
 
 /// Opens (or refreshes) the alert for (policy, agent, key). `bump` adds to its occurrence
@@ -368,6 +466,10 @@ pub async fn policy_changed(st: &Arc<AppState>, policy_id: Uuid) {
             let st = st.clone();
             tokio::spawn(async move { recheck_security(&st, policy_id).await });
         }
+        Some("patch") => {
+            let st = st.clone();
+            tokio::spawn(async move { recheck_patches(&st, policy_id).await });
+        }
         Some("log") | None => push_watchers(st).await,
         _ => {}
     }
@@ -376,7 +478,7 @@ pub async fn policy_changed(st: &Arc<AppState>, policy_id: Uuid) {
 /// The policy `p`'s scope against agent `a` / site `s`, without binds.
 fn scope_sql_policy() -> &'static str {
     "(p.client_id IS NULL OR p.client_id = s.client_id) AND (p.site_id IS NULL OR p.site_id = a.site_id)
-     AND (p.os_family IS NULL OR p.os_family = a.os_family)"
+     AND (p.os_family IS NULL OR p.os_family = a.os_family) AND NOT (a.id = ANY(p.excluded_agents))"
 }
 
 // ---------------------------------------------------------------------------
@@ -397,7 +499,7 @@ pub async fn run(st: Arc<AppState>) {
 
 async fn evaluate(st: &AppState) -> sqlx::Result<()> {
     let policies: Vec<Policy> = sqlx::query_as(AssertSqlSafe(format!(
-        "SELECT {POLICY_COLS} FROM alert_policies p WHERE p.enabled AND p.kind IN ('offline', 'cpu', 'memory', 'disk', 'security')"
+        "SELECT {POLICY_COLS} FROM alert_policies p WHERE p.enabled AND p.kind IN ('offline', 'cpu', 'memory', 'disk', 'security', 'patch')"
     )))
     .fetch_all(&st.db)
     .await?;
@@ -407,15 +509,26 @@ async fn evaluate(st: &AppState) -> sqlx::Result<()> {
             Some(Rule::Cpu(t)) => check_threshold(st, p, "m.cpu_percent", "CPU", &t).await,
             Some(Rule::Memory(t)) => check_threshold(st, p, "100.0 * m.mem_used / nullif(m.mem_total, 0)", "Memory", &t).await,
             Some(Rule::Disk(t)) => check_threshold(st, p, "m.disk_max_pct", "Disk", &t).await,
-            // Signatures age without the agent reporting anything new.
-            Some(Rule::Security(SecurityRule { signature_max_age_hours: Some(h), .. })) => check_signatures(st, p, h).await,
+            Some(Rule::Security(r)) => {
+                // Signatures age, and reports stop, without the agent sending anything new.
+                let mut res = Ok(());
+                if let Some(h) = r.signature_max_age_hours {
+                    res = check_signatures(st, p, h).await;
+                }
+                if let (Ok(()), Some(h)) = (&res, r.stale_hours) {
+                    res = check_stale_security(st, p, h).await;
+                }
+                res
+            }
+            Some(Rule::Patch(PatchRule { reboot_hours: Some(h), .. })) => check_reboot(st, p, h).await,
             _ => Ok(()),
         };
         if let Err(e) = res {
             warn!(policy = %p.id, "checking {}: {e}", p.name);
         }
     }
-    Ok(())
+    unsuppress(st).await?;
+    remind(st).await
 }
 
 async fn check_offline(st: &AppState, p: &Policy, minutes: i32) -> sqlx::Result<()> {
@@ -439,6 +552,7 @@ async fn check_offline(st: &AppState, p: &Policy, minutes: i32) -> sqlx::Result<
     .bind(p.client_id)
     .bind(p.site_id)
     .bind(&p.os_family)
+    .bind(&p.excluded_agents)
     .fetch_all(&st.db)
     .await?;
     announce(st, &opened, "opened", &p.channel_ids, true).await;
@@ -454,6 +568,7 @@ async fn check_offline(st: &AppState, p: &Policy, minutes: i32) -> sqlx::Result<
     .bind(p.client_id)
     .bind(p.site_id)
     .bind(&p.os_family)
+    .bind(&p.excluded_agents)
     .fetch_all(&st.db)
     .await?;
     announce(st, &cleared, "resolved", &p.channel_ids, p.notify_resolved).await;
@@ -492,6 +607,7 @@ async fn check_threshold(st: &AppState, p: &Policy, expr: &str, label: &str, t: 
     .bind(p.client_id)
     .bind(p.site_id)
     .bind(&p.os_family)
+    .bind(&p.excluded_agents)
     .fetch_all(&st.db)
     .await?;
     let opened: Vec<Uuid> = opened.into_iter().filter(|(_, new)| *new).map(|(id, _)| id).collect();
@@ -512,6 +628,7 @@ async fn check_threshold(st: &AppState, p: &Policy, expr: &str, label: &str, t: 
     .bind(p.client_id)
     .bind(p.site_id)
     .bind(&p.os_family)
+    .bind(&p.excluded_agents)
     .fetch_all(&st.db)
     .await?;
     announce(st, &cleared, "resolved", &p.channel_ids, p.notify_resolved).await;
@@ -658,6 +775,7 @@ async fn recheck_services(st: &AppState, policy_id: Uuid) {
     .bind(p.client_id)
     .bind(p.site_id)
     .bind(&p.os_family)
+    .bind(&p.excluded_agents)
     .fetch_all(&st.db)
     .await;
     for (agent_id, services) in rows.unwrap_or_default() {
@@ -746,6 +864,23 @@ pub struct DetectionState {
     pub detected_at: Option<DateTime<Utc>>,
 }
 
+/// When an agent last reported its protection state, for the "stopped reporting" check.
+#[derive(Debug, Clone, Default)]
+pub struct Reporting {
+    pub online: bool,
+    pub reported_at: Option<DateTime<Utc>>,
+    /// When its connection started: a fresh connection gets time to report.
+    pub connected_at: Option<DateTime<Utc>>,
+}
+
+impl Reporting {
+    /// The last report (if any) when it's older than `hours` on an online agent.
+    pub fn stale_since(&self, hours: i32, now: DateTime<Utc>) -> Option<Option<DateTime<Utc>>> {
+        let latest = self.reported_at.max(self.connected_at)?;
+        (self.online && latest < now - chrono::Duration::hours(hours.into())).then_some(self.reported_at)
+    }
+}
+
 /// Up-to-date signatures, as SQL on `sp` (security_products) with the age in hours at `$n`.
 /// Products without a date go by Security Center's verdict, else count as current.
 fn fresh_sql(n: usize) -> String {
@@ -762,17 +897,24 @@ fn fresh(p: &ProductState, max_age_hours: i32, now: DateTime<Utc>) -> bool {
 
 /// What a security policy finds on one agent: `(key, title, details)`. `new` are
 /// detections first seen in the report being checked.
+#[allow(clippy::too_many_arguments)]
 pub fn security_findings(
     rule: &SecurityRule,
     products: &[ProductState],
     detections: &[DetectionState],
     new: &[Uuid],
     sensor: Option<&Value>,
+    reporting: &Reporting,
     now: DateTime<Utc>,
 ) -> Vec<(String, String, Value)> {
     let enabled: Vec<&ProductState> = products.iter().filter(|p| p.enabled == Some(true)).collect();
     let all_names: Vec<&str> = products.iter().map(|p| p.name.as_str()).collect();
     let mut out = Vec::new();
+    if let Some(h) = rule.stale_hours
+        && let Some(since) = reporting.stale_since(h, now)
+    {
+        out.push(("stale".into(), "Protection state not reported".into(), json!({ "last_report": since, "hours": h })));
+    }
     if rule.unprotected && enabled.is_empty() {
         out.push(("unprotected".into(), "No active antivirus".into(), json!({ "products": all_names })));
     }
@@ -852,8 +994,11 @@ async fn check_security(st: &AppState, p: &Policy, agent_id: Uuid, new: &[Uuid])
     .bind(new)
     .fetch_all(&st.db)
     .await?;
-    let sensor: Option<Value> = sqlx::query_scalar("SELECT sensor FROM agents WHERE id = $1").bind(agent_id).fetch_one(&st.db).await?;
-    let findings = security_findings(&rule, &products, &detections, new, sensor.as_ref(), Utc::now());
+    type Row = (Option<Value>, bool, Option<DateTime<Utc>>, Option<DateTime<Utc>>);
+    let (sensor, online, reported_at, connected_at): Row =
+        sqlx::query_as("SELECT sensor, online, security_at, connected_at FROM agents WHERE id = $1").bind(agent_id).fetch_one(&st.db).await?;
+    let reporting = Reporting { online, reported_at, connected_at };
+    let findings = security_findings(&rule, &products, &detections, new, sensor.as_ref(), &reporting, Utc::now());
     let keep: Vec<String> = findings.iter().map(|f| f.0.clone()).collect();
     for (key, title, details) in findings {
         fire(st, p, agent_id, &key, &title, details, 0).await?;
@@ -899,6 +1044,7 @@ async fn recheck_security(st: &AppState, policy_id: Uuid) {
     .bind(p.client_id)
     .bind(p.site_id)
     .bind(&p.os_family)
+    .bind(&p.excluded_agents)
     .fetch_all(&st.db)
     .await;
     for agent_id in agents.unwrap_or_default() {
@@ -935,6 +1081,7 @@ async fn check_signatures(st: &AppState, p: &Policy, hours: i32) -> sqlx::Result
     .bind(p.client_id)
     .bind(p.site_id)
     .bind(&p.os_family)
+    .bind(&p.excluded_agents)
     .fetch_all(&st.db)
     .await?;
     announce(st, &opened, "opened", &p.channel_ids, true).await;
@@ -952,9 +1099,170 @@ async fn check_signatures(st: &AppState, p: &Policy, hours: i32) -> sqlx::Result
     .bind(p.client_id)
     .bind(p.site_id)
     .bind(&p.os_family)
+    .bind(&p.excluded_agents)
     .fetch_all(&st.db)
     .await?;
     announce(st, &cleared, "resolved", &p.channel_ids, p.notify_resolved).await;
+    Ok(())
+}
+
+/// Polled: an online agent that has gone `hours` without reporting its protection state
+/// (counting from when it connected: every connection starts with a report).
+async fn check_stale_security(st: &AppState, p: &Policy, hours: i32) -> sqlx::Result<()> {
+    let stale = |n: usize| {
+        format!(
+            "a.online AND ${cap} = ANY(a.capabilities)
+             AND greatest(a.security_at, a.connected_at) < now() - make_interval(hours => ${n})",
+            cap = n + 1
+        )
+    };
+    let opened: Vec<Uuid> = sqlx::query_scalar(AssertSqlSafe(format!(
+        "INSERT INTO alerts (id, policy_id, agent_id, key, kind, severity, title, details)
+         SELECT gen_random_uuid(), $1, a.id, 'stale', 'security', $2, 'Protection state not reported',
+                jsonb_build_object('last_report', a.security_at, 'hours', $3::int)
+           FROM agents a JOIN sites s ON s.id = a.site_id
+          WHERE {} AND {}
+         ON CONFLICT (policy_id, agent_id, key) WHERE resolved_at IS NULL DO NOTHING
+         RETURNING id",
+        stale(3),
+        scope_sql(5)
+    )))
+    .bind(p.id)
+    .bind(&p.severity)
+    .bind(hours)
+    .bind(rmm_proto::security::CAPABILITY)
+    .bind(p.client_id)
+    .bind(p.site_id)
+    .bind(&p.os_family)
+    .bind(&p.excluded_agents)
+    .fetch_all(&st.db)
+    .await?;
+    announce(st, &opened, "opened", &p.channel_ids, true).await;
+
+    let cleared: Vec<Uuid> = sqlx::query_scalar(AssertSqlSafe(format!(
+        "UPDATE alerts al SET resolved_at = now(), resolution = 'cleared'
+          WHERE al.policy_id = $1 AND al.key = 'stale' AND al.resolved_at IS NULL
+            AND NOT EXISTS (SELECT 1 FROM agents a JOIN sites s ON s.id = a.site_id WHERE a.id = al.agent_id AND {} AND {})
+          RETURNING al.id",
+        stale(2),
+        scope_sql(4)
+    )))
+    .bind(p.id)
+    .bind(hours)
+    .bind(rmm_proto::security::CAPABILITY)
+    .bind(p.client_id)
+    .bind(p.site_id)
+    .bind(&p.os_family)
+    .bind(&p.excluded_agents)
+    .fetch_all(&st.db)
+    .await?;
+    announce(st, &cleared, "resolved", &p.channel_ids, p.notify_resolved).await;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Patches
+// ---------------------------------------------------------------------------
+
+/// Updates on this agent whose last install failed, and nobody declined since.
+const FAILED_PATCHES: &str = "p.state = 'failed' AND p.approval <> 'declined'";
+
+/// What a patch policy finds on one agent: `(key, title, details)`.
+async fn patch_findings(st: &AppState, rule: &PatchRule, agent_id: Uuid) -> sqlx::Result<Vec<(String, String, Value)>> {
+    let mut out = Vec::new();
+    if rule.failed {
+        let failed: Vec<(String, Option<String>)> = sqlx::query_as(AssertSqlSafe(format!(
+            "SELECT p.title, p.last_error FROM patches p WHERE p.agent_id = $1 AND {FAILED_PATCHES} ORDER BY p.title"
+        )))
+        .bind(agent_id)
+        .fetch_all(&st.db)
+        .await?;
+        if !failed.is_empty() {
+            let title = match failed.len() {
+                1 => format!("Update failed to install: {}", failed[0].0),
+                n => format!("{n} updates failed to install"),
+            };
+            let updates: Vec<&str> = failed.iter().take(10).map(|f| f.0.as_str()).collect();
+            out.push(("failed".into(), title, json!({ "updates": updates, "count": failed.len(), "error": failed[0].1 })));
+        }
+    }
+    if let Some(h) = rule.reboot_hours {
+        let since: Option<DateTime<Utc>> =
+            sqlx::query_scalar("SELECT reboot_pending_since FROM agents WHERE id = $1 AND reboot_pending").bind(agent_id).fetch_optional(&st.db).await?.flatten();
+        if let Some(t) = since.filter(|t| *t < Utc::now() - chrono::Duration::hours(h.into())) {
+            out.push(("reboot".into(), "Restart pending to finish updates".into(), json!({ "since": t, "hours": h })));
+        }
+    }
+    Ok(out)
+}
+
+async fn check_patches(st: &AppState, p: &Policy, agent_id: Uuid) -> sqlx::Result<()> {
+    let Some(Rule::Patch(rule)) = p.rule() else { return Ok(()) };
+    let findings = patch_findings(st, &rule, agent_id).await?;
+    let keep: Vec<String> = findings.iter().map(|f| f.0.clone()).collect();
+    for (key, title, details) in findings {
+        fire(st, p, agent_id, &key, &title, details, 0).await?;
+    }
+    clear(st, p, agent_id, None, &keep).await
+}
+
+/// The agent's patch state changed (a scan, an install's result).
+pub async fn patches_changed(st: &AppState, agent_id: Uuid) {
+    let res: sqlx::Result<()> = async {
+        for p in policies_for(st, agent_id, "patch").await? {
+            check_patches(st, &p, agent_id).await?;
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(e) = res {
+        warn!(%agent_id, "patch alerts: {e}");
+    }
+}
+
+/// A patch policy changed: check every covered agent that has scanned.
+async fn recheck_patches(st: &AppState, policy_id: Uuid) {
+    let Ok(Some(p)) = load_policy(st, policy_id).await else { return };
+    let agents: sqlx::Result<Vec<Uuid>> = sqlx::query_scalar(AssertSqlSafe(format!(
+        "SELECT a.id FROM agents a JOIN sites s ON s.id = a.site_id WHERE a.patch_scanned_at IS NOT NULL AND {}",
+        scope_sql(1)
+    )))
+    .bind(p.client_id)
+    .bind(p.site_id)
+    .bind(&p.os_family)
+    .bind(&p.excluded_agents)
+    .fetch_all(&st.db)
+    .await;
+    for agent_id in agents.unwrap_or_default() {
+        if let Err(e) = check_patches(st, &p, agent_id).await {
+            warn!(%agent_id, "patch alerts: {e}");
+        }
+    }
+}
+
+/// Polled: restarts that have been pending too long (they age without any new report).
+async fn check_reboot(st: &AppState, p: &Policy, hours: i32) -> sqlx::Result<()> {
+    let opened: Vec<Uuid> = sqlx::query_scalar(AssertSqlSafe(format!(
+        "INSERT INTO alerts (id, policy_id, agent_id, key, kind, severity, title, details)
+         SELECT gen_random_uuid(), $1, a.id, 'reboot', 'patch', $2, 'Restart pending to finish updates',
+                jsonb_build_object('since', a.reboot_pending_since, 'hours', $3::int)
+           FROM agents a JOIN sites s ON s.id = a.site_id
+          WHERE a.reboot_pending AND a.reboot_pending_since < now() - make_interval(hours => $3) AND {}
+         ON CONFLICT (policy_id, agent_id, key) WHERE resolved_at IS NULL DO NOTHING
+         RETURNING id",
+        scope_sql(4)
+    )))
+    .bind(p.id)
+    .bind(&p.severity)
+    .bind(hours)
+    .bind(p.client_id)
+    .bind(p.site_id)
+    .bind(&p.os_family)
+    .bind(&p.excluded_agents)
+    .fetch_all(&st.db)
+    .await?;
+    announce(st, &opened, "opened", &p.channel_ids, true).await;
+    // Clearing happens as agents report (a scan after the restart), in `patches_changed`.
     Ok(())
 }
 
@@ -998,7 +1306,7 @@ pub async fn push_watchers(st: &AppState) {
         .fetch_all(&st.db)
         .await?;
         for (agent_id, client_id, site_id, os) in agents {
-            let watchers = policies.iter().filter(|p| p.covers(client_id, site_id, &os)).filter_map(watcher).collect();
+            let watchers = policies.iter().filter(|p| p.covers(agent_id, client_id, site_id, &os)).filter_map(watcher).collect();
             st.hub.send(agent_id, ServerMsg::Watchers { watchers }).await;
         }
         Ok(())
@@ -1041,6 +1349,7 @@ mod tests {
         assert!(Rule::parse("security", &json!({ "signature_max_age_hours": 0 })).unwrap().validate().is_err());
 
         let now = Utc::now();
+        let r0 = Reporting::default();
         let product = |name: &str, enabled, realtime, age_h: Option<i64>| ProductState {
             name: name.into(),
             enabled: Some(enabled),
@@ -1048,19 +1357,26 @@ mod tests {
             signatures_updated_at: age_h.map(|h| now - chrono::Duration::hours(h)),
             signatures_current: None,
         };
-        let all = SecurityRule { unprotected: true, realtime_off: true, signature_max_age_hours: Some(72), threats: ThreatAlerts::Active, sensor_down: false };
+        let all = SecurityRule {
+            unprotected: true,
+            realtime_off: true,
+            signature_max_age_hours: Some(72),
+            threats: ThreatAlerts::Active,
+            sensor_down: false,
+            stale_hours: None,
+        };
         let keys = |f: Vec<(String, String, Value)>| f.into_iter().map(|f| f.0).collect::<Vec<_>>();
-        assert!(keys(security_findings(&all, &[product("Defender", true, true, Some(2))], &[], &[], None, now)).is_empty());
-        assert_eq!(keys(security_findings(&all, &[product("Defender", false, false, Some(2))], &[], &[], None, now)), ["unprotected"]);
-        assert_eq!(keys(security_findings(&all, &[], &[], &[], None, now)), ["unprotected"], "nothing installed at all");
-        assert_eq!(keys(security_findings(&all, &[product("ClamAV", true, false, Some(100))], &[], &[], None, now)), ["realtime", "signatures"]);
+        assert!(keys(security_findings(&all, &[product("Defender", true, true, Some(2))], &[], &[], None, &r0, now)).is_empty());
+        assert_eq!(keys(security_findings(&all, &[product("Defender", false, false, Some(2))], &[], &[], None, &r0, now)), ["unprotected"]);
+        assert_eq!(keys(security_findings(&all, &[], &[], &[], None, &r0, now)), ["unprotected"], "nothing installed at all");
+        assert_eq!(keys(security_findings(&all, &[product("ClamAV", true, false, Some(100))], &[], &[], None, &r0, now)), ["realtime", "signatures"]);
         // One product with fresh signatures is enough; a disabled one doesn't count.
         let two = [product("ClamAV", true, false, Some(100)), product("Other", true, true, Some(1)), product("Off", false, false, Some(1))];
-        assert!(keys(security_findings(&all, &two, &[], &[], None, now)).is_empty());
+        assert!(keys(security_findings(&all, &two, &[], &[], None, &r0, now)).is_empty());
         // Security Center's verdict stands in for a missing date.
         let mut sc = product("Sophos", true, true, None);
         sc.signatures_current = Some(false);
-        assert_eq!(keys(security_findings(&all, &[sc], &[], &[], None, now)), ["signatures"]);
+        assert_eq!(keys(security_findings(&all, &[sc], &[], &[], None, &r0, now)), ["signatures"]);
 
         let det = |status: &str, hours_ago: i64| DetectionState {
             id: Uuid::new_v4(),
@@ -1075,23 +1391,55 @@ mod tests {
         let ds = [active.clone(), quarantined.clone(), old.clone()];
         let new = [active.id, quarantined.id, old.id];
         let ok = [product("Defender", true, true, Some(1))];
-        let f = security_findings(&all, &ok, &ds, &new, None, now);
+        let f = security_findings(&all, &ok, &ds, &new, None, &r0, now);
         assert_eq!(keys(f.clone()), [format!("threat:{}", active.id)]);
         assert_eq!(f[0].1, "Threat detected: EICAR");
         let any = SecurityRule { threats: ThreatAlerts::Any, ..all.clone() };
-        let f = security_findings(&any, &ok, &ds, &new, None, now);
+        let f = security_findings(&any, &ok, &ds, &new, None, &r0, now);
         assert_eq!(keys(f.clone()), [format!("threat:{}", active.id), format!("threat:{}", quarantined.id)], "old history doesn't alert");
         assert_eq!(f[1].1, "Threat quarantined: EICAR");
-        assert!(keys(security_findings(&any, &ok, &ds, &[], None, now)).len() == 1, "only new detections, apart from active ones");
+        assert!(keys(security_findings(&any, &ok, &ds, &[], None, &r0, now)).len() == 1, "only new detections, apart from active ones");
         let off = SecurityRule { threats: ThreatAlerts::Off, ..all.clone() };
-        assert!(keys(security_findings(&off, &ok, &ds, &new, None, now)).is_empty());
+        assert!(keys(security_findings(&off, &ok, &ds, &new, None, &r0, now)).is_empty());
         let sd = SecurityRule { sensor_down: true, ..all };
         let down = json!({ "enabled": true, "running": false, "restarts": 1 });
-        assert_eq!(keys(security_findings(&sd, &ok, &[], &[], Some(&down), now)), ["sensor"]);
+        assert_eq!(keys(security_findings(&sd, &ok, &[], &[], Some(&down), &r0, now)), ["sensor"]);
         let flapping = json!({ "enabled": true, "running": true, "restarts": 4 });
-        assert_eq!(security_findings(&sd, &ok, &[], &[], Some(&flapping), now)[0].1, "Sensor keeps restarting");
+        assert_eq!(security_findings(&sd, &ok, &[], &[], Some(&flapping), &r0, now)[0].1, "Sensor keeps restarting");
         let off_by_policy = json!({ "enabled": false, "running": false, "restarts": 0 });
-        assert!(keys(security_findings(&sd, &ok, &[], &[], Some(&off_by_policy), now)).is_empty());
+        assert!(keys(security_findings(&sd, &ok, &[], &[], Some(&off_by_policy), &r0, now)).is_empty());
+    }
+
+    #[test]
+    fn stale_reports() {
+        let now = Utc::now();
+        let h = |n: i64| Some(now - chrono::Duration::hours(n));
+        let r = |online, reported_at, connected_at| Reporting { online, reported_at, connected_at };
+        assert_eq!(r(true, h(30), h(40)).stale_since(24, now), Some(h(30)), "old report, long connection");
+        assert_eq!(r(true, h(30), h(2)).stale_since(24, now), None, "just reconnected: gets time to report");
+        assert_eq!(r(false, h(30), h(40)).stale_since(24, now), None, "offline is the offline policy's business");
+        assert_eq!(r(true, None, h(30)).stale_since(24, now), Some(None), "never reported");
+        assert_eq!(r(true, None, None).stale_since(24, now), None);
+        let rule = SecurityRule {
+            unprotected: false,
+            realtime_off: false,
+            signature_max_age_hours: None,
+            threats: ThreatAlerts::Off,
+            sensor_down: false,
+            stale_hours: Some(24),
+        };
+        assert!(Rule::Security(rule.clone()).validate().is_ok(), "stale alone is something to alert on");
+        assert!(Rule::Security(SecurityRule { stale_hours: Some(1), ..rule.clone() }).validate().is_err());
+        let f = security_findings(&rule, &[], &[], &[], None, &r(true, h(30), h(40)), now);
+        assert_eq!(f.iter().map(|f| f.0.as_str()).collect::<Vec<_>>(), ["stale"]);
+    }
+
+    #[test]
+    fn patch_rules() {
+        assert_eq!(Rule::parse("patch", &json!({})).unwrap(), Rule::Patch(PatchRule { failed: true, reboot_hours: None }));
+        assert!(Rule::parse("patch", &json!({ "failed": false })).unwrap().validate().is_err(), "nothing to alert on");
+        assert!(Rule::parse("patch", &json!({ "failed": false, "reboot_hours": 48 })).unwrap().validate().is_ok());
+        assert!(Rule::parse("patch", &json!({ "reboot_hours": 0 })).unwrap().validate().is_err());
     }
 
     #[test]

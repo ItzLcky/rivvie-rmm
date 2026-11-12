@@ -28,10 +28,35 @@ macro_rules! failed_24h {
              AND fj.status IN ('failed', 'error', 'timed_out', 'lost'))"
     };
 }
-/// Unresolved alerts on this agent with the given severity.
+/// Unresolved alerts on this agent with the given severity. Alerts held back by a
+/// maintenance window or snooze don't count.
 macro_rules! open_alert {
     ($sev:literal) => {
-        concat!("EXISTS (SELECT 1 FROM alerts oa WHERE oa.agent_id = a.id AND oa.resolved_at IS NULL AND oa.severity = '", $sev, "')")
+        concat!(
+            "EXISTS (SELECT 1 FROM alerts oa WHERE oa.agent_id = a.id AND oa.resolved_at IS NULL AND NOT oa.suppressed AND oa.severity = '",
+            $sev,
+            "')"
+        )
+    };
+}
+/// Security or critical updates missing for more than a week (a normal monthly cycle with a
+/// short deferral stays clear of it), not declined.
+macro_rules! patches_overdue {
+    () => {
+        "(SELECT count(*) FROM patches pp WHERE pp.agent_id = a.id AND pp.state <> 'installed' AND pp.approval <> 'declined'
+             AND (pp.category IN ('security', 'critical') OR pp.severity = 'critical') AND pp.first_seen_at < now() - interval '7 days')"
+    };
+}
+/// Updates whose last install failed, not declined since.
+macro_rules! patches_failed {
+    () => {
+        "(SELECT count(*) FROM patches pp WHERE pp.agent_id = a.id AND pp.state = 'failed' AND pp.approval <> 'declined')"
+    };
+}
+/// A restart has been pending for over a day.
+macro_rules! reboot_overdue {
+    () => {
+        "(a.reboot_pending AND a.reboot_pending_since < now() - interval '24 hours')"
     };
 }
 /// Health rank: 0 healthy, 1 unknown (never reported), 2 needs attention, 3 unhealthy.
@@ -43,7 +68,11 @@ macro_rules! health_rank {
         concat!(
             "(CASE WHEN ", open_alert!("critical"), " THEN 3 WHEN a.last_metrics IS NULL THEN 1 WHEN ", disk_pct!(), " >= 95 THEN 3 WHEN ",
             disk_pct!(), " >= 90 OR ", open_alert!("warning"), " OR ",
-            failed_24h!(), " > 0 OR (a.update_state IN ('failed', 'rolled_back') AND a.update_at > now() - interval '7 days') ",
+            failed_24h!(), " > 0 OR (a.update_state IN ('failed', 'rolled_back') AND a.update_at > now() - interval '7 days') OR ",
+            "EXISTS (SELECT 1 FROM patches pp WHERE pp.agent_id = a.id AND pp.state <> 'installed' AND pp.approval <> 'declined'
+               AND (pp.state = 'failed' OR ((pp.category IN ('security', 'critical') OR pp.severity = 'critical')
+                                            AND pp.first_seen_at < now() - interval '7 days'))) OR ",
+            reboot_overdue!(), " ",
             "THEN 2 ELSE 0 END)"
         )
     };
@@ -82,6 +111,13 @@ pub struct AgentSummary {
     failed_jobs_24h: i64,
     /// Unresolved alerts.
     open_alerts: i64,
+    /// See `patches_overdue!`.
+    patches_overdue: i64,
+    patches_failed: i64,
+    reboot_pending: bool,
+    reboot_pending_since: Option<DateTime<Utc>>,
+    /// Alerts are held back right now (maintenance window or snooze).
+    alerts_muted: bool,
     #[sqlx(default)]
     #[serde(skip)]
     sort_key: String,
@@ -96,7 +132,11 @@ pub(crate) const SUMMARY_COLS: &str = concat!(
     disk_pct!(),
     " AS disk_max_pct, ",
     failed_24h!(),
-    " AS failed_jobs_24h, (SELECT count(*) FROM alerts oa WHERE oa.agent_id = a.id AND oa.resolved_at IS NULL) AS open_alerts"
+    " AS failed_jobs_24h, (SELECT count(*) FROM alerts oa WHERE oa.agent_id = a.id AND oa.resolved_at IS NULL) AS open_alerts, ",
+    patches_overdue!(),
+    " AS patches_overdue, ",
+    patches_failed!(),
+    " AS patches_failed, a.reboot_pending, a.reboot_pending_since, agent_muted(a.id, now()) AS alerts_muted"
 );
 const AGENT_FROM: &str = "FROM agents a JOIN sites s ON s.id = a.site_id JOIN clients c ON c.id = s.client_id";
 

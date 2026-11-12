@@ -1,10 +1,10 @@
 <script lang="ts">
 	import { BellRing, Check, CheckCheck, Search, ShieldCheck } from '@lucide/svelte';
-	import { ago, datetime, num } from '#lib/format.js';
+	import { ago, datetime, num, plural } from '#lib/format.js';
 	import { liveReload } from '#lib/live.svelte.js';
 	import { acknowledge, alertCounts, resolve } from '#lib/monitoring/alerts.svelte.js';
 	import { kindLabels } from '#lib/monitoring/labels.js';
-	import { paged } from '#lib/paged.svelte.js';
+	import { inBatches, paged } from '#lib/paged.svelte.js';
 	import { clientId, currentClient, withClient } from '#lib/scope.svelte.js';
 	import { can } from '#lib/session.svelte.js';
 	import { attempt } from '#lib/toast.svelte.js';
@@ -45,7 +45,11 @@
 
 	async function apply(action: 'acknowledge' | 'resolve') {
 		const ids = [...selected];
-		const ok = await attempt(() => (action === 'acknowledge' ? acknowledge(ids) : resolve(ids)), action === 'acknowledge' ? 'Acknowledged.' : 'Resolved.');
+		// The bulk endpoint takes 1000 at a time.
+		const ok = await attempt(
+			() => inBatches(ids, 1000, (slice) => (action === 'acknowledge' ? acknowledge(slice) : resolve(slice))),
+			action === 'acknowledge' ? `Acknowledged ${plural(ids.length, 'alert')}.` : `Resolved ${plural(ids.length, 'alert')}.`
+		);
 		if (ok) {
 			selected = new Set();
 			list.reload();
@@ -95,6 +99,7 @@
 		busy={list.busy}
 		{sort}
 		bind:selected={() => (can('technician') ? selected : undefined), (v) => (selected = v ?? new Set())}
+		matching={list.data ? { total: list.data.total, exact: list.data.total_exact, select: async () => (await list.all()).map((a) => a.id) } : undefined}
 		rowHref={(a) => `/alerts/${a.id}`}
 		columns={[
 			{ id: 'severity', label: 'Severity', sort: 'severity', cell: sevCell, class: 'w-28', from: 'sm' },

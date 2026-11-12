@@ -728,7 +728,11 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
         .await;
     let (s, _) = admin.call(reqwest::Method::POST, "/patch-policies", Some(json!({ "client_id": a_id, "reboot_policy": "never" }))).await;
     assert_eq!(s, StatusCode::CONFLICT, "one policy per client");
+    // Resetting one agent goes back to the client-wide decline (a standing decision)...
     admin.post("/patches/approval", json!({ "decision": "pending", "update_ids": ["drv-1"], "agent_ids": [id1] })).await;
+    assert_eq!(approval(&admin.get(&format!("/agents/{id1}/patches")).await, "drv-1"), ("declined".into(), "missing".into(), true));
+    // ...resetting the client hands it to the policy.
+    admin.post("/patches/approval", json!({ "decision": "pending", "update_ids": ["drv-1"], "client_id": a_id })).await;
     let p = admin.get(&format!("/agents/{id1}/patches")).await;
     assert_eq!(p["policy"]["source"], "client");
     assert_eq!(approval(&p, "drv-1"), ("approved".into(), "missing".into(), false));
@@ -759,6 +763,20 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
     .await
     .unwrap();
     assert!(in_window, "window arithmetic");
+
+    // Patch alerts: failed installs, and (with reboot_hours) a restart left pending.
+    let patch_policy = admin
+        .post("/alert-policies", json!({ "name": "Patching", "kind": "patch", "params": { "failed": true, "reboot_hours": 1 }, "severity": "warning", "client_id": a_id }))
+        .await;
+    let patch_policy_id = patch_policy["id"].as_str().unwrap().to_string();
+    // The pending reboot from the first install is an hour "old".
+    sqlx::query("UPDATE agents SET reboot_pending_since = now() - interval '2 hours' WHERE id = $1::uuid").bind(&id1).execute(db).await.unwrap();
+    let (api, pp) = (&admin, patch_policy_id.as_str());
+    let reboot = eventually(30, "the restart-pending alert", move || async move {
+        alerts_for(api, &format!("policy_id={pp}")).await.into_iter().find(|a| a["title"] == "Restart pending to finish updates")
+    })
+    .await;
+    assert_eq!(reboot["agent_id"], id1.as_str());
 
     // Automatic install: a new critical update, a policy that installs automatically, a
     // failure that is recorded (and retried later, up to three times).
@@ -794,6 +812,25 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
     .await;
     assert_eq!(p["fail_count"], 1);
     assert!(p["last_error"].as_str().unwrap().contains("simulated"), "{p}");
+    let (api, pp) = (&admin, patch_policy_id.as_str());
+    let failed = eventually(30, "the failed-install alert", move || async move {
+        alerts_for(api, &format!("policy_id={pp}")).await.into_iter().find(|a| a["title"] == "Update failed to install: Update sec-2")
+    })
+    .await;
+    assert_eq!(failed["details"]["count"], 1, "{failed}");
+    let a = admin.get(&format!("/agents/{id1}")).await;
+    assert_eq!(a["patches_failed"].as_i64(), Some(1), "{a}");
+    // The rescan reported no pending restart any more (the fake's file was replaced), so that alert cleared.
+    let (api, rid) = (&admin, reboot["id"].as_str().unwrap().to_string());
+    eventually(30, "the restart-pending alert to clear", || async { (api.get(&format!("/alerts/{rid}")).await["state"] == "resolved").then_some(()) }).await;
+    assert_ne!(a["health"], "healthy", "a failed install counts against health");
+    // Declining the update clears it.
+    admin.post("/patches/approval", json!({ "decision": "declined", "update_ids": ["sec-2"], "agent_ids": [id1] })).await;
+    admin.post("/patches/scan", json!({ "agent_ids": [id1] })).await;
+    let (api, fid) = (&admin, failed["id"].as_str().unwrap().to_string());
+    eventually(30, "the failed-install alert to clear", || async { (api.get(&format!("/alerts/{fid}")).await["state"] == "resolved").then_some(()) }).await;
+    let (s, _) = admin.call(reqwest::Method::DELETE, &format!("/alert-policies/{patch_policy_id}"), None).await;
+    assert!(s.is_success());
     let agent = admin.get(&format!("/agents/{id1}/activity")).await;
     assert!(agent.as_array().unwrap().iter().any(|r| r["action"] == "agent.patch_result"), "results are in the agent's activity");
     // Back to the conservative default so the rest of the run isn't patched behind its back.
@@ -804,6 +841,21 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
             Some(json!({ "auto_approve_categories": ["security", "critical", "definition"], "reboot_policy": "never" })),
         )
         .await;
+
+    // An approval for a client stands: an agent that reports the update later gets it approved.
+    let r = admin.post("/patches/approval", json!({ "decision": "approved", "update_ids": ["later-1"], "client_id": a_id })).await;
+    assert_eq!(r["changed"], 0, "nobody has it yet");
+    std::fs::write(dir.join("a1-patches.json"), json!({ "updates": [upd("later-1", "update", None, false)], "fail": [] }).to_string()).unwrap();
+    admin.post("/patches/scan", json!({ "agent_ids": [id1] })).await;
+    let (api, id) = (&admin, id1.as_str());
+    let p = eventually(30, "the scan with a newly reported update", move || async move {
+        let p = api.get(&format!("/agents/{id}/patches")).await;
+        p["patches"].as_array().unwrap().iter().any(|r| r["update_id"] == "later-1").then_some(p)
+    })
+    .await;
+    assert_eq!(approval(&p, "later-1"), ("approved".into(), "missing".into(), true), "the standing approval applies");
+    admin.post("/patches/approval", json!({ "decision": "pending", "update_ids": ["later-1"], "client_id": a_id })).await;
+    assert_eq!(approval(&admin.get(&format!("/agents/{id1}/patches")).await, "later-1").0, "pending", "and goes with a reset");
 
     // Granting client A takes effect on the next request.
     let tech_id = admin.get("/users").await.as_array().unwrap().iter().find(|u| u["email"] == "tech@e2e.test").unwrap()["id"]
@@ -915,6 +967,7 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
     security(&admin, dir, &id1, &id3).await;
     sensor(&url, &admin, db, dir, &id1, a_id).await;
     monitoring(server, &admin, db, dir, &id1, &id3, a_id).await;
+    day_to_day(&admin, &tech, db, dir, &id1, &id3, a_id).await;
 
     // --- rate limits ------------------------------------------------------------------------------
     // Failed sign-ins from one client IP (via the trusted proxy's X-Forwarded-For).
@@ -2226,4 +2279,171 @@ async fn tickets(url: &str, admin: &Api, id1: &str, a_id: &str, b_id: &str) {
     }
     let summary = admin.get("/tickets/summary").await;
     assert!(summary["open"].as_i64() >= Some(2) && summary["mine"].as_i64() >= Some(1), "{summary}");
+}
+
+/// Maintenance windows and snoozes, reminders, per-agent exclusions, the stale protection
+/// report, the process list and the file browser.
+async fn day_to_day(admin: &Api, tech: &Api, db: &sqlx::PgPool, dir: &Path, id1: &str, id3: &str, a_id: &str) {
+    let (hook_url, hooks) = webhook_receiver().await;
+    let ch = admin.post("/notification-channels", json!({ "name": "e2e day-to-day", "kind": "webhook", "config": { "url": hook_url, "secret": "hook-secret" } })).await;
+    let ch_id = ch["id"].as_str().unwrap().to_string();
+
+    // --- a snooze holds an alert back; ending it announces the alert ---------------------------
+    for bad in [json!({ "for_minutes": 60 }), json!({ "agent_id": id3, "client_id": a_id, "for_minutes": 60 }), json!({ "agent_id": id3 }),
+                json!({ "client_id": a_id, "days": [1], "start": "02:00", "minutes": 60, "tz": "Mars/Olympus" })] {
+        let (s, v) = admin.call(reqwest::Method::POST, "/alert-mutes", Some(bad.clone())).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{bad} -> {v}");
+    }
+    let snooze = admin.post("/alert-mutes", json!({ "agent_id": id3, "for_minutes": 120, "reason": "e2e: planned work" })).await;
+    assert_eq!((snooze["active"].as_bool(), snooze["target_name"].is_string()), (Some(true), true), "{snooze}");
+    assert_eq!(admin.get(&format!("/agents/{id3}")).await["alerts_muted"], true);
+    let off = admin
+        .post("/alert-policies", json!({ "name": "Offline (e2e)", "kind": "offline", "params": { "minutes": 1 }, "severity": "critical",
+                                         "client_id": a_id, "channel_ids": [ch_id], "renotify_minutes": 15 }))
+        .await;
+    assert_eq!(off["renotify_minutes"], 15);
+    let off_id = off["id"].as_str().unwrap().to_string();
+    let (api, o) = (admin, off_id.as_str());
+    let held = eventually(120, "the offline alert, held back", move || async move {
+        alerts_for(api, &format!("policy_id={o}")).await.into_iter().find(|a| a["agent_id"] == id3)
+    })
+    .await;
+    assert_eq!(held["suppressed"], true, "{held}");
+    let a3 = admin.get(&format!("/agents/{id3}")).await;
+    assert_ne!(a3["health"], "unhealthy", "held-back alerts don't count against health: {a3}");
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert!(!hooks.lock().unwrap().iter().any(|(_, _, b)| b["alert"]["id"] == held["id"]), "nobody is told during a snooze");
+    let (s, _) = tech.call(reqwest::Method::DELETE, &format!("/alert-mutes/{}", snooze["id"].as_str().unwrap()), None).await;
+    assert!(s.is_success(), "technicians can end snoozes on their clients");
+    let held_id = held["id"].as_str().unwrap().to_string();
+    wait_hook(&hooks, "the alert announced when the snooze ends", |ev, b| ev == "opened" && b["alert"]["id"] == held_id.as_str()).await;
+    assert_eq!(admin.get(&format!("/alerts/{held_id}")).await["suppressed"], false);
+    let activity = admin.get(&format!("/agents/{id3}/activity")).await;
+    assert!(activity.as_array().unwrap().iter().any(|r| r["action"] == "alert.mute"), "{activity}");
+
+    // --- reminders while it stays open and unacknowledged ----------------------------------------
+    sqlx::query("UPDATE alerts SET last_notified_at = now() - interval '1 hour' WHERE id = $1::uuid").bind(&held_id).execute(db).await.unwrap();
+    wait_hook(&hooks, "a reminder", |ev, b| ev == "reminder" && b["alert"]["id"] == held_id.as_str()).await;
+    admin.post(&format!("/alerts/{held_id}/acknowledge"), json!({})).await;
+    sqlx::query("UPDATE alerts SET last_notified_at = now() - interval '1 hour' WHERE id = $1::uuid").bind(&held_id).execute(db).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let reminders = hooks.lock().unwrap().iter().filter(|(ev, _, b)| ev == "reminder" && b["alert"]["id"] == held_id.as_str()).count();
+    assert_eq!(reminders, 1, "acknowledged alerts aren't repeated");
+
+    // --- leave one agent out of a policy --------------------------------------------------------
+    let p = admin.call(reqwest::Method::PUT, &format!("/alert-policies/{off_id}/exclusions/{id3}"), Some(json!({}))).await;
+    assert!(p.0.is_success(), "{p:?}");
+    assert_eq!(p.1["excluded"][0]["id"], id3, "{}", p.1);
+    let al = admin.get(&format!("/alerts/{held_id}")).await;
+    assert_eq!((al["state"].as_str(), al["resolution"].as_str()), (Some("resolved"), Some("policy")), "{al}");
+    let covering = admin.get(&format!("/agents/{id3}/alert-policies")).await;
+    let row = covering.as_array().unwrap().iter().find(|r| r["id"] == off_id.as_str()).unwrap().clone();
+    assert_eq!((row["excluded"].as_bool(), row["level"].as_str()), (Some(true), Some("client")), "{row}");
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert!(alerts_for(admin, &format!("policy_id={off_id}")).await.iter().all(|a| a["agent_id"] != id3), "excluded agents don't alert");
+    let (s, _) = admin.call(reqwest::Method::DELETE, &format!("/alert-policies/{off_id}/exclusions/{id3}"), None).await;
+    assert!(s.is_success());
+    let (api, o) = (admin, off_id.as_str());
+    eventually(30, "the offline alert to return once included again", move || async move {
+        alerts_for(api, &format!("policy_id={o}")).await.into_iter().find(|a| a["agent_id"] == id3)
+    })
+    .await;
+    let (s, _) = admin.call(reqwest::Method::DELETE, &format!("/alert-policies/{off_id}"), None).await;
+    assert!(s.is_success());
+
+    // --- weekly windows -------------------------------------------------------------------------
+    let w = admin.post("/alert-mutes", json!({ "client_id": a_id, "days": [0, 1, 2, 3, 4, 5, 6], "start": "00:00", "minutes": 1440, "tz": "Europe/London", "reason": "always" })).await;
+    assert_eq!(w["active"], true, "{w}");
+    assert_eq!(admin.get(&format!("/agents/{id1}")).await["alerts_muted"], true, "a client window covers its agents");
+    let listed = admin.get(&format!("/alert-mutes?agent_id={id1}")).await;
+    assert!(listed.as_array().unwrap().iter().any(|m| m["id"] == w["id"]), "{listed}");
+    let (s, _) = admin.call(reqwest::Method::DELETE, &format!("/alert-mutes/{}", w["id"].as_str().unwrap()), None).await;
+    assert!(s.is_success());
+    assert_eq!(admin.get(&format!("/agents/{id1}")).await["alerts_muted"], false);
+
+    // --- an agent that stops reporting its protection state ---------------------------------------
+    let stale = admin
+        .post("/alert-policies", json!({ "name": "Silent AV (e2e)", "kind": "security", "params": { "threats": "off", "stale_hours": 2 }, "severity": "warning", "client_id": a_id }))
+        .await;
+    let stale_id = stale["id"].as_str().unwrap().to_string();
+    sqlx::query("UPDATE agents SET security_at = now() - interval '3 hours', connected_at = now() - interval '3 hours' WHERE id = $1::uuid")
+        .bind(id1)
+        .execute(db)
+        .await
+        .unwrap();
+    let (api, sp) = (admin, stale_id.as_str());
+    let silent = eventually(30, "the stale-report alert", move || async move {
+        alerts_for(api, &format!("policy_id={sp}")).await.into_iter().find(|a| a["agent_id"] == id1)
+    })
+    .await;
+    assert_eq!(silent["title"], "Protection state not reported");
+    admin.post(&format!("/agents/{id1}/security/refresh"), json!({})).await;
+    let (api, sid) = (admin, silent["id"].as_str().unwrap().to_string());
+    eventually(30, "a fresh report to clear it", || async { (api.get(&format!("/alerts/{sid}")).await["state"] == "resolved").then_some(()) }).await;
+    let (s, _) = admin.call(reqwest::Method::DELETE, &format!("/alert-policies/{stale_id}"), None).await;
+    assert!(s.is_success());
+
+    // --- processes --------------------------------------------------------------------------------
+    let mut victim = Command::new("sleep").arg("300").spawn().unwrap();
+    let pid = victim.id();
+    let (api, id) = (admin, id1);
+    let procs = eventually(15, "the process list", move || async move {
+        let v = api.get(&format!("/agents/{id}/processes")).await;
+        v["processes"].as_array().unwrap().iter().any(|p| p["pid"] == pid).then_some(v)
+    })
+    .await;
+    let list = procs["processes"].as_array().unwrap();
+    assert!(list.iter().any(|p| p["name"].as_str().unwrap_or("").starts_with("rmm-agent") && p["protected"] == true), "the agent protects itself");
+    let k = admin.post(&format!("/agents/{id1}/processes/{pid}/kill"), json!({ "tree": false, "name": "sleep" })).await;
+    assert!(k["message"].as_str().unwrap().contains("Killed"), "{k}");
+    let status = tokio::task::spawn_blocking(move || victim.wait().unwrap()).await.unwrap();
+    assert!(!status.success(), "killed");
+    let agent_pid = list.iter().find(|p| p["name"].as_str().unwrap_or("").starts_with("rmm-agent")).unwrap()["pid"].as_u64().unwrap();
+    let (s, v) = admin.call(reqwest::Method::POST, &format!("/agents/{id1}/processes/{agent_pid}/kill"), Some(json!({ "tree": true }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    let (s, _) = admin.call(reqwest::Method::GET, &format!("/agents/{id3}/processes"), None).await;
+    assert_eq!(s, StatusCode::CONFLICT, "offline");
+
+    // --- files: browse, download, upload past the 8 MB request limit -----------------------------
+    let here = dir.canonicalize().unwrap();
+    let listing = admin.get(&format!("/agents/{id1}/files?path={}", url_escape(&here.to_string_lossy()))).await;
+    assert!(listing["entries"].as_array().unwrap().iter().any(|e| e["name"] == "a1.toml" && e["dir"] == false), "{listing}");
+    assert_eq!(listing["parent"], here.parent().unwrap().to_string_lossy().as_ref());
+    let roots = admin.get(&format!("/agents/{id1}/files")).await;
+    assert_eq!(roots["entries"][0]["path"], "/");
+    let (s, _) = admin.call(reqwest::Method::GET, &format!("/agents/{id1}/files?path=relative/dir"), None).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+
+    let base = admin.base.clone();
+    let data: Vec<u8> = (0..20 * 1024 * 1024 + 123).map(|i: u32| (i.wrapping_mul(2654435761) >> 24) as u8).collect();
+    let target = here.join("uploaded.bin");
+    let up = |overwrite: bool, body: Vec<u8>| {
+        let url = format!("{base}/agents/{id1}/files/upload?path={}&overwrite={overwrite}", url_escape(&target.to_string_lossy()));
+        admin.http.put(url).body(body).send()
+    };
+    let res = up(false, data.clone()).await.unwrap();
+    assert!(res.status().is_success(), "{}", res.text().await.unwrap());
+    assert_eq!(std::fs::read(&target).unwrap(), data, "uploaded intact");
+    let res = up(false, b"again".to_vec()).await.unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST, "no silent overwrite");
+    assert_eq!(std::fs::metadata(&target).unwrap().len(), data.len() as u64, "the refused upload changed nothing");
+    let res = up(true, b"small".to_vec()).await.unwrap();
+    assert!(res.status().is_success());
+    assert_eq!(std::fs::read(&target).unwrap(), b"small");
+    std::fs::write(&target, &data).unwrap();
+    let res = admin.http.get(format!("{base}/agents/{id1}/files/download?path={}", url_escape(&target.to_string_lossy()))).send().await.unwrap();
+    assert!(res.status().is_success());
+    assert_eq!(res.headers()["x-file-size"], data.len().to_string().as_str());
+    assert!(res.headers()["content-disposition"].to_str().unwrap().contains("uploaded.bin"));
+    assert_eq!(res.bytes().await.unwrap().as_ref(), data.as_slice(), "downloaded intact");
+    let (s, _) = admin.call(reqwest::Method::GET, &format!("/agents/{id1}/files/download?path={}", url_escape(&here.join("missing").to_string_lossy())), None).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let activity = admin.get(&format!("/agents/{id1}/activity")).await;
+    let acts: Vec<&str> = activity.as_array().unwrap().iter().filter_map(|r| r["action"].as_str()).collect();
+    assert!(acts.contains(&"agent.file_upload") && acts.contains(&"agent.file_download") && acts.contains(&"agent.process_kill"), "{acts:?}");
+    let _ = std::fs::remove_file(&target);
+}
+
+fn url_escape(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
 }

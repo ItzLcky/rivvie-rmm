@@ -26,6 +26,10 @@ export interface AgentSummary {
 	site_id: string; site_name: string; client_id: string; client_name: string; last_metrics: Metrics | null;
 	update_state: UpdateState | null; update_version: string | null; update_detail: string | null; update_at: string | null;
 	health: Health; disk_max_pct: number; failed_jobs_24h: number; open_alerts: number;
+	/** Security or critical updates missing for over a week. */
+	patches_overdue: number; patches_failed: number; reboot_pending: boolean; reboot_pending_since: string | null;
+	/** A maintenance window or snooze is holding its alerts back right now. */
+	alerts_muted: boolean;
 }
 
 export type UpdateState = 'offered' | 'downloading' | 'waiting' | 'applying' | 'completed' | 'rolled_back' | 'failed';
@@ -101,7 +105,7 @@ export interface Session { id: string; created_at: string; last_seen_at: string;
 
 export type Severity = 'critical' | 'warning' | 'info';
 export type AlertState = 'open' | 'acknowledged' | 'resolved';
-export type PolicyKind = 'offline' | 'cpu' | 'memory' | 'disk' | 'service' | 'job_failed' | 'log' | 'security';
+export type PolicyKind = 'offline' | 'cpu' | 'memory' | 'disk' | 'service' | 'job_failed' | 'log' | 'security' | 'patch';
 export type LogLevel = 'critical' | 'error' | 'warning' | 'info';
 
 export interface Alert {
@@ -111,6 +115,8 @@ export interface Alert {
 	acknowledged_by_name: string | null; resolved_at: string | null; resolved_by_name: string | null;
 	/** cleared (condition went away), manual, policy (policy changed or deleted) */
 	resolution: 'cleared' | 'manual' | 'policy' | null;
+	/** Opened during a maintenance window or snooze: nobody was notified (yet). */
+	suppressed: boolean;
 }
 export interface Delivery {
 	id: number; channel_name: string; channel_kind: ChannelKind; event: 'opened' | 'resolved' | 'test';
@@ -128,7 +134,31 @@ export interface Policy {
 	channel_ids: string[]; notify_resolved: boolean; enabled: boolean; open_alerts: number; created_at: string; updated_at: string;
 	/** Open tickets for its alerts on this board (null = no tickets). */
 	ticket_board_id: string | null; ticket_priority: Priority; ticket_auto_resolve: boolean;
+	/** Remind the channels this often while an alert stays open and unacknowledged. */
+	renotify_minutes: number | null;
+	/** Agents left out of it. */
+	excluded: { id: string; hostname: string }[];
 }
+
+/** An alert policy that covers an agent (`GET /agents/{id}/alert-policies`). */
+export interface CoveringPolicy {
+	id: string; name: string; kind: PolicyKind; severity: Severity; enabled: boolean; level: 'msp' | 'client' | 'site';
+	excluded: boolean; editable: boolean; open_alerts: number;
+}
+
+/** A maintenance window (weekly) or snooze (one-off) holding alerts back. */
+export interface Mute {
+	id: string; client_id: string | null; site_id: string | null; agent_id: string | null; owner_client_id: string; target_name: string;
+	starts_at: string | null; ends_at: string | null; days: number[] | null; start_time: string | null; minutes: number | null; tz: string;
+	reason: string; created_by_name: string | null; created_at: string; active: boolean; ended: boolean;
+}
+
+export interface Process {
+	pid: number; ppid: number | null; name: string; exe: string | null; cmd: string | null; user: string | null;
+	cpu: number; mem: number; started_at: string | null; protected: boolean;
+}
+export interface DirEntry { name: string; path: string; dir: boolean; symlink: boolean; size: number; modified: string | null; error: string | null }
+export interface DirListing { path: string; parent: string | null; entries: DirEntry[]; truncated: boolean }
 
 export type ChannelKind = 'email' | 'webhook' | 'slack' | 'teams';
 export interface Channel {

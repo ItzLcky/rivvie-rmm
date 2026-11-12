@@ -26,7 +26,9 @@
 	import { DropdownMenu } from 'bits-ui';
 	import { goto } from '$app/navigation';
 	import { ArrowDown, ArrowUp, ArrowUpDown, Check, Columns3, ListFilter, X } from '@lucide/svelte';
-	import { cx, plural } from '#lib/format.js';
+	import { cx, num, plural } from '#lib/format.js';
+	import { ALL_CAP } from '#lib/paged.svelte.js';
+	import { toast } from '#lib/toast.svelte.js';
 	import { prefs, setPref } from '#lib/prefs.svelte.js';
 	import Button from './Button.svelte';
 	import Checkbox from './Checkbox.svelte';
@@ -50,6 +52,7 @@
 		filters,
 		activeFilters = 0,
 		bulk,
+		matching,
 		empty,
 		footer,
 		scroll = true
@@ -77,6 +80,8 @@
 		/** How many of `filters` are set; shown on the phone button. */
 		activeFilters?: number;
 		bulk?: Snippet<[number]>;
+		/** Rows matching the filters across every page: offers "Select all N" once the page is selected. */
+		matching?: { total: number; exact: boolean; select: () => Promise<string[]> };
 		empty?: Snippet;
 		footer?: Snippet;
 		/** Scroll inside the card with a sticky header (long lists). */
@@ -106,6 +111,18 @@
 			else s.add(k);
 		}
 		selected = s;
+	}
+	let selectingAll = $state(false);
+	async function selectAllMatching() {
+		if (!matching) return;
+		selectingAll = true;
+		try {
+			selected = new Set(await matching.select());
+		} catch (e) {
+			toast.error(e);
+		} finally {
+			selectingAll = false;
+		}
 	}
 	function toggleRow(k: string) {
 		const s = new Set(selected);
@@ -205,6 +222,13 @@
 	{#if selectable && selected!.size > 0 && bulk}
 		<div class="border-border bg-accent-soft flex flex-wrap items-center gap-2 border-b px-4 py-2 text-sm" role="region" aria-label="Bulk actions">
 			<span class="text-accent font-medium">{plural(selected!.size, 'selected', 'selected')}</span>
+			{#if matching && allOn && matching.total > selected!.size && selected!.size < ALL_CAP}
+				<button class="link text-sm" disabled={selectingAll} onclick={selectAllMatching}>
+					{selectingAll ? 'Selecting…' : matching.total > ALL_CAP ? `Select the first ${num(ALL_CAP)} matching` : `Select all ${num(matching.total)}${matching.exact ? '' : '+'} matching`}
+				</button>
+			{:else if matching && selected!.size > rows.length}
+				<span class="text-muted text-xs">across every page</span>
+			{/if}
 			<div class="flex flex-wrap items-center gap-2">{@render bulk(selected!.size)}</div>
 			<button class="text-muted hover:text-fg ml-auto inline-flex items-center gap-1 text-xs" onclick={() => (selected = new Set())}><X class="size-3.5" />Clear</button>
 		</div>

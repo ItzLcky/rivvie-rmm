@@ -141,6 +141,8 @@ pub struct Hub {
     controls: std::sync::Mutex<HashMap<Uuid, (Uuid, oneshot::Sender<ControlResult>)>>,
     /// Telemetry queries waiting for the agent's answer.
     queries: std::sync::Mutex<HashMap<Uuid, (Uuid, oneshot::Sender<QueryResult>)>>,
+    /// Tool requests (processes, files) waiting for the agent's answer.
+    tools: std::sync::Mutex<HashMap<Uuid, (Uuid, oneshot::Sender<rmm_proto::tools::Reply>)>>,
     events: broadcast::Sender<Event>,
 }
 
@@ -157,6 +159,7 @@ impl Default for Hub {
             desktops: Default::default(),
             controls: Default::default(),
             queries: Default::default(),
+            tools: Default::default(),
             events,
         }
     }
@@ -296,6 +299,39 @@ impl Hub {
             && let Some((_, tx)) = q.remove(&request_id)
         {
             let _ = tx.send(result);
+        }
+    }
+
+    /// Sends a tool request and waits up to `timeout` for the answer. Errors read as messages
+    /// for the person who asked.
+    pub async fn tool(
+        &self,
+        agent_id: Uuid,
+        request: rmm_proto::tools::Request,
+        timeout: std::time::Duration,
+    ) -> Result<rmm_proto::tools::Reply, String> {
+        let request_id = Uuid::new_v4();
+        let (tx, rx) = oneshot::channel();
+        self.tools.lock().unwrap().insert(request_id, (agent_id, tx));
+        if !self.send(agent_id, ServerMsg::Tool { request_id, request }).await {
+            self.tools.lock().unwrap().remove(&request_id);
+            return Err("the agent is offline".into());
+        }
+        let res = tokio::time::timeout(timeout, rx).await;
+        self.tools.lock().unwrap().remove(&request_id);
+        match res {
+            Ok(Ok(reply)) => Ok(reply),
+            Ok(Err(_)) => Err("the agent disconnected".into()),
+            Err(_) => Err(format!("the agent didn't answer within {} seconds", timeout.as_secs())),
+        }
+    }
+
+    pub fn complete_tool(&self, from_agent: Uuid, request_id: Uuid, reply: rmm_proto::tools::Reply) {
+        let mut t = self.tools.lock().unwrap();
+        if t.get(&request_id).is_some_and(|(a, _)| *a == from_agent)
+            && let Some((_, tx)) = t.remove(&request_id)
+        {
+            let _ = tx.send(reply);
         }
     }
 

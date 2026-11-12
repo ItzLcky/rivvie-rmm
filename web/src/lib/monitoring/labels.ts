@@ -9,7 +9,8 @@ export const kindLabels: Record<PolicyKind, string> = {
 	service: 'Service stopped',
 	job_failed: 'Failed job',
 	log: 'Event log match',
-	security: 'Antivirus'
+	security: 'Antivirus',
+	patch: 'Patches'
 };
 
 export const kindHelp: Record<PolicyKind, string> = {
@@ -20,7 +21,8 @@ export const kindHelp: Record<PolicyKind, string> = {
 	service: 'A watched service (systemd unit or Windows service) is stopped or failed.',
 	job_failed: 'A script fails, errors or times out. Clears when the same script next succeeds.',
 	log: 'An entry in the journal (Linux) or the Event Log (Windows) matches your rules.',
-	security: 'Protection is off or out of date, or the antivirus finds a threat.'
+	security: 'Protection is off or out of date, stopped reporting, or the antivirus finds a threat.',
+	patch: 'An update fails to install, or a restart to finish updates stays pending.'
 };
 
 export const severityTone: Record<Severity, Tone> = { critical: 'danger', warning: 'warning', info: 'info' };
@@ -65,8 +67,15 @@ export function describePolicy(p: Pick<Policy, 'kind' | 'params'>): string {
 			if (q.realtime_off) bits.push('real-time off');
 			if (q.sensor_down) bits.push('sensor not running');
 			if (q.signature_max_age_hours) bits.push(`signatures over ${q.signature_max_age_hours} h`);
+			if (q.stale_hours) bits.push(`no report for ${q.stale_hours} h`);
 			if (q.threats === 'any') bits.push('every detection');
 			else if (q.threats !== 'off') bits.push('active threats');
+			return bits.join(', ') || 'Nothing';
+		}
+		case 'patch': {
+			const bits: string[] = [];
+			if (q.failed !== false) bits.push('failed installs');
+			if (q.reboot_hours) bits.push(`restart pending over ${q.reboot_hours} h`);
 			return bits.join(', ') || 'Nothing';
 		}
 		case 'log': {
@@ -103,4 +112,15 @@ export function describeCron(expr: string): string {
 	if (dom === '*' && mon === '*' && /^\d(,\d)*$/.test(dow)) return `Every ${dow.split(',').map((d) => dows[Number(d) % 7]).join(', ')} at ${at}`;
 	if (num(dom) && mon === '*' && dow === '*') return `Monthly on day ${dom} at ${at}`;
 	return e;
+}
+
+const dayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
+/** "Sat, Sun 22:00 for 6 h (Europe/London)" or "until 14 Nov, 18:00". */
+export function describeMute(m: { ends_at: string | null; starts_at: string | null; days: number[] | null; start_time: string | null; minutes: number | null; tz: string }, fmt: (iso: string) => string): string {
+	if (m.ends_at) return m.starts_at && Date.parse(m.starts_at) > Date.now() ? `${fmt(m.starts_at)} to ${fmt(m.ends_at)}` : `Until ${fmt(m.ends_at)}`;
+	const days = (m.days ?? []).map((d) => dayNames[d]).join(', ');
+	const mins = m.minutes ?? 0;
+	const len = mins % 60 === 0 ? `${mins / 60} h` : `${mins} min`;
+	return `${days} ${(m.start_time ?? '').slice(0, 5)} for ${len} (${m.tz})`;
 }

@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Check, CheckCheck } from '@lucide/svelte';
+	import { BellOff, Check, CheckCheck } from '@lucide/svelte';
 	import { api } from '#lib/api.js';
 	import { ago, datetime, num } from '#lib/format.js';
 	import { liveReload } from '#lib/live.svelte.js';
@@ -8,7 +8,10 @@
 	import { resource } from '#lib/resource.svelte.js';
 	import { can } from '#lib/session.svelte.js';
 	import { attempt } from '#lib/toast.svelte.js';
-	import type { Alert, Page } from '#lib/types.js';
+	import type { Alert, CoveringPolicy, Mute, Page } from '#lib/types.js';
+	import { describeMute } from '#lib/monitoring/labels.js';
+	import Badge from '#lib/ui/Badge.svelte';
+	import MuteDialog from '#lib/components/MuteDialog.svelte';
 	import Button from '#lib/ui/Button.svelte';
 	import DataTable, { type Column } from '#lib/ui/DataTable.svelte';
 	import EmptyState from '#lib/ui/EmptyState.svelte';
@@ -16,7 +19,28 @@
 	import AlertStateBadge from '#lib/components/AlertStateBadge.svelte';
 	import SeverityBadge from '#lib/components/SeverityBadge.svelte';
 
-	let { agentId }: { agentId: string } = $props();
+	let { agentId, hostname, onchange }: { agentId: string; hostname: string; onchange?: () => void } = $props();
+	const mutes = resource(() => api.get<Mute[]>(`/alert-mutes?agent_id=${agentId}`));
+	const policies = resource(() => api.get<CoveringPolicy[]>(`/agents/${agentId}/alert-policies`));
+	let snoozing = $state(false);
+	const levels = { msp: 'MSP-wide', client: 'Client', site: 'Site' };
+
+	async function endMute(m: Mute) {
+		if (await attempt(() => api.del(`/alert-mutes/${m.id}`), m.ends_at ? 'Snooze ended.' : 'Maintenance window removed.')) {
+			mutes.reload();
+			res.reload();
+			onchange?.();
+		}
+	}
+	async function setExcluded(p: CoveringPolicy, excluded: boolean) {
+		const path = `/alert-policies/${p.id}/exclusions/${agentId}`;
+		const done = excluded ? `${hostname} is left out of ${p.name}; its alerts from it are closed.` : `${p.name} covers ${hostname} again.`;
+		if (await attempt(() => (excluded ? api.put(path, {}) : api.del(path)), done)) {
+			policies.reload();
+			res.reload();
+			onchange?.();
+		}
+	}
 	let view = $state<'active' | 'all'>('active');
 	const res = resource(() => api.get<Page<Alert>>(`/alerts?agent_id=${agentId}&state=${view}&limit=200`));
 	liveReload(() => res.reload(), (e) => e.type === 'alert' && e.agent_id === agentId, { debounceMs: 500 });
@@ -67,3 +91,59 @@
 		<EmptyState compact title={view === 'active' ? 'No open alerts' : 'No alerts yet'} description={view === 'active' ? 'Nothing on this agent needs a look.' : undefined} />
 	{/snippet}
 </DataTable>
+
+<div class="mt-4 grid gap-4 xl:grid-cols-2">
+	<section class="card" aria-label="Maintenance windows and snoozes">
+		<header class="border-border flex min-h-12 items-center justify-between gap-2 border-b px-4 py-2">
+			<h2 class="panel-title">Maintenance and snoozes</h2>
+			{#if can('technician')}<Button size="sm" icon={BellOff} onclick={() => (snoozing = true)}>Snooze</Button>{/if}
+		</header>
+		{#if mutes.data?.length}
+			<ul class="divide-border divide-y">
+				{#each mutes.data as m (m.id)}
+					<li class="flex flex-wrap items-center gap-x-3 gap-y-1 px-4 py-2.5 text-sm">
+						<div class="min-w-0 flex-1">
+							<div class="flex flex-wrap items-center gap-2">
+								<span>{describeMute(m, datetime)}</span>
+								{#if m.active}<Badge tone="warning">Now</Badge>{/if}
+							</div>
+							<div class="text-muted text-xs">
+								{m.agent_id ? 'This agent' : m.site_id ? `Site ${m.target_name}` : `Client ${m.target_name}`}{m.reason ? ` · ${m.reason}` : ''}{m.created_by_name ? ` · ${m.created_by_name}` : ''}
+							</div>
+						</div>
+						{#if can('technician')}<Button size="sm" variant="ghost" onclick={() => endMute(m)}>{m.ends_at ? 'End' : 'Remove'}</Button>{/if}
+					</li>
+				{/each}
+			</ul>
+		{:else if !mutes.loading}
+			<EmptyState compact title="Alerts aren't held back" description="Snooze before planned work, or add a weekly window (on the Alert policies page) for regular reboots and backups." />
+		{/if}
+	</section>
+
+	<section class="card" aria-label="Alert policies covering this agent">
+		<header class="border-border flex min-h-12 items-center border-b px-4 py-2"><h2 class="panel-title">Alert policies</h2></header>
+		{#if policies.data?.length}
+			<ul class="divide-border divide-y">
+				{#each policies.data as p (p.id)}
+					<li class="flex flex-wrap items-center gap-x-3 gap-y-1 px-4 py-2.5 text-sm">
+						<div class="min-w-0 flex-1">
+							<div class="flex flex-wrap items-center gap-2">
+								<a class={p.excluded || !p.enabled ? 'text-muted line-through decoration-1 hover:text-fg' : 'hover:text-accent font-medium'} href="/policies/{p.id}">{p.name}</a>
+								<SeverityBadge severity={p.severity} />
+								{#if !p.enabled}<Badge tone="neutral">Disabled</Badge>{:else if p.excluded}<Badge tone="neutral">Excluded</Badge>{/if}
+							</div>
+							<div class="text-muted text-xs">{kindLabels[p.kind]} · {levels[p.level]}{p.open_alerts ? ` · ${num(p.open_alerts)} open` : ''}</div>
+						</div>
+						{#if p.editable}
+							<Button size="sm" variant="ghost" onclick={() => setExcluded(p, !p.excluded)}>{p.excluded ? 'Include' : 'Exclude'}</Button>
+						{/if}
+					</li>
+				{/each}
+			</ul>
+		{:else if !policies.loading}
+			<EmptyState compact title="No policies cover this agent" />
+		{/if}
+	</section>
+</div>
+
+{#if snoozing}<MuteDialog target={{ agent_id: agentId, name: hostname }} onclose={() => (snoozing = false)} onsaved={() => { mutes.reload(); onchange?.(); }} />{/if}

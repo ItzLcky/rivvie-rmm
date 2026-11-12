@@ -46,7 +46,7 @@ impl PatchProvider for Pacman {
 
     fn install(&self, _ids: &[String], log: &Log, progress: Progress) -> Result<Installed> {
         progress(PatchStage::Installing, Some("pacman -Syu".into()), None);
-        let out = cmd::run(log, "pacman", &["-Syu", "--noconfirm", "--noprogressbar"], Opts { timeout: Duration::from_secs(3 * 3600), ..Default::default() }, &mut |line| {
+        let out = cmd::run(log, "pacman", &["-Syu", "--noconfirm", "--noprogressbar"], Opts { timeout: Duration::from_secs(3 * 3600), detach: true, ..Default::default() }, &mut |line| {
             // "(12/40) upgrading openssl"
             if let Some((counter, rest)) = line.trim_start().strip_prefix('(').and_then(|l| l.split_once(") "))
                 && let Some((n, total)) = counter.split_once('/')

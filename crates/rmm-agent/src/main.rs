@@ -11,6 +11,7 @@ mod service;
 mod services;
 mod shell;
 mod software;
+mod tools;
 mod update;
 #[cfg(windows)]
 mod winjob;

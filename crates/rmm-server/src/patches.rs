@@ -243,6 +243,7 @@ pub async fn ingest_scan(
     let error = error.map(|e| e.chars().take(8000).collect::<String>());
     sqlx::query(
         "UPDATE agents SET patch_provider = $2, patch_all_or_nothing = $3, patch_scan_error = $4, reboot_pending = $5,
+                reboot_pending_since = CASE WHEN $5 THEN coalesce(reboot_pending_since, now()) END,
                 patch_scanned_at = CASE WHEN $4::text IS NULL THEN now() ELSE patch_scanned_at END,
                 patch_scan_requested_at = NULL
           WHERE id = $1",
@@ -304,9 +305,10 @@ pub async fn ingest_scan(
         .await?;
     }
     // In the same transaction, so nobody sees new updates before the policy has judged them.
-    apply_policies(&mut *tx, Some(&[agent_id])).await?;
+    apply_policies(&mut tx, Some(&[agent_id])).await?;
     tx.commit().await?;
     publish(st, agent_id, client_id);
+    crate::alerts::patches_changed(st, agent_id).await;
     Ok(())
 }
 
@@ -390,7 +392,10 @@ pub async fn ingest_result(st: &AppState, agent_id: Uuid, client_id: Uuid, o: &P
             }
         }
         if o.reboot_required {
-            sqlx::query("UPDATE agents SET reboot_pending = true WHERE id = $1").bind(agent_id).execute(&mut *tx).await?;
+            sqlx::query("UPDATE agents SET reboot_pending = true, reboot_pending_since = coalesce(reboot_pending_since, now()) WHERE id = $1")
+                .bind(agent_id)
+                .execute(&mut *tx)
+                .await?;
         }
     }
     tx.commit().await?;
@@ -407,14 +412,30 @@ pub async fn ingest_result(st: &AppState, agent_id: Uuid, client_id: Uuid, o: &P
         )
         .await;
         publish(st, agent_id, client_id);
+        crate::alerts::patches_changed(st, agent_id).await;
     }
     Ok(())
 }
 
-/// Re-evaluates policy approvals for these agents (all agents with None). Manual decisions
-/// are left alone.
-pub async fn apply_policies<'e>(db: impl sqlx::PgExecutor<'e>, agent_ids: Option<&[Uuid]>) -> sqlx::Result<u64> {
-    Ok(sqlx::query(
+/// Re-evaluates approvals for these agents (all agents with None): standing decisions a
+/// person made for a scope ([`STANDING`]) first, then the approval policy. Decisions made on
+/// one agent's row are left alone.
+pub async fn apply_policies(db: &mut sqlx::PgConnection, agent_ids: Option<&[Uuid]>) -> sqlx::Result<u64> {
+    let standing = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE patches p
+            SET approval = m.decision, approval_manual = true, approved_by = m.decided_by,
+                approved_at = CASE WHEN m.decision = 'approved' THEN m.decided_at END
+           FROM (SELECT p2.agent_id, p2.update_id, d.*
+                   FROM patches p2 JOIN agents a ON a.id = p2.agent_id JOIN sites s ON s.id = a.site_id
+                   CROSS JOIN LATERAL ({STANDING}) d
+                  WHERE NOT p2.approval_manual AND ($1::uuid[] IS NULL OR p2.agent_id = ANY($1))) m
+          WHERE p.agent_id = m.agent_id AND p.update_id = m.update_id"
+    )))
+    .bind(agent_ids)
+    .execute(&mut *db)
+    .await?
+    .rows_affected();
+    let by_policy = sqlx::query(
         "UPDATE patches p
             SET approval = m.approval,
                 approved_at = CASE WHEN m.approval = 'approved' THEN coalesce(p.approved_at, now()) END,
@@ -427,10 +448,18 @@ pub async fn apply_policies<'e>(db: impl sqlx::PgExecutor<'e>, agent_ids: Option
           WHERE p.agent_id = m.agent_id AND p.update_id = m.update_id AND p.approval IS DISTINCT FROM m.approval",
     )
     .bind(agent_ids)
-    .execute(db)
+    .execute(&mut *db)
     .await?
-    .rows_affected())
+    .rows_affected();
+    Ok(standing + by_policy)
 }
+
+/// The standing decision (`patch_approvals`) for update `p2.update_id` on agent `a` (site `s`):
+/// the site's, else the client's, else the MSP-wide one.
+pub const STANDING: &str = "SELECT pa.decision, pa.decided_by, pa.decided_at FROM patch_approvals pa
+          WHERE pa.update_id = p2.update_id
+            AND (pa.site_id = s.id OR (pa.client_id = s.client_id AND pa.site_id IS NULL) OR (pa.client_id IS NULL AND pa.site_id IS NULL))
+          ORDER BY (pa.site_id IS NOT NULL) DESC, (pa.client_id IS NOT NULL) DESC LIMIT 1";
 
 /// Every minute: request stale scans, start automatic installs, give up on silent installs.
 pub async fn scheduler(st: Arc<AppState>) {

@@ -3,7 +3,7 @@
 	import { api } from '#lib/api.js';
 	import { num } from '#lib/format.js';
 	import { liveReload } from '#lib/live.svelte.js';
-	import { paged } from '#lib/paged.svelte.js';
+	import { inBatches, paged } from '#lib/paged.svelte.js';
 	import { clientId, currentClient } from '#lib/scope.svelte.js';
 	import { categories, priorities, ticketCounts, ticketMeta } from '#lib/servicedesk/tickets.svelte.js';
 	import { can, session } from '#lib/session.svelte.js';
@@ -61,7 +61,8 @@
 
 	async function applyBulk(patch: { status_category?: StatusCategory; priority?: number; assignee_id?: string | null }, done: string) {
 		const ids = [...selected];
-		if (await attempt(() => api.post('/tickets/bulk', { ids, ...patch }), done)) {
+		// The bulk endpoint takes 500 at a time.
+		if (await attempt(() => inBatches(ids, 500, (slice) => api.post('/tickets/bulk', { ids: slice, ...patch })), done)) {
 			selected = new Set();
 			list.reload();
 		}
@@ -88,6 +89,7 @@
 		{sort}
 		hide={scoped ? ['client'] : []}
 		bind:selected={() => (can('technician') ? selected : undefined), (v) => (selected = v ?? new Set())}
+		matching={list.data ? { total: list.data.total, exact: list.data.total_exact, select: async () => (await list.all()).map((t) => t.id) } : undefined}
 		activeFilters={(board ? 1 : 0) + (priority ? 1 : 0) + (assignee ? 1 : 0)}
 	>
 		{#snippet toolbar()}

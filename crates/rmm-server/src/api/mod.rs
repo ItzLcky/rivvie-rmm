@@ -14,6 +14,7 @@ mod clients;
 mod downloads;
 mod jobs;
 mod msi;
+mod mutes;
 mod packages;
 mod schedules;
 mod patches;
@@ -24,6 +25,7 @@ mod servicedesk;
 mod services;
 mod settings;
 pub(crate) mod tickets;
+mod tools;
 mod totp;
 pub(crate) mod users;
 
@@ -149,6 +151,10 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/alerts/{id}/resolve", post(alerts::resolve))
         .route("/alert-policies", get(alerts::list_policies).post(alerts::create_policy))
         .route("/alert-policies/{id}", get(alerts::get_policy).put(alerts::update_policy).delete(alerts::remove_policy))
+        .route("/alert-policies/{id}/exclusions/{agent_id}", axum::routing::put(alerts::exclude).delete(alerts::include))
+        .route("/agents/{id}/alert-policies", get(alerts::for_agent))
+        .route("/alert-mutes", get(mutes::list).post(mutes::create))
+        .route("/alert-mutes/{id}", delete(mutes::remove))
         .route("/schedules", get(schedules::list).post(schedules::create))
         .route("/schedules/preview", get(schedules::preview))
         .route("/schedules/{id}", get(schedules::get).put(schedules::update).delete(schedules::remove))
@@ -180,4 +186,11 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/mailboxes/{id}/poll", post(servicedesk::poll_mailbox))
         .route("/mailboxes/{id}/rotate-token", post(servicedesk::rotate_mailbox_token))
         .route("/inbound/email/{token}", post(servicedesk::inbound))
+        .route("/agents/{id}/processes", get(tools::processes))
+        .route("/agents/{id}/processes/{pid}/kill", post(tools::kill))
+        .route("/agents/{id}/files", get(tools::list))
+        .route("/agents/{id}/files/download", get(tools::download))
+        // Everything above takes bodies of at most 8 MB; uploads stream to the agent instead.
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(8 * 1024 * 1024))
+        .route("/agents/{id}/files/upload", axum::routing::put(tools::upload))
 }

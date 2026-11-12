@@ -58,7 +58,7 @@ impl PatchProvider for Apt {
         args.extend(ids.iter().map(String::as_str));
         let total = ids.len().max(1);
         let mut done = 0usize;
-        let out = cmd::run(log, "apt-get", &args, Opts { env: ENV, timeout: Duration::from_secs(3 * 3600), ..Default::default() }, &mut |line| {
+        let out = cmd::run(log, "apt-get", &args, Opts { env: ENV, timeout: Duration::from_secs(3 * 3600), detach: true, ..Default::default() }, &mut |line| {
             if let Some(rest) = line.strip_prefix("Setting up ") {
                 done += 1;
                 let pkg = rest.split_whitespace().next().unwrap_or(rest);

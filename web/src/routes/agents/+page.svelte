@@ -78,6 +78,12 @@
 		for (const id of [...picked.keys()]) if (!selected.has(id)) picked.delete(id);
 	});
 	let running = $state(false);
+	/** Every agent matching the filters, remembered for Run script. */
+	async function selectAll() {
+		const all = await list.all();
+		for (const a of all) picked.set(a.id, a);
+		return all.map((a) => a.id);
+	}
 
 	const releases = resource(() => (can('admin') ? api.get<{ releases: Release[] }>('/agent-updates').then((r) => r.releases) : Promise.resolve([])));
 	const outdated = $derived((releases.data ?? []).reduce((n, r) => n + r.outdated, 0));
@@ -167,6 +173,7 @@
 		busy={list.busy}
 		{sort}
 		bind:selected
+		matching={list.data ? { total: list.data.total, exact: list.data.total_exact, select: selectAll } : undefined}
 		rowHref={(a) => `/agents/${a.id}`}
 		columns={[
 			{ id: 'hostname', label: 'Hostname', sort: 'hostname', cell: hostCell, hideable: false },

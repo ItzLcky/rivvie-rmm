@@ -291,7 +291,7 @@ async fn serve(db: sqlx::PgPool, args: ServeArgs) -> Result<()> {
         .route("/healthz", get(|| async { "ok" }))
         .nest("/api", api::router())
         .fallback_service(ServeDir::new(&args.web_dir).fallback(ServeFile::new(index)))
-        .layer(tower_http::limit::RequestBodyLimitLayer::new(8 * 1024 * 1024))
+        // (The API sets its own body limit, see `api::router`.)
         .layer(TraceLayer::new_for_http());
     let https = state.cfg.secure_cookies();
     let app = security_headers(app.with_state(state), https);
@@ -443,6 +443,7 @@ async fn housekeeping(state: Arc<AppState>) {
             results.push(
                 sqlx::query("DELETE FROM log_events WHERE received_at < now() - interval '30 days'").execute(db).await,
             );
+            results.push(sqlx::query("DELETE FROM alert_mutes WHERE ends_at < now() - interval '30 days'").execute(db).await);
             results.push(
                 sqlx::query("DELETE FROM notifications WHERE status <> 'pending' AND created_at < now() - interval '30 days'")
                     .execute(db)

@@ -62,7 +62,7 @@
 			const ok = await confirmAction({
 				title: decision === 'declined' ? `Decline ${plural(ids.length, 'update')}?` : `Reset ${plural(ids.length, 'update')} to the policy?`,
 				message: decision === 'declined'
-					? `They won't be installed on ${where} unless someone approves them again. Compliance ignores declined updates.`
+					? `They won't be installed on ${where} unless someone approves them again, including agents that report them later. Compliance ignores declined updates.`
 					: `Manual approvals and declines on ${where} are forgotten; the patch policy decides again.`,
 				confirmLabel: decision === 'declined' ? 'Decline' : 'Reset'
 			});
@@ -71,7 +71,7 @@
 		const ok = await attempt(async () => {
 			const r = await api.post<{ changed: number; agents: number }>('/patches/approval', { decision, update_ids: ids, agent_ids: agentIds, client_id: agentIds ? null : clientId() || null });
 			return r;
-		}, `${decision === 'approved' ? 'Approved' : decision === 'declined' ? 'Declined' : 'Reset'} ${plural(ids.length, 'update')} on ${where}.`);
+		}, `${decision === 'approved' ? 'Approved' : decision === 'declined' ? 'Declined' : 'Reset'} ${plural(ids.length, 'update')} on ${where}${agentIds || decision === 'pending' ? '' : ', and on agents that report them later'}.`);
 		if (ok) {
 			selected = new Set();
 			updates.reload();

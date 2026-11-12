@@ -12,6 +12,7 @@ pub mod desktop;
 pub mod patch;
 pub mod security;
 pub mod telemetry;
+pub mod tools;
 pub mod update;
 
 use chrono::{DateTime, Utc};
@@ -233,6 +234,11 @@ pub enum AgentMsg {
         data: Vec<u8>,
         done: bool,
     },
+    /// Answer to [`ServerMsg::Tool`].
+    ToolReply {
+        request_id: Uuid,
+        reply: tools::Reply,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -410,6 +416,12 @@ pub enum ServerMsg {
     TelemetryQuery {
         request_id: Uuid,
         query: telemetry::Query,
+    },
+    /// A process list, kill or file operation (only to agents listing [`tools::CAPABILITY`]);
+    /// answered with [`AgentMsg::ToolReply`].
+    Tool {
+        request_id: Uuid,
+        request: tools::Request,
     },
 }
 
