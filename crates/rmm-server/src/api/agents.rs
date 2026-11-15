@@ -356,7 +356,7 @@ pub struct Dashboard {
     open_alerts: Vec<super::alerts::AlertRow>,
 }
 
-#[derive(Serialize, sqlx::FromRow)]
+#[derive(Serialize)]
 pub struct ClientHealth {
     id: Uuid,
     name: String,
@@ -406,13 +406,6 @@ pub async fn dashboard(State(st): State<Arc<AppState>>, u: User, Query(q): Query
     .bind(scope)
     .fetch_one(&st.db)
     .await?;
-    let health: serde_json::Value = sqlx::query_scalar(AssertSqlSafe(format!(
-        "SELECT coalesce(jsonb_object_agg(h, n), '{{}}') FROM (SELECT {} AS h, count(*) n {scoped} GROUP BY 1) t",
-        health_name!()
-    )))
-    .bind(scope)
-    .fetch_one(&st.db)
-    .await?;
     let jobs_24h: serde_json::Value = sqlx::query_scalar(
         "SELECT coalesce(jsonb_object_agg(status, n), '{}')
            FROM (SELECT j.status, count(*) n
@@ -437,24 +430,59 @@ pub async fn dashboard(State(st): State<Arc<AppState>>, u: User, Query(q): Query
     .fetch_all(&st.db)
     .await?;
     let failed_jobs = super::jobs::recent_failures(&st, scope).await?;
-    let client_health = sqlx::query_as(AssertSqlSafe(format!(
-        "SELECT c.id, c.name,
-                count(a.id) AS agents,
-                count(a.id) FILTER (WHERE a.online) AS online,
-                count(a.id) FILTER (WHERE {rank} = 2) AS attention,
-                count(a.id) FILTER (WHERE {rank} = 3) AS unhealthy,
-                coalesce(sum({failed}), 0)::bigint AS failed_jobs_24h,
-                coalesce(sum((SELECT count(*) FROM alerts oa WHERE oa.agent_id = a.id AND oa.resolved_at IS NULL)), 0)::bigint AS open_alerts
-           FROM clients c LEFT JOIN sites s ON s.client_id = c.id LEFT JOIN agents a ON a.site_id = s.id
+    // Health is the expensive part (alerts, jobs and patches, and the disks in last_metrics, for
+    // every agent): work it out once per agent, for both the per-client rows and the totals.
+    #[derive(sqlx::FromRow)]
+    struct ClientRow {
+        id: Uuid,
+        name: String,
+        agents: i64,
+        online: i64,
+        ranks: Vec<i64>,
+        failed_jobs_24h: i64,
+        open_alerts: i64,
+    }
+    let rows: Vec<ClientRow> = sqlx::query_as(AssertSqlSafe(format!(
+        "WITH r AS (SELECT s.client_id, a.online, {rank} AS rank, {failed} AS failed,
+                           (SELECT count(*) FROM alerts oa WHERE oa.agent_id = a.id AND oa.resolved_at IS NULL) AS open_alerts
+                      {scoped})
+         SELECT c.id, c.name, count(r.client_id) AS agents, count(r.client_id) FILTER (WHERE r.online) AS online,
+                ARRAY[count(r.client_id) FILTER (WHERE r.rank = 0), count(r.client_id) FILTER (WHERE r.rank = 1),
+                      count(r.client_id) FILTER (WHERE r.rank = 2), count(r.client_id) FILTER (WHERE r.rank = 3)] AS ranks,
+                coalesce(sum(r.failed), 0)::bigint AS failed_jobs_24h, coalesce(sum(r.open_alerts), 0)::bigint AS open_alerts
+           FROM clients c LEFT JOIN r ON r.client_id = c.id
           WHERE ($1::uuid[] IS NULL OR c.id = ANY($1))
           GROUP BY c.id
-          ORDER BY 6 DESC, 5 DESC, 8 DESC, count(a.id) - count(a.id) FILTER (WHERE a.online) DESC, lower(c.name)",
+          ORDER BY count(r.client_id) FILTER (WHERE r.rank = 3) DESC, count(r.client_id) FILTER (WHERE r.rank = 2) DESC, 7 DESC,
+                   count(r.client_id) - count(r.client_id) FILTER (WHERE r.online) DESC, lower(c.name)",
         rank = health_rank!(),
         failed = failed_24h!(),
     )))
     .bind(scope)
     .fetch_all(&st.db)
     .await?;
+    let mut totals = [0i64; 4];
+    for r in &rows {
+        for (t, n) in totals.iter_mut().zip(&r.ranks) {
+            *t += n;
+        }
+    }
+    let health: serde_json::Map<String, serde_json::Value> =
+        ["healthy", "unknown", "attention", "unhealthy"].iter().zip(totals).filter(|(_, n)| *n > 0).map(|(h, n)| (h.to_string(), n.into())).collect();
+    let health = serde_json::Value::Object(health);
+    let client_health: Vec<ClientHealth> = rows
+        .into_iter()
+        .map(|r| ClientHealth {
+            id: r.id,
+            name: r.name,
+            agents: r.agents,
+            online: r.online,
+            attention: r.ranks[2],
+            unhealthy: r.ranks[3],
+            failed_jobs_24h: r.failed_jobs_24h,
+            open_alerts: r.open_alerts,
+        })
+        .collect();
     let alerts = super::alerts::summary(&st, scope).await?;
     let open_alerts = super::alerts::recent_open(&st, scope).await?;
     Ok(Json(Dashboard {

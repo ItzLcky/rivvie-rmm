@@ -110,7 +110,9 @@ async fn pump(st: Arc<AppState>, mut user: User, token: String, mut events: broa
                     };
                     pending.insert(k, ev);
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => {
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    crate::metrics::M.sse_lagged_events.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+                    crate::metrics::inc(&crate::metrics::M.sse_resyncs);
                     pending.clear();
                     if tx.send(r#"{"type":"resync"}"#.into()).await.is_err() {
                         return;

@@ -491,7 +491,7 @@ pub async fn run(st: Arc<AppState>) {
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tick.tick().await;
-        if let Err(e) = evaluate(&st).await {
+        if let Err(e) = crate::metrics::M.alert_eval.time(evaluate(&st)).await {
             warn!("alert evaluation: {e}");
         }
     }

@@ -24,12 +24,12 @@
 	} from '@lucide/svelte';
 	import { api } from '#lib/api.js';
 	import { confirmAction } from '#lib/confirm.svelte.js';
-	import { ago, bytes, cx, datetime, pct } from '#lib/format.js';
+	import { ago, bytes, cx, datetime, oversized, pct } from '#lib/format.js';
 	import { liveReload } from '#lib/live.svelte.js';
 	import { resource } from '#lib/resource.svelte.js';
 	import { clients, loadClients } from '#lib/scope.svelte.js';
 	import { categoryOf, levels, priorities, priorityOf, sourceLabels, ticketMeta, ticketNumber } from '#lib/servicedesk/tickets.svelte.js';
-	import { can, session } from '#lib/session.svelte.js';
+	import { can, company, session } from '#lib/session.svelte.js';
 	import { attempt, toast } from '#lib/toast.svelte.js';
 	import type { AgentSummary, CannedResponse, Contact, Page, Priority, StatusCategory, Ticket, TicketAgent, TicketAttachment, TicketDetail, TicketEvent, TicketMeta } from '#lib/types.js';
 	import { targetLabels, until } from '#lib/servicedesk/sla.js';
@@ -120,13 +120,20 @@
 
 	async function upload(list: FileList | null) {
 		if (!list?.length) return;
+		// Checked here too, so a large file isn't sent only to be refused at the end.
+		const tooBig = oversized(list, company.attachmentMaxMb);
+		if (tooBig) {
+			toast.error(tooBig);
+			if (fileInput) fileInput.value = '';
+			return;
+		}
 		uploading = true;
 		try {
 			const form = new FormData();
 			for (const f of list) form.append('file', f);
 			const r = await fetch(`/api/tickets/${id}/attachments`, { method: 'POST', body: form, credentials: 'same-origin' });
 			const data = await r.json().catch(() => null);
-			if (!r.ok) throw new Error(data?.error ?? (r.status === 413 ? 'files are limited to 8 MB per upload' : r.statusText));
+			if (!r.ok) throw new Error(data?.error ?? (r.status === 413 ? `files are limited to ${company.attachmentMaxMb ?? 100} MB each` : r.statusText));
 			files = [...files, ...(data as TicketAttachment[])];
 		} catch (err) {
 			toast.error(err);

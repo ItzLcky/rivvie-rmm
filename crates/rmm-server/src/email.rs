@@ -899,39 +899,51 @@ async fn send(st: &AppState, r: &OutRow) -> Result<(), String> {
     } else if matches!(r.purpose.as_deref(), Some("assigned" | "client_message" | "sla" | "portal_link" | "survey" | "invoice" | "low_balance")) {
         b = b.raw_header(HeaderValue::new(HeaderName::new_from_ascii_str("Auto-Submitted"), "auto-generated".into()));
     }
-    // A reply's attachments go with it, up to a total that mail servers accept.
-    let mut files: Vec<(String, String, String)> = match r.event_id {
-        Some(ev) => sqlx::query_as("SELECT name, content_type, storage_key FROM ticket_attachments WHERE event_id = $1 ORDER BY created_at")
-            .bind(ev)
-            .fetch_all(&st.db)
-            .await
-            .map_err(|e| e.to_string())?,
+    // A reply's attachments go with it, up to a total that mail servers accept. The rest
+    // become links (chosen by the recorded size, so a large file is never read to find out).
+    let mut files: Vec<OutFile> = match r.event_id {
+        Some(ev) => sqlx::query_as(
+            "SELECT id, name, content_type, storage_key, size, ticket_id FROM ticket_attachments WHERE event_id = $1 ORDER BY created_at",
+        )
+        .bind(ev)
+        .fetch_all(&st.db)
+        .await
+        .map_err(|e| e.to_string())?,
         None => vec![],
     };
     for f in r.files.as_array().into_iter().flatten() {
         if let (Some(n), Some(c), Some(k)) = (f["name"].as_str(), f["content_type"].as_str(), f["key"].as_str()) {
-            files.push((n.into(), c.into(), k.into()));
+            // Generated files (invoice PDFs): small, but check the stored size anyway.
+            let size = st.storage.size(k).await.map_err(|e| format!("{e:#}"))? as i64;
+            files.push(OutFile { id: None, name: n.into(), content_type: c.into(), storage_key: k.into(), size, ticket_id: None });
         }
     }
     let email = if files.is_empty() {
         b.header(ContentType::TEXT_PLAIN).body(r.body.clone()).map_err(|e| e.to_string())?
     } else {
         use lettre::message::{Attachment, MultiPart, SinglePart};
-        let mut parts = MultiPart::mixed().singlepart(SinglePart::plain(r.body.clone()));
-        let mut total = 0usize;
-        let mut skipped = vec![];
-        for (name, ct, key) in files {
-            let bytes = st.storage.get(&key).await.map_err(|e| format!("{e:#}"))?;
-            total += bytes.len();
-            if total > MAX_OUTBOUND_ATTACHMENTS {
-                skipped.push(name);
+        let mut attached = vec![];
+        let mut links = vec![];
+        let mut total = 0i64;
+        for f in files {
+            if total + f.size > MAX_OUTBOUND_ATTACHMENTS as i64 {
+                links.push(f);
                 continue;
             }
-            let ct = ContentType::parse(&ct).unwrap_or(ContentType::parse("application/octet-stream").expect("valid"));
-            parts = parts.singlepart(Attachment::new(name).body(bytes, ct));
+            total += f.size;
+            attached.push(f);
         }
-        if !skipped.is_empty() {
-            warn!(email = %r.id, ?skipped, "attachments too large to email; they stay on the ticket");
+        let mut body = r.body.clone();
+        if !links.is_empty() {
+            let to = r.to_addrs.first().map(String::as_str).unwrap_or_default();
+            body.push_str(&too_large_section(st, to, &links).await.map_err(|e| format!("{e:#}"))?);
+            info!(email = %r.id, files = links.len(), "attachments too large to email; sent as links");
+        }
+        let mut parts = MultiPart::mixed().singlepart(SinglePart::plain(body));
+        for f in attached {
+            let bytes = st.storage.get(&f.storage_key).await.map_err(|e| format!("{e:#}"))?;
+            let ct = ContentType::parse(&f.content_type).unwrap_or(ContentType::parse("application/octet-stream").expect("valid"));
+            parts = parts.singlepart(Attachment::new(f.name).body(bytes, ct));
         }
         b.multipart(parts).map_err(|e| e.to_string())?
     };
@@ -943,6 +955,69 @@ async fn send(st: &AppState, r: &OutRow) -> Result<(), String> {
         (None, Some(mb)) => crate::graph::send(st, &mb, &email.formatted()).await,
         (None, None) => Err("no way to send mail".into()),
     }
+}
+
+#[derive(sqlx::FromRow)]
+struct OutFile {
+    /// The ticket attachment (none for generated files such as invoice PDFs).
+    id: Option<Uuid>,
+    name: String,
+    content_type: String,
+    storage_key: String,
+    size: i64,
+    ticket_id: Option<Uuid>,
+}
+
+/// Links in place of attachments over the email cap.
+pub const ATTACHMENT_LINK_DAYS: i64 = 30;
+
+/// The part of the message listing files that were too large to attach: a portal link for
+/// a contact who can sign in there, otherwise a download link per file that works without an
+/// account (a random token, like the satisfaction survey's, valid [`ATTACHMENT_LINK_DAYS`]).
+async fn too_large_section(st: &AppState, to: &str, files: &[OutFile]) -> Result<String> {
+    let base = &st.cfg.public_url;
+    let ticket = files.iter().find_map(|f| f.ticket_id);
+    let portal = match ticket {
+        Some(t) => sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM tickets t JOIN contacts co ON co.client_id = t.client_id
+                             WHERE t.id = $1 AND lower(co.email) = lower($2) AND co.portal_enabled)",
+        )
+        .bind(t)
+        .bind(to)
+        .fetch_one(&st.db)
+        .await?,
+        None => false,
+    };
+    let mut out = String::from("\n\nToo large to attach");
+    if let (true, Some(t)) = (portal, ticket) {
+        out.push_str(&format!(", in the portal at {base}/portal/tickets/{t}:\n"));
+        for f in files {
+            out.push_str(&format!("  {} ({})\n", f.name, human_size(f.size)));
+        }
+        return Ok(out);
+    }
+    out.push_str(&format!(" (links valid for {ATTACHMENT_LINK_DAYS} days):\n"));
+    for f in files {
+        match f.id {
+            Some(id) => {
+                let token = crate::auth::random_token();
+                sqlx::query("INSERT INTO attachment_links (token_hash, attachment_id, expires_at) VALUES ($1, $2, now() + make_interval(days => $3))")
+                    .bind(crate::auth::token_hash(&token))
+                    .bind(id)
+                    .bind(ATTACHMENT_LINK_DAYS as i32)
+                    .execute(&st.db)
+                    .await?;
+                out.push_str(&format!("  {} ({}): {base}/api/files/{token}\n", f.name, human_size(f.size)));
+            }
+            None => out.push_str(&format!("  {} ({}): ask us for a copy\n", f.name, human_size(f.size))),
+        }
+    }
+    Ok(out)
+}
+
+fn human_size(n: i64) -> String {
+    let n = n.max(0) as f64;
+    if n >= 1024.0 * 1024.0 { format!("{:.1} MB", n / 1048576.0) } else { format!("{:.0} KB", (n / 1024.0).ceil()) }
 }
 
 // ---------------------------------------------------------------------------

@@ -1,0 +1,25 @@
+[package]
+name = "rmm-loadgen"
+description = "Load generator: simulated agents speaking the real protocol, dashboards and API users against an RMM server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+rmm-proto.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+tokio.workspace = true
+futures-util.workspace = true
+clap.workspace = true
+hex.workspace = true
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "cookies", "stream"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "postgres"] }
+hmac = "0.13"
+sha1 = "0.11"
+data-encoding = "2"

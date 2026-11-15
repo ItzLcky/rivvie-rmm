@@ -97,10 +97,18 @@ pub struct Settings {
     pub content_pubkey: Option<String>,
     /// Encrypts sensitive columns at rest (RMM_DATA_KEY).
     pub data_key: Option<crate::crypto::DataKey>,
+    /// Largest ticket or portal attachment, per file (RMM_ATTACHMENT_MAX_MB).
+    pub attachment_max_mb: u32,
+    /// Bearer token for `GET /metrics` (RMM_METRICS_TOKEN); the route is off without it.
+    pub metrics_token: Option<String>,
 }
 
 impl Settings {
     pub fn secure_cookies(&self) -> bool {
         self.public_url.starts_with("https://")
+    }
+
+    pub fn attachment_max_bytes(&self) -> u64 {
+        u64::from(self.attachment_max_mb) * 1024 * 1024
     }
 }

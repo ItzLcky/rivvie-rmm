@@ -21,9 +21,9 @@ jobs:
         run: cargo clippy -p rmm-agent -p rmm-proto -p rmm-sign --all-targets -- -D warnings
       - name: Test (agent + proto + sign)
         run: cargo test -p rmm-agent -p rmm-proto -p rmm-sign
-      - name: Server (Linux only)
+      - name: Server and load generator (Linux only)
         if: runner.os == 'Linux'
-        run: cargo clippy -p rmm-server --all-targets -- -D warnings && cargo test -p rmm-server
+        run: cargo clippy -p rmm-server -p rmm-loadgen --all-targets -- -D warnings && cargo test -p rmm-server -p rmm-loadgen
       - name: Release agent
         run: cargo build --release -p rmm-agent
       - uses: actions/upload-artifact@v4
@@ -38,6 +38,7 @@ jobs:
   # rate limits. See crates/rmm-server/tests/e2e.rs.
   e2e:
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     services:
       postgres:
         image: postgres:17-alpine
@@ -51,24 +52,146 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Package tools (to validate the generated .deb/.rpm)
         run: sudo apt-get install -y --no-install-recommends rpm
+      # Prometheus's own parser and linter, for the /metrics output.
+      - name: promtool
+        run: |
+          curl -sSfL https://github.com/prometheus/prometheus/releases/download/v3.5.0/prometheus-3.5.0.linux-amd64.tar.gz \
+            | tar xz -C /tmp --strip-components=1 prometheus-3.5.0.linux-amd64/promtool
+          /tmp/promtool --version
       - run: cargo build -p rmm-agent
       - name: End-to-end
         run: cargo test -p rmm-server --test e2e -- --ignored --nocapture
         env:
           RMM_E2E_DATABASE_URL: postgres://rmm:rmm@localhost:5432/postgres
+          RMM_E2E_PROMTOOL: /tmp/promtool
+      # Keeps the load generator working: 200 simulated agents for a minute, with dashboards,
+      # page requests and bulk jobs; --check fails on any refused connection, dropped session or
+      # API error. The full runs (docs/research/load-test-2026-11.md) are manual.
+      - name: Load generator smoke run
+        run: |
+          cargo build -p rmm-server -p rmm-loadgen
+          mkdir -p /tmp/load/web && echo '<!doctype html><title>smoke</title>' > /tmp/load/web/200.html
+          PGPASSWORD=rmm psql -h localhost -U rmm -d postgres -c 'CREATE DATABASE rmm_load'
+          DATABASE_URL=postgres://rmm:rmm@localhost:5432/rmm_load RMM_BIND=127.0.0.1:18080 RMM_PUBLIC_URL=http://127.0.0.1:18080 \
+            RMM_WEB_DIR=/tmp/load/web RMM_AGENT_DIR=/tmp/load RMM_STORAGE_DIR=/tmp/load/storage RMM_METRICS_TOKEN=smoke-token \
+            RMM_ADMIN_EMAIL=load@example.test RMM_ADMIN_PASSWORD=load-test-password target/debug/rmm-server > /tmp/load/server.log 2>&1 &
+          for i in $(seq 60); do curl -fs http://127.0.0.1:18080/healthz && break; sleep 1; done
+          target/debug/rmm-loadgen --server http://127.0.0.1:18080 --admin-email load@example.test --admin-password load-test-password \
+            --agents 200 --ramp 50 --duration 60 --bulk-every 20 --bulk-size 50 --sse 3 --api-rps 3 --sample-secs 10 \
+            --metrics-token smoke-token --database-url postgres://rmm:rmm@localhost:5432/rmm_load \
+            --state /tmp/load/state.json --out /tmp/load/smoke.json --check > /tmp/load/loadgen.log 2>&1 \
+            || { tail -n 60 /tmp/load/loadgen.log; exit 1; }
+          grep -E '^(ramp|check)' /tmp/load/loadgen.log
       - name: Server and agent logs
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: e2e-logs
-          path: /tmp/rmm_e2e_*/*.log
+          path: |
+            /tmp/rmm_e2e_*/*.log
+            /tmp/load/*.log
+
+  # An upgrade keeps data: the previous release (the newest v* tag, from its GHCR image) makes a
+  # database with real rows in it (admin, client and site, its own agent enrolled with metrics
+  # and inventory, a ticket; see crates/rmm-server/tests/upgrade.rs), then this commit's server
+  # migrates a copy of it and the whole e2e suite runs there, after reading those rows back.
+  # A shipped migration that was edited fails twice: the diff step names the file, and sqlx's
+  # checksums stop the new server on the old database.
+  upgrade:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    permissions:
+      contents: read
+      packages: read
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env: { POSTGRES_USER: rmm, POSTGRES_PASSWORD: rmm, POSTGRES_DB: rmm }
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U rmm" --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      PREV_DB_URL: postgres://rmm:rmm@localhost:5432/rmm_prev
+      PREV_URL: http://127.0.0.1:18090
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Previous release
+        id: prev
+        run: |
+          tag=$(git tag --list 'v*' --sort=-v:refname | head -n1)
+          test -n "$tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/${GITHUB_REPOSITORY,,}:${tag#v}" >> "$GITHUB_OUTPUT"
+          echo "previous release: $tag"
+      - name: Shipped migrations are unchanged
+        run: |
+          shipped=$(git ls-tree --name-only "${{ steps.prev.outputs.tag }}" crates/rmm-server/migrations/)
+          git diff --exit-code --stat "${{ steps.prev.outputs.tag }}" -- $shipped \
+            || { echo "::error::a migration shipped in ${{ steps.prev.outputs.tag }} was edited; add a new one instead"; exit 1; }
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Start the previous release
+        env:
+          IMAGE: ${{ steps.prev.outputs.image }}
+        run: |
+          docker pull "$IMAGE"
+          mkdir -p /tmp/prev
+          docker create --name prev-files "$IMAGE" && docker cp prev-files:/srv/agents/rmm-agent-linux-x86_64 /tmp/prev/rmm-agent && docker rm prev-files
+          PGPASSWORD=rmm psql -h localhost -U rmm -d postgres -c 'CREATE DATABASE rmm_prev'
+          docker run -d --name prev --network host -e DATABASE_URL="$PREV_DB_URL" -e RMM_BIND=127.0.0.1:18090 -e RMM_PUBLIC_URL="$PREV_URL" \
+            -e RMM_ADMIN_EMAIL=admin@e2e.test -e RMM_ADMIN_PASSWORD=e2e-admin-password -e RMM_HEARTBEAT_SECS=5 \
+            -e RMM_DATA_KEY=abababababababababababababababababababababababababababababababab "$IMAGE"
+          for i in $(seq 60); do curl -fs "$PREV_URL/healthz" && break; sleep 1; done
+          curl -fs "$PREV_URL/healthz"
+      - run: cargo build -p rmm-agent
+      - name: Data through the previous release
+        run: cargo test -p rmm-server --test upgrade -- --ignored --nocapture
+        env:
+          RMM_UPGRADE_URL: ${{ env.PREV_URL }}
+          RMM_UPGRADE_AGENT_BIN: /tmp/prev/rmm-agent
+          RMM_UPGRADE_EXPECT: /tmp/prev/expect.json
+      - name: Stop it, and clear the admin's 2FA for the suite (with the old release's CLI)
+        env:
+          IMAGE: ${{ steps.prev.outputs.image }}
+        run: |
+          docker logs prev > /tmp/prev/server.log 2>&1
+          docker rm -f prev
+          docker run --rm --network host -e DATABASE_URL="$PREV_DB_URL" "$IMAGE" reset2fa --email admin@e2e.test
+          PGPASSWORD=rmm psql -h localhost -U rmm -d rmm_prev -Atc 'SELECT max(version) FROM _sqlx_migrations'
+      - name: End-to-end on the upgraded database
+        run: cargo test -p rmm-server --test e2e -- --ignored --nocapture
+        env:
+          RMM_E2E_DATABASE_URL: postgres://rmm:rmm@localhost:5432/postgres
+          RMM_E2E_TEMPLATE: rmm_prev
+          RMM_E2E_EXPECT: /tmp/prev/expect.json
+      - name: Logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: upgrade-logs
+          path: |
+            /tmp/prev/*.log
+            /tmp/rmm_e2e_*/*.log
 
   # The agent installed from the generated MSI as a real Windows service: install, jobs
   # (PowerShell, cmd), Job Object tree kill, results across a service restart, services,
   # upgrade over itself, uninstall. See crates/rmm-server/tests/e2e_windows.rs. The runner
   # image ships PostgreSQL (service disabled; user postgres, password root).
+  #
+  # On ab72ebc the tests passed and the job then hung in its post-job steps (rust-cache's save)
+  # until GitHub killed it at the default limit; that run's log was never written, so what was
+  # still running is unknown. Hence the timeouts, and a cleanup step that first lists what is
+  # left (so the next hang says why) and then stops it before the post-job steps run.
   e2e-windows:
     runs-on: windows-latest
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -81,9 +204,29 @@ jobs:
           & "$env:PGBIN\pg_isready.exe" -h localhost -t 60
       - run: cargo build -p rmm-agent
       - name: End-to-end (Windows)
+        timeout-minutes: 20
         run: cargo test -p rmm-server --test e2e_windows -- --ignored --nocapture
         env:
           RMM_E2E_DATABASE_URL: postgres://postgres:root@localhost:5432/postgres
+      - name: Stop what the test started
+        if: always()
+        timeout-minutes: 5
+        shell: pwsh
+        run: |
+          $ws = (Resolve-Path .).Path
+          $left = Get-CimInstance Win32_Process | Where-Object {
+            $_.Name -match '^(rmm-server|rmm-agent|rmm-sensor|e2e_windows-.*|msiexec)\.exe$' -or
+            ($_.ExecutablePath -and $_.ExecutablePath.StartsWith($ws)) -or
+            ($_.CommandLine -and $_.CommandLine -like '*rmm-e2e-*')
+          }
+          "Processes left behind:"; $left | Format-Table ProcessId, ParentProcessId, Name, CommandLine -AutoSize -Wrap | Out-String -Width 300
+          if (Get-Service RmmAgent -ErrorAction SilentlyContinue) {
+            "The RmmAgent service is still installed"; sc.exe stop RmmAgent; sc.exe delete RmmAgent
+          }
+          $left | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+          Get-Service -Name postgresql* | Stop-Service -Force -ErrorAction SilentlyContinue
+          "Handles still open under target/ (if any):"
+          Get-Process | Where-Object { $_.Modules.FileName -like "$ws\target\*" } -ErrorAction SilentlyContinue | Format-Table Id, Name -AutoSize
       - name: Server, agent and msiexec logs
         if: failure()
         uses: actions/upload-artifact@v4

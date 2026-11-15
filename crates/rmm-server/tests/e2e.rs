@@ -13,6 +13,16 @@
 //! the one next to the server binary (`target/debug/rmm-agent`); set `RMM_E2E_AGENT_BIN`
 //! to use another. Linux only: the agent runs bash jobs.
 //!
+//! `RMM_E2E_TEMPLATE=<database>` starts from a copy of an existing database instead of an
+//! empty one (`CREATE DATABASE ... TEMPLATE`; nothing may be connected to it). The CI
+//! `upgrade` job uses it for a database made by the previous release, with
+//! `RMM_E2E_EXPECT=<file>` naming the rows that release wrote (see `tests/upgrade.rs`): they
+//! must read back through the API before the suite runs. That database's admin must be the
+//! e2e admin with two-factor auth cleared (`rmm-server reset2fa`).
+//!
+//! `RMM_E2E_PROMTOOL=<path to promtool>` also parses and lints the `/metrics` output with
+//! Prometheus's own tool (CI sets it; without it that check is skipped).
+//!
 //! `RMM_E2E_ONLY=desk` runs only the core and service desk sections (faster while working on
 //! tickets, the portal and billing).
 //!
@@ -34,6 +44,8 @@ use sqlx::Connection;
 
 const ADMIN_EMAIL: &str = "admin@e2e.test";
 const ADMIN_PASSWORD: &str = "e2e-admin-password";
+/// RMM_ATTACHMENT_MAX_MB for the e2e server.
+const ATTACHMENT_MAX_MB: usize = 20;
 /// Seed of the key that signs the e2e detection content (agents and server get its public half).
 const CONTENT_SEED: [u8; 32] = [9u8; 32];
 
@@ -53,16 +65,26 @@ struct Server {
     port: u16,
     db_url: String,
     dir: PathBuf,
+    /// RMM_METRICS_TOKEN and JSON logs: off for the first start (`/metrics` must 404), on
+    /// from the first restart.
+    observability: bool,
 }
+
+/// RMM_METRICS_TOKEN once `observability` is on.
+const METRICS_TOKEN: &str = "e2e-metrics-token";
 
 impl Server {
     fn url(&self) -> String {
         format!("http://127.0.0.1:{}", self.port)
     }
 
-    fn start(db_url: &str, dir: &Path, port: u16) -> Child {
+    fn start(db_url: &str, dir: &Path, port: u16, observability: bool) -> Child {
         let log = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("server.log")).unwrap();
-        Command::new(env!("CARGO_BIN_EXE_rmm-server"))
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_rmm-server"));
+        if observability {
+            cmd.env("RMM_METRICS_TOKEN", METRICS_TOKEN).env("RMM_LOG_FORMAT", "json");
+        }
+        cmd
             .env("DATABASE_URL", db_url)
             .env("RMM_BIND", format!("127.0.0.1:{port}"))
             .env("RMM_PUBLIC_URL", format!("http://127.0.0.1:{port}"))
@@ -78,6 +100,8 @@ impl Server {
             .env("RMM_CONTENT_SOAK_MINUTES", "0")
             .env("RMM_DATA_KEY", "ab".repeat(32))
             .env("RMM_SLA_SWEEP_SECS", "2")
+            // Small enough to test the limit quickly, over the 8 MB that other requests get.
+            .env("RMM_ATTACHMENT_MAX_MB", ATTACHMENT_MAX_MB.to_string())
             .env("RMM_XERO_AUTH_URL", format!("{}/xero/authorize", ACCT_URL.get().map(String::as_str).unwrap_or("http://127.0.0.1:9")))
             .env("RMM_XERO_TOKEN_URL", format!("{}/xero/token", ACCT_URL.get().map(String::as_str).unwrap_or("http://127.0.0.1:9")))
             .env("RMM_XERO_API_URL", format!("{}/xero/api", ACCT_URL.get().map(String::as_str).unwrap_or("http://127.0.0.1:9")))
@@ -104,7 +128,7 @@ impl Server {
     }
 
     async fn start_again(&mut self) {
-        self.child = Self::start(&self.db_url, &self.dir, self.port);
+        self.child = Self::start(&self.db_url, &self.dir, self.port, self.observability);
         wait_healthy(&self.url()).await;
     }
 }
@@ -346,7 +370,14 @@ async fn end_to_end() {
     let admin_url = std::env::var("RMM_E2E_DATABASE_URL").expect("set RMM_E2E_DATABASE_URL (see the test's module docs)");
     let db_name = format!("rmm_e2e_{}", uuid::Uuid::new_v4().simple());
     let mut admin_conn = sqlx::PgConnection::connect(&admin_url).await.expect("connecting to RMM_E2E_DATABASE_URL");
-    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {db_name}"))).execute(&mut admin_conn).await.unwrap();
+    let create = match std::env::var("RMM_E2E_TEMPLATE").ok().filter(|t| !t.is_empty()) {
+        Some(t) => {
+            assert!(t.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'), "RMM_E2E_TEMPLATE must be a plain database name");
+            format!("CREATE DATABASE {db_name} TEMPLATE {t}")
+        }
+        None => format!("CREATE DATABASE {db_name}"),
+    };
+    sqlx::query(sqlx::AssertSqlSafe(create)).execute(&mut admin_conn).await.unwrap();
     let db_url = {
         let (base, _) = admin_url.rsplit_once('/').expect("database URL with a /dbname");
         format!("{base}/{db_name}")
@@ -369,7 +400,8 @@ async fn end_to_end() {
     let _ = ACCT.set(acct);
     let result = {
         let port = free_port();
-        let mut server = Server { child: Server::start(&db_url, &dir, port), port, db_url: db_url.clone(), dir: dir.clone() };
+        let mut server =
+            Server { child: Server::start(&db_url, &dir, port, false), port, db_url: db_url.clone(), dir: dir.clone(), observability: false };
         wait_healthy(&server.url()).await;
         let db = sqlx::PgPool::connect(&db_url).await.unwrap();
         run(&mut server, &db, &dir).await
@@ -418,6 +450,9 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
     };
     let (stored, sealed) = stored_totp().await;
     assert!(sealed && stored != plain_secret && stored.len() > plain_secret.len(), "TOTP secrets are encrypted at rest");
+    if let Ok(path) = std::env::var("RMM_E2E_EXPECT") {
+        previous_release_rows(&admin, &path).await;
+    }
 
     // --- tenancy -------------------------------------------------------------------------
     let client_a = admin.post("/clients", json!({ "name": "Client A" })).await;
@@ -543,8 +578,12 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
         .execute(db)
         .await
         .unwrap();
+    // Without RMM_METRICS_TOKEN there is no metrics endpoint at all.
+    let res = http.get(format!("{url}/metrics")).bearer_auth(METRICS_TOKEN).send().await.unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
     // Housekeeping runs as soon as the server starts. Sessions live in Postgres, so the
-    // admin's cookie still works afterwards.
+    // admin's cookie still works afterwards. From here on: metrics on, JSON logs.
+    server.observability = true;
     server.restart().await;
     let (stored, sealed) = stored_totp().await;
     assert!(sealed && stored != plain_secret, "plaintext TOTP secrets are encrypted on startup");
@@ -1049,8 +1088,95 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
     }
     assert_eq!(limited, Some(20));
 
+    observability(&url, dir).await;
     a1.kill();
     Ok(())
+}
+
+/// Rows written by the previous release (`RMM_E2E_EXPECT`, from `tests/upgrade.rs`) read back
+/// through this release's API after the migrations ran on them.
+async fn previous_release_rows(admin: &Api, path: &str) {
+    let e: Value = serde_json::from_slice(&std::fs::read(path).expect("RMM_E2E_EXPECT")).unwrap();
+    let s = |k: &str| e[k].as_str().unwrap_or_else(|| panic!("{k} in {e}")).to_string();
+    let client = admin.get(&format!("/clients/{}", s("client_id"))).await;
+    assert_eq!(client["name"], e["client_name"], "{client}");
+    let agent = admin.get(&format!("/agents/{}", s("agent_id"))).await;
+    assert_eq!((agent["hostname"].as_str(), agent["site_id"].as_str()), (e["hostname"].as_str(), e["site_id"].as_str()), "{agent}");
+    assert!(agent["inventory"].is_object() || agent["inventory_at"].is_string(), "the old agent's inventory: {agent}");
+    // The range tests/upgrade.rs counted with: points are bucketed by range (and ranges over
+    // 48 hours come from the hourly rollups), so another range can merge or miss samples.
+    let points = admin.get(&format!("/agents/{}/metrics?hours=1", s("agent_id"))).await;
+    assert!(points.as_array().unwrap().len() as i64 >= e["metric_samples"].as_i64().unwrap(), "metrics from before the upgrade: {points}");
+    let t = admin.get(&format!("/tickets/{}", s("ticket_id"))).await;
+    assert_eq!((t["subject"].as_str(), t["number"].as_i64()), (e["ticket_subject"].as_str(), e["ticket_number"].as_i64()), "{t}");
+    assert!(t["agents"].as_array().unwrap().iter().any(|a| a["id"] == e["agent_id"]), "the ticket's linked agent: {t}");
+    let found = admin.get(&format!("/search?q={}", url_escape(&s("hostname")))).await;
+    assert!(found.to_string().contains(&s("agent_id")), "search finds the old agent: {found}");
+    println!("previous release's rows: ok (client, agent with {} metric samples, ticket T-{})", points.as_array().unwrap().len(), e["ticket_number"]);
+    // The suite counts what it creates (agents, tickets, alerts), so the old client goes once
+    // it has been read back: deleting it is a check of its own on the migrated rows' keys.
+    admin.call(reqwest::Method::DELETE, &format!("/agents/{}", s("agent_id")), None).await;
+    let (st, v) = admin.call(reqwest::Method::DELETE, &format!("/clients/{}", s("client_id")), None).await;
+    assert!(st.is_success(), "deleting the old client: {st} {v}");
+    let (st, _) = admin.call(reqwest::Method::GET, &format!("/tickets/{}", s("ticket_id")), None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "its ticket went with it");
+}
+
+/// `/metrics` (auth, content, bounded labels, a real Prometheus parser) and the JSON logs
+/// written since the first restart.
+async fn observability(url: &str, dir: &Path) {
+    let http = reqwest::Client::new();
+    let res = http.get(format!("{url}/metrics")).send().await.unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    let res = http.get(format!("{url}/metrics")).bearer_auth("e2e-metrics-tokem").send().await.unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    let res = http.get(format!("{url}/metrics")).bearer_auth(METRICS_TOKEN).send().await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert!(res.headers()["content-type"].to_str().unwrap().starts_with("text/plain; version=0.0.4"));
+    let text = res.text().await.unwrap();
+    let value = |series: &str| -> f64 {
+        text.lines().find_map(|l| l.strip_prefix(series).and_then(|v| v.strip_prefix(' '))).unwrap_or_else(|| panic!("{series} in:\n{text}")).parse().unwrap()
+    };
+    assert!(value("rmm_agents_connected") >= 1.0);
+    assert!(value("rmm_agent_messages_total{type=\"heartbeat\"}") > 0.0);
+    assert!(value("rmm_agent_connects_total") >= 1.0);
+    assert!(value("rmm_db_pool_max") >= 1.0 && value("rmm_db_pool_connections") >= 1.0);
+    assert!(value("rmm_alert_eval_duration_seconds_count") > 0.0);
+    assert!(value("rmm_db_pool_acquire_seconds_count") > 0.0);
+    assert!(value("process_resident_memory_bytes") > 1e6 && value("process_cpu_seconds_total") > 0.0);
+    assert!(value("rmm_http_requests_total{method=\"GET\",route=\"/api/tickets/{id}\",status=\"2xx\"}") > 0.0);
+    assert!(value("rmm_http_requests_total{method=\"GET\",route=\"/api/agent-downloads/{id}\",status=\"4xx\"}") > 0.0);
+    assert!(text.contains("rmm_outbox_pending{outbox=\"notifications\"}") && text.contains("rmm_outbox_oldest_seconds{outbox=\"email\"}"));
+    assert!(text.contains(&format!("rmm_build_info{{version=\"{}\"}} 1", env!("CARGO_PKG_VERSION"))));
+    // Bounded labels: no ids (a UUID or a 64-hex token) and no query strings anywhere.
+    let id = regex_lite::Regex::new(r"[0-9a-f]{8}-[0-9a-f]{4}-|[0-9a-f]{32}").unwrap();
+    assert!(!id.is_match(&text) && !text.contains('?'), "ids or query strings in the metrics:\n{text}");
+    // Parsed and linted by Prometheus's own tool when it's available (CI installs it).
+    match std::env::var("RMM_E2E_PROMTOOL") {
+        Ok(tool) if !tool.is_empty() => {
+            let mut child = Command::new(&tool).args(["check", "metrics"]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+            use std::io::Write;
+            child.stdin.take().unwrap().write_all(text.as_bytes()).unwrap();
+            let out = child.wait_with_output().unwrap();
+            assert!(out.status.success(), "promtool check metrics: {}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+            println!("promtool: the metrics parse and pass its lint");
+        }
+        _ => println!("RMM_E2E_PROMTOOL not set: metrics not checked with promtool"),
+    }
+
+    // JSON logs: every line since the restart is one object; request lines carry the request
+    // id, method, route template, status and duration, and never a query string or token.
+    let log = std::fs::read_to_string(dir.join("server.log")).unwrap();
+    let json: Vec<Value> = log.lines().filter(|l| l.starts_with('{')).map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("{e}: {l}"))).collect();
+    assert!(json.len() > 100, "JSON log lines after the restart: {}", json.len());
+    let requests: Vec<&Value> = json.iter().filter(|v| v["target"] == "rmm_server::http").collect();
+    let r = requests.iter().find(|v| v["span"]["route"] == "/api/tickets/{id}").expect("a request log line");
+    assert!(r["span"]["id"].as_str().is_some_and(|i| i.len() == 16) && r["span"]["method"] == "GET" && r["fields"]["status"].is_number());
+    assert!(r["fields"]["duration_ms"].is_number());
+    for l in log.lines().filter(|l| l.starts_with('{')) {
+        assert!(!l.contains("token=bogus") && !l.contains("?from=") && !l.contains("e2e-metrics-token"), "{l}");
+    }
+    println!("observability: ok ({} request log lines)", requests.len());
 }
 
 /// Collects webhook deliveries: (X-RMM-Event, X-RMM-Signature, body).
@@ -2209,6 +2335,45 @@ async fn tickets(url: &str, admin: &Api, id1: &str, a_id: &str, b_id: &str) {
     let (s, _) = admin.call(reqwest::Method::POST, &format!("/tickets/{tid}/events"), Some(json!({ "kind": "note", "body": "x", "attachment_ids": [up_id] }))).await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "an attachment belongs to one event");
 
+    // --- attachments over 8 MB: streamed in and out, a link in the email instead of the file -----------
+    // 16 MiB: over the old 8 MB request limit and over the 15 MB that a reply email carries.
+    let big = pattern(16 << 20, 7);
+    let form = reqwest::multipart::Form::new().part("file", reqwest::multipart::Part::bytes(big.clone()).file_name("disk image.bin"));
+    let res = admin.http.post(format!("{}/tickets/{tid}/attachments", admin.base)).multipart(form).send().await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let up: Value = res.json().await.unwrap();
+    let big_id = up[0]["id"].as_str().unwrap().to_string();
+    assert_eq!(up[0]["size"], big.len());
+    let res = admin.http.get(format!("{}/tickets/{tid}/attachments/{big_id}", admin.base)).send().await.unwrap();
+    assert_eq!((res.status(), res.headers()["accept-ranges"].to_str().unwrap()), (StatusCode::OK, "bytes"));
+    assert_eq!(sha256(&res.bytes().await.unwrap()), sha256(&big), "read back by hash");
+    let res = admin.http.get(format!("{}/tickets/{tid}/attachments/{big_id}", admin.base)).header("range", "bytes=1000-1999").send().await.unwrap();
+    assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(res.headers()["content-range"], format!("bytes 1000-1999/{}", big.len()).as_str());
+    assert_eq!(res.bytes().await.unwrap().as_ref(), &big[1000..2000]);
+    let res = admin.http.get(format!("{}/tickets/{tid}/attachments/{big_id}", admin.base)).header("range", "bytes=99999999-").send().await.unwrap();
+    assert_eq!(res.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+    let before = admin.get(&format!("/tickets/{tid}")).await["attachments"].as_array().unwrap().len();
+    let over = pattern((ATTACHMENT_MAX_MB << 20) + 1, 1);
+    let form = reqwest::multipart::Form::new()
+        .part("file", reqwest::multipart::Part::bytes(b"small".to_vec()).file_name("first.txt"))
+        .part("file", reqwest::multipart::Part::bytes(over).file_name("huge.iso"));
+    let res = admin.http.post(format!("{}/tickets/{tid}/attachments", admin.base)).multipart(form).send().await.unwrap();
+    assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let err: Value = res.json().await.unwrap();
+    assert_eq!(err["error"], format!("huge.iso is larger than the {ATTACHMENT_MAX_MB} MB limit for attachments"));
+    assert_eq!(admin.get(&format!("/tickets/{tid}")).await["attachments"].as_array().unwrap().len(), before, "a failed upload keeps none of its files");
+    admin.post(&format!("/tickets/{tid}/events"), json!({ "kind": "reply", "body": "The disk image you asked for.", "attachment_ids": [big_id] })).await;
+    let sent = wait_mail(&mail, "the reply with a large attachment", |_, d| d.contains("The disk image you asked for")).await;
+    let text = mail_text(&sent);
+    assert!(sent.len() < 1 << 20 && text.contains("disk image.bin (16.0 MB)"), "a link, not the file: {text}");
+    let token = token_after(&text, "/api/files/");
+    let res = reqwest::get(format!("{}/files/{token}", admin.base)).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK, "the link works without signing in");
+    assert_eq!(sha256(&res.bytes().await.unwrap()), sha256(&big));
+    let (s, _) = admin.call(reqwest::Method::GET, &format!("/files/{}", "0".repeat(64)), None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+
     // --- a script run from the ticket reports back ----------------------------------------------------------
     let j = admin.post("/jobs", json!({ "agent_ids": [id1], "interpreter": "bash", "body": "echo spooler restarted", "timeout_secs": 30, "ticket_id": tid })).await;
     admin.wait_job(j["jobs"][0]["job_id"].as_str().unwrap(), 30).await;
@@ -2564,6 +2729,24 @@ async fn graph_mock() -> (String, GraphMock) {
 }
 
 /// The decoded text of a raw message from the SMTP sink.
+/// `n` bytes that don't compress to nothing and differ by `seed`.
+fn pattern(n: usize, seed: u8) -> Vec<u8> {
+    let mut x = 0x9e37_79b9u32 ^ seed as u32;
+    (0..n)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x as u8
+        })
+        .collect()
+}
+
+fn sha256(b: &[u8]) -> String {
+    use sha2::Digest;
+    hex::encode(sha2::Sha256::digest(b))
+}
+
 fn mail_text(raw: &str) -> String {
     let m = mail_parser::MessageParser::default().parse(raw.as_bytes()).expect("a MIME message");
     m.body_text(0).map(|t| t.into_owned()).unwrap_or_default()
@@ -2758,6 +2941,27 @@ async fn portal_and_sla(url: &str, admin: &Api, db: &sqlx::PgPool, a_id: &str, b
     let res = portal.http.get(format!("{}/portal/tickets/{ptid}/attachments/{aid}", portal.base)).send().await.unwrap();
     assert_eq!(res.headers()["content-type"], "application/octet-stream");
     assert_eq!(res.bytes().await.unwrap().as_ref(), b"charger photo");
+    // Over 8 MB through the portal (a new request), read back by hash; over the limit is a 413.
+    let big = pattern(9 << 20, 3);
+    let form = reqwest::multipart::Form::new()
+        .text("subject", "Event log export")
+        .part("file", reqwest::multipart::Part::bytes(big.clone()).file_name("events.evtx"))
+        .text("description", "Attached (fields after the file are read too).");
+    let (s, created) = portal_form(&portal, "/portal/tickets", form).await;
+    assert!(s.is_success(), "{s} {created}");
+    let big_ticket = created["id"].as_str().unwrap().to_string();
+    let v = portal.get(&format!("/portal/tickets/{big_ticket}")).await;
+    assert!(v["events"][0]["body"].as_str().unwrap().contains("fields after the file"), "{v}");
+    let res = portal.http.get(format!("{}/portal/tickets/{big_ticket}/attachments/{}", portal.base, v["attachments"][0]["id"].as_str().unwrap())).send().await.unwrap();
+    assert_eq!(sha256(&res.bytes().await.unwrap()), sha256(&big));
+    let form = reqwest::multipart::Form::new()
+        .text("body", "And the full dump")
+        .part("file", reqwest::multipart::Part::bytes(pattern((ATTACHMENT_MAX_MB << 20) + 1, 4)).file_name("full.dmp"));
+    let (s, err) = portal_form(&portal, &format!("/portal/tickets/{big_ticket}/messages"), form).await;
+    assert_eq!(s, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(err["error"], format!("full.dmp is larger than the {ATTACHMENT_MAX_MB} MB limit for attachments"));
+    let v = portal.get(&format!("/portal/tickets/{big_ticket}")).await;
+    assert_eq!((v["attachments"].as_array().unwrap().len(), v["events"].as_array().unwrap().len()), (1, 1), "nothing of the failed reply is kept");
     let list = portal.get("/portal/tickets").await;
     assert!(list.as_array().unwrap().iter().any(|x| x["id"] == ptid.as_str()));
     assert!(!list.as_array().unwrap().iter().any(|x| x["id"] == tid.as_str()), "not Pat's ticket, and Pat isn't primary");
@@ -3351,8 +3555,13 @@ async fn billing(url: &str, admin: &Api, tech: &Api, db: &sqlx::PgPool, a_id: &s
     assert_eq!(pa["revenue"], total_a);
     let (s, _) = tech.call(reqwest::Method::GET, "/reports/profitability", None).await;
     assert_eq!(s, StatusCode::FORBIDDEN);
+    // In a full run client A has an offline alert in the period (the monitoring section),
+    // which is what made the QBR's offline-hours query fail once.
     let res = admin.http.get(format!("{}/reports/qbr/{a_id}?from={month_start}&to={month_end}", admin.base)).send().await.unwrap();
-    assert_eq!(res.headers()["content-type"], "application/pdf");
+    let ct = res.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
+    if ct != "application/pdf" {
+        panic!("QBR: {} {ct}: {}", res.status(), res.text().await.unwrap_or_default());
+    }
     let qbr = res.bytes().await.unwrap();
     assert!(String::from_utf8_lossy(&qbr).contains("(Quarterly business review)"));
     let ov = admin.get("/billing/overview").await;

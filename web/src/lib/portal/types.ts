@@ -19,6 +19,8 @@ export interface PortalMe {
 	sees_all_tickets: boolean;
 	has_password: boolean;
 	totp_enabled: boolean;
+	/** RMM_ATTACHMENT_MAX_MB: the largest file a message can carry. */
+	attachment_max_mb?: number;
 }
 
 export interface PortalInfo {

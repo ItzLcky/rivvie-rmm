@@ -42,16 +42,19 @@ pub async fn run(st: Arc<AppState>) {
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tick.tick().await;
-        match claim_due(&st).await {
-            Ok(due) => {
-                for id in due {
-                    if let Err(e) = run_schedule(&st, id, None).await {
-                        warn!(schedule = %id, "scheduled run failed: {e}");
+        let work = async {
+            match claim_due(&st).await {
+                Ok(due) => {
+                    for id in due {
+                        if let Err(e) = run_schedule(&st, id, None).await {
+                            warn!(schedule = %id, "scheduled run failed: {e}");
+                        }
                     }
                 }
+                Err(e) => warn!("scheduler: {e}"),
             }
-            Err(e) => warn!("scheduler: {e}"),
-        }
+        };
+        crate::metrics::M.scheduler_tick.time(work).await;
     }
 }
 

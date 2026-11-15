@@ -7,18 +7,17 @@
 use std::sync::Arc;
 
 use axum::Json;
-use axum::body::Body;
 use axum::extract::{Multipart, Path, Query, State};
-use axum::http::{HeaderValue, header};
+use axum::http::HeaderMap;
 use axum::response::Response;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use sqlx::{AssertSqlSafe, PgConnection};
 use uuid::Uuid;
 
 use crate::auth::{self, Role, User};
+use super::attachments;
 use crate::error::{ApiError, ApiResult};
 use crate::paging::{self, Page, PageQuery, Plan, SortKey};
 use crate::state::AppState;
@@ -933,54 +932,72 @@ pub async fn add_event(State(st): State<Arc<AppState>>, u: User, Path(id): Path<
     Ok(Json(json!({ "id": event_id, "emailed": emailed.is_some() })))
 }
 
-/// Uploads files to the ticket (multipart, field `file`, one or more). Attach them to a reply or
-/// note by passing their ids to `POST /tickets/{id}/events`.
+/// Files per upload request.
+pub(crate) const MAX_UPLOAD_FILES: usize = 20;
+
+/// Uploads files to the ticket (multipart, field `file`, one or more, each up to
+/// RMM_ATTACHMENT_MAX_MB). Attach them to a reply or note by passing their ids to
+/// `POST /tickets/{id}/events`.
 pub async fn upload(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uuid>, mut form: Multipart) -> ApiResult<Json<Vec<AttachmentRow>>> {
     u.require(Role::Technician)?;
     visible(&st, &u, id).await?;
-    let mut out = vec![];
-    while let Some(field) = form.next_field().await.map_err(|e| ApiError::BadRequest(format!("upload: {e}")))? {
-        if field.name() != Some("file") {
-            continue;
+    let mut saved: Vec<attachments::Saved> = vec![];
+    let res = async {
+        while let Some(field) = form.next_field().await.map_err(|e| attachments::multipart_error(&st, e))? {
+            if field.name() != Some("file") {
+                continue;
+            }
+            if saved.len() >= MAX_UPLOAD_FILES {
+                return Err(ApiError::BadRequest(format!("at most {MAX_UPLOAD_FILES} files at once")));
+            }
+            let name = super::tickets::clean_filename(field.file_name().unwrap_or("attachment"));
+            match attachments::save(&st, field).await? {
+                Some(f) => saved.push(f),
+                None => return Err(ApiError::BadRequest(format!("{name} is empty"))),
+            }
         }
-        if out.len() >= 20 {
-            return Err(ApiError::BadRequest("at most 20 files at once".into()));
+        if saved.is_empty() {
+            return Err(ApiError::BadRequest("no file in the upload".into()));
         }
-        let name = field.file_name().map(clean_filename).unwrap_or_else(|| "attachment".into());
-        let ct = field
-            .content_type()
-            .filter(|c| c.len() < 100 && c.contains('/') && c.bytes().all(|b| b.is_ascii_graphic()))
-            .unwrap_or("application/octet-stream")
-            .to_ascii_lowercase();
-        let bytes = field.bytes().await.map_err(|e| ApiError::BadRequest(format!("upload: {e}")))?;
-        if bytes.is_empty() {
-            return Err(ApiError::BadRequest(format!("{name} is empty")));
+        let mut tx = st.db.begin().await?;
+        for f in &saved {
+            sqlx::query(
+                "INSERT INTO ticket_attachments (id, ticket_id, name, content_type, size, sha256, storage_key, uploaded_by)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+            )
+            .bind(f.id)
+            .bind(id)
+            .bind(&f.name)
+            .bind(&f.content_type)
+            .bind(f.size)
+            .bind(&f.sha256)
+            .bind(&f.key)
+            .bind(u.id)
+            .execute(&mut *tx)
+            .await?;
         }
-        let aid = Uuid::new_v4();
-        let key = format!("attachments/{aid}");
-        let sha = Sha256::digest(&bytes).to_vec();
-        let size = bytes.len() as i64;
-        st.storage.put(&key, bytes.to_vec(), &ct).await?;
-        sqlx::query(
-            "INSERT INTO ticket_attachments (id, ticket_id, name, content_type, size, sha256, storage_key, uploaded_by)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-        )
-        .bind(aid)
-        .bind(id)
-        .bind(&name)
-        .bind(&ct)
-        .bind(size)
-        .bind(sha)
-        .bind(&key)
-        .bind(u.id)
-        .execute(&st.db)
-        .await?;
-        out.push(AttachmentRow { id: aid, event_id: None, name, content_type: ct, size, uploaded_by_name: Some(u.name.clone()), created_at: Utc::now() });
+        tx.commit().await?;
+        Ok(())
     }
-    if out.is_empty() {
-        return Err(ApiError::BadRequest("no file in the upload".into()));
+    .await;
+    if let Err(e) = res {
+        attachments::discard(&st, &saved).await;
+        return Err(e);
     }
-    Ok(Json(out))
+    Ok(Json(
+        saved
+            .into_iter()
+            .map(|f| AttachmentRow {
+                id: f.id,
+                event_id: None,
+                name: f.name,
+                content_type: f.content_type,
+                size: f.size,
+                uploaded_by_name: Some(u.name.clone()),
+                created_at: Utc::now(),
+            })
+            .collect(),
+    ))
 }
 
 pub(crate) fn clean_filename(name: &str) -> String {
@@ -988,10 +1005,6 @@ pub(crate) fn clean_filename(name: &str) -> String {
     let n = n.trim().trim_start_matches('.').to_string();
     if n.is_empty() { "attachment".into() } else { n }
 }
-
-/// Images that are safe to show inline. Everything else downloads (an HTML or SVG file opened
-/// from our origin could run script).
-const INLINE_TYPES: &[&str] = &["image/png", "image/jpeg", "image/gif", "image/webp"];
 
 #[derive(Deserialize)]
 pub struct DownloadQuery {
@@ -1004,37 +1017,17 @@ pub async fn download(
     u: User,
     Path((id, aid)): Path<(Uuid, Uuid)>,
     Query(q): Query<DownloadQuery>,
+    headers: HeaderMap,
 ) -> ApiResult<Response> {
     visible(&st, &u, id).await?;
-    let (name, ct, key): (String, String, String) =
-        sqlx::query_as("SELECT name, content_type, storage_key FROM ticket_attachments WHERE id = $1 AND ticket_id = $2")
+    let (name, ct, key, size): (String, String, String, i64) =
+        sqlx::query_as("SELECT name, content_type, storage_key, size FROM ticket_attachments WHERE id = $1 AND ticket_id = $2")
             .bind(aid)
             .bind(id)
             .fetch_optional(&st.db)
             .await?
             .ok_or(ApiError::NotFound("attachment"))?;
-    let bytes = st.storage.get(&key).await?;
-    file_response(bytes, &name, &ct, matches!(q.inline.as_deref(), Some("1" | "true")))
-}
-
-/// A stored file as a download: only safe image types may show inline, everything else is
-/// `application/octet-stream` with a sandboxing CSP.
-pub(crate) fn file_response(bytes: Vec<u8>, name: &str, ct: &str, inline: bool) -> ApiResult<Response> {
-    let inline = inline && INLINE_TYPES.contains(&ct);
-    let ascii: String = name.chars().map(|c| if c.is_ascii_alphanumeric() || " ._-()".contains(c) { c } else { '_' }).collect();
-    let encoded: String = name
-        .bytes()
-        .map(|b| if b.is_ascii_alphanumeric() || b"._-".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") })
-        .collect();
-    let disposition = format!("{}; filename=\"{ascii}\"; filename*=UTF-8''{encoded}", if inline { "inline" } else { "attachment" });
-    let content_type = if inline { ct.to_string() } else { "application/octet-stream".to_string() };
-    let mut res = Response::new(Body::from(bytes));
-    let h = res.headers_mut();
-    h.insert(header::CONTENT_TYPE, HeaderValue::from_str(&content_type).unwrap_or(HeaderValue::from_static("application/octet-stream")));
-    h.insert(header::CONTENT_DISPOSITION, HeaderValue::from_str(&disposition).map_err(anyhow::Error::from)?);
-    h.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static("sandbox; default-src 'none'; img-src 'self'"));
-    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("private, no-store"));
-    Ok(res)
+    attachments::serve(&st, &headers, &key, size, &name, &ct, matches!(q.inline.as_deref(), Some("1" | "true"))).await
 }
 
 // ---------------------------------------------------------------------------

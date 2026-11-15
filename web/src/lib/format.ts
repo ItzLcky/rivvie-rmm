@@ -73,3 +73,15 @@ export function interpreterLabel(v: string): string {
 export function cx(...c: (string | false | null | undefined)[]): string {
 	return c.filter(Boolean).join(' ');
 }
+
+/** RMM_ATTACHMENT_MAX_MB when the server doesn't say (older servers). */
+export const DEFAULT_ATTACHMENT_MAX_MB = 100;
+
+/**
+ * The first file over the per-file attachment limit, as the same message the server answers
+ * with (413), or null when they all fit.
+ */
+export function oversized(files: Iterable<File>, maxMb: number = DEFAULT_ATTACHMENT_MAX_MB): string | null {
+	for (const f of files) if (f.size > maxMb * 1024 * 1024) return `${f.name} is larger than the ${maxMb} MB limit for attachments`;
+	return null;
+}

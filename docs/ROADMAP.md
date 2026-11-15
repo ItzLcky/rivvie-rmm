@@ -1,13 +1,13 @@
 # Roadmap
 
-Last reviewed 2026-11-12.
+Last reviewed 2026-11-15.
 
 ## Where things stand
 
 | Phase | Status |
 |---|---|
 | 1. Core | Done |
-| 2. Hardening | Done on Linux; MSI, Job Objects, persisted job results and sealed TOTP secrets added; Windows e2e passing in CI (see Next) |
+| 2. Hardening | Done on Linux; MSI, Job Objects, persisted job results and sealed TOTP secrets added; Windows e2e in CI (see Next) |
 | 3. UI redesign | Done |
 | 4. Monitoring and alerting | Done |
 | 5. Patch management | Done |
@@ -17,18 +17,23 @@ Last reviewed 2026-11-12.
 
 What's built works end to end on Linux and is covered by unit tests, the e2e suite (`crates/rmm-server/tests/e2e.rs`) and the Playwright visual and accessibility tests. The biggest gap is that **no Windows code path has run on a real Windows host.** Windows is where most MSP fleets are, so that comes first.
 
-Design records: [PSA](design/psa.md), [endpoint protection](design/endpoint-protection.md), [UI survey](research/rmm-ui-survey.md).
+**Main should be green again; not yet proven on GitHub.** CI failed on `ab72ebc` (2026-11-12). The Linux e2e failure was the QBR's offline-hours query returning `numeric` where the code reads `float8`, which sqlx only notices when the value isn't NULL, i.e. for a client with an offline alert in the period; fixed, and the full suite passes locally. The Windows job's hang (in rust-cache's post-job save, after the tests passed) left no log, so its cause is unknown: the job now has timeouts and a cleanup step that lists and stops whatever is left over. Both fixes, and the new `upgrade` job and loadgen smoke step, run for the first time on the next push.
+
+**Current block: production readiness** (the open items of block 2 below; spec in [design/production-readiness.md](design/production-readiness.md)). Built 2026-11-15 and verified locally except where noted below; waiting for the first CI run. Blocks 3, 4 and 6 are done. Block 1 is higher priority but waits on real Windows machines, and the outside security review waits on a reviewer. The load test ([research/load-test-2026-11.md](research/load-test-2026-11.md)) says one node holds 10,000 agents, so horizontal scaling isn't urgent; the dashboard and search queries are what to fix first (see block 2). Block 5 follows.
+
+Design records: [PSA](design/psa.md), [endpoint protection](design/endpoint-protection.md), [production readiness](design/production-readiness.md), [UI survey](research/rmm-ui-survey.md), [load test](research/load-test-2026-11.md).
 
 ## Next
 
-In priority order. Each block should be finished and usable before the next starts.
+In priority order, except that block 1 is waiting on hardware (see above). Each block should be finished and usable before the next starts.
 
 ### 1. Windows on real hosts
 
 Every Windows feature is compile-checked (clippy via mingw) and unit-tested against recorded output only. Run them all on Windows 10/11 and Server 2019/2022, and keep them running:
 
 - [ ] **Windows e2e in CI.** GitHub's `windows-latest` runners can install a service, run Defender and query Windows Update. Run the real agent as a service there against a server in the job, so regressions show up without a lab.
-  - Written: `crates/rmm-server/tests/e2e_windows.rs` and the `e2e-windows` CI job (server and Postgres on the runner, agent installed from the generated MSI). It covers the MSI install/upgrade/uninstall, the service and its recovery actions, the data-directory ACL, PowerShell and cmd jobs, the Job Object tree kill, results across a service restart and the service list. Passing in CI since 2026-11-12. The first runs found that msiexec rejected the package (version 4 compound file, UTF-8 code page) and that a running job kept the service from stopping; both fixed.
+  - Written: `crates/rmm-server/tests/e2e_windows.rs` and the `e2e-windows` CI job (server and Postgres on the runner, agent installed from the generated MSI). It covers the MSI install/upgrade/uninstall, the service and its recovery actions, the data-directory ACL, PowerShell and cmd jobs, the Job Object tree kill, results across a service restart and the service list. First passed in CI on 2026-11-12. The first runs found that msiexec rejected the package (version 4 compound file, UTF-8 code page) and that a running job kept the service from stopping; both fixed.
+  - On `ab72ebc` the tests passed but the job hung in its post-job steps until the 50-minute mark; see the current block.
   - Still to add: self-update, ConPTY shells, Event Log watchers, patches, Defender, the sensor.
 - [ ] Install and service: the `C:\ProgramData\RMM` ACL, the Program Files copy, SCM recovery actions, file logging, reinstall over a running service.
 - [ ] Self-update: service stop/start from the detached watchdog, and rollback.
@@ -40,14 +45,20 @@ Every Windows feature is compile-checked (clippy via mingw) and unit-tested agai
 
 ### 2. Before the first real customer
 
+The open items are the current block. Order, scope and acceptance for each are in [design/production-readiness.md](design/production-readiness.md).
+
+- [ ] **Green main**: fix the QBR PDF failure in the Linux e2e and the hanging Windows e2e job (both on `ab72ebc`).
+  - QBR: fixed (`::float8` on the offline-hours sum; the test prints the body when it isn't a PDF). Reproduced and verified with the full local e2e.
+  - Windows: `timeout-minutes` on the job and the test step, and an `if: always()` step that lists leftover processes, removes the RmmAgent service, kills what the test started and stops PostgreSQL. The hung run's log was never written, so the cause is still unknown; unverified until the next push. Tick this when both jobs pass on GitHub.
 - [x] **MSI installer** with the server URL and token baked in, like the `.deb`/`.rpm`. Built by the server with the `msi` and `cab` crates rather than WiX (`crates/rmm-server/src/api/msi.rs`), so there's no Windows toolchain. Silent install, major upgrades, keeps the enrollment on upgrade/repair (`enroll --keep-existing`), removes the service on uninstall. Installed, upgraded and uninstalled on `windows-latest` by the Windows e2e above; not yet on a real (non-CI) Windows host.
 - [x] **Windows Job Objects** for jobs and shells (`crates/rmm-agent/src/winjob.rs`). Jobs: a timeout kills the tree, but what a script leaves running survives it, as on Unix. Shells: kill-on-close, so closing the terminal kills everything started from it. Compile-checked only.
 - [x] **Persist the agent's job buffer to disk** (`job-results` in the state directory): results survive an agent restart, and a job that was running when the agent stopped is reported as `error` with its output instead of `lost`.
 - [x] **Encrypt TOTP secrets at rest** with `RMM_DATA_KEY` (`users.totp_sealed`); plaintext rows are sealed at startup, and the server refuses to start if sealed secrets exist but the key is missing. `RMM_DATA_KEY` is required by both production compose files.
-- [ ] **Attachments and uploads over 8 MB** (agent file uploads stream since block 3; ticket and portal attachments are still under the 8 MB request limit): a per-route body limit or chunked upload, instead of the global request limit.
-- [ ] **Load test the server**: simulate 1,000 and 10,000 agents (metrics, heartbeats, jobs, SSE clients) and record CPU, memory, Postgres size per agent per day, and alert evaluation time. Sets the honest per-node limit and tells us whether horizontal scaling (below) is urgent.
-- [ ] **Server observability**: a Prometheus `/metrics` endpoint (connected agents, hub queue depths, outbox backlog, alert eval duration, request latency) and JSON logs.
-- [ ] **Upgrade path**: a CI job that migrates a database built by the previous release and runs the e2e suite against it. Document backup → upgrade → rollback in the README.
+- [x] **Attachments over 8 MB**: `RMM_ATTACHMENT_MAX_MB` (default 100, per file) on the three upload routes, everything else still 8 MB. Uploads stream into storage with the size and SHA-256 worked out on the way (local: written beside the key and renamed; S3: multipart in 8 MiB parts, aborted on failure or a dropped request); downloads stream, with single `Range` requests. Over the limit is a 413 naming it, and both the ticket page and the portal check before sending. Reply emails attach up to 15 MB by recorded size and link the rest (the portal for contacts who can sign in, otherwise a 30-day download link, `attachment_links` in migration `0018`). Verified by the e2e (16 MiB and 9 MiB files through both routes, read back by hash and by range, 413s, the emailed link) and unit tests of the S3 multipart path against a stand-in; a 1 GiB upload and download moved the server's peak RSS by 3 MB. Reading axum's source, multipart uploads before this were probably capped at 2 MB (its default body limit applies to `Multipart` and nothing raised it), not the 8 MB the UI said; not tested against the old build. Not tried against real AWS S3 or MinIO.
+- [x] **Load test the server**: `crates/rmm-loadgen` (the real protocol via `rmm-proto`, dashboards, page requests, bulk jobs, `/metrics` and Postgres sampling), run at 1,000 and 10,000 agents on a Ryzen 9 5900X with Postgres 17 in Docker; report in [research/load-test-2026-11.md](research/load-test-2026-11.md). 10,000 agents held for 10 minutes with no dropped sessions; at 20,000 all stayed connected but the database fell behind for ~3 minutes after they came on (94 pool-timeout 500s, alert passes up to 56 s), so this machine's limit is between the two. Fixed on the way and re-measured: 128 KiB WebSocket read buffers (server RSS 1.76 → 1.02 GB at 10,000), one-query-per-agent bulk job creation (500 jobs 10.6 s → 0.05 s), the dashboard computing health three times per agent, and heartbeats waiting for an fsync each (pool waits 849 → 22 ms). A 200-agent smoke run is in the `e2e` CI job.
+  - Left for later (see the report): agent search scans every inventory's JSON (~0.8 s per search at 10,000 agents) and the dashboard's health is computed per request (~0.3 s at 10,000, and an open dashboard refetches on every alert, job and online change). Both want stored columns; they're the first thing to give at 10,000 agents.
+- [x] **Server observability**: `GET /metrics` behind `RMM_METRICS_TOKEN` (404 without it, constant-time bearer check), from a small registry of atomics and fixed-bucket histograms (`crates/rmm-server/src/metrics.rs`): agents, messages by type, hub queues and drops, SSE subscribers and lag, outboxes, alert evaluation and scheduler durations, HTTP by route template and status class, the database pool, process RSS and CPU, build version. `RMM_LOG_FORMAT=json`, and one request log line with method, route template, status, duration and a request id (never query strings, bodies or headers). The e2e checks the output with `promtool check metrics` and that no ids or query strings appear in labels or logs. README: variables, scrape config, alert rules.
+- [ ] **Upgrade path**: the `upgrade` CI job runs the newest `v*` tag's image and agent to make real rows (`tests/upgrade.rs`), clears the admin's 2FA with that release's CLI, then runs the e2e suite on a copy (`RMM_E2E_TEMPLATE`) that first reads those rows back (`RMM_E2E_EXPECT`). A step fails if a migration shipped in that tag was edited, and sqlx's checksums stop the new server too (both seen locally by editing `0005`). README: backup, upgrade, verify, roll back. The whole sequence ran locally against `ghcr.io/…:0.1.1` and passed; tick this once the job passes on GitHub.
 - [ ] **Security review** by someone outside the project: agent/server protocol, enrollment, the update and content signing chain, session handling, per-client scoping, the shell and desktop relays.
 
 ### 3. Day-to-day gaps MSPs will hit first

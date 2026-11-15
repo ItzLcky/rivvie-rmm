@@ -18,9 +18,9 @@ use axum::response::{AppendHeaders, IntoResponse, Response};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use super::attachments;
 use crate::auth;
 use crate::error::{ApiError, ApiResult};
 use crate::ratelimit::ClientIp;
@@ -33,7 +33,7 @@ pub const PORTAL_LINK_MINUTES: i64 = 30;
 /// Absolute session lifetime; sessions unused for [`IDLE_DAYS`] end sooner.
 const SESSION_DAYS: i64 = 30;
 const IDLE_DAYS: i32 = 7;
-const MAX_FILES: usize = 10;
+pub(crate) const MAX_FILES: usize = 10;
 
 // ---------------------------------------------------------------------------
 // Session
@@ -321,7 +321,7 @@ pub async fn logout(State(st): State<Arc<AppState>>, headers: HeaderMap) -> ApiR
 /// Company name and the portal's welcome text, for the sign-in page.
 pub async fn public_info(State(st): State<Arc<AppState>>) -> ApiResult<Json<Value>> {
     let welcome: String = sqlx::query_scalar("SELECT portal_welcome FROM company_settings").fetch_one(&st.db).await?;
-    Ok(Json(json!({ "company_name": st.company().company_name, "welcome": welcome })))
+    Ok(Json(json!({ "company_name": st.company().company_name, "welcome": welcome, "attachment_max_mb": st.cfg.attachment_max_mb })))
 }
 
 pub async fn me(State(st): State<Arc<AppState>>, c: Contact) -> ApiResult<Json<Value>> {
@@ -343,6 +343,7 @@ pub async fn me(State(st): State<Arc<AppState>>, c: Contact) -> ApiResult<Json<V
         "invoices": c.is_billing,
         "has_password": has_password,
         "totp_enabled": totp,
+        "attachment_max_mb": st.cfg.attachment_max_mb,
     })))
 }
 
@@ -561,71 +562,73 @@ pub async fn ticket(State(st): State<Arc<AppState>>, c: Contact, Path(id): Path<
     Ok(Json(v))
 }
 
-struct Upload {
-    name: String,
-    content_type: String,
-    bytes: Vec<u8>,
-}
-
-/// Text fields and files from a portal form.
-async fn read_form(mut form: Multipart) -> ApiResult<(std::collections::HashMap<String, String>, Vec<Upload>)> {
-    let bad = |e: axum::extract::multipart::MultipartError| ApiError::BadRequest(format!("upload: {e}"));
+/// Text fields and files from a portal form. Files are streamed to storage as they arrive;
+/// the caller records them with [`record_files`], or removes them with
+/// [`attachments::discard`] if the request fails.
+async fn read_form(st: &AppState, mut form: Multipart, saved: &mut Vec<attachments::Saved>) -> ApiResult<std::collections::HashMap<String, String>> {
     let mut fields = std::collections::HashMap::new();
-    let mut files = vec![];
-    while let Some(f) = form.next_field().await.map_err(bad)? {
+    while let Some(f) = form.next_field().await.map_err(|e| attachments::multipart_error(st, e))? {
         let name = f.name().unwrap_or_default().to_string();
         if name == "file" {
-            if files.len() >= MAX_FILES {
+            if saved.len() >= MAX_FILES {
                 return Err(ApiError::BadRequest(format!("at most {MAX_FILES} files")));
             }
-            let fname = super::tickets::clean_filename(f.file_name().unwrap_or("attachment"));
-            let ct = f
-                .content_type()
-                .filter(|c| c.len() < 100 && c.contains('/') && c.bytes().all(|b| b.is_ascii_graphic()))
-                .unwrap_or("application/octet-stream")
-                .to_ascii_lowercase();
-            let bytes = f.bytes().await.map_err(bad)?.to_vec();
-            if !bytes.is_empty() {
-                files.push(Upload { name: fname, content_type: ct, bytes });
+            if let Some(file) = attachments::save(st, f).await? {
+                saved.push(file);
             }
         } else {
-            let text = f.text().await.map_err(bad)?;
+            // Read in pieces: the route takes bodies big enough for files, a text field gets 1 MB.
+            let mut f = f;
+            let mut buf = Vec::new();
+            while let Some(chunk) = f.chunk().await.map_err(|e| attachments::multipart_error(st, e))? {
+                if buf.len() + chunk.len() > 1 << 20 {
+                    return Err(ApiError::TooLarge(format!("the {name} field is too long")));
+                }
+                buf.extend_from_slice(&chunk);
+            }
+            let text = String::from_utf8(buf).map_err(|_| ApiError::BadRequest(format!("the {name} field isn't UTF-8 text")))?;
             fields.insert(name, text);
         }
     }
-    Ok((fields, files))
+    Ok(fields)
 }
 
-async fn store_files(st: &AppState, ticket: Uuid, event: i64, contact: Uuid, files: Vec<Upload>) -> ApiResult<()> {
+async fn record_files(st: &AppState, ticket: Uuid, event: i64, contact: Uuid, files: &[attachments::Saved]) -> ApiResult<()> {
+    let mut tx = st.db.begin().await?;
     for f in files {
-        let aid = Uuid::new_v4();
-        let key = format!("attachments/{aid}");
-        let sha = Sha256::digest(&f.bytes).to_vec();
-        let size = f.bytes.len() as i64;
-        st.storage.put(&key, f.bytes, &f.content_type).await?;
         sqlx::query(
             "INSERT INTO ticket_attachments (id, ticket_id, event_id, name, content_type, size, sha256, storage_key, uploaded_by_contact)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
         )
-        .bind(aid)
+        .bind(f.id)
         .bind(ticket)
         .bind(event)
         .bind(&f.name)
         .bind(&f.content_type)
-        .bind(size)
-        .bind(sha)
-        .bind(&key)
+        .bind(f.size)
+        .bind(&f.sha256)
+        .bind(&f.key)
         .bind(contact)
-        .execute(&st.db)
+        .execute(&mut *tx)
         .await?;
     }
+    tx.commit().await?;
     Ok(())
 }
 
 /// `POST /portal/tickets` (multipart: `subject`, `description`, `urgency` = low / normal / high,
 /// and any number of `file`s up to the request limit).
 pub async fn create_ticket(State(st): State<Arc<AppState>>, c: Contact, form: Multipart) -> ApiResult<Json<Value>> {
-    let (fields, files) = read_form(form).await?;
+    let mut files = vec![];
+    let res = create_ticket_with(&st, &c, form, &mut files).await;
+    if res.is_err() {
+        attachments::discard(&st, &files).await;
+    }
+    res
+}
+
+async fn create_ticket_with(st: &Arc<AppState>, c: &Contact, form: Multipart, files: &mut Vec<attachments::Saved>) -> ApiResult<Json<Value>> {
+    let fields = read_form(st, form, files).await?;
     let subject = fields.get("subject").map(|s| s.split_whitespace().collect::<Vec<_>>().join(" ")).unwrap_or_default();
     if subject.is_empty() || subject.chars().count() > 300 {
         return Err(ApiError::BadRequest("give the request a subject (up to 300 characters)".into()));
@@ -667,9 +670,10 @@ pub async fn create_ticket(State(st): State<Arc<AppState>>, c: Contact, form: Mu
     )
     .await?;
     tx.commit().await?;
-    store_files(&st, created.id, created.event_id, c.id, files).await?;
-    tickets::notify_created(&st, created.id).await;
-    tickets::announce(&st, created.id).await;
+    // If this fails the ticket stays and the caller removes the files.
+    record_files(st, created.id, created.event_id, c.id, files).await?;
+    tickets::notify_created(st, created.id).await;
+    tickets::announce(st, created.id).await;
     Ok(Json(json!({ "id": created.id, "number": created.number })))
 }
 
@@ -680,7 +684,23 @@ pub async fn add_message(State(st): State<Arc<AppState>>, c: Contact, Path(id): 
     if t.merged_into.is_some() || t.status_category == "closed" {
         return Err(ApiError::Conflict("this ticket is closed: open a new request instead".into()));
     }
-    let (fields, files) = read_form(form).await?;
+    let mut files = vec![];
+    let res = add_message_with(&st, &c, id, &t, form, &mut files).await;
+    if res.is_err() {
+        attachments::discard(&st, &files).await;
+    }
+    res
+}
+
+async fn add_message_with(
+    st: &Arc<AppState>,
+    c: &Contact,
+    id: Uuid,
+    t: &PortalTicket,
+    form: Multipart,
+    files: &mut Vec<attachments::Saved>,
+) -> ApiResult<Json<Value>> {
+    let fields = read_form(st, form, files).await?;
     let body = fields.get("body").map(|s| s.trim().to_string()).unwrap_or_default();
     if body.is_empty() && files.is_empty() {
         return Err(ApiError::BadRequest("write something first".into()));
@@ -698,11 +718,11 @@ pub async fn add_message(State(st): State<Arc<AppState>>, c: Contact, Path(id): 
         }
     }
     tx.commit().await?;
-    store_files(&st, id, event, c.id, files).await?;
-    if let Err(e) = crate::email::queue_client_message(&st, id, &c.name).await {
+    record_files(st, id, event, c.id, files).await?;
+    if let Err(e) = crate::email::queue_client_message(st, id, &c.name).await {
         tracing::warn!(ticket = %id, "telling the assignee about a portal reply: {e:#}");
     }
-    tickets::announce(&st, id).await;
+    tickets::announce(st, id).await;
     Ok(Json(json!({ "id": event })))
 }
 
@@ -723,10 +743,10 @@ pub async fn resolve(State(st): State<Arc<AppState>>, c: Contact, Path(id): Path
     Ok(Json(json!({ "ok": true })))
 }
 
-pub async fn download(State(st): State<Arc<AppState>>, c: Contact, Path((id, aid)): Path<(Uuid, Uuid)>) -> ApiResult<Response> {
+pub async fn download(State(st): State<Arc<AppState>>, c: Contact, Path((id, aid)): Path<(Uuid, Uuid)>, headers: HeaderMap) -> ApiResult<Response> {
     visible(&st, &c, id).await?;
-    let (name, ct, key): (String, String, String) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "SELECT a.name, a.content_type, a.storage_key FROM ticket_attachments a WHERE a.id = $3 AND a.ticket_id = $1 AND {VISIBLE_ATTACHMENT}"
+    let (name, ct, key, size): (String, String, String, i64) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT a.name, a.content_type, a.storage_key, a.size FROM ticket_attachments a WHERE a.id = $3 AND a.ticket_id = $1 AND {VISIBLE_ATTACHMENT}"
     )))
     .bind(id)
     .bind(c.id)
@@ -734,8 +754,7 @@ pub async fn download(State(st): State<Arc<AppState>>, c: Contact, Path((id, aid
     .fetch_optional(&st.db)
     .await?
     .ok_or(ApiError::NotFound("attachment"))?;
-    let bytes = st.storage.get(&key).await?;
-    super::tickets::file_response(bytes, &name, &ct, false)
+    attachments::serve(&st, &headers, &key, size, &name, &ct, false).await
 }
 
 // ---------------------------------------------------------------------------

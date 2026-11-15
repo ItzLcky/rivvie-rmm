@@ -29,8 +29,14 @@ const JOB_OUTPUT_CAP: i32 = 1024 * 1024;
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(15);
 const PING_EVERY: Duration = Duration::from_secs(30);
 
+/// Read buffer per agent connection. tungstenite allocates 128 KiB by default; with 8 KiB the
+/// server holding 10,000 agents went from 1.76 GB to 1.02 GB resident (load test,
+/// docs/research/load-test-2026-11.md). Heartbeats are under 1 KiB; larger messages
+/// (inventory, ~30 KiB) just take a few reads.
+const READ_BUFFER: usize = 8 * 1024;
+
 pub async fn handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>, ClientIp(ip): ClientIp) -> Response {
-    ws.max_message_size(MAX_FRAME).on_upgrade(move |socket| async move {
+    ws.max_message_size(MAX_FRAME).read_buffer_size(READ_BUFFER).on_upgrade(move |socket| async move {
         if let Err(e) = handle(socket, state, ip).await {
             debug!("agent socket ended: {e:#}");
         }
@@ -75,6 +81,7 @@ async fn handle(mut ws: WebSocket, state: Arc<AppState>, ip: IpAddr) -> anyhow::
                 return Ok(());
             }
             if !authenticate(&state, agent_id, &secret).await? {
+                crate::metrics::inc(&crate::metrics::M.agent_auth_failures);
                 warn!(%agent_id, %ip, "agent auth failed");
                 send(&mut ws, &ServerMsg::AuthFailed { reason: "invalid credentials".into() }).await?;
                 return Ok(());
@@ -84,6 +91,7 @@ async fn handle(mut ws: WebSocket, state: Arc<AppState>, ip: IpAddr) -> anyhow::
                 &ServerMsg::AuthOk { heartbeat_secs: state.cfg.heartbeat_secs, inventory_secs: state.cfg.inventory_secs },
             )
             .await?;
+            crate::metrics::inc(&crate::metrics::M.agent_connects);
             let held = Held { jobs, patch_runs, security_actions };
             run_session(ws, state, agent_id, agent_version, held, capabilities).await
         }
@@ -278,7 +286,12 @@ async fn run_session(
         };
         let msg = match frame {
             Message::Binary(b) => match rmm_proto::decode::<AgentMsg>(&b) {
-                Ok(m) => m,
+                Ok(m) => {
+                    let metrics = &crate::metrics::M;
+                    metrics.agent_message_bytes.fetch_add(b.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                    crate::metrics::inc(&metrics.agent_messages[message_type(&m)]);
+                    m
+                }
                 Err(e) => {
                     warn!(%agent_id, "bad frame: {e}");
                     continue;
@@ -541,6 +554,42 @@ async fn on_message(
     Ok(())
 }
 
+/// Index into [`crate::metrics::AGENT_MESSAGE_TYPES`].
+fn message_type(m: &AgentMsg) -> usize {
+    match m {
+        AgentMsg::Enroll { .. } => 0,
+        AgentMsg::Auth { .. } => 1,
+        AgentMsg::Heartbeat(_) => 2,
+        AgentMsg::Inventory(_) => 3,
+        AgentMsg::JobOutput { .. } => 4,
+        AgentMsg::JobFinished { .. } => 5,
+        AgentMsg::JobSync { .. } => 6,
+        AgentMsg::UpdateFetch { .. } => 7,
+        AgentMsg::UpdateStatus { .. } => 8,
+        AgentMsg::ShellOpened { .. } => 9,
+        AgentMsg::ShellOutput { .. } => 10,
+        AgentMsg::ShellClosed { .. } => 11,
+        AgentMsg::Pong { .. } => 12,
+        AgentMsg::Services { .. } => 13,
+        AgentMsg::ServiceControlResult { .. } => 14,
+        AgentMsg::LogMatches { .. } => 15,
+        AgentMsg::PatchScanResult { .. } => 16,
+        AgentMsg::PatchProgress { .. } => 17,
+        AgentMsg::PatchResult(_) => 18,
+        AgentMsg::DesktopInfo { .. } => 19,
+        AgentMsg::DesktopFrame { .. } => 20,
+        AgentMsg::DesktopClosed { .. } => 21,
+        AgentMsg::SecurityStatus(_) => 22,
+        AgentMsg::SecurityActionResult { .. } => 23,
+        AgentMsg::SensorStatus(_) => 24,
+        AgentMsg::SensorDetection(_) => 25,
+        AgentMsg::QuarantineList { .. } => 26,
+        AgentMsg::TelemetryResult { .. } => 27,
+        AgentMsg::TriageChunk { .. } => 28,
+        AgentMsg::ToolReply { .. } => 29,
+    }
+}
+
 fn status_str(s: JobStatus) -> &'static str {
     s.as_str()
 }
@@ -553,6 +602,12 @@ async fn store_metrics(state: &AppState, agent_id: Uuid, m: &Metrics) -> anyhow:
         .map(|d| 100.0 * (d.total - d.available.min(d.total)) as f32 / d.total as f32)
         .fold(0.0f32, f32::max);
     let mut tx = state.db.begin().await?;
+    // Heartbeats are most of what the server writes (one per agent every 30 seconds), and a
+    // sample isn't worth an fsync: commit without waiting for the WAL flush. A crash can lose
+    // the last fraction of a second of samples, never anything else. At 10,000 agents on a
+    // SATA SSD (~150 fsyncs/s) waiting for it held every pooled connection in COMMIT
+    // (load test, docs/research/load-test-2026-11.md).
+    sqlx::query("SET LOCAL synchronous_commit = off").execute(&mut *tx).await?;
     sqlx::query("UPDATE agents SET last_seen_at = now(), online = true, last_metrics = $2 WHERE id = $1")
         .bind(agent_id)
         .bind(serde_json::to_value(m)?)

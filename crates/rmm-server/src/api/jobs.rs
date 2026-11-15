@@ -199,6 +199,35 @@ pub async fn deliver(st: &AppState, agent_id: Uuid, client_id: Uuid, job: Script
     Ok(status)
 }
 
+/// [`deliver`] for many new jobs of one script: claims every job whose agent is online in one
+/// query, then hands each to its agent. Returns each job's status, in order.
+async fn deliver_many(st: &AppState, jobs: &[(Uuid, Uuid, Uuid)], script: &ScriptJob) -> ApiResult<Vec<&'static str>> {
+    let online: Vec<Uuid> = jobs.iter().filter(|(_, a, _)| st.hub.is_online(*a)).map(|(j, _, _)| *j).collect();
+    let claimed: std::collections::HashSet<Uuid> = if online.is_empty() {
+        Default::default()
+    } else {
+        sqlx::query_scalar("UPDATE jobs SET status = 'sent', sent_at = now() WHERE id = ANY($1) AND status = 'queued' RETURNING id")
+            .bind(&online)
+            .fetch_all(&st.db)
+            .await?
+            .into_iter()
+            .collect()
+    };
+    let mut out = Vec::with_capacity(jobs.len());
+    for (job_id, agent_id, client_id) in jobs {
+        let mut sent = claimed.contains(job_id);
+        if sent && !st.hub.send(*agent_id, ServerMsg::RunScript(ScriptJob { job_id: *job_id, ..script.clone() })).await {
+            // Went offline in between: it stays queued and goes out when the agent is back.
+            sqlx::query("UPDATE jobs SET status = 'queued', sent_at = NULL WHERE id = $1").bind(job_id).execute(&st.db).await?;
+            sent = false;
+        }
+        let status = if sent { "sent" } else { "queued" };
+        st.hub.publish(Event::Job { id: *job_id, agent_id: *agent_id, client_id: *client_id, status: status.into(), output: false });
+        out.push(status);
+    }
+    Ok(out)
+}
+
 #[derive(Deserialize)]
 pub struct NewJob {
     agent_ids: Vec<Uuid>,
@@ -257,43 +286,49 @@ pub async fn create(State(st): State<Arc<AppState>>, u: User, Json(b): Json<NewJ
     let timeout = b.timeout_secs.unwrap_or(default_timeout).clamp(1, 86400);
     let args = serde_json::to_value(&b.args).unwrap_or_default();
 
-    let mut jobs = Vec::with_capacity(b.agent_ids.len());
+    // One insert for every agent (a bulk run can be thousands), skipping the ones that don't
+    // exist, that the user can't see, or that belong to another client than the script.
+    let created: Vec<(Uuid, Uuid, Uuid)> = sqlx::query_as(
+        "WITH ins AS (
+            INSERT INTO jobs (id, agent_id, script_id, interpreter, body, args, timeout_secs, created_by, ticket_id)
+            SELECT gen_random_uuid(), a.id, $2, $3, $4, $5, $6, $7, $10
+              FROM unnest($1::uuid[]) AS u(agent_id) JOIN agents a ON a.id = u.agent_id JOIN sites s ON s.id = a.site_id
+             WHERE ($8::uuid[] IS NULL OR s.client_id = ANY($8)) AND ($9::uuid IS NULL OR s.client_id = $9)
+            RETURNING id, agent_id)
+         SELECT ins.id, ins.agent_id, s.client_id FROM ins JOIN agents a ON a.id = ins.agent_id JOIN sites s ON s.id = a.site_id",
+    )
+    .bind(&b.agent_ids)
+    .bind(b.script_id)
+    .bind(&interp)
+    .bind(&body)
+    .bind(&args)
+    .bind(timeout)
+    .bind(u.id)
+    .bind(u.scope())
+    .bind(required_client)
+    .bind(b.ticket_id)
+    .fetch_all(&st.db)
+    .await?;
+    // Back in the order asked for (an agent listed twice gets two jobs).
+    let mut by_agent: std::collections::HashMap<Uuid, Vec<(Uuid, Uuid)>> = std::collections::HashMap::new();
+    for (job_id, agent_id, client_id) in created {
+        by_agent.entry(agent_id).or_default().push((job_id, client_id));
+    }
+    let mut ordered = Vec::with_capacity(b.agent_ids.len());
     let mut skipped = Vec::new();
     for agent_id in &b.agent_ids {
-        let job_id = Uuid::new_v4();
-        // Agents that don't exist, that the user can't see, or that belong to a different
-        // client than the script are skipped and reported back.
-        let client_id: Option<Uuid> = sqlx::query_scalar(
-            "INSERT INTO jobs (id, agent_id, script_id, interpreter, body, args, timeout_secs, created_by, ticket_id)
-             SELECT $1, $2, $3, $4, $5, $6, $7, $8, $11
-               FROM agents a JOIN sites s ON s.id = a.site_id
-              WHERE a.id = $2 AND ($9::uuid[] IS NULL OR s.client_id = ANY($9))
-                AND ($10::uuid IS NULL OR s.client_id = $10)
-             RETURNING (SELECT s.client_id FROM agents a JOIN sites s ON s.id = a.site_id WHERE a.id = $2)",
-        )
-        .bind(job_id)
-        .bind(agent_id)
-        .bind(b.script_id)
-        .bind(&interp)
-        .bind(&body)
-        .bind(&args)
-        .bind(timeout)
-        .bind(u.id)
-        .bind(u.scope())
-        .bind(required_client)
-        .bind(b.ticket_id)
-        .fetch_optional(&st.db)
-        .await?;
-        let Some(client_id) = client_id else {
-            skipped.push(*agent_id);
-            continue;
-        };
-
-        let job = ScriptJob { job_id, interpreter, script: body.clone(), args: b.args.clone(), timeout_secs: timeout as u32 };
-        let status = deliver(&st, *agent_id, client_id, job).await?;
+        match by_agent.get_mut(agent_id).and_then(|v| v.pop()) {
+            Some((job_id, client_id)) => ordered.push((job_id, *agent_id, client_id)),
+            None => skipped.push(*agent_id),
+        }
+    }
+    let script = ScriptJob { job_id: Uuid::nil(), interpreter, script: body.clone(), args: b.args.clone(), timeout_secs: timeout as u32 };
+    let statuses = deliver_many(&st, &ordered, &script).await?;
+    let mut jobs = Vec::with_capacity(ordered.len());
+    for ((job_id, agent_id, _), status) in ordered.iter().zip(statuses) {
         jobs.push(json!({ "job_id": job_id, "agent_id": agent_id, "status": status }));
         if let Some(t) = b.ticket_id {
-            super::tickets::job_started(&st, &u, t, job_id, *agent_id, b.script_id).await?;
+            super::tickets::job_started(&st, &u, t, *job_id, *agent_id, b.script_id).await?;
         }
     }
     if jobs.is_empty() {

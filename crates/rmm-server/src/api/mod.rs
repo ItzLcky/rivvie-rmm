@@ -7,6 +7,7 @@ use crate::state::AppState;
 
 pub mod access;
 mod agents;
+mod attachments;
 mod alerts;
 mod billing;
 mod channels;
@@ -54,7 +55,11 @@ pub fn agent_binary_path(st: &AppState, id: &str) -> Option<std::path::PathBuf> 
     downloads::platform_path(st, id)
 }
 
-pub fn router() -> Router<Arc<AppState>> {
+/// `attachment_max` is RMM_ATTACHMENT_MAX_MB in bytes: the three attachment upload routes take
+/// that much per file (streamed to storage), everything else at most 8 MB.
+pub fn router(attachment_max: u64) -> Router<Arc<AppState>> {
+    // A whole upload: every file it may carry at the per-file limit, plus the form fields.
+    let upload_limit = |files: usize| axum::extract::DefaultBodyLimit::max((attachment_max as usize).saturating_mul(files).saturating_add(1 << 20));
     Router::new()
         .route("/auth/login", post(auth::login))
         .route("/auth/logout", post(auth::logout))
@@ -178,7 +183,6 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/tickets/bulk", post(tickets::bulk))
         .route("/tickets/{id}", get(tickets::get).patch(tickets::update))
         .route("/tickets/{id}/events", post(tickets::add_event))
-        .route("/tickets/{id}/attachments", post(tickets::upload))
         .route("/tickets/{id}/attachments/{aid}", get(tickets::download))
         .route("/tickets/{id}/agents", post(tickets::link_agent))
         .route("/tickets/{id}/agents/{agent_id}", delete(tickets::unlink_agent))
@@ -212,6 +216,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/contacts/{id}/portal-invite", post(portal::invite))
         .route("/contacts/{id}/portal-credentials", delete(portal::reset_credentials))
         .route("/feedback/{token}", get(portal::feedback).post(portal::answer_feedback))
+        .route("/files/{token}", get(attachments::shared))
         .route("/portal/info", get(portal::public_info))
         .route("/portal/auth/link", post(portal::request_link))
         .route("/portal/auth/verify", post(portal::verify))
@@ -222,9 +227,8 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/portal/account/totp/setup", post(portal::totp_setup))
         .route("/portal/account/totp/enable", post(portal::totp_enable))
         .route("/portal/account/totp/disable", post(portal::totp_disable))
-        .route("/portal/tickets", get(portal::tickets).post(portal::create_ticket))
+        .route("/portal/tickets", get(portal::tickets))
         .route("/portal/tickets/{id}", get(portal::ticket))
-        .route("/portal/tickets/{id}/messages", post(portal::add_message))
         .route("/portal/tickets/{id}/resolve", post(portal::resolve))
         .route("/portal/tickets/{id}/attachments/{aid}", get(portal::download))
         .route("/portal/kb", get(portal::kb))
@@ -291,7 +295,10 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/agents/{id}/processes/{pid}/kill", post(tools::kill))
         .route("/agents/{id}/files", get(tools::list))
         .route("/agents/{id}/files/download", get(tools::download))
-        // Everything above takes bodies of at most 8 MB; uploads stream to the agent instead.
+        // Everything above takes bodies of at most 8 MB; uploads stream to the agent or to storage instead.
         .layer(tower_http::limit::RequestBodyLimitLayer::new(8 * 1024 * 1024))
         .route("/agents/{id}/files/upload", axum::routing::put(tools::upload))
+        .route("/tickets/{id}/attachments", post(tickets::upload).layer(upload_limit(tickets::MAX_UPLOAD_FILES)))
+        .route("/portal/tickets", post(portal::create_ticket).layer(upload_limit(portal::MAX_FILES)))
+        .route("/portal/tickets/{id}/messages", post(portal::add_message).layer(upload_limit(portal::MAX_FILES)))
 }

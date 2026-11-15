@@ -26,6 +26,13 @@ services:
       # Caddy reaches the server over the compose network; believe its X-Forwarded-For.
       RMM_TRUSTED_PROXIES: private
       RUST_LOG: info
+      # Prometheus metrics at /metrics for scrapers sending "Authorization: Bearer <token>"
+      # (off, answering 404, unless set). See "Monitoring the server" in the README.
+      # RMM_METRICS_TOKEN: ${RMM_METRICS_TOKEN}
+      # One JSON object per log line instead of text, for log shippers.
+      # RMM_LOG_FORMAT: json
+      # Largest ticket or portal attachment, per file (default 100).
+      # RMM_ATTACHMENT_MAX_MB: 100
     # Ticket attachments and raw email. Back this up along with the database dumps.
     volumes: [files:/srv/data]
 

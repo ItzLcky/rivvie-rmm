@@ -165,7 +165,39 @@ impl Default for Hub {
     }
 }
 
+/// Point-in-time sizes for `/metrics`.
+pub struct HubStats {
+    pub agents: usize,
+    /// Messages waiting in all agent send queues, and in the fullest one.
+    pub queued: usize,
+    pub queued_max: usize,
+    pub capacity: usize,
+    pub shells: usize,
+    pub desktops: usize,
+    pub subscribers: usize,
+}
+
 impl Hub {
+    pub fn stats(&self) -> HubStats {
+        let agents = self.agents.read().unwrap();
+        let (mut queued, mut queued_max, mut capacity) = (0, 0, 0);
+        for h in agents.values() {
+            let q = h.tx.max_capacity() - h.tx.capacity();
+            queued += q;
+            queued_max = queued_max.max(q);
+            capacity = h.tx.max_capacity();
+        }
+        HubStats {
+            agents: agents.len(),
+            queued,
+            queued_max,
+            capacity,
+            shells: self.shells.read().unwrap().len(),
+            desktops: self.desktops.read().unwrap().len(),
+            subscribers: self.events.receiver_count(),
+        }
+    }
+
     /// Publishes to every open dashboard. Never blocks; a no-op when nobody is listening.
     pub fn publish(&self, ev: Event) {
         let _ = self.events.send(ev);
@@ -212,10 +244,14 @@ impl Hub {
     /// Sends to a connected agent; returns false if it is offline or its queue is gone.
     pub async fn send(&self, agent_id: Uuid, msg: ServerMsg) -> bool {
         let tx = self.agents.read().unwrap().get(&agent_id).map(|h| h.tx.clone());
-        match tx {
+        let sent = match &tx {
             Some(tx) => tx.send(msg).await.is_ok(),
             None => false,
+        };
+        if !sent {
+            crate::metrics::dropped(if tx.is_some() { "agent_queue_closed" } else { "agent_offline" });
         }
+        sent
     }
 
     pub fn open_shell(&self, session_id: Uuid, agent_id: Uuid) -> mpsc::Receiver<ShellEvent> {
@@ -258,6 +294,7 @@ impl Hub {
         let mut desktops = self.desktops.write().unwrap();
         let Some(r) = desktops.get(&session_id).filter(|r| r.agent_id == from_agent) else { return };
         if let Err(mpsc::error::TrySendError::Full(_)) = r.tx.try_send(ev) {
+            crate::metrics::dropped("desktop_queue_full");
             desktops.remove(&session_id);
         }
     }

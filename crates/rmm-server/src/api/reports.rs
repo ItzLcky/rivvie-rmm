@@ -276,8 +276,10 @@ pub async fn qbr(State(st): State<Arc<AppState>>, u: User, Path(client): Path<Uu
     .bind(to)
     .fetch_all(&st.db)
     .await?;
+    // `extract` returns numeric (Postgres 14+); sqlx only checks the type of a non-NULL value,
+    // so without the cast this failed only for clients with an offline alert in the period.
     let offline: (i64, Option<f64>) = sqlx::query_as(
-        "SELECT count(*), sum(extract(epoch FROM coalesce(al.resolved_at, now()) - al.opened_at)) / 3600
+        "SELECT count(*), (sum(extract(epoch FROM coalesce(al.resolved_at, now()) - al.opened_at)) / 3600)::float8
            FROM alerts al JOIN agents a ON a.id = al.agent_id JOIN sites s ON s.id = a.site_id
           WHERE s.client_id = $1 AND al.kind = 'offline' AND al.opened_at >= $2 AND al.opened_at < $3::date + 1",
     )

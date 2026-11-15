@@ -21,6 +21,9 @@ pub enum ApiError {
     BadRequest(String),
     #[error("{0}")]
     Conflict(String),
+    /// An upload over its limit; the message names the limit.
+    #[error("{0}")]
+    TooLarge(String),
     #[error("too many failed attempts; try again in {} seconds", .0.as_secs())]
     TooManyRequests(std::time::Duration),
     #[error(transparent)]
@@ -40,11 +43,15 @@ impl IntoResponse for ApiError {
             ApiError::NotFound(_) => StatusCode::NOT_FOUND,
             ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
             ApiError::Conflict(_) => StatusCode::CONFLICT,
+            ApiError::TooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             ApiError::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
             ApiError::Db(sqlx::Error::RowNotFound) => StatusCode::NOT_FOUND,
             ApiError::Db(sqlx::Error::Database(e)) if e.is_unique_violation() => StatusCode::CONFLICT,
             ApiError::Db(_) | ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
+        if matches!(self, ApiError::Db(sqlx::Error::PoolTimedOut)) {
+            crate::metrics::inc(&crate::metrics::M.db_acquire_timeouts);
+        }
         let msg = if status == StatusCode::INTERNAL_SERVER_ERROR {
             tracing::error!("internal error: {self:#}");
             "internal server error".to_string()

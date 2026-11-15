@@ -4,7 +4,7 @@ import type { User } from './types';
 export const session = $state<{ user: User | null; loaded: boolean }>({ user: null, loaded: false });
 
 /** Public company settings (shown on the login page and in the sidebar). */
-export const company = $state<{ name: string }>({ name: '' });
+export const company = $state<{ name: string; attachmentMaxMb?: number }>({ name: '' });
 
 /** "Acme IT RMM" when a company name is set, otherwise "RMM". */
 export function brand(): string {
@@ -17,7 +17,11 @@ export function loadCompany(force = false) {
 	companyRequested = true;
 	fetch('/api/settings/public')
 		.then((r) => (r.ok ? r.json() : null))
-		.then((d) => d && (company.name = d.company_name ?? ''))
+		.then((d) => {
+			if (!d) return;
+			company.name = d.company_name ?? '';
+			if (typeof d.attachment_max_mb === 'number') company.attachmentMaxMb = d.attachment_max_mb;
+		})
 		.catch(() => {});
 }
 

@@ -21,6 +21,7 @@ crates/
     migrations/ Postgres schema (applied automatically on start)
     tests/      End-to-end test: real server, Postgres and agent processes
   rmm-sign/     Offline release signing for agent self-update (never deployed to the server)
+  rmm-loadgen/  Load generator: simulated agents (the real protocol), dashboards and API users
 web/            SvelteKit dashboard (static SPA, served by rmm-server)
 deploy/         Dockerfile, docker-compose (Postgres + server + Caddy), Caddyfile
 docs/           Roadmap and design notes
@@ -152,6 +153,46 @@ docker compose -f deploy/docker-compose.yml start server
 Ticket attachments and raw inbound email aren't in the database: they're files in the `files`
 volume (`rmm-files` in the Arcane stack), or in your S3 bucket. Back that up too.
 
+**Upgrading**
+
+Migrations run when the server starts and only go forward: there is no down migration. So an
+upgrade is a backup, a new image, and a check; a rollback is restoring that backup.
+
+1. **Back up**, right before, whatever the nightly job did: `docker compose -f
+   deploy/docker-compose.yml exec -T db pg_dump -U rmm -Fc rmm > rmm-before-upgrade.dump`.
+   Keep it with the `RMM_DATA_KEY` that was in use: the 2FA secrets in the dump are encrypted
+   with it, and no other key opens them.
+2. **Upgrade**: set the image tag (`RMM_TAG` in the Arcane stack; `git pull` then `up -d
+   --build` for the build-from-source stack) and start it. The server applies new migrations
+   and logs `listening on`; if a migration fails it exits instead of serving, and the database
+   is left at the last migration that succeeded.
+3. **Verify**: `/healthz` answers `ok`, agents show online again within a minute or two (they
+   reconnect on their own), and a ticket, an agent page and the alert list open. With
+   `RMM_METRICS_TOKEN` set, `rmm_agents_connected` should climb back to where it was.
+4. **Roll back** only by restoring: stop the server, restore the dump into an empty database,
+   and start the *old* image tag with the same `RMM_DATA_KEY`.
+
+   ```sh
+   docker compose -f deploy/docker-compose.yml stop server
+   docker compose -f deploy/docker-compose.yml exec -T db dropdb -U rmm rmm
+   docker compose -f deploy/docker-compose.yml exec -T db createdb -U rmm rmm
+   docker compose -f deploy/docker-compose.yml exec -T db pg_restore -U rmm -d rmm < rmm-before-upgrade.dump
+   git checkout v0.1.1   # the version you upgraded from
+   docker compose -f deploy/docker-compose.yml up -d --build server
+   ```
+
+   (In the Arcane stack, set `RMM_TAG` back to the old version instead of checking it out.)
+
+   Pointing an old image at an upgraded database doesn't work: it refuses migrations it doesn't
+   know. Anything written between the backup and the rollback (tickets, metrics, alerts) is
+   lost, so decide quickly.
+
+CI checks this path on every push: the `upgrade` job builds a database with the previous
+release's image and agent (an admin, a client and site, an enrolled agent with metrics, a
+ticket), starts the new server on it, reads those rows back and runs the e2e suite there. A
+migration that has shipped in a tag must never be edited (the job fails if one is); add a new
+one instead.
+
 **Installing an agent**
 
 In the dashboard, open Clients & Sites → Enroll agents. The dialog has download buttons for the
@@ -213,6 +254,82 @@ to SYSTEM and Administrators. Windows service logs go to `C:\ProgramData\RMM\log
 | `RMM_EMAIL_RAW_DAYS` | `90` | Raw MIME of inbound mail is deleted after this (the ticket keeps the text and attachments) |
 | `RMM_DATA_KEY` | empty (required by the compose files) | 32 bytes, hex or base64 (`openssl rand -hex 32`). Encrypts two-factor secrets and detection context at rest. Secrets stored before it was set are encrypted at the next start. Keep a copy off the server: if it's lost, users with 2FA can't sign in until `rmm-server reset2fa` clears it, and the server refuses to start without it once anything has been encrypted |
 | `RMM_TRUSTED_PROXIES` | empty | Reverse proxies whose `X-Forwarded-For` gives the client IP (for rate limiting and the audit log): comma-separated addresses/CIDRs, or `private` for loopback + RFC 1918 + IPv6 ULA. The bundled compose stack sets `private` for Caddy |
+| `RMM_ATTACHMENT_MAX_MB` | `100` | Largest ticket or portal attachment, per file. Uploads and downloads stream to and from storage (S3 multipart over 8 MB), so this bounds disk use, not server memory. Replies email attachments up to 15 MB in total; larger files go as links (the portal for contacts who can sign in, otherwise a download link valid for 30 days) |
+| `RMM_METRICS_TOKEN` | empty | Turns on `GET /metrics` (see [Monitoring the server](#monitoring-the-server)); without it the route answers 404 |
+| `RMM_LOG_FORMAT` | `text` | `json`: one JSON object per log line |
+
+## Monitoring the server
+
+**Metrics.** With `RMM_METRICS_TOKEN` set (`openssl rand -hex 32`), `GET /metrics` answers in
+the Prometheus text format to requests with `Authorization: Bearer <token>` (compared in
+constant time; anything else gets 401). It sits outside `/api`, so it goes through your proxy
+like everything else: scrape it from inside the network if you can. Labels are bounded: route
+templates (`/api/tickets/{id}`), message types and status classes, never an agent, client, user
+or ticket id. What's there:
+
+| Series | |
+|---|---|
+| `rmm_agents_connected`, `rmm_agent_connects_total`, `rmm_agent_auth_failures_total` | Agents online on this server, sessions started, refused credentials |
+| `rmm_agent_messages_total{type}`, `rmm_agent_message_bytes_total` | What agents send, by message type |
+| `rmm_hub_send_queue_depth`, `_max`, `_capacity`; `rmm_hub_dropped_total{reason}` | Messages waiting for agents (all, and the fullest queue), and sends that were thrown away |
+| `rmm_sse_subscribers`, `rmm_sse_lagged_events_total`, `rmm_sse_resyncs_total` | Open dashboards, and how often one fell behind the event stream |
+| `rmm_outbox_pending{outbox}`, `rmm_outbox_oldest_seconds{outbox}` | Notifications and emails waiting to go out, and the age of the oldest |
+| `rmm_alert_eval_duration_seconds`, `rmm_alert_eval_interval_seconds` | Time for one pass over the polled alert policies, and how often a pass starts |
+| `rmm_scheduler_tick_duration_seconds` | Scheduled scripts: one tick |
+| `rmm_http_requests_total{method,route,status}`, `rmm_http_request_duration_seconds` | Requests and time to response headers |
+| `rmm_db_pool_connections`, `_idle`, `_max`, `rmm_db_pool_acquire_seconds`, `rmm_db_pool_acquire_timeouts_total` | The Postgres pool (the acquire time is sampled every 5 seconds) |
+| `rmm_shell_sessions`, `rmm_desktop_sessions` | Open terminals and remote desktops |
+| `process_resident_memory_bytes`, `process_cpu_seconds_total`, `process_open_fds`, `process_threads` | The server process (Linux) |
+| `rmm_build_info{version}`, `rmm_uptime_seconds` | |
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: rmm
+    scheme: https
+    metrics_path: /metrics
+    authorization: { type: Bearer, credentials_file: /etc/prometheus/rmm-token }
+    static_configs: [{ targets: ["rmm.example.com"] }]
+```
+
+The alerts worth having:
+
+```yaml
+groups:
+  - name: rmm
+    rules:
+      - alert: RmmAgentsDropping        # a fifth of the fleet gone in 10 minutes: network, proxy or server
+        expr: rmm_agents_connected < 0.8 * max_over_time(rmm_agents_connected[1h] offset 10m)
+        for: 5m
+      - alert: RmmOutboxBacklog         # notifications or email not going out (SMTP down, webhook failing)
+        expr: rmm_outbox_oldest_seconds > 900
+        for: 10m
+      - alert: RmmAlertEvaluationSlow   # a pass takes longer than the interval: alerts arrive late
+        expr: rate(rmm_alert_eval_duration_seconds_sum[15m]) / rate(rmm_alert_eval_duration_seconds_count[15m]) > rmm_alert_eval_interval_seconds
+        for: 15m
+      - alert: RmmDatabasePoolExhausted # requests waiting for a database connection
+        expr: increase(rmm_db_pool_acquire_timeouts_total[10m]) > 0 or (rmm_db_pool_idle == 0 and rmm_db_pool_connections == rmm_db_pool_max)
+        for: 5m
+      - alert: RmmDown
+        expr: up{job="rmm"} == 0
+        for: 2m
+```
+
+**Logs.** Text by default; `RMM_LOG_FORMAT=json` writes one JSON object per line for log
+shippers. Every request is logged once by `rmm_server::http` with its method, route template,
+status, duration and a request id (also returned as `X-Request-Id`, and attached to anything
+else logged while handling it). Query strings (portal sign-in links and survey tokens travel
+there), bodies and headers are never logged. `RUST_LOG=info,rmm_server::http=warn` keeps only
+failed requests.
+
+**Capacity.** One server and the default Postgres container on a desktop-class machine were
+load tested at 1,000 and 10,000 simulated agents: see
+[docs/research/load-test-2026-11.md](docs/research/load-test-2026-11.md) for the numbers and
+what gives out first. In short: one server held 10,000 agents with the server process at a
+quarter of a core; Postgres is what to size. Give it a disk with a fast fsync (NVMe, ideally
+with power-loss protection, not a copy-on-write filesystem such as btrfs), and budget about
+4.5 MB of database per agent at the default metric retention. `rmm-loadgen` repeats the test
+against your own hardware.
 
 ## Monitoring and alerts
 

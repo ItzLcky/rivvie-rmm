@@ -10,6 +10,7 @@ mod email;
 mod error;
 mod events;
 mod hub;
+mod metrics;
 mod notify;
 mod paging;
 mod patches;
@@ -38,7 +39,6 @@ use axum::routing::get;
 use clap::{Parser, Subcommand};
 use sqlx::postgres::PgPoolOptions;
 use tower_http::services::{ServeDir, ServeFile};
-use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -140,6 +140,13 @@ struct ServeArgs {
     /// 32-byte key (hex or base64) for encrypting detection context at rest.
     #[arg(long, env = "RMM_DATA_KEY", hide_env_values = true)]
     data_key: Option<String>,
+    /// Largest ticket or portal attachment, in MB per file. Uploads stream to storage, so
+    /// this bounds disk use, not memory.
+    #[arg(long, env = "RMM_ATTACHMENT_MAX_MB", default_value_t = 100)]
+    attachment_max_mb: u32,
+    /// Turns on `GET /metrics` (Prometheus), for scrapers sending `Authorization: Bearer <token>`.
+    #[arg(long, env = "RMM_METRICS_TOKEN", hide_env_values = true)]
+    metrics_token: Option<String>,
 }
 
 impl Default for ServeArgs {
@@ -168,15 +175,25 @@ impl Default for ServeArgs {
             content_soak_minutes: env("RMM_CONTENT_SOAK_MINUTES", "1440").parse().unwrap_or(1440),
             content_pubkey: std::env::var("RMM_UPDATE_PUBKEY").ok().filter(|s| !s.trim().is_empty()),
             data_key: std::env::var("RMM_DATA_KEY").ok().filter(|s| !s.trim().is_empty()),
+            attachment_max_mb: env("RMM_ATTACHMENT_MAX_MB", "100").parse().unwrap_or(100),
+            metrics_token: std::env::var("RMM_METRICS_TOKEN").ok().filter(|s| !s.trim().is_empty()),
         }
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,tower_http=warn,sqlx=warn".into()))
-        .init();
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,tower_http=warn,sqlx=warn".into());
+    // RMM_LOG_FORMAT=json: one JSON object per line (with the request span's id, method and
+    // route on request logs), for log shippers. Text otherwise.
+    match std::env::var("RMM_LOG_FORMAT").unwrap_or_default().trim() {
+        "json" => tracing_subscriber::fmt().json().with_current_span(true).with_span_list(false).with_env_filter(filter).init(),
+        "" | "text" => tracing_subscriber::fmt().with_env_filter(filter).init(),
+        other => {
+            tracing_subscriber::fmt().with_env_filter(filter).init();
+            warn!("RMM_LOG_FORMAT must be text or json, not {other:?}; using text");
+        }
+    }
     let cli = Cli::parse();
 
     let db = PgPoolOptions::new()
@@ -270,6 +287,8 @@ async fn serve(db: sqlx::PgPool, args: ServeArgs) -> Result<()> {
             content_soak_minutes: args.content_soak_minutes,
             content_pubkey: args.content_pubkey.clone(),
             data_key,
+            attachment_max_mb: args.attachment_max_mb.max(1),
+            metrics_token: args.metrics_token.clone().map(|t| t.trim().to_string()).filter(|t| !t.is_empty()),
         },
         triage: Default::default(),
     });
@@ -282,6 +301,10 @@ async fn serve(db: sqlx::PgPool, args: ServeArgs) -> Result<()> {
     tokio::spawn(email::poll_loop(state.clone(), args.mail_poll_secs));
     tokio::spawn(sla::run(state.clone()));
     tokio::spawn(accounting::run(state.clone()));
+    tokio::spawn(metrics::probe_pool(state.clone()));
+    if state.cfg.metrics_token.is_some() {
+        info!("metrics: GET /metrics (bearer token required)");
+    }
 
     // adapter-static writes the SPA shell as 200.html; every non-file route falls back to it.
     let found: Vec<_> = api::agent_platforms().filter(|id| api::agent_binary_exists(&state, id)).collect();
@@ -297,10 +320,11 @@ async fn serve(db: sqlx::PgPool, args: ServeArgs) -> Result<()> {
     let app = Router::new()
         .route("/api/agent/ws", get(agent_ws::handler))
         .route("/healthz", get(|| async { "ok" }))
-        .nest("/api", api::router())
+        .route("/metrics", get(metrics::handler))
+        .nest("/api", api::router(state.cfg.attachment_max_bytes()))
         .fallback_service(ServeDir::new(&args.web_dir).fallback(ServeFile::new(index)))
         // (The API sets its own body limit, see `api::router`.)
-        .layer(TraceLayer::new_for_http());
+        .layer(axum::middleware::from_fn(metrics::http_layer));
     let https = state.cfg.secure_cookies();
     let app = security_headers(app.with_state(state), https);
 
@@ -452,6 +476,7 @@ async fn housekeeping(state: Arc<AppState>) {
                 sqlx::query("DELETE FROM log_events WHERE received_at < now() - interval '30 days'").execute(db).await,
             );
             results.push(sqlx::query("DELETE FROM alert_mutes WHERE ends_at < now() - interval '30 days'").execute(db).await);
+            results.push(sqlx::query("DELETE FROM attachment_links WHERE expires_at < now()").execute(db).await);
             results.push(
                 sqlx::query("DELETE FROM notifications WHERE status <> 'pending' AND created_at < now() - interval '30 days'")
                     .execute(db)
