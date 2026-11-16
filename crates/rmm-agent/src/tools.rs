@@ -21,10 +21,10 @@ pub fn handle(req: Request) -> Reply {
         Request::ListDir { path } => list_dir(&path).map(Reply::Dir),
         Request::ReadFile { path, offset, len } => read_file(Path::new(&path), offset, len),
         Request::WriteFile { path, offset, data, last, overwrite } => write_file(Path::new(&path), offset, &data, last, overwrite),
-        Request::AbortWrite { path } => {
-            let _ = std::fs::remove_file(partial(Path::new(&path)));
-            Ok(Reply::Written { size: 0 })
-        }
+        Request::AbortWrite { path } => absolute(&path).map(|path| {
+            let _ = std::fs::remove_file(partial(&path));
+            Reply::Written { size: 0 }
+        }),
     };
     res.unwrap_or_else(|e| Reply::Error(format!("{e:#}")))
 }
@@ -114,12 +114,9 @@ fn roots() -> DirListing {
     DirListing { path: String::new(), parent: None, entries, truncated: false }
 }
 
+/// Any absolute path on the machine (that's the point of a file browser), but no `..`.
 fn absolute(path: &str) -> Result<PathBuf> {
-    let p = PathBuf::from(path);
-    if !p.is_absolute() {
-        bail!("{path} isn't an absolute path");
-    }
-    Ok(p)
+    crate::fsutil::checked_absolute(Path::new(path))
 }
 
 fn list_dir(path: &str) -> Result<DirListing> {
@@ -201,11 +198,27 @@ fn write_file(path: &Path, offset: u64, data: &[u8], last: bool, overwrite: bool
                 bail!("{} already exists", path.display());
             }
         }
-        std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?
+        // The partial file sits at a predictable name, often in a directory its user can
+        // write to: never write through whatever might already be there (a planted link
+        // would have us write the upload wherever it points).
+        let _ = std::fs::remove_file(&tmp);
+        crate::fsutil::open_no_follow(std::fs::OpenOptions::new().write(true).create_new(true), &tmp)
+            .with_context(|| format!("creating {}", tmp.display()))?
     } else {
-        let f = std::fs::OpenOptions::new().write(true).open(&tmp).with_context(|| format!("the upload to {} was interrupted; start again", path.display()))?;
+        let f = crate::fsutil::open_no_follow(std::fs::OpenOptions::new().write(true), &tmp)
+            .with_context(|| format!("the upload to {} was interrupted; start again", path.display()))?;
+        let m = f.metadata()?;
+        if !m.is_file() {
+            bail!("{} isn't a regular file", tmp.display());
+        }
+        // A hard link swapped in for the partial file would point the rest of the upload at
+        // another file.
+        #[cfg(unix)]
+        if std::os::unix::fs::MetadataExt::nlink(&m) != 1 {
+            bail!("{} has other links; start again", tmp.display());
+        }
         // Pieces arrive in order; anything else means a piece was lost.
-        let have = f.metadata()?.len();
+        let have = m.len();
         if have != offset {
             bail!("expected the piece at byte {have}, got {offset}");
         }
@@ -269,6 +282,56 @@ mod tests {
         write_file(&up, 0, b"z", true, true).unwrap();
         assert_eq!(std::fs::read(&up).unwrap(), b"z");
         assert!(matches!(handle(Request::ListDir { path: "relative".into() }), Reply::Error(_)));
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn relative_and_dotdot_paths_are_refused() {
+        let d = tmpdir();
+        std::fs::write(d.join("a.txt"), b"x").unwrap();
+        let dotdot = d.join("sub").join("..").join("a.txt");
+        assert!(read_file(Path::new("a.txt"), 0, 10).is_err());
+        assert!(read_file(&dotdot, 0, 10).unwrap_err().to_string().contains(".."));
+        assert!(write_file(Path::new("up.bin"), 0, b"x", true, false).is_err());
+        assert!(write_file(&dotdot, 0, b"x", true, true).unwrap_err().to_string().contains(".."));
+        assert_eq!(std::fs::read(d.join("a.txt")).unwrap(), b"x");
+        assert!(matches!(handle(Request::ListDir { path: dotdot.parent().unwrap().to_string_lossy().into() }), Reply::Error(_)));
+        assert!(matches!(handle(Request::AbortWrite { path: "up.bin".into() }), Reply::Error(_)));
+        // An abort with a `..` path leaves the partial file it would have named alone.
+        let up = d.join("up.bin");
+        write_file(&up, 0, b"abc", false, false).unwrap();
+        let sneaky = d.join("sub").join("..").join("up.bin").to_string_lossy().into_owned();
+        assert!(matches!(handle(Request::AbortWrite { path: sneaky }), Reply::Error(_)));
+        assert!(partial(&up).exists());
+        assert!(matches!(handle(Request::AbortWrite { path: up.to_string_lossy().into() }), Reply::Written { size: 0 }));
+        assert!(!partial(&up).exists());
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uploads_dont_write_through_planted_links() {
+        let d = tmpdir();
+        let victim = d.join("victim");
+        std::fs::write(&victim, b"precious").unwrap();
+        let up = d.join("up.bin");
+        // A link at the partial name before the upload starts: replaced, not followed.
+        std::os::unix::fs::symlink(&victim, partial(&up)).unwrap();
+        write_file(&up, 0, b"abc", false, false).unwrap();
+        assert!(!std::fs::symlink_metadata(partial(&up)).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
+        // A link swapped in mid-upload: refused.
+        std::fs::remove_file(partial(&up)).unwrap();
+        std::os::unix::fs::symlink(&victim, partial(&up)).unwrap();
+        assert!(write_file(&up, 3, b"def", true, false).is_err());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
+        assert!(!up.exists());
+        // Likewise a hard link.
+        std::fs::remove_file(partial(&up)).unwrap();
+        std::fs::write(&victim, b"pre").unwrap();
+        std::fs::hard_link(&victim, partial(&up)).unwrap();
+        assert!(write_file(&up, 3, b"def", true, false).unwrap_err().to_string().contains("links"));
+        assert_eq!(std::fs::read(&victim).unwrap(), b"pre");
         std::fs::remove_dir_all(&d).unwrap();
     }
 

@@ -84,8 +84,30 @@ impl State {
     pub fn save(&self, config: &Path) -> Result<()> {
         let path = Self::path(config);
         let tmp = path.with_extension("toml.tmp");
-        std::fs::write(&tmp, toml::to_string_pretty(self)?)?;
+        create_private(&tmp, 0o600)?.write_all(toml::to_string_pretty(self)?.as_bytes())?;
         std::fs::rename(&tmp, &path)?;
+        Ok(())
+    }
+
+    /// Before the watchdog acts on the paths (it copies `backup` over `exe` and runs from
+    /// `backup`): they must be exactly what [`handoff`] writes, the staged and backup
+    /// siblings of `exe`, and `running` (the watchdog's own binary, the backup copy) must be
+    /// that backup. That ties `exe` to the binary this agent is installed as. The file sits
+    /// in a root/SYSTEM-only directory; this is defence in depth.
+    fn check_paths(&self, running: &Path) -> Result<()> {
+        let exe = crate::fsutil::checked_absolute(&self.exe).context("update.toml: exe")?;
+        if exe.file_name().is_none() {
+            bail!("update.toml: exe {} isn't a file name", exe.display());
+        }
+        if self.staged != sibling(&exe, "new") {
+            bail!("update.toml: staged {} isn't {}", self.staged.display(), sibling(&exe, "new").display());
+        }
+        if self.backup != sibling(&exe, "old") {
+            bail!("update.toml: backup {} isn't {}", self.backup.display(), sibling(&exe, "old").display());
+        }
+        if running != self.backup {
+            bail!("update.toml: the watchdog runs as {}, not as the backup {}", running.display(), self.backup.display());
+        }
         Ok(())
     }
 
@@ -210,7 +232,7 @@ impl Updater {
         supervised()?;
         let exe = current_exe()?;
         let path = sibling(&exe, "new");
-        let file = create_private(&path).with_context(|| format!("creating {}", path.display()))?;
+        let file = create_private(&path, 0o700).with_context(|| format!("creating {}", path.display()))?;
         *self.download.lock().unwrap_or_else(|e| e.into_inner()) = Some(Download {
             version: version.into(),
             size,
@@ -313,7 +335,7 @@ fn handoff(config: &Path, d: &Download) -> Result<()> {
     d.file.sync_all()?;
     let exe = current_exe()?;
     let backup = sibling(&exe, "old");
-    std::fs::copy(&exe, &backup).with_context(|| format!("backing up to {}", backup.display()))?;
+    copy_private(&exe, &backup).with_context(|| format!("backing up to {}", backup.display()))?;
     make_executable(&backup)?;
     make_executable(&d.path)?;
     State {
@@ -335,6 +357,7 @@ pub fn watchdog(config: &Path) -> Result<()> {
     if state.phase != Phase::Pending {
         bail!("update state is {:?}, not pending", state.phase);
     }
+    state.check_paths(&current_exe()?)?;
     info!(from = %state.from_version, to = %state.to_version, "watchdog: swapping in the new version");
     // Let the old agent send its last status before the restart cuts it off.
     std::thread::sleep(Duration::from_secs(2));
@@ -389,16 +412,28 @@ fn supervised() -> Result<()> {
     Ok(())
 }
 
-fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
+/// A fresh file at `path` (whatever was there is removed first, and never written through),
+/// created with `mode` on unix.
+fn create_private(path: &Path, mode: u32) -> std::io::Result<std::fs::File> {
     let _ = std::fs::remove_file(path);
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o700);
+        opts.mode(mode);
     }
+    #[cfg(not(unix))]
+    let _ = mode;
     opts.open(path)
+}
+
+/// Copies `from` to a fresh file at `to` (see [`create_private`]).
+fn copy_private(from: &Path, to: &Path) -> std::io::Result<()> {
+    let mut src = std::fs::File::open(from)?;
+    let mut dst = create_private(to, 0o700)?;
+    std::io::copy(&mut src, &mut dst)?;
+    dst.sync_all()
 }
 
 fn make_executable(_path: &Path) -> Result<()> {
@@ -448,7 +483,7 @@ fn swap_in(staged: &Path, exe: &Path) -> Result<()> {
 fn restore(backup: &Path, exe: &Path) -> Result<()> {
     // Copy, then rename over: the running watchdog is the backup itself.
     let tmp = sibling(exe, "restore");
-    std::fs::copy(backup, &tmp)?;
+    copy_private(backup, &tmp).with_context(|| format!("copying {} to {}", backup.display(), tmp.display()))?;
     make_executable(&tmp)?;
     std::fs::rename(&tmp, exe)?;
     systemctl(&["restart", UNIT])
@@ -551,6 +586,65 @@ mod tests {
         assert_eq!(back.phase, Phase::Pending);
         assert_eq!(back.to_version, "0.2.0");
         State::clear(&cfg);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn watchdog_only_acts_on_the_paths_handoff_writes() {
+        let exe = if cfg!(windows) { PathBuf::from("C:\\RMM\\rmm-agent.exe") } else { PathBuf::from("/usr/local/bin/rmm-agent") };
+        let good = State {
+            from_version: "0.1.0".into(),
+            to_version: "0.2.0".into(),
+            phase: Phase::Pending,
+            detail: None,
+            staged: sibling(&exe, "new"),
+            backup: sibling(&exe, "old"),
+            exe: exe.clone(),
+        };
+        let running = good.backup.clone();
+        good.check_paths(&running).unwrap();
+        assert!(good.check_paths(&exe).is_err(), "the watchdog runs from the backup");
+        let elsewhere = if cfg!(windows) { PathBuf::from("C:\\Users\\x\\rmm-agent.old.exe") } else { PathBuf::from("/tmp/rmm-agent.old") };
+        let bad = [
+            State { backup: elsewhere.clone(), ..good.clone() },
+            State { staged: elsewhere.with_file_name("x"), ..good.clone() },
+            State { exe: "rmm-agent".into(), staged: "rmm-agent.new".into(), backup: "rmm-agent.old".into(), ..good.clone() },
+            State { exe: exe.parent().unwrap().join("..").join("bin").join("rmm-agent"), ..good.clone() },
+        ];
+        for s in bad {
+            assert!(s.check_paths(&s.backup.clone()).is_err() && s.check_paths(&running).is_err(), "{s:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_and_restore_copies_dont_write_through_links() {
+        let dir = std::env::temp_dir().join(format!("rmm-update-links-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let victim = dir.join("victim");
+        std::fs::write(&victim, b"precious").unwrap();
+        let cfg = dir.join("agent.toml");
+        std::os::unix::fs::symlink(&victim, State::path(&cfg).with_extension("toml.tmp")).unwrap();
+        let s = State {
+            from_version: "0.1.0".into(),
+            to_version: "0.2.0".into(),
+            phase: Phase::Pending,
+            detail: None,
+            exe: dir.join("rmm-agent"),
+            staged: dir.join("rmm-agent.new"),
+            backup: dir.join("rmm-agent.old"),
+        };
+        s.save(&cfg).unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
+        assert_eq!(State::load(&cfg).unwrap().unwrap().to_version, "0.2.0");
+
+        std::fs::write(&s.backup, b"old agent").unwrap();
+        let tmp = sibling(&s.exe, "restore");
+        std::os::unix::fs::symlink(&victim, &tmp).unwrap();
+        copy_private(&s.backup, &tmp).unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
+        assert_eq!(std::fs::read(&tmp).unwrap(), b"old agent");
+        assert!(!std::fs::symlink_metadata(&tmp).unwrap().file_type().is_symlink());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

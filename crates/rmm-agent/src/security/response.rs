@@ -65,8 +65,11 @@ pub fn kill_process(pid: u32, tree: bool) -> Result<(String, serde_json::Value)>
     Ok((msg, serde_json::json!({ "killed": killed, "skipped": skipped })))
 }
 
+/// A technician's request: any absolute path, OS files included (no [`super::quarantine::guarded`]
+/// check; that only stops automatic quarantine), but no `..`.
 pub fn quarantine_file(path: &str) -> Result<(String, serde_json::Value)> {
-    let item = Store::open()?.quarantine(Path::new(path), Some("quarantined by a technician".into()), None)?;
+    let path = crate::fsutil::checked_absolute(Path::new(path))?;
+    let item = Store::open()?.quarantine(&path, Some("quarantined by a technician".into()), None)?;
     Ok((format!("Quarantined {} ({} bytes)", item.path, item.size), serde_json::to_value(&item)?))
 }
 
@@ -242,6 +245,14 @@ mod tests {
         assert!(child.wait().is_ok());
         assert!(kill_process(1, false).unwrap_err().to_string().contains("protected"));
         assert!(kill_process(u32::MAX - 7, false).is_err());
+    }
+
+    /// Checked before the store is even opened, so this touches nothing.
+    #[test]
+    fn quarantine_needs_an_absolute_path_without_dotdot() {
+        assert!(quarantine_file("evil.bin").unwrap_err().to_string().contains("absolute"));
+        let up = if cfg!(windows) { "C:\\no-such-dir-rmm\\..\\evil.bin" } else { "/no-such-dir-rmm/../evil.bin" };
+        assert!(quarantine_file(up).unwrap_err().to_string().contains(".."));
     }
 
     #[test]

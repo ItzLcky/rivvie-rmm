@@ -2,6 +2,7 @@ mod collect;
 mod config;
 mod conn;
 mod desktop;
+mod fsutil;
 mod jobs;
 mod logwatch;
 mod patch;
