@@ -239,6 +239,13 @@ pub enum AgentMsg {
         request_id: Uuid,
         reply: tools::Reply,
     },
+    /// Hashes of programs this machine ran that its own database doesn't know, each asked once
+    /// (at most [`security::REPUTATION_BATCH`]); only sent when the policy says the server
+    /// answers ([`security::SensorPolicy::reputation`]). Answered with
+    /// [`ServerMsg::ReputationResult`].
+    ReputationQuery {
+        hashes: Vec<security::HashSeen>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -404,6 +411,12 @@ pub enum ServerMsg {
         signature: String,
     },
     SensorPolicy(security::SensorPolicy),
+    /// The signature database to run (only to agents listing [`security::SIGDB_CAPABILITY`]);
+    /// `None` means none (every version was rolled back). The file comes over HTTPS, not this
+    /// socket.
+    Database {
+        offer: Option<security::DatabaseOffer>,
+    },
     /// The server stored this detection.
     SensorDetectionAck {
         id: String,
@@ -422,6 +435,10 @@ pub enum ServerMsg {
     Tool {
         request_id: Uuid,
         request: tools::Request,
+    },
+    /// The hashes of a [`AgentMsg::ReputationQuery`] the server knows as malicious.
+    ReputationResult {
+        known: Vec<security::HashKnown>,
     },
 }
 
@@ -671,7 +688,24 @@ impl OsFamily {
     }
 }
 
-/// Small identity block sent at enrollment.
+/// Workstation or server, as the agent sees its machine (it picks the device category).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Platform {
+    Workstation,
+    Server,
+}
+
+impl Platform {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Platform::Workstation => "workstation",
+            Platform::Server => "server",
+        }
+    }
+}
+
+/// Small identity block sent at enrollment (and inside every inventory).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemInfo {
     pub hostname: String,
@@ -683,6 +717,9 @@ pub struct SystemInfo {
     pub agent_version: String,
     /// Stable machine id (/etc/machine-id, MachineGuid, IOPlatformUUID).
     pub machine_id: Option<String>,
+    /// None from builds that predate it (the server then guesses from the OS name).
+    #[serde(default)]
+    pub platform: Option<Platform>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -780,6 +817,27 @@ mod tests {
     }
 
     #[test]
+    fn system_info_without_platform_decodes() {
+        // What builds before platform reporting send.
+        #[derive(Serialize)]
+        struct Old {
+            hostname: &'static str,
+            os_family: OsFamily,
+            os_name: &'static str,
+            os_version: &'static str,
+            kernel_version: &'static str,
+            arch: &'static str,
+            agent_version: &'static str,
+            machine_id: Option<String>,
+        }
+        let old = Old { hostname: "h", os_family: OsFamily::Windows, os_name: "Windows", os_version: "", kernel_version: "", arch: "x86_64", agent_version: "0.1.0", machine_id: None };
+        let s: SystemInfo = decode(&encode(&old).unwrap()).unwrap();
+        assert_eq!((s.hostname.as_str(), s.platform), ("h", None));
+        let new = SystemInfo { platform: Some(Platform::Server), ..s };
+        assert_eq!(decode::<SystemInfo>(&encode(&new).unwrap()).unwrap().platform, Some(Platform::Server));
+    }
+
+    #[test]
     fn unknown_service_state_decodes() {
         #[derive(Serialize)]
         struct Raw {
@@ -791,6 +849,27 @@ mod tests {
         let buf = encode(&Raw { name: "x", display_name: "", state: "reloading-ish", start_mode: "weird" }).unwrap();
         let s: ServiceInfo = decode(&buf).unwrap();
         assert_eq!((s.state, s.start_mode), (ServiceState::Unknown, StartMode::Unknown));
+    }
+
+    #[test]
+    fn old_sensor_policies_mean_no_realtime_and_reputation_roundtrips() {
+        // A server that predates real-time protection and reputation sends neither field.
+        #[derive(Serialize)]
+        struct Old {
+            enabled: bool,
+        }
+        let p: security::SensorPolicy = decode(&encode(&Old { enabled: true }).unwrap()).unwrap();
+        assert_eq!((p.realtime, p.scan_on_write, p.archive_depth, p.reputation), (security::RealtimeMode::Off, false, 0, false));
+        let q = AgentMsg::ReputationQuery { hashes: vec![security::HashSeen { sha256: "ab".repeat(32), path: Some("/usr/bin/x".into()) }] };
+        match decode::<AgentMsg>(&encode(&q).unwrap()).unwrap() {
+            AgentMsg::ReputationQuery { hashes } => assert_eq!(hashes[0].path.as_deref(), Some("/usr/bin/x")),
+            other => panic!("{other:?}"),
+        }
+        let r = ServerMsg::ReputationResult {
+            known: vec![security::HashKnown { sha256: "ab".repeat(32), name: "X".into(), severity: security::ThreatSeverity::High, source: "list:x".into() }],
+        };
+        assert!(matches!(decode::<ServerMsg>(&encode(&r).unwrap()).unwrap(), ServerMsg::ReputationResult { known } if known[0].source == "list:x"));
+        assert_eq!(security::RealtimeMode::parse("block").map(security::RealtimeMode::as_str), Some("block"));
     }
 
     #[test]
@@ -894,6 +973,7 @@ mod tests {
             arch: String::new(),
             machine_id: None,
             agent_version: String::new(),
+            platform: None,
         };
         let buf = encode(&Old::Enroll { protocol: 1, token: "t".into(), system }).unwrap();
         assert!(matches!(decode::<AgentMsg>(&buf).unwrap(), AgentMsg::Enroll { previous: None, .. }));

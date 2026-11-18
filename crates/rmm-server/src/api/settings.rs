@@ -21,7 +21,6 @@ pub struct SettingsView {
     /// RMM_SESSION_IDLE_HOURS, used when `session_idle_hours` is null.
     session_idle_hours_default: u32,
     require_2fa_all: bool,
-    auto_update_agents: bool,
 }
 
 fn view(st: &AppState) -> SettingsView {
@@ -31,7 +30,6 @@ fn view(st: &AppState) -> SettingsView {
         session_idle_hours: c.session_idle_hours,
         session_idle_hours_default: st.cfg.session_idle_hours,
         require_2fa_all: c.require_2fa_all,
-        auto_update_agents: c.auto_update_agents,
     }
 }
 
@@ -46,8 +44,6 @@ pub struct Update {
     session_idle_hours: Option<i32>,
     /// Omitted = unchanged.
     require_2fa_all: Option<bool>,
-    /// Omitted = unchanged.
-    auto_update_agents: Option<bool>,
 }
 
 pub async fn update(State(st): State<Arc<AppState>>, u: User, Json(b): Json<Update>) -> ApiResult<Json<SettingsView>> {
@@ -63,8 +59,7 @@ pub async fn update(State(st): State<Arc<AppState>>, u: User, Json(b): Json<Upda
     }
     let new: Company = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "UPDATE company_settings
-            SET company_name = $1, session_idle_hours = $2, require_2fa_all = COALESCE($4, require_2fa_all),
-                auto_update_agents = COALESCE($5, auto_update_agents), updated_at = now(), updated_by = $3
+            SET company_name = $1, session_idle_hours = $2, require_2fa_all = COALESCE($4, require_2fa_all), updated_at = now(), updated_by = $3
          RETURNING {}",
         Company::COLUMNS
     )))
@@ -72,7 +67,6 @@ pub async fn update(State(st): State<Arc<AppState>>, u: User, Json(b): Json<Upda
     .bind(b.session_idle_hours)
     .bind(u.id)
     .bind(b.require_2fa_all)
-    .bind(b.auto_update_agents)
     .fetch_one(&st.db)
     .await?;
     *st.company.write().unwrap_or_else(|e| e.into_inner()) = new.clone();
@@ -85,7 +79,6 @@ pub async fn update(State(st): State<Arc<AppState>>, u: User, Json(b): Json<Upda
             "company_name": new.company_name,
             "session_idle_hours": new.session_idle_hours,
             "require_2fa_all": new.require_2fa_all,
-            "auto_update_agents": new.auto_update_agents,
         }),
     )
     .await;

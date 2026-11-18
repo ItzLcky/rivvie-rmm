@@ -21,6 +21,7 @@
 	import Tabs from '#lib/ui/Tabs.svelte';
 	import AlertStateBadge from '#lib/components/AlertStateBadge.svelte';
 	import SeverityBadge from '#lib/components/SeverityBadge.svelte';
+	import MaintenanceWindows from '#lib/components/MaintenanceWindows.svelte';
 
 	const sort = sortState('opened', 'desc');
 	let q = $state(param('q'));
@@ -127,7 +128,7 @@
 				<EmptyState compact title="No alerts match" />
 			{:else if view === 'active' || view === 'open'}
 				<EmptyState icon={BellRing} title="All clear" description="No open alerts. Policies decide what raises one: offline agents, CPU, memory, disk, services, failed jobs and log entries.">
-					{#snippet action()}<Button href={withClient('/policies')} icon={ShieldCheck}>Alert policies</Button>{/snippet}
+					{#snippet action()}<Button href={withClient('/policies')} icon={ShieldCheck}>Policies</Button>{/snippet}
 				</EmptyState>
 			{:else}
 				<EmptyState compact title="No alerts yet" />
@@ -151,3 +152,5 @@
 		{/snippet}
 	</DataTable>
 {/if}
+
+<MaintenanceWindows />

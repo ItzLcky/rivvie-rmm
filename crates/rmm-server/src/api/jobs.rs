@@ -42,7 +42,7 @@ const JOB_COLS: &str = "j.id, j.agent_id, a.hostname, j.script_id, sc.name AS sc
        u.name AS created_by_name, j.created_at, j.sent_at, j.finished_at, j.duration_ms, j.schedule_id, sch.name AS schedule_name";
 const JOB_FROM: &str = "FROM jobs j JOIN agents a ON a.id = j.agent_id JOIN sites s ON s.id = a.site_id
        LEFT JOIN scripts sc ON sc.id = j.script_id LEFT JOIN users u ON u.id = j.created_by
-       LEFT JOIN schedules sch ON sch.id = j.schedule_id";
+       LEFT JOIN policy_items sch ON sch.id = j.schedule_id";
 
 pub async fn list_for_agent(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uuid>) -> ApiResult<Json<Vec<JobRow>>> {
     super::access::agent(&st, &u, id).await?;

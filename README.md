@@ -44,12 +44,13 @@ docs/           Roadmap and design notes
 - **Transport:** the agent dials out, so endpoints need no inbound ports. Everything is multiplexed over one WebSocket: heartbeats (every 30 s), inventory (every 6 h or on demand), script jobs, and PTY streams. The agent reconnects with jittered exponential backoff, and treats 100 s of silence from the server as a dead connection.
 - **Jobs:** sending a script to an offline agent queues it, and it runs on reconnect (queued jobs expire after `RMM_JOB_QUEUE_DAYS`). Output streams into Postgres (capped at 1 MB per stream). Jobs outlive the connection: the agent keeps a copy of each job's output and its result, and resends them after a reconnect or server restart until the server acknowledges them. The agent also keeps each job on disk (`job-results` in its state directory) until the server acknowledges it, so results survive an agent restart, crash or self-update too; a job that was still running when the agent stopped is reported as `error` with the output it had produced. A job is only marked `lost` when the agent comes back with no record of it (its state was wiped) or never comes back. Timeouts kill the whole process tree (a process group on Unix, a Job Object on Windows), and closing a terminal kills everything started from it.
 - **Terminal:** xterm.js ↔ server relay ↔ PTY on the agent (bash/zsh on Linux, PowerShell through ConPTY on Windows).
-- **Remote desktop:** view and control the machine's screen from the browser, relayed over the agent's existing socket (no extra ports). Changed areas are sent as JPEG, paced by the browser so slow links get fewer frames rather than lag. Optional consent prompt per client. See [Remote desktop](#remote-desktop).
+- **Remote desktop:** view and control the machine's screen from the browser, relayed over the agent's existing socket (no extra ports). Changed areas are sent as JPEG, paced by the browser so slow links get fewer frames rather than lag. An optional consent prompt, and whether remote desktop, the terminal and file access are allowed at all, come from the device's policy set. See [Remote desktop](#remote-desktop).
 - **Per-client access:** admins see every client. Technicians and read-only users see every client by default, or only the clients an admin picks under Company settings → Users. Everything they can reach (agents, sites, tokens, jobs, terminal, dashboard counts) is scoped to those clients, and anything outside them reads as "not found". Scripts are MSP-wide (admins edit them; they run anywhere) or belong to one client (its technicians edit them; they only run on its agents).
-- **Alerting:** alert policies, per client or site (and optionally one OS, minus agents you leave out), raise alerts for agents that are offline, CPU, memory or disk held over a threshold, a stopped or failed service, a failed script, a log entry that matches, failed patch installs and restarts left pending. Offline and threshold policies are checked every minute; the others act as agents report. An alert stays open until its condition clears (or someone resolves it), reminds its channels while nobody acknowledges it, and feeds the health model. Maintenance windows and snoozes hold alerts back during planned work. See [Monitoring and alerts](#monitoring-and-alerts).
+- **Policies:** every device sits in one device category (Windows, Linux or macOS, workstation or server, or one you make, such as kiosks) and uses one policy set from a tree that starts at *All devices*. Sets inherit everything above them and can override single fields; a client or one of its sites is assigned a set per category, and a single device can be pinned to its own. Alert policies, scheduled scripts, patching, the security policy, remote access and automatic agent updates all live there, and each device's page says which set it uses, why, and where each of its policies comes from. See [Policies](#policies).
+- **Alerting:** alert policies, in a policy set (optionally limited to one client or site, minus devices you leave out), raise alerts for agents that are offline, CPU, memory or disk held over a threshold, a stopped or failed service, a failed script, a log entry that matches, failed patch installs and restarts left pending. Offline and threshold policies are checked every minute; the others act as agents report. An alert stays open until its condition clears (or someone resolves it), reminds its channels while nobody acknowledges it, and feeds the health model. Maintenance windows and snoozes hold alerts back during planned work. See [Monitoring and alerts](#monitoring-and-alerts).
 - **Processes and files:** technicians see an agent's processes live and kill them (or a whole tree), and browse its file system, downloading and uploading files of any size in pieces over the agent's socket. Kills and transfers are audited.
-- **Schedules:** saved scripts run on a cron timetable, in any time zone, on every agent of a client or site. Each schedule keeps its runs' output for as many days as you choose.
-- **Patch management:** agents scan for OS updates (Windows Update Agent, apt, dnf/yum, pacman, softwareupdate) when they connect and every `RMM_PATCH_SCAN_HOURS`. Patch policies approve updates by category or severity and can install them during each site's maintenance window, with a reboot policy. Technicians approve, decline and install from the Patches page or an agent's Patches tab, and the Compliance tab shows how many agents per client are fully patched. See [Patch management](#patch-management).
+- **Schedules:** saved scripts run on a cron timetable, in any time zone, on every device using a policy set (or a set below it), optionally limited to one client or site. Each schedule keeps its runs' output for as many days as you choose.
+- **Patch management:** agents scan for OS updates (Windows Update Agent, apt, dnf/yum, pacman, softwareupdate) when they connect and every `RMM_PATCH_SCAN_HOURS`. The patch policy approves updates by category or severity and can install them during each site's maintenance window (or a window of its own, so servers and workstations at one site patch at different times), with a reboot policy. Technicians approve, decline and install from the Patches page or an agent's Patches tab, and the Compliance tab shows how many agents per client are fully patched. See [Patch management](#patch-management).
 - **Endpoint protection:** agents report the antivirus the machine already has (Microsoft Defender and other Windows Security Center products, ClamAV, XProtect), and can run our own sensor: telemetry, behaviour rules and file scanning from signed content rolled out to canary clients first, quarantine, network isolation, triage packages and fleet-wide hunting. Technicians start scans and signature updates from the Security page or an agent's Security tab, and alert policies raise alerts for protection that's off or out of date and for threats. See [Endpoint protection](#endpoint-protection).
 - **Self-update:** agents install new versions signed with an offline ed25519 key whose public half is compiled into the agent, and roll themselves back if the new version can't reconnect. See [Agent updates](#agent-updates).
 - **Security:** argon2id passwords; opaque, revocable session tokens in an HttpOnly SameSite=Strict cookie, with an idle timeout and a 7-day cap; users can change their password and review or revoke their sessions, and admins can reset passwords, re-enable users, and revoke anyone's sessions; TOTP two-factor auth with single-use recovery codes, required for admins and optionally for everyone; an Origin check on the terminal and desktop sockets; three roles (admin / technician / readonly); an audit log covering logins, shells, remote desktop sessions, jobs, enrollment, and deletes. Failed sign-ins are rate-limited per client IP and per account, and bad enrollment tokens per IP (see `RMM_TRUSTED_PROXIES`). The dashboard ships a hash-based script CSP, so no inline or third-party script runs.
@@ -331,11 +332,45 @@ with power-loss protection, not a copy-on-write filesystem such as btrfs), and b
 4.5 MB of database per agent at the default metric retention. `rmm-loadgen` repeats the test
 against your own hardware.
 
+## Policies
+
+**Policies** (Monitoring → Policies) has three tabs.
+
+- **Policy sets**: one tree. *All devices* is the root, with Windows, Linux and macOS below it and
+  a workstation and a server set below each of those. Add your own sets anywhere below (eight
+  levels at most): MSP-wide ones, or sets that belong to one client, which only its devices can use
+  and its technicians can change. Each row shows how many devices use the set and what it defines
+  or overrides.
+- **Device categories**: every device is in exactly one. The six built-in ones (Windows, Linux,
+  macOS × workstation, server) fill themselves from what the agent reports; a custom category
+  (kiosks, SQL servers) is filled by hand from the Agents list (**Change category**) or by an
+  enrollment token that names it. Each category has a default set.
+- **Assignments**: per client, the set each category uses, for the whole client or one site.
+
+**Which set a device uses** is the first of: a set pinned to it, the set assigned to its site for
+its category, the one assigned to its client, the category's default. The agent's **Policy** section
+says which and why, lets technicians change its category, pin a set, or **Customize for this
+device** (a new set below its current one, named after the host and pinned to it), and lists every
+policy that reaches it with the set it's defined in and the sets that change it.
+
+**Inheritance.** A set gets every policy of the sets above it. Alert policies and scheduled scripts
+can be added to any set (and optionally limited to one client or site, minus single devices).
+Patching, the security policy, remote access and the agent policy exist once, in All devices. On a
+set's page each policy, and each of its fields, says whether it's defined here, inherited (and from
+which set) or overridden here. Changing an inherited field stores only that field in the set's
+override; **Reset** next to it goes back to the inherited value, and **Reset all** drops the
+override. A scheduled script's timetable stays the same everywhere; sets below can change its
+arguments and timeout, or switch it off. A change that would leave any set below with an invalid
+policy is refused with the name of that set.
+
 ## Monitoring and alerts
 
-**Policies** (Monitoring → Alert policies) say what to watch and where. Admins write MSP-wide
-policies; technicians write policies for the clients they can see. Each has a severity: open
-critical alerts make an agent *unhealthy*, warnings make it *need attention*.
+**Alert policies** say what to watch. They live in [policy sets](#policies) (a set's **Alerts**
+section) and apply to every device using that set or one below it. Admins write MSP-wide ones;
+technicians write ones limited to the clients they can see, or in a client's own sets. Each has a
+severity: open critical alerts make an agent *unhealthy*, warnings make it *need attention*. An
+alert policy can also run a saved script on the device when its alert opens (once; while a
+maintenance window holds the alert back, when the window ends), and the alert links to that job.
 
 | Type | Opens when | Clears when |
 |---|---|---|
@@ -347,13 +382,13 @@ critical alerts make an agent *unhealthy*, warnings make it *need attention*.
 | Patches | an update failed to install (one alert per agent), or a restart to finish updates has been pending for N hours | the updates install or are declined; the restart happens |
 | Antivirus | no product on, real-time off, signatures older than N hours, a threat, our sensor down, or an online agent that hasn't reported its protection state for N hours (agents resend it at least hourly) | the condition goes away |
 
-**Leaving one agent out.** A policy covers every agent of its client or site; the agent's Alerts tab
-lists the policies that cover it and can exclude it from any of them (its open alerts from that
-policy close quietly). The policy page lists its excluded agents.
+**Leaving one agent out.** The agent's Policy section lists the policies that reach it and can leave
+it out of any alert policy or scheduled script (its open alerts from that policy close quietly).
+The policy lists its excluded devices where it's defined.
 
 **Maintenance windows and snoozes** hold alerts back for a client, a site or one agent: a one-off
-period (snooze an agent from its page before planned work) or a weekly window (Alert policies →
-Maintenance windows, e.g. weekend patching). Alerts that open meanwhile are recorded but marked
+period (snooze an agent from its page before planned work) or a weekly window (at the bottom of the
+Alerts page, e.g. weekend patching). Alerts that open meanwhile are recorded but marked
 muted: nobody is notified, no ticket opens, and they don't count against health. Any still open
 when the window ends are announced then, as if they had just opened.
 
@@ -406,7 +441,8 @@ private key stays on a build machine or in CI.
    secret `RMM_UPDATE_SIGNING_KEY` (the key file's contents) and push a `v0.2.0` tag.
 4. Put the binary and its `.update.json` in `RMM_AGENT_DIR` (the image already has them there).
    Agents → **Update N outdated** (or the agent page's **Update** button) offers it. Turn on
-   **Update agents automatically** under Company settings to offer it whenever an agent connects.
+   **Update agents automatically** in the agent policy (Policies → All devices → Agent, or any set
+   below it, say to leave servers to be updated by hand) to offer it whenever an agent connects.
 
 The agent checks that the version is newer than its own, downloads it over its socket, and
 verifies the checksum and signature. It then waits for running jobs to finish (at most 30 minutes)
@@ -435,12 +471,12 @@ Each agent scans with its OS's own update mechanism:
 `rmm-agent patches` runs a scan in the foreground and prints what the server would get, and
 `rmm-agent patches --install ID…` installs. Both are useful for debugging a machine.
 
-**Approval.** The patch policy that applies to an agent approves updates by category (security,
-critical, definitions, rollups, updates, drivers, feature updates) or by vendor severity
-(critical, important, moderate, low; only Windows and RHEL/Fedora rate updates). There is one
-MSP-wide policy, which by default approves security, critical and definition updates and installs
-nothing on its own. Clients and sites can have their own, and the most specific one applies,
-whole. A person's approve or decline overrides the policy until someone resets it. Made for a
+**Approval.** The patch policy approves updates by category (security, critical, definitions,
+rollups, updates, drivers, feature updates) or by vendor severity (critical, important, moderate,
+low; only Windows and RHEL/Fedora rate updates). It's set in All devices (Policies, or **Patch
+policy** on the Patches page), which by default approves security, critical and definition updates
+and installs nothing on its own, and any [policy set](#policies) below can override single fields
+of it, so one client's servers can install automatically while the rest don't. A person's approve or decline overrides the policy until someone resets it. Made for a
 client, a site or everything (rather than picked agents), it also covers agents that report the
 update later; resetting the scope hands the update back to the policy. Declined updates don't count
 against compliance.
@@ -451,7 +487,7 @@ policy turns failed installs and long-pending restarts into alerts.
 
 **Installing.** With **Install automatically** on, the server starts installs for approved
 updates (after the policy's deferral, counted from when the update was first seen) while the
-site's maintenance window is open. A site without a window installs whenever updates are
+site's maintenance window is open, or the policy's own install window when it has one. A site without a window installs whenever updates are
 eligible. Installing by hand from the dashboard starts right away, ignoring windows and
 deferrals. The reboot policy (never, if required, always) decides whether the agent restarts the
 machine afterwards, with a one-minute warning. Failed updates are retried automatically up to
@@ -575,8 +611,9 @@ screen and injects input; the agent relays between it and the server over its on
 - Keys are sent by physical position, so the remote machine's own keyboard layout applies.
   **Type text** types a string independently of the layout (handy for passwords).
 - Multiple monitors: pick one from the toolbar.
-- **Consent:** under a client's settings, admins can turn on **Ask the user before connecting**.
-  The person at the machine gets an Allow/Deny prompt (a message box on Windows; zenity, kdialog
+- **Consent:** the remote access policy (a policy set's **Remote access** section) can turn on
+  **Ask the user before a remote desktop session starts**, and can switch remote desktop, the
+  terminal or file access off; a refused session names the set that turned it off. The person at the machine gets an Allow/Deny prompt (a message box on Windows; zenity, kdialog
   or xmessage on Linux) and the session is refused if nobody answers within 30 seconds. If
   nobody is signed in, there is nobody to ask and the session starts.
 - Every session is in the audit log (`desktop.open`, `desktop.close` with its duration).
@@ -617,11 +654,11 @@ quick_scan` (or `full_scan`, `update_signatures`) runs an action in the foregrou
 
 ### Our own sensor
 
-Turn it on per client or site under **Security → Settings** (the MSP-wide policy is off by default). The agent then starts `rmm-agent sensor`, a separate process it restarts if it crashes, which:
+Turn it on in the security policy (Policies → All devices → Security, or any set below it for some devices only; it's off in All devices by default). The agent then starts `rmm-agent sensor`, a separate process it restarts if it crashes, which:
 
 - records telemetry (process starts with their parents and image hashes, network connections, changes to autostart locations, SSH keys and profiles, Windows Run keys and services, kernel modules) in a local store capped by the policy (`telemetry_mb`). It stays on the machine; the console queries it (an agent's Security tab, the detection page, and **Hunt** across the fleet).
-- runs behaviour rules on every event, scans files (quick and full scans on the policy's schedule, one path on demand, every program as it starts) against hashes and file rules, and watches ransomware decoys it places in each user's folder.
-- quarantines what scans find (high and severe, with **auto-quarantine** on) into a store only root/SYSTEM can read. Files can be restored byte for byte, optionally excluding their hash.
+- runs behaviour rules on every event, scans files (quick and full scans on the policy's schedule, one path on demand, every program as it starts) with its own engine (hash signatures, YARA rules and heuristics, looking inside zip/gzip/bzip2/xz/tar archives, Office macros, shortcuts and PDF/HTML scripts; files unchanged since a clean scan aren't read again), and watches ransomware decoys it places in each user's folder.
+- quarantines what scans find (high and severe, with **auto-quarantine** on) into a store only root/SYSTEM can read. Files can be restored byte for byte, optionally excluding their hash. The operating system's own files and the agent are never quarantined automatically.
 
 Detection content is a signed bundle, never code from the server:
 
@@ -632,12 +669,26 @@ rmm-sign sign-content --key release.key content/starter.json  # writes content/s
 
 Upload both files under **Security → Content**. A new version goes to canary clients first, and everyone gets it after `RMM_CONTENT_SOAK_MINUTES` (1440) unless the canaries show trouble (the sensor crashing, new rules firing widely, or a false-positive verdict), in which case it's rolled back. Agents verify the signature with the release key they were built with (`RMM_UPDATE_PUBKEY`); set the same variable on the server to check uploads there too. `content/build_starter.py` regenerates the starter bundle.
 
+Hash signatures and YARA rules come in a **signature database**, a separate signed file built offline from feeds you download yourself:
+
+```sh
+rmm-sign build-db --key release.key --version 2026.11.15.1 --rules content/yara \
+    --sha256 sha256_hashes.txt --yara yara-forge-core.yar --clamav main.hdb --benign /usr/bin --out sigs.rmmdb
+rmm-sign inspect-db --pubkey <hex> --rules sigs.rmmdb
+```
+
+`build-db` imports plain SHA-256 lists and MalwareBazaar CSV exports, YARA rule files (YARA Forge packages, for example) and ClamAV `.hdb`/`.hsb` hash signatures, adds the first-party rules in `content/yara`, and refuses to write the file if any first-party rule fails its samples or anything other than an audit-mode heuristic matches the benign files. `content/feeds-example` shows each format. **Which feeds you may use commercially is yours to check:** MalwareBazaar data is CC0, YARA Forge and other rule sets carry their own licences (kept with each rule and shown in the console), and ClamAV's signatures are GPL. Upload the `.rmmdb` with `POST /api/security/databases` (the file as the body; there's no console page for it yet); it goes through the same canary stages and automatic rollback as content, agents download it over HTTPS with their own credentials, check its signature, and keep the previous version to fall back on. Rolling back the general version brings back the one before it. Building the agent with `--no-default-features` leaves the YARA engine out (about 1.5 MB smaller): hash signatures still match and the agent reports the rules as unsupported.
+
+**Real-time protection** (policy field `realtime`: `off`, `audit` or `block`; `scan_on_write`; `archive_depth`; in the security policy of a policy set). On Linux, with the sensor running as root, every program is checked before it runs (fanotify exec permission events, on every local filesystem; network, FUSE and pseudo filesystems are skipped) and files are scanned after they're written. **Block** refuses a program that matches a hash signature or a high-confidence blocking rule with **prevention** on; **audit** decides the same way but never refuses or acts. A check that takes longer than 500 ms lets the program run and finishes in the background (then kills and quarantines it if it must). Our own processes are never held up and package-manager writes are never quarantined. Without fanotify permission events (an old kernel, a container without `CAP_SYS_ADMIN`) and on Windows and macOS, programs are scanned just after they start, and the agent's Security status says so. `scripts/test-onaccess.sh` runs its tests as root in a privileged container.
+
+**Reputation.** Agents ask the server, in batches and once per hash, about programs their own database doesn't know; a known hash raises an alert (never a block or quarantine: the answer isn't signed). The server's set is the newest database plus hash lists that agents never download (`PUT /api/security/reputation/lists/{name}?severity=high`, one SHA-256 per line, optionally with a name), so a large feed can live on the server only. `GET /api/security/prevalence?sha256=` answers which machines have run a hash and since when, and `GET /api/security/reputation/rare` lists programs seen on few machines: hunting leads, counted within the clients a technician can see.
+
 Rules start in **audit** mode (recorded, not alerted). Promote them under **Security → Rules** once their hit counts and verdicts look right; **disabled** is a fleet-wide kill switch. **Block** (kill the process or quarantine the file) needs a high-confidence rule, 7 days in general content without false positives, and **prevention** on in the policy.
 
 Response actions (technicians with `security.respond`): kill a process tree, quarantine/restore/delete files, isolate the machine (only the RMM server, DNS and DHCP stay reachable; nftables/iptables, Windows Firewall or pf), and collect a triage package (.tar.gz of processes, connections, autoruns, logs and recent telemetry). Every action is audited. Permissions: `security.read`, `security.respond`, `security.manage`, granted by role or set per user under **Company settings → Users**.
 
 `RMM_DATA_KEY` (see Server configuration) also encrypts detection context at rest: it contains command lines, which can contain passwords.
 
-Limits: the Windows and macOS sensors are compile-checked only and poll for processes (fast short-lived processes can be missed; ETW and Endpoint Security are planned); on Linux the real-time process source needs root. ClamAV's own on-access detections aren't collected yet. See the roadmap for the rest.
+Limits: the Windows and macOS sensors are compile-checked only and poll for processes (fast short-lived processes can be missed; ETW and Endpoint Security are planned); on Linux the real-time process source and on-access protection need root. ClamAV's own on-access detections aren't collected yet. See the roadmap for the rest.
 
 See [docs/ROADMAP.md](docs/ROADMAP.md) for what's next: the rest of the PSA and more.

@@ -118,6 +118,13 @@ pub struct AgentSummary {
     reboot_pending_since: Option<DateTime<Utc>>,
     /// Alerts are held back right now (maintenance window or snooze).
     alerts_muted: bool,
+    /// workstation / server.
+    platform: String,
+    category_id: Uuid,
+    category_name: String,
+    /// The policy set it uses (see `/agents/{id}/policy` for why).
+    policy_set_id: Uuid,
+    policy_set_name: String,
     #[sqlx(default)]
     #[serde(skip)]
     sort_key: String,
@@ -136,7 +143,9 @@ pub(crate) const SUMMARY_COLS: &str = concat!(
     patches_overdue!(),
     " AS patches_overdue, ",
     patches_failed!(),
-    " AS patches_failed, a.reboot_pending, a.reboot_pending_since, agent_muted(a.id, now()) AS alerts_muted"
+    " AS patches_failed, a.reboot_pending, a.reboot_pending_since, agent_muted(a.id, now()) AS alerts_muted, a.platform, a.category_id,
+       (SELECT dc.name FROM device_categories dc WHERE dc.id = a.category_id) AS category_name, a.policy_set_id,
+       (SELECT ps.name FROM policy_sets ps WHERE ps.id = a.policy_set_id) AS policy_set_name"
 );
 const AGENT_FROM: &str = "FROM agents a JOIN sites s ON s.id = a.site_id JOIN clients c ON c.id = s.client_id";
 
@@ -156,6 +165,7 @@ const SORT_KEYS: &[SortKey] = &[
     },
     SortKey { name: "disk", expr: disk_pct!(), ty: "float8" },
     SortKey { name: "version", expr: "a.agent_version", ty: "text" },
+    SortKey { name: "category", expr: "(SELECT lower(dc.name) FROM device_categories dc WHERE dc.id = a.category_id)", ty: "text" },
 ];
 
 #[derive(Deserialize)]
@@ -170,6 +180,8 @@ pub struct ListQuery {
     health: Option<String>,
     /// Enrolled in the last N days.
     new_days: Option<i32>,
+    category_id: Option<Uuid>,
+    policy_set_id: Option<Uuid>,
 }
 
 /// Matches hostname, OS name, an IP address prefix or a logged-in user. `$n` is the search text.
@@ -190,7 +202,7 @@ pub async fn list(
     Query(q): Query<ListQuery>,
     Query(page): Query<PageQuery>,
 ) -> ApiResult<Json<Page<AgentSummary>>> {
-    let plan = Plan::new(SORT_KEYS, ("hostname", false), &page, "a.id", "uuid", 9)?;
+    let plan = Plan::new(SORT_KEYS, ("hostname", false), &page, "a.id", "uuid", 11)?;
     let health: Option<Vec<String>> =
         q.health.as_deref().filter(|h| !h.is_empty()).map(|h| h.split(',').map(str::to_string).collect());
     let filters = format!(
@@ -202,7 +214,9 @@ pub async fn list(
             AND ($5::text IS NULL OR a.os_family = $5)
             AND ($6::uuid[] IS NULL OR c.id = ANY($6))
             AND ($7::text[] IS NULL OR {health} = ANY($7))
-            AND ($8::int IS NULL OR a.enrolled_at > now() - make_interval(days => $8))",
+            AND ($8::int IS NULL OR a.enrolled_at > now() - make_interval(days => $8))
+            AND ($9::uuid IS NULL OR a.category_id = $9)
+            AND ($10::uuid IS NULL OR a.policy_set_id = $10)",
         search = agent_search(3),
         health = health_name!(),
     );
@@ -211,7 +225,7 @@ pub async fn list(
     let os = q.os.as_deref().filter(|s| !s.is_empty());
     macro_rules! bind_filters {
         ($query:expr) => {
-            $query.bind(q.client_id).bind(q.site_id).bind(search).bind(q.online).bind(os).bind(u.scope()).bind(&health).bind(q.new_days)
+            $query.bind(q.client_id).bind(q.site_id).bind(search).bind(q.online).bind(os).bind(u.scope()).bind(&health).bind(q.new_days).bind(q.category_id).bind(q.policy_set_id)
         };
     }
     let mut rows = bind_filters!(sqlx::query_as::<_, AgentSummary>(AssertSqlSafe(sql)));
@@ -558,7 +572,12 @@ pub async fn releases(State(st): State<Arc<AppState>>, u: User) -> ApiResult<Jso
             outdated,
         });
     }
-    Ok(Json(json!({ "releases": out, "auto_update": st.company().auto_update_agents })))
+    // All devices' setting; sets below may override it (the agent policy).
+    let auto_update: bool = sqlx::query_scalar("SELECT coalesce((config ->> 'auto_update')::boolean, false) FROM policy_items WHERE id = $1")
+        .bind(crate::policy::AGENT_ITEM)
+        .fetch_one(&st.db)
+        .await?;
+    Ok(Json(json!({ "releases": out, "auto_update": auto_update })))
 }
 
 #[derive(Deserialize)]

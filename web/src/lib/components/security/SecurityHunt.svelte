@@ -4,15 +4,17 @@
 	import { api } from '#lib/api.js';
 	import { ago, datetime, plural } from '#lib/format.js';
 	import { clientId, currentClient } from '#lib/scope.svelte.js';
-	import { eventKindLabels, eventKinds } from '#lib/security.js';
-	import type { EventKind, HuntResult, PrevalenceRow } from '#lib/types.js';
+	import { eventKindLabels, eventKinds, reputationSourceLabel, severityLabels, severityTone } from '#lib/security.js';
+	import type { EventKind, HuntResult, Prevalence } from '#lib/types.js';
 	import { param, setParams } from '#lib/url.svelte.js';
+	import Badge from '#lib/ui/Badge.svelte';
 	import Button from '#lib/ui/Button.svelte';
 	import Checkbox from '#lib/ui/Checkbox.svelte';
 	import EmptyState from '#lib/ui/EmptyState.svelte';
 	import Input from '#lib/ui/Input.svelte';
 	import Select from '#lib/ui/Select.svelte';
 	import EventTable from './EventTable.svelte';
+	import RarePrograms from './RarePrograms.svelte';
 
 	/**
 	 * Asks every online agent with our sensor to search its telemetry at once: for a command
@@ -24,7 +26,7 @@
 	let busy = $state(false);
 	let error = $state('');
 	let result = $state<HuntResult | null>(null);
-	let prevalence = $state<PrevalenceRow[] | null>(null);
+	let prevalence = $state<Prevalence | null>(null);
 	let searchedFor = $state('');
 
 	const scoped = $derived(currentClient());
@@ -61,7 +63,7 @@
 					limit: 50,
 					client_id: clientId() || undefined
 				}),
-				hash ? api.get<{ sha256: string; agents: PrevalenceRow[] }>(`/security/prevalence?sha256=${v.toLowerCase()}`).then((x) => x.agents) : Promise.resolve(null)
+				hash ? api.get<Prevalence>(`/security/prevalence?sha256=${v.toLowerCase()}`) : Promise.resolve(null)
 			]);
 			result = r;
 			prevalence = p;
@@ -73,6 +75,12 @@
 		} finally {
 			busy = false;
 		}
+	}
+
+	function huntHash(sha256: string) {
+		query = sha256;
+		hunt();
+		document.getElementById('hunt-h')?.scrollIntoView({ block: 'start' });
 	}
 
 	// Arriving with ?sha256= (from a detection) runs the hunt straight away.
@@ -111,22 +119,30 @@
 {#if prevalence}
 	<section class="card mb-4" aria-labelledby="prev-h">
 		<header class="border-border min-h-12 border-b px-4 py-3">
-			<h2 id="prev-h" class="panel-title">Known from detections and quarantine</h2>
-			<p class="text-muted text-xs">Where the server has already seen this hash, including offline machines.</p>
+			<h2 id="prev-h" class="panel-title">Known to the server</h2>
+			<p class="text-sm">
+				{#if prevalence.seen_on}Seen on <span class="font-semibold tabular">{plural(prevalence.seen_on, 'machine')}</span>{#if prevalence.first_seen}, first <span title={datetime(prevalence.first_seen)}>{ago(prevalence.first_seen)}</span>{/if}.{:else}Not seen on any machine yet.{/if}
+				<span class="text-muted text-xs">Where it ran, was detected or was quarantined, offline machines included; counted in the clients you can see.</span>
+			</p>
 		</header>
-		{#if prevalence.length}
+		{#if prevalence.known.length}
+			<ul class="border-border space-y-0.5 border-b px-4 py-2 text-sm" aria-label="Reputation">
+				{#each prevalence.known as r (r.source)}
+					<li class="flex flex-wrap items-baseline gap-x-2"><span class="font-medium break-all">{r.name}</span><Badge tone={severityTone[r.severity]}>{severityLabels[r.severity]}</Badge><span class="text-muted text-xs">known from {reputationSourceLabel(r.source)}</span></li>
+				{/each}
+			</ul>
+		{/if}
+		{#if prevalence.agents.length}
 			<ul class="divide-border divide-y">
-				{#each prevalence as p (p.agent_id + p.how)}
+				{#each prevalence.agents as p (p.agent_id + p.how)}
 					<li class="flex flex-wrap items-baseline gap-x-3 gap-y-0.5 px-4 py-2 text-sm">
 						<a class="hover:text-accent font-medium" href="/agents/{p.agent_id}?tab=security">{p.hostname}</a>
 						<span class="text-muted text-xs">{p.client_name}</span>
-						<span class="text-muted min-w-0 flex-1 text-xs">{p.how}</span>
+						<span class="text-muted min-w-0 flex-1 text-xs">{p.how}{#if p.path}<span class="block font-mono break-all">{p.path}</span>{/if}</span>
 						<span class="text-muted text-xs" title={datetime(p.first_seen)}>first {ago(p.first_seen)}</span>
 					</li>
 				{/each}
 			</ul>
-		{:else}
-			<p class="text-muted px-4 py-3 text-sm">No detection or quarantined file has this hash.</p>
 		{/if}
 	</section>
 {/if}
@@ -158,3 +174,7 @@
 		</div>
 	{/each}
 {/if}
+
+<div class="mt-6">
+	<RarePrograms onhunt={huntHash} />
+</div>

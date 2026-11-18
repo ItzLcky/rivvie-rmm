@@ -25,8 +25,6 @@ pub struct ClientOut {
     id: Uuid,
     name: String,
     created_at: DateTime<Utc>,
-    /// Ask the person at the machine before a remote desktop session starts.
-    desktop_consent: bool,
     /// Mail from these domains is filed under the client.
     email_domains: Vec<String>,
     /// Gets new detection content before everyone else.
@@ -41,8 +39,8 @@ pub struct ClientOut {
 /// Clients (all visible ones, or just `only`) with their sites and agent counts.
 async fn load(st: &AppState, u: &User, only: Option<Uuid>) -> ApiResult<Vec<ClientOut>> {
     #[allow(clippy::type_complexity)]
-    let clients: Vec<(Uuid, String, DateTime<Utc>, bool, Vec<String>, bool, Option<Uuid>, bool)> = sqlx::query_as(
-        "SELECT id, name, created_at, desktop_consent, email_domains, security_canary, sla_policy_id, portal_devices FROM clients
+    let clients: Vec<(Uuid, String, DateTime<Utc>, Vec<String>, bool, Option<Uuid>, bool)> = sqlx::query_as(
+        "SELECT id, name, created_at, email_domains, security_canary, sla_policy_id, portal_devices FROM clients
           WHERE ($1::uuid[] IS NULL OR id = ANY($1)) AND ($2::uuid IS NULL OR id = $2) ORDER BY lower(name)",
     )
     .bind(u.scope())
@@ -64,11 +62,10 @@ async fn load(st: &AppState, u: &User, only: Option<Uuid>) -> ApiResult<Vec<Clie
     let mut out: Vec<ClientOut> =
         clients
         .into_iter()
-        .map(|(id, name, created_at, desktop_consent, email_domains, security_canary, sla_policy_id, portal_devices)| ClientOut {
+        .map(|(id, name, created_at, email_domains, security_canary, sla_policy_id, portal_devices)| ClientOut {
             id,
             name,
             created_at,
-            desktop_consent,
             email_domains,
             security_canary,
             sla_policy_id,
@@ -122,31 +119,6 @@ pub async fn rename_site(
         return Err(ApiError::NotFound("site"));
     }
     auth::audit(&st.db, Some(u.id), "site.rename", Some(("site", id)), json!({ "name": name })).await;
-    Ok(Json(json!({ "ok": true })))
-}
-
-#[derive(Deserialize)]
-pub struct DesktopBody {
-    consent: bool,
-}
-
-pub async fn update_desktop(
-    State(st): State<Arc<AppState>>,
-    u: User,
-    Path(id): Path<Uuid>,
-    Json(b): Json<DesktopBody>,
-) -> ApiResult<Json<serde_json::Value>> {
-    u.require(Role::Admin)?;
-    let n = sqlx::query("UPDATE clients SET desktop_consent = $2 WHERE id = $1")
-        .bind(id)
-        .bind(b.consent)
-        .execute(&st.db)
-        .await?
-        .rows_affected();
-    if n == 0 {
-        return Err(ApiError::NotFound("client"));
-    }
-    auth::audit(&st.db, Some(u.id), "client.desktop_settings", Some(("client", id)), json!({ "consent": b.consent })).await;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -227,6 +199,9 @@ pub struct TokenRow {
     uses: i32,
     expires_at: Option<DateTime<Utc>>,
     created_at: DateTime<Utc>,
+    /// Agents enrolled with it start in this device category.
+    category_id: Option<Uuid>,
+    category_name: Option<String>,
 }
 
 pub async fn list_tokens(State(st): State<Arc<AppState>>, u: User, Path(site_id): Path<Uuid>) -> ApiResult<Json<Vec<TokenRow>>> {
@@ -234,8 +209,9 @@ pub async fn list_tokens(State(st): State<Arc<AppState>>, u: User, Path(site_id)
     super::access::site(&st, &u, site_id).await?;
     Ok(Json(
         sqlx::query_as(
-            "SELECT id, label, max_uses, uses, expires_at, created_at FROM enrollment_tokens
-              WHERE site_id = $1 ORDER BY created_at DESC",
+            "SELECT t.id, t.label, t.max_uses, t.uses, t.expires_at, t.created_at, t.category_id, dc.name AS category_name
+               FROM enrollment_tokens t LEFT JOIN device_categories dc ON dc.id = t.category_id
+              WHERE t.site_id = $1 ORDER BY t.created_at DESC",
         )
         .bind(site_id)
         .fetch_all(&st.db)
@@ -254,6 +230,9 @@ pub struct NewToken {
     /// bounded: defaults to 30 days and 50 uses, and refuses "never" or "unlimited".
     #[serde(default)]
     purpose: Option<String>,
+    /// Agents enrolled with it start in this device category (moved by hand, as it were).
+    #[serde(default)]
+    category_id: Option<Uuid>,
 }
 
 pub const PACKAGE_TOKEN_HOURS: i64 = 24 * 30;
@@ -283,11 +262,17 @@ pub async fn create_token(
         (b.expires_in_hours.unwrap_or(24 * 7), b.max_uses.filter(|n| *n > 0))
     };
     let expires_at = (hours > 0).then(|| Utc::now() + Duration::hours(hours));
+    if let Some(c) = b.category_id {
+        let exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM device_categories WHERE id = $1)").bind(c).fetch_one(&st.db).await?;
+        if !exists {
+            return Err(ApiError::NotFound("device category"));
+        }
+    }
     let token = auth::random_token();
     let id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO enrollment_tokens (id, site_id, token_hash, label, max_uses, expires_at, created_by)
-         VALUES ($1,$2,$3,$4,$5,$6,$7)",
+        "INSERT INTO enrollment_tokens (id, site_id, token_hash, label, max_uses, expires_at, created_by, category_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
     )
     .bind(id)
     .bind(site_id)
@@ -296,13 +281,14 @@ pub async fn create_token(
     .bind(max_uses)
     .bind(expires_at)
     .bind(u.id)
+    .bind(b.category_id)
     .execute(&st.db)
     .await
     .map_err(|e| match e {
         sqlx::Error::Database(d) if d.is_foreign_key_violation() => ApiError::NotFound("site"),
         e => e.into(),
     })?;
-    auth::audit(&st.db, Some(u.id), "enrollment_token.create", Some(("site", site_id)), json!({ "token_id": id, "package": package }))
+    auth::audit(&st.db, Some(u.id), "enrollment_token.create", Some(("site", site_id)), json!({ "token_id": id, "package": package, "category_id": b.category_id }))
         .await;
 
     let url = &st.cfg.public_url;

@@ -9,6 +9,9 @@ pub enum ApiError {
     Unauthorized,
     #[error("insufficient permissions")]
     Forbidden,
+    /// Forbidden, with the reason (a policy turned the feature off).
+    #[error("{0}")]
+    Denied(String),
     /// Password was right; a TOTP or recovery code is needed (or was wrong).
     #[error("{0}")]
     MfaRequired(&'static str),
@@ -38,7 +41,7 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = match &self {
             ApiError::Unauthorized => StatusCode::UNAUTHORIZED,
-            ApiError::Forbidden | ApiError::MfaSetupRequired => StatusCode::FORBIDDEN,
+            ApiError::Forbidden | ApiError::Denied(_) | ApiError::MfaSetupRequired => StatusCode::FORBIDDEN,
             ApiError::MfaRequired(_) => StatusCode::UNAUTHORIZED,
             ApiError::NotFound(_) => StatusCode::NOT_FOUND,
             ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,

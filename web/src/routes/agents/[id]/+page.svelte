@@ -32,6 +32,7 @@
 	import Status from '#lib/components/Status.svelte';
 	import UsageBar from '#lib/components/UsageBar.svelte';
 	import AgentAlerts from '#lib/components/agent/AgentAlerts.svelte';
+	import AgentPolicy from '#lib/components/policy/AgentPolicy.svelte';
 	import AgentFiles from '#lib/components/agent/AgentFiles.svelte';
 	import AgentProcesses from '#lib/components/agent/AgentProcesses.svelte';
 	import MuteDialog from '#lib/components/MuteDialog.svelte';
@@ -167,8 +168,10 @@
 			'agent.file_upload': `${d.ok ? 'Uploaded' : 'Failed to upload'} ${d.path}${d.ok ? '' : `: ${d.error}`}`,
 			'alert.mute': r.details.ends_at ? `Snoozed alerts until ${datetime(String(r.details.ends_at))}${d.reason ? ` (${d.reason})` : ''}` : `Added an alert maintenance window${d.reason ? ` (${d.reason})` : ''}`,
 			'alert.unmute': 'Ended an alert snooze or maintenance window',
-			'policy.exclude_agent': `Excluded from the alert policy ${d.name}`,
-			'policy.include_agent': `Covered by the alert policy ${d.name} again`,
+			'policy.exclude_agent': `Left out of the policy ${d.name}`,
+			'policy.include_agent': `Covered by the policy ${d.name} again`,
+			'agent.policy_pin': d.policy_set_id ? 'Pinned a policy set' : 'Unpinned its policy set',
+			'agent.policy_customize': 'Customized its policies (a set of its own, pinned)',
 			'security.quick_scan': `Started a quick scan (${productLabels[d.product as ProductKind] ?? d.product})`,
 			'security.full_scan': `Started a full scan (${productLabels[d.product as ProductKind] ?? d.product})`,
 			'security.update_signatures': `Started a signature update (${productLabels[d.product as ProductKind] ?? d.product})`,
@@ -264,6 +267,7 @@
 					{ value: 'logs', label: 'Event log' }
 				] },
 				{ label: 'Management', items: [
+					{ value: 'policy', label: 'Policy' },
 					{ value: 'patches', label: 'Patches', count: a.patches_overdue || a.patches_failed ? num(a.patches_overdue + a.patches_failed) : undefined, title: a.patches_overdue || a.patches_failed ? 'Overdue security updates and failed installs' : undefined },
 					{ value: 'security', label: 'Security' },
 					{ value: 'jobs', label: 'Jobs' },
@@ -283,6 +287,7 @@
 					<h2 class="mb-3 panel-title">System</h2>
 					<dl class="dl">
 						<dt>Client</dt><dd><a class="link" href="/clients/{a.client_id}">{a.client_name}</a><span class="text-subtle mx-1" aria-hidden="true">›</span>{a.site_name}</dd>
+						{#if a.policy_set_name}<dt>Policy</dt><dd><a class="link" href="?tab=policy">{a.policy_set_name}</a><span class="text-muted block text-xs">{a.category_name}</span></dd>{/if}
 						<dt>OS</dt><dd>{a.os_version || a.os_name}</dd>
 						<dt>Kernel</dt><dd class="font-mono text-[13px]">{a.kernel_version || '–'}</dd>
 						<dt>Arch</dt><dd>{a.arch}</dd>
@@ -461,6 +466,8 @@
 				{#snippet empty()}<EmptyState compact title="No jobs on this agent yet" />{/snippet}
 				{#snippet footer()}{#if jobs.data?.next}<p class="text-muted px-3 py-2 text-xs">Showing the latest 200. <a class="link" href="/jobs?q={encodeURIComponent(a.hostname)}">See all in Jobs</a></p>{/if}{/snippet}
 			</DataTable>
+		{:else if tab === 'policy'}
+			<AgentPolicy agent={a} onchange={() => agent.reload()} />
 		{:else if tab === 'alerts'}
 			<AgentAlerts agentId={a.id} hostname={a.hostname} onchange={() => agent.reload()} />
 		{:else if tab === 'processes'}
@@ -476,7 +483,7 @@
 				{#snippet empty()}<EmptyState compact title={ticketView === 'open' ? 'No open tickets about this agent' : 'No tickets about this agent'} description="Tickets list the agents they're about; alert tickets link theirs automatically." />{/snippet}
 			</TicketTable>
 		{:else if tab === 'security'}
-			<AgentSecurity agentId={a.id} hostname={a.hostname} />
+			<AgentSecurity agentId={a.id} hostname={a.hostname} os={a.os_family} />
 		{:else if tab === 'services'}
 			<AgentServices agentId={a.id} online={a.online} hostname={a.hostname} />
 		{:else if tab === 'logs'}

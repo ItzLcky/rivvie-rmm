@@ -2,6 +2,7 @@ mod accounting;
 mod agent_ws;
 mod billing;
 mod pdf;
+mod policy;
 mod alerts;
 mod desktop_ws;
 mod api;
@@ -460,8 +461,8 @@ async fn housekeeping(state: Arc<AppState>) {
             // Output retention for scheduled runs, per schedule.
             results.push(
                 sqlx::query(
-                    "DELETE FROM jobs j USING schedules s
-                      WHERE j.schedule_id = s.id AND j.finished_at < now() - make_interval(days => s.retain_days)",
+                    "DELETE FROM jobs j USING policy_items s
+                      WHERE j.schedule_id = s.id AND j.finished_at < now() - make_interval(days => coalesce((s.config ->> 'retain_days')::int, 30))",
                 )
                 .execute(db)
                 .await,

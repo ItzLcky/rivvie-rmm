@@ -46,6 +46,10 @@ pub async fn handler(
     user.require(Role::Technician)?;
     check_origin(&headers, &st.cfg.public_url)?;
     crate::api::access::agent(&st, &user, agent_id).await?;
+    let (policy, set) = crate::policy::remote_access(&st, agent_id).await?;
+    if !policy.shell_enabled {
+        return Err(ApiError::Denied(format!("the remote shell is turned off for this device by policy set {set}")));
+    }
     if !st.hub.is_online(agent_id) {
         return Err(ApiError::Conflict("agent is offline".into()));
     }

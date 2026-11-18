@@ -1,0 +1,1 @@
+To test the scanner, download the EICAR test file; its marker is $EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H* but this text is not it.

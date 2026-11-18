@@ -131,7 +131,10 @@
 		{/if}
 
 		<section class="card" aria-labelledby="versions-h">
-			<header class="border-border min-h-12 border-b px-4 py-3"><h2 id="versions-h" class="panel-title">Versions</h2></header>
+			<header class="border-border min-h-12 border-b px-4 py-3">
+				<h2 id="versions-h" class="panel-title">Content versions</h2>
+				<p class="text-muted text-xs">Signed bundles of behaviour rules, rule modes and a few file signatures.</p>
+			</header>
 			{#if c.versions.length}
 				<ul class="divide-border divide-y">
 					{#each c.versions as v (v.id)}

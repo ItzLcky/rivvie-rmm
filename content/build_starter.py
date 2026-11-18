@@ -177,8 +177,10 @@ file_rules = [
    "tests": [{"hex": hexs(EICAR), "expect": True}, {"text": "an ordinary file", "expect": False}]},
   {"id": "RMM-F-0002", "name": "Mimikatz binary", "severity": "severe", "confidence": "high", "mode": "alert", "mitre": ["T1003"],
    "strings": [{"hex": hexs("sekurlsa::logonpasswords"), "nocase": True}, {"hex": hexs("gentilkiwi"), "nocase": True}, {"hex": hexs("mimikatz"), "nocase": True}],
-   "condition": {"at_least": 2},
-   "tests": [{"hex": hexs("... gentilkiwi ... sekurlsa::LogonPasswords ..."), "expect": True}, {"hex": hexs("mimikatz is mentioned once in this article"), "expect": False}]},
+   "condition": {"at_least": 2}, "header": {"hex": "4d 5a"},
+   "tests": [{"hex": hexs("MZ\x90 ... gentilkiwi ... sekurlsa::LogonPasswords ..."), "expect": True},
+             {"hex": hexs("A note quoting gentilkiwi and sekurlsa::logonpasswords, not a program"), "expect": False},
+             {"hex": hexs("mimikatz is mentioned once in this article"), "expect": False}]},
   {"id": "RMM-F-0003", "name": "PHP web shell", "severity": "high", "confidence": "medium", "mode": "audit", "mitre": ["T1505.003"],
    "strings": [{"hex": hexs("eval(base64_decode($_"), "nocase": True}, {"hex": hexs("system($_get["), "nocase": True}, {"hex": hexs("assert($_post["), "nocase": True}, {"hex": hexs("passthru($_request["), "nocase": True}],
    "max_size": 2097152,
@@ -188,7 +190,7 @@ file_rules = [
    "condition": {"at_least": 2},
    "tests": [{"text": "MZ...beacon.dll...ReflectiveLoader...", "expect": True}, {"text": "MZ...ReflectiveLoader only", "expect": False}]},
 ]
-bundle = {"version": "2026.11.10.1", "created_at": "2026-11-10T00:00:00Z",
+bundle = {"version": "2026.11.15.1", "created_at": "2026-11-10T00:00:00Z",
   "description": "Starter content: ransomware preparation, credential theft, persistence, execution and defence evasion. Rules marked audit record hits without alerting until their false-positive rate is known.",
   "hashes": [{"sha256": "275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f", "name": "EICAR test file", "severity": "low"}],
   "file_rules": file_rules, "behaviour_rules": rules}

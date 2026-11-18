@@ -118,10 +118,13 @@ pub async fn offer(st: &AppState, agent_id: Uuid) -> Result<String, String> {
     Ok(version)
 }
 
-/// On connect, with auto-update on: offer unless this exact version already failed here.
+/// On connect, when the agent's policy (`agent.auto_update`) has automatic updates on: offer
+/// unless this exact version already failed here.
 pub async fn auto_offer(st: &AppState, agent_id: Uuid) {
-    if !st.company().auto_update_agents {
-        return;
+    match crate::policy::auto_update(st, agent_id).await {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(e) => return tracing::warn!(%agent_id, "reading the agent policy: {e}"),
     }
     #[derive(sqlx::FromRow)]
     struct Row {

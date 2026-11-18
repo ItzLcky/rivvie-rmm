@@ -30,8 +30,6 @@ pub struct Company {
     pub session_idle_hours: Option<i32>,
     /// Require 2FA for every user, not just admins.
     pub require_2fa_all: bool,
-    /// Offer the newest signed agent release to agents as they connect.
-    pub auto_update_agents: bool,
     /// Outgoing mail for email notification channels.
     pub smtp_host: String,
     pub smtp_port: i32,
@@ -45,7 +43,7 @@ pub struct Company {
 }
 
 impl Company {
-    pub const COLUMNS: &str = "company_name, session_idle_hours, require_2fa_all, auto_update_agents,
+    pub const COLUMNS: &str = "company_name, session_idle_hours, require_2fa_all,
         smtp_host, smtp_port, smtp_security, smtp_username, smtp_password, smtp_from, csat_enabled";
 
     pub async fn load(db: &PgPool) -> sqlx::Result<Self> {

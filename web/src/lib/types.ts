@@ -30,6 +30,8 @@ export interface AgentSummary {
 	patches_overdue: number; patches_failed: number; reboot_pending: boolean; reboot_pending_since: string | null;
 	/** A maintenance window or snooze is holding its alerts back right now. */
 	alerts_muted: boolean;
+	/** Policy management: its device category and the policy set it uses. */
+	platform?: 'workstation' | 'server'; category_id?: string; category_name?: string; policy_set_id?: string; policy_set_name?: string;
 }
 
 export type UpdateState = 'offered' | 'downloading' | 'waiting' | 'applying' | 'completed' | 'rolled_back' | 'failed';
@@ -55,8 +57,6 @@ export interface MetricPoint {
 export interface Site { id: string; client_id: string; name: string; agent_count: number; online_count: number }
 export interface Client {
 	id: string; name: string; created_at: string; sites: Site[];
-	/** Ask the person at the machine before a remote desktop session starts. */
-	desktop_consent: boolean;
 	/** Mail from these domains is filed under this client. */
 	email_domains: string[];
 	/** Gets new security content first (canary ring). */
@@ -132,24 +132,6 @@ export interface LogEvent {
 }
 export interface AlertDetail extends Alert { notifications: Delivery[]; log_events: LogEvent[]; ticket: { id: string; number: number } | null }
 
-export interface Policy {
-	id: string; name: string; kind: PolicyKind; params: Record<string, unknown>; severity: Severity;
-	client_id: string | null; client_name: string | null; site_id: string | null; site_name: string | null; os_family: 'linux' | 'windows' | 'macos' | null;
-	channel_ids: string[]; notify_resolved: boolean; enabled: boolean; open_alerts: number; created_at: string; updated_at: string;
-	/** Open tickets for its alerts on this board (null = no tickets). */
-	ticket_board_id: string | null; ticket_priority: Priority; ticket_auto_resolve: boolean;
-	/** Remind the channels this often while an alert stays open and unacknowledged. */
-	renotify_minutes: number | null;
-	/** Agents left out of it. */
-	excluded: { id: string; hostname: string }[];
-}
-
-/** An alert policy that covers an agent (`GET /agents/{id}/alert-policies`). */
-export interface CoveringPolicy {
-	id: string; name: string; kind: PolicyKind; severity: Severity; enabled: boolean; level: 'msp' | 'client' | 'site';
-	excluded: boolean; editable: boolean; open_alerts: number;
-}
-
 /** A maintenance window (weekly) or snooze (one-off) holding alerts back. */
 export interface Mute {
 	id: string; client_id: string | null; site_id: string | null; agent_id: string | null; owner_client_id: string; target_name: string;
@@ -173,9 +155,12 @@ export interface Channel {
 export interface DeliveryRow extends Delivery { channel_id: string; alert_id: string | null; alert_title: string | null; hostname: string | null; next_attempt_at: string }
 export interface Smtp { host: string; port: number; security: 'starttls' | 'tls' | 'none'; username: string; password_set: boolean; from: string }
 
+/** A scheduled script (a `schedule` item of a policy set), read-only here: it's edited in its set. */
 export interface Schedule {
-	id: string; name: string; script_id: string; script_name: string; interpreter: Interpreter; client_id: string | null; client_name: string | null;
-	site_id: string | null; site_name: string | null; os_family: 'linux' | 'windows' | 'macos' | null; cron: string; timezone: string; args: string[];
+	id: string; name: string; set_id: string; set_name: string; script_id: string; script_name: string; interpreter: Interpreter; client_id: string | null; client_name: string | null;
+	site_id: string | null; site_name: string | null; cron: string; timezone: string; args: string[];
+	/** Devices it runs on now. */
+	agents: number;
 	timeout_secs: number | null; retain_days: number; enabled: boolean; next_run_at: string | null; last_run_at: string | null;
 	last_run: Partial<Record<JobStatus, number>>; created_by_name: string | null; created_at: string; updated_at: string;
 }
@@ -210,11 +195,15 @@ export interface AgentPatch {
 	approval_manual: boolean; approved_by_name: string | null; approved_at: string | null; first_seen_at: string;
 	installed_at: string | null; last_error: string | null; fail_count: number; deferred_until: string | null;
 }
-export interface PatchPolicy {
-	id: string; client_id: string | null; site_id: string | null; client_name: string | null; site_name: string | null;
+/** The patch policy as it applies to one agent (its set's merged patch item). */
+export interface AgentPatchPolicy {
+	/** The patch item, its agent's set, and that set's name. */
+	id: string; set_id: string; source: string;
 	auto_approve_severities: PatchSeverity[]; auto_approve_categories: PatchCategory[]; deferral_days: number; auto_install: boolean;
-	reboot_policy: RebootPolicy; updated_by_name: string | null; updated_at: string; agents: number;
-	source?: 'site' | 'client' | 'global' | null;
+	reboot_policy: RebootPolicy;
+	/** The policy has a window of its own; otherwise automatic installs use the site's. */
+	own_window: boolean;
+	window: { days: number[] | null; start: string | null; minutes: number | null; tz: string; open_now: boolean; next_start: string | null } | null;
 }
 export interface MaintenanceWindow {
 	site_id: string; site_name: string; client_id: string; client_name: string; days: number[] | null; start: string | null;
@@ -235,7 +224,7 @@ export interface AgentPatches {
 		supported: boolean; online: boolean; os_family: string; provider: string | null; all_or_nothing: boolean; scanned_at: string | null;
 		scan_requested_at: string | null; scan_error: string | null; reboot_pending: boolean;
 	};
-	policy: PatchPolicy | null; window: MaintenanceWindow; patches: AgentPatch[]; runs: PatchRun[];
+	policy: AgentPatchPolicy | null; window: MaintenanceWindow; patches: AgentPatch[]; runs: PatchRun[];
 }
 export interface ComplianceRow {
 	id: string; name: string; client_id: string | null; agents: number; supported: number; scanned: number; compliant: number;
@@ -338,10 +327,18 @@ export interface InboundMail {
 }
 
 // Endpoint protection (Phase 8)
-/** threats: an active detection; unprotected: no product enabled; at_risk: real-time protection off or signatures over 72 h old. */
+/** threats: an active detection; unprotected: no product enabled; at_risk: see `SecurityRisk`. */
 export type ProtectionState = 'threats' | 'unprotected' | 'at_risk' | 'unknown' | 'protected';
 export type ProductKind = 'defender' | 'clamav' | 'xprotect' | 'rmm' | 'other';
 export type SecurityAction = 'quick_scan' | 'full_scan' | 'update_signatures';
+/**
+ * Why an agent is at risk: no enabled product scans in real time; no product has current
+ * signatures; our database is older than the security policy allows; our real-time protection is
+ * wanted and not on (Linux only: elsewhere it doesn't exist yet).
+ */
+export type SecurityRisk = 'realtime_off' | 'signatures' | 'database' | 'sensor_realtime';
+/** The signature database an agent runs, as the server has it. */
+export interface AgentDatabase { version: string; built_at: string; stage: ContentStage; hashes: number; yara_rules: number; size: number }
 export type ThreatSeverity = 'severe' | 'high' | 'moderate' | 'low' | 'unknown';
 export type ThreatStatus = 'active' | 'quarantined' | 'removed' | 'blocked' | 'allowed' | 'unknown';
 export type SecurityActionStatus = 'sent' | 'running' | 'succeeded' | 'failed' | 'lost';
@@ -361,7 +358,13 @@ export interface SecurityDetection {
 	source: DetectionSource; rule_id: string | null; mitre: string[];
 	/** Recorded by a rule in audit mode: not acted on, not alerted. */
 	audit: boolean; action_taken: string | null; sha256: string | null; verdict: Verdict | null;
+	/** How a file detection was found (our sensor); null for behaviour and other products. */
+	found_by?: FoundBy | null;
+	/** The program was refused before it ran. */
+	denied?: boolean;
 }
+export type FoundBy = 'on_exec' | 'on_write' | 'scan' | 'reputation';
+export type RealtimeMode = 'off' | 'audit' | 'block';
 export interface SecurityActionRow {
 	id: string; product: ProductKind; action: SecurityAction | ResponseActionName; status: SecurityActionStatus; message: string | null;
 	created_by_name: string | null; created_at: string; started_at: string | null; finished_at: string | null;
@@ -372,6 +375,9 @@ export interface AgentSecurity {
 	products: SecurityProduct[]; detections: SecurityDetection[]; actions: SecurityActionRow[];
 	sensor_supported: boolean; sensor: SensorStatus | null; sensor_at: string | null; content_version: string | null;
 	isolated: boolean; policy: SensorPolicy; quarantine: QuarantineRow[];
+	risks: SecurityRisk[]; database: AgentDatabase | null;
+	/** The security policy's limit on the database's age, hours (0: none). */
+	database_max_age_hours: number;
 }
 export interface SecurityAgentRow {
 	id: string; hostname: string; online: boolean; os_family: AgentSummary['os_family']; client_id: string; client_name: string;
@@ -379,6 +385,9 @@ export interface SecurityAgentRow {
 	products: { kind: ProductKind; name: string; enabled: boolean | null; realtime: boolean | null }[];
 	signatures_updated_at: string | null; last_scan_at: string | null; active_threats: number; running_action: SecurityAction | null;
 	isolated: boolean; sensor: SensorStatus | null; content_version: string | null;
+	risks: SecurityRisk[]; database_version: string | null; database_built_at: string | null; database_max_age_hours: number;
+	/** The policy's prevention: without it real-time Block denies nothing. */
+	prevention: boolean;
 }
 export interface SecuritySummary {
 	agents: Record<ProtectionState, number>; active_threats: number; detections_7d: number; actions_running: number;
@@ -407,15 +416,31 @@ export type ResponseAction =
 export interface SensorPolicy {
 	enabled: boolean; quick_scan_hours: number; full_scan_days: number; auto_quarantine: boolean; prevention: boolean;
 	telemetry_mb: number; canaries: boolean; exclusions: { kind: ExclusionKind; value: string }[]; rule_modes: [string, RuleMode][];
+	realtime?: RealtimeMode; scan_on_write?: boolean; archive_depth?: number; reputation?: boolean;
+}
+/** On-access protection as the sensor runs it. */
+export interface RealtimeHealth {
+	mode: RealtimeMode;
+	/** on | off (the policy) | unavailable (see error; programs are then scanned just after they start) */
+	state: 'on' | 'off' | 'unavailable';
+	mechanism: 'fanotify' | 'scan-after-start';
+	error: string | null; scan_on_write: boolean; filesystems: number;
+	decisions: number; denied: number; cache_hits: number; timeouts: number; overloaded: number;
+	write_scans: number; write_dropped: number;
+	/** Decision time over the last health interval, microseconds. */
+	p50_us: number; p99_us: number;
 }
 export interface SensorHealth {
 	events_total: number; events_per_min: number; store_bytes: number; cpu_percent: number; rss_bytes: number; rules: number;
 	/** [collector, mechanism] */
 	collectors: [string, string][];
 	canaries: number; last_scan: string | null;
+	database_version?: string | null; yara_rules?: number; hash_signatures?: number; files_scanned?: number; cache_hits?: number;
+	realtime?: RealtimeHealth | null;
 }
 export interface SensorStatus {
 	enabled: boolean; running: boolean; restarts: number; content_version: string | null; error: string | null; isolated: boolean;
+	database_version?: string | null;
 	health: SensorHealth | null;
 }
 export interface Proc {
@@ -433,7 +458,11 @@ export interface QuarantineRow {
 	id: string; agent_id: string; hostname: string; client_id: string; client_name: string; path: string; sha256: string; size: number;
 	reason: string | null; quarantined_at: string; state: QuarantineState; updated_at: string;
 }
-export interface PrevalenceRow { agent_id: string; hostname: string; client_name: string; first_seen: string; how: string }
+/** `how`: comma-separated ran, detected, quarantined. */
+export interface PrevalenceRow { agent_id: string; hostname: string; client_name: string; first_seen: string; how: string; path?: string | null }
+export interface ReputationEntry { name: string; severity: ThreatSeverity; source: string; added_at: string }
+/** GET /security/prevalence?sha256= (counts only the user's clients). */
+export interface Prevalence { sha256: string; agents: PrevalenceRow[]; seen_on: number; first_seen: string | null; known: ReputationEntry[] }
 export interface DetectionRule {
 	id: string; name: string; description: string; kind: 'file' | 'behaviour'; event: EventKind | null; severity: ThreatSeverity;
 	confidence: 'low' | 'medium' | 'high'; mode: RuleMode; mitre: string[]; digest?: string | null;
@@ -441,16 +470,13 @@ export interface DetectionRule {
 export interface DetectionDetail extends SecurityDetection {
 	os_family: AgentSummary['os_family']; online: boolean; isolated: boolean; context: TelemetryEvent[]; context_unavailable: boolean;
 	content_version: string | null; notes: string | null; verdict_by_name: string | null; verdict_at: string | null; quarantine_id: string | null;
-	prevalence: PrevalenceRow[]; actions: SecurityActionRow[]; alert: { id: string; title: string; state: string } | null; rule: DetectionRule | null;
+	database_version?: string | null; part?: string | null;
+	prevalence: PrevalenceRow[]; seen_on?: number; first_seen?: string | null; reputation?: ReputationEntry[];
+	actions: SecurityActionRow[]; alert: { id: string; title: string; state: string } | null; rule: DetectionRule | null;
 }
 export interface HuntResult {
 	hits: { agent_id: string; hostname: string; client_name: string; events: TelemetryEvent[]; truncated: boolean }[];
 	searched: number; offline: number; errors: { agent_id: string; hostname: string; error: string }[];
-}
-export interface SecurityPolicyRow {
-	id: string; client_id: string | null; client_name: string | null; site_id: string | null; site_name: string | null; sensor_enabled: boolean;
-	quick_scan_hours: number; full_scan_days: number; auto_quarantine: boolean; prevention: boolean; canaries: boolean; telemetry_mb: number;
-	updated_by_name: string | null; updated_at: string;
 }
 export interface ExclusionRow {
 	id: string; client_id: string | null; client_name: string | null; kind: ExclusionKind; value: string; comment: string;
@@ -466,3 +492,21 @@ export interface ContentVersion {
 	stage_reason: string | null; uploaded_by_name: string | null; uploaded_at: string; stage_changed_at: string; agents: number;
 }
 export interface ContentOverview { versions: ContentVersion[]; canary_clients: number; soak_minutes: number; verifies_signatures: boolean }
+/** A signature database (hashes and YARA rules, built and signed by `rmm-sign build-db`). */
+export interface SignatureDatabase {
+	id: string; version: string; sha256: string; size: number; description: string; hashes: number; yara_rules: number; rule_count: number;
+	/** What `build-db` imported. `kind`: sha256-list, yara, clamav-hdb, clamav-hsb. */
+	sources: { name: string; kind: string; entries: number }[];
+	built_at: string; stage: ContentStage; stage_reason: string | null;
+	/** False once pruned from storage: it can't be rolled out again. */
+	stored: boolean;
+	uploaded_by_name: string | null; uploaded_at: string; stage_changed_at: string; agents: number;
+}
+export interface DatabaseOverview { versions: SignatureDatabase[]; soak_minutes: number; verifies_signatures: boolean }
+/** A program that ran on few machines recently and nothing knows: a hunting lead. */
+export interface RareProgram {
+	sha256: string; seen_on: number; first_seen: string;
+	agents: { agent_id: string; hostname: string; client_name: string; path: string | null }[];
+}
+/** What the server's reputation set holds: `db:<version>` (the newest database) or `list:<name>`. */
+export interface ReputationSource { source: string; hashes: number; added_at: string }

@@ -30,7 +30,7 @@
 		<img src={favicon} alt="" class="size-7 shrink-0" />
 		{#if !collapsed}
 			<span class="min-w-0 leading-tight">
-				<span class="block truncate text-[0.9375rem] font-semibold tracking-tight text-white">{company.name || 'RMM'}</span>
+				<span class="font-display block truncate text-base font-bold tracking-[-0.02em] text-white">{company.name || 'Rivvie'}</span>
 				<span class="text-nav-muted block truncate text-xs">Remote management</span>
 			</span>
 		{/if}

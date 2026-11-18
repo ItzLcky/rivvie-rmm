@@ -1,15 +1,16 @@
 <script lang="ts">
-	import { Ban, Check, Clock, Download, PackageOpen, Pencil, Plus, RefreshCw, RotateCcw, Search, ShieldAlert, Trash2 } from '@lucide/svelte';
+	import { Ban, Check, Download, PackageOpen, Pencil, RefreshCw, RotateCcw, Search, ShieldAlert, ShieldCheck } from '@lucide/svelte';
 	import { api } from '#lib/api.js';
 	import { confirmAction } from '#lib/confirm.svelte.js';
 	import { ago, bytes, cx, datetime, ms, num, plural } from '#lib/format.js';
 	import { liveReload } from '#lib/live.svelte.js';
-	import { categories, categoryLabel, compliancePct, rebootLabel, severities, windowLabel } from '#lib/patches.js';
+	import { categories, categoryLabel, compliancePct, severities, windowLabel } from '#lib/patches.js';
 	import { resource } from '#lib/resource.svelte.js';
 	import { clientId, currentClient, loadClients, withClient } from '#lib/scope.svelte.js';
 	import { can } from '#lib/session.svelte.js';
 	import { attempt } from '#lib/toast.svelte.js';
-	import type { Approval, Compliance, ComplianceRow, MaintenanceWindow, PatchPolicy, PatchRun, UpdateAgent, UpdateGroup } from '#lib/types.js';
+	import type { Approval, Compliance, ComplianceRow, MaintenanceWindow, PatchRun, UpdateAgent, UpdateGroup } from '#lib/types.js';
+	import { ROOT_SET } from '#lib/policy/policy.js';
 	import { param, qs, setParams } from '#lib/url.svelte.js';
 	import Async from '#lib/ui/Async.svelte';
 	import Badge from '#lib/ui/Badge.svelte';
@@ -18,7 +19,6 @@
 	import Drawer from '#lib/ui/Drawer.svelte';
 	import EmptyState from '#lib/ui/EmptyState.svelte';
 	import ErrorState from '#lib/ui/ErrorState.svelte';
-	import IconButton from '#lib/ui/IconButton.svelte';
 	import Input from '#lib/ui/Input.svelte';
 	import PageHeader from '#lib/ui/PageHeader.svelte';
 	import Segmented from '#lib/ui/Segmented.svelte';
@@ -28,7 +28,6 @@
 	import InstallPatches from '#lib/components/InstallPatches.svelte';
 	import OsBadge from '#lib/components/OsBadge.svelte';
 	import PatchBadge from '#lib/components/PatchBadge.svelte';
-	import PolicyEditor from '#lib/components/PolicyEditor.svelte';
 	import Status from '#lib/components/Status.svelte';
 	import WindowEditor from '#lib/components/WindowEditor.svelte';
 
@@ -90,25 +89,10 @@
 	const compliance = resource(() => (tab === 'compliance' ? api.get<Compliance>(`/patches/compliance${qs({ client_id: clientId() })}`) : Promise.resolve(null)));
 	liveReload(() => tab === 'compliance' && compliance.reload(), (e) => e.type === 'patches', { debounceMs: 3000, pollMs: 60000 });
 
-	// --- Policies -----------------------------------------------------------------------------
-	const policies = resource(() => (tab === 'policies' ? api.get<PatchPolicy[]>('/patch-policies') : Promise.resolve(null)));
-	const windows = resource(() => (tab === 'policies' ? api.get<MaintenanceWindow[]>('/patch-windows') : Promise.resolve(null)));
-	let editing = $state<{ policy: PatchPolicy | null } | null>(null);
+	// --- Maintenance windows ---------------------------------------------------------------------
+	const windows = resource(() => (tab === 'windows' ? api.get<MaintenanceWindow[]>('/patch-windows') : Promise.resolve(null)));
 	let editingWindow = $state<MaintenanceWindow | null>(null);
-	const shownPolicies = $derived((policies.data ?? []).filter((p) => !clientId() || !p.client_id || p.client_id === clientId()));
 	const shownWindows = $derived((windows.data ?? []).filter((w) => !clientId() || w.client_id === clientId()));
-	async function removePolicy(p: PatchPolicy) {
-		const ok = await confirmAction({
-			title: `Delete the policy for ${p.site_name ? `${p.client_name} › ${p.site_name}` : p.client_name}?`,
-			message: `Its ${plural(p.agents, 'agent')} fall back to the ${p.site_id ? 'client’s policy, or the MSP-wide one' : 'MSP-wide policy'}. Manual approvals are kept.`,
-			confirmLabel: 'Delete policy',
-			danger: true
-		});
-		if (ok && (await attempt(() => api.del(`/patch-policies/${p.id}`), 'Policy deleted.'))) policies.reload();
-	}
-	function canEdit(p: PatchPolicy) {
-		return p.client_id ? can('technician') : can('admin');
-	}
 
 	// --- History ------------------------------------------------------------------------------
 	const runFilter = $derived(param('status', ''));
@@ -133,7 +117,7 @@
 
 <PageHeader title="Patches">
 	{#snippet actions()}
-		{#if tab === 'policies' && can('technician')}<Button variant="primary" icon={Plus} onclick={() => (editing = { policy: null })}>New policy</Button>{/if}
+		<Button icon={ShieldCheck} href="/policies/sets/{ROOT_SET}?section=patching">Patch policy</Button>
 	{/snippet}
 </PageHeader>
 
@@ -145,7 +129,7 @@
 	items={[
 		{ value: 'updates', label: 'Updates', count: updates.data ? `${num(updates.data.total)}` : undefined },
 		{ value: 'compliance', label: 'Compliance' },
-		{ value: 'policies', label: 'Policies & windows' },
+		{ value: 'windows', label: 'Maintenance windows' },
 		{ value: 'history', label: 'Install history' }
 	]}
 />
@@ -345,45 +329,10 @@
 			{/if}
 		{/snippet}
 	</Async>
-{:else if tab === 'policies'}
-	<section class="card mb-6" aria-label="Patch policies">
-		<header class="border-border min-h-12 border-b px-4 py-3">
-			<h2 class="panel-title">Policies</h2>
-			<p class="text-muted text-xs">The most specific one applies to each agent: site, then client, then MSP-wide.</p>
-		</header>
-		<Async res={policies} compact>
-			{#snippet children()}
-				<ul class="divide-border divide-y">
-					{#each shownPolicies as p (p.id)}
-						<li class="flex flex-wrap items-start gap-x-4 gap-y-2 px-4 py-3">
-							<div class="min-w-0 flex-1">
-								<div class="text-sm font-medium">
-									{#if p.site_name}{p.client_name} › {p.site_name}{:else if p.client_name}{p.client_name}{:else}MSP-wide{/if}
-									<span class="text-muted ml-1 text-xs font-normal">{plural(p.agents, 'agent')}</span>
-								</div>
-								<div class="text-muted mt-1 flex flex-wrap gap-1.5 text-xs">
-									{#each p.auto_approve_categories as c (c)}<Badge tone="accent">{categoryLabel(c)}</Badge>{/each}
-									{#each p.auto_approve_severities as s (s)}<Badge tone="accent">{severities.find((x) => x.value === s)?.label ?? s} severity</Badge>{/each}
-									{#if !p.auto_approve_categories.length && !p.auto_approve_severities.length}<Badge>Approves nothing automatically</Badge>{/if}
-									{#if p.deferral_days}<Badge icon={Clock}>Deferred {plural(p.deferral_days, 'day')}</Badge>{/if}
-									<Badge tone={p.auto_install ? 'success' : 'neutral'}>{p.auto_install ? 'Installs automatically' : 'Manual installs'}</Badge>
-									<Badge tone={p.reboot_policy === 'never' ? 'neutral' : 'warning'}>{rebootLabel(p.reboot_policy)}</Badge>
-								</div>
-								<p class="text-muted mt-1 text-xs">Updated {ago(p.updated_at)}{p.updated_by_name ? ` by ${p.updated_by_name}` : ''}</p>
-							</div>
-							{#if canEdit(p)}
-								<div class="flex gap-1">
-									<Button size="sm" icon={Pencil} onclick={() => (editing = { policy: p })}>Edit</Button>
-									{#if p.client_id}<IconButton icon={Trash2} label="Delete policy" size="sm" onclick={() => removePolicy(p)} />{/if}
-								</div>
-							{/if}
-						</li>
-					{/each}
-				</ul>
-			{/snippet}
-		</Async>
-	</section>
-
+{:else if tab === 'windows'}
+	<p class="border-border bg-sunken text-muted mb-4 max-w-3xl rounded-md border px-3 py-2 text-sm">
+		What's approved automatically, when it installs and whether machines restart is the patch policy, set in <a class="link" href="/policies/sets/{ROOT_SET}?section=patching">All devices</a> and overridden in any set below it. A patch policy can also bring its own install window instead of the site's.
+	</p>
 	<section class="card" aria-label="Maintenance windows">
 		<header class="border-border min-h-12 border-b px-4 py-3">
 			<h2 class="panel-title">Maintenance windows</h2>
@@ -447,9 +396,6 @@
 	</DataTable>
 {/if}
 
-{#if editing}
-	<PolicyEditor policy={editing.policy} taken={(policies.data ?? []).filter((p) => p.client_id).map((p) => `${p.client_id}:${p.site_id ?? ''}`)} onclose={() => (editing = null)} onsaved={() => policies.reload()} />
-{/if}
 {#if editingWindow}
 	<WindowEditor window={editingWindow} onclose={() => (editingWindow = null)} onsaved={() => windows.reload()} />
 {/if}

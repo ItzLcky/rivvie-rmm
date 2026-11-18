@@ -32,8 +32,8 @@
 	{#if crumbs?.length}<Breadcrumbs items={crumbs} />{/if}
 	<div class="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
 		<div class="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
-			<h1 class="truncate text-2xl leading-tight font-semibold tracking-tight">{title}</h1>
-			{#if count != null}<span class="bg-sunken border-border text-muted rounded-md border px-2 py-0.5 text-sm font-medium tabular">{typeof count === 'number' ? num(count) : count}</span>{/if}
+			<h1 class="truncate text-[1.75rem] leading-tight">{title}</h1>
+			{#if count != null}<span class="bg-accent-soft text-accent-ink rounded-full px-2.5 py-0.5 text-sm font-semibold tabular">{typeof count === 'number' ? num(count) : count}</span>{/if}
 			{@render meta?.()}
 		</div>
 		{#if actions || menu?.length}

@@ -67,17 +67,19 @@ pub async fn handler(
     user.require(Role::Technician)?;
     crate::shell_ws::check_origin(&headers, &st.cfg.public_url)?;
     crate::api::access::agent(&st, &user, agent_id).await?;
+    let (policy, set) = crate::policy::remote_access(&st, agent_id).await?;
+    if !policy.desktop_enabled {
+        return Err(ApiError::Denied(format!("remote desktop is turned off for this device by policy set {set}")));
+    }
     if !st.hub.is_online(agent_id) {
         return Err(ApiError::Conflict("agent is offline".into()));
     }
-    let (capable, ask): (bool, bool) = sqlx::query_as(
-        "SELECT $2 = ANY(a.capabilities), c.desktop_consent FROM agents a JOIN sites s ON s.id = a.site_id JOIN clients c ON c.id = s.client_id
-          WHERE a.id = $1",
-    )
-    .bind(agent_id)
-    .bind(desktop::CAPABILITY)
-    .fetch_one(&st.db)
-    .await?;
+    let capable: bool = sqlx::query_scalar("SELECT $2 = ANY(capabilities) FROM agents WHERE id = $1")
+        .bind(agent_id)
+        .bind(desktop::CAPABILITY)
+        .fetch_one(&st.db)
+        .await?;
+    let ask = policy.desktop_consent;
     if !capable {
         return Err(ApiError::Conflict("this agent version doesn't support remote desktop; update the agent".into()));
     }

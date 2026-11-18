@@ -1,164 +1,149 @@
 <script lang="ts">
-	import { BellOff, Plus, Search, ShieldCheck } from '@lucide/svelte';
+	import { goto } from '$app/navigation';
+	import { FolderPlus, Pencil, Plus, Trash2 } from '@lucide/svelte';
 	import { api } from '#lib/api.js';
-	import { datetime, osLabels } from '#lib/format.js';
-	import MuteDialog from '#lib/components/MuteDialog.svelte';
-	import { describeMute, describePolicy, kindLabels } from '#lib/monitoring/labels.js';
+	import { confirmAction } from '#lib/confirm.svelte.js';
+	import { num, plural } from '#lib/format.js';
+	import { setHref, treeOrder } from '#lib/policy/policy.js';
+	import type { Category, SetRow } from '#lib/policy/types.js';
 	import { resource } from '#lib/resource.svelte.js';
-	import { clientId, clients, currentClient, withClient } from '#lib/scope.svelte.js';
+	import { clientId, clients, currentClient, loadClients } from '#lib/scope.svelte.js';
 	import { can } from '#lib/session.svelte.js';
-	import { attempt, toast } from '#lib/toast.svelte.js';
-	import type { Mute, Policy } from '#lib/types.js';
-	import { param, qs, setParams, sortState } from '#lib/url.svelte.js';
+	import { attempt } from '#lib/toast.svelte.js';
+	import { param, qs, setParams } from '#lib/url.svelte.js';
+	import Async from '#lib/ui/Async.svelte';
 	import Badge from '#lib/ui/Badge.svelte';
 	import Button from '#lib/ui/Button.svelte';
 	import DataTable, { type Column } from '#lib/ui/DataTable.svelte';
 	import EmptyState from '#lib/ui/EmptyState.svelte';
-	import ErrorState from '#lib/ui/ErrorState.svelte';
-	import Input from '#lib/ui/Input.svelte';
+	import IconButton from '#lib/ui/IconButton.svelte';
 	import PageHeader from '#lib/ui/PageHeader.svelte';
 	import Select from '#lib/ui/Select.svelte';
-	import Switch from '#lib/ui/Switch.svelte';
-	import SeverityBadge from '#lib/components/SeverityBadge.svelte';
+	import Tabs from '#lib/ui/Tabs.svelte';
+	import AssignmentGrid from '#lib/components/policy/AssignmentGrid.svelte';
+	import CategoryDialog from '#lib/components/policy/CategoryDialog.svelte';
+	import SetDialog from '#lib/components/policy/SetDialog.svelte';
+	import SetTree from '#lib/components/policy/SetTree.svelte';
 
-	const res = resource(() => api.get<Policy[]>('/alert-policies'));
-	const sort = sortState('name');
-	let q = $state(param('q'));
-	$effect(() => {
-		const v = q;
-		const t = setTimeout(() => setParams({ q: v.trim() || null }), 250);
-		return () => clearTimeout(t);
-	});
-	const kind = $derived(param('kind'));
+	const tab = $derived(param('tab', 'sets'));
 	const scoped = $derived(currentClient());
-	const rank = { critical: 0, warning: 1, info: 2 };
-	const keyed: Record<string, (p: Policy) => string | number> = {
-		name: (p) => p.name.toLowerCase(),
-		kind: (p) => kindLabels[p.kind],
-		severity: (p) => rank[p.severity],
-		scope: (p) => `${p.client_name ?? ''} ${p.site_name ?? ''}`.toLowerCase(),
-		open: (p) => p.open_alerts
-	};
-	const rows = $derived.by(() => {
-		const f = param('q').toLowerCase();
-		const cid = clientId();
-		const list = (res.data ?? []).filter(
-			(p) => (!f || `${p.name} ${describePolicy(p)}`.toLowerCase().includes(f)) && (!kind || p.kind === kind) && (!cid || !p.client_id || p.client_id === cid)
-		);
-		const k = keyed[sort.key] ?? keyed.name;
-		const sign = sort.dir === 'asc' ? 1 : -1;
-		return [...list].sort((a, b) => (k(a) < k(b) ? -sign : k(a) > k(b) ? sign : 0));
+	$effect(() => {
+		loadClients();
 	});
-	const mayEdit = (p: Policy) => (p.client_id ? can('technician') : can('admin'));
-	const canCreate = $derived(can('admin') || (can('technician') && clients.list.length > 0));
 
-	const mutes = resource(() => api.get<Mute[]>(`/alert-mutes${qs({ client_id: clientId() })}`));
-	let addingMute = $state(false);
-	async function removeMute(m: Mute) {
-		if (await attempt(() => api.del(`/alert-mutes/${m.id}`), m.ends_at ? 'Snooze ended.' : 'Maintenance window removed.')) mutes.reload();
-	}
+	const sets = resource(() => api.get<SetRow[]>(`/policy-sets${qs({ client_id: clientId() })}`));
+	const categories = resource(() => api.get<Category[]>('/device-categories'));
+	let newSet = $state(false);
+	let editing = $state<Category | 'new' | null>(null);
 
-	async function toggle(p: Policy, enabled: boolean) {
-		const body = { ...p, enabled };
-		res.update((list) => list.map((x) => (x.id === p.id ? { ...x, enabled } : x)));
-		try {
-			await api.put(`/alert-policies/${p.id}`, body);
-			toast.success(`${p.name} ${enabled ? 'enabled' : 'disabled'}.`);
-		} catch (e) {
-			toast.error(e);
-			res.reload();
-		}
+	async function removeCategory(c: Category) {
+		const ok = await confirmAction({
+			title: `Delete ${c.name}?`,
+			message: `${c.devices ? `Its ${plural(c.devices, 'device')} go back to their built-in category. ` : ''}Its assignments are deleted, and enrollment tokens naming it no longer do.`,
+			confirmLabel: 'Delete category',
+			danger: true
+		});
+		if (ok && (await attempt(() => api.del(`/device-categories/${c.id}`), `${c.name} deleted.`))) categories.reload();
 	}
 </script>
 
-<PageHeader title="Alert policies" count={res.data ? rows.length : null} description={scoped ? `MSP-wide policies, plus policies for ${scoped.name} only.` : 'What raises an alert, on which agents, and who hears about it.'}>
+<svelte:head><title>Policies</title></svelte:head>
+
+<PageHeader
+	title="Policies"
+	description={scoped
+		? `The sets ${scoped.name}'s devices can use: MSP-wide ones and ${scoped.name}'s own.`
+		: 'Every device uses one policy set: its pin, else the set assigned to its site or client for its category, else the category’s default. Sets inherit from the set above them.'}
+>
 	{#snippet actions()}
-		{#if canCreate}<Button variant="primary" icon={Plus} href={withClient('/policies/new')}>New policy</Button>{/if}
+		{#if tab === 'sets' && can('technician')}<Button variant="primary" icon={FolderPlus} onclick={() => (newSet = true)}>New set</Button>{/if}
+		{#if tab === 'categories' && can('admin')}<Button variant="primary" icon={Plus} onclick={() => (editing = 'new')}>New category</Button>{/if}
 	{/snippet}
 </PageHeader>
 
-{#if res.error && !res.data}
-	<div class="card"><ErrorState error={res.error} onretry={() => res.reload()} /></div>
-{:else}
-	{#snippet nameCell(p: Policy)}
-		<a class="hover:text-accent font-medium" href="/policies/{p.id}">{p.name}</a>
-		<div class="text-muted max-w-md truncate text-xs">{describePolicy(p)}</div>
-	{/snippet}
-	{#snippet kindCell(p: Policy)}{kindLabels[p.kind]}{/snippet}
-	{#snippet sevCell(p: Policy)}<SeverityBadge severity={p.severity} />{/snippet}
-	{#snippet scopeCell(p: Policy)}
-		{#if p.client_name}<Badge>{p.client_name}{p.site_name ? ` › ${p.site_name}` : ''}</Badge>{:else}<Badge tone="accent">All clients</Badge>{/if}
-		{#if p.os_family}<span class="text-muted ml-1 text-xs">{osLabels[p.os_family]} only</span>{/if}
-	{/snippet}
-	{#snippet notifyCell(p: Policy)}<span class="text-muted">{p.channel_ids.length ? `${p.channel_ids.length} channel${p.channel_ids.length === 1 ? '' : 's'}` : 'None'}</span>{/snippet}
-	{#snippet openCell(p: Policy)}
-		{#if p.open_alerts}<a class="text-danger font-medium hover:underline" href="/alerts?policy={p.id}">{p.open_alerts}</a>{:else}<span class="text-muted" aria-label="none">–</span>{/if}
-	{/snippet}
-	{#snippet enabledCell(p: Policy)}
-		<Switch checked={p.enabled} disabled={!mayEdit(p)} label="{p.enabled ? 'Disable' : 'Enable'} {p.name}" onchange={(c) => toggle(p, c)} />
-	{/snippet}
+<Tabs
+	label="Policy sections"
+	class="mb-4"
+	value={tab}
+	onchange={(v) => setParams({ tab: v === 'sets' ? null : v }, { push: true })}
+	items={[
+		{ value: 'sets', label: 'Policy sets', count: sets.data ? num(sets.data.length) : undefined },
+		{ value: 'categories', label: 'Device categories', count: categories.data ? num(categories.data.length) : undefined },
+		{ value: 'assignments', label: 'Assignments' }
+	]}
+/>
 
+{#if tab === 'sets'}
+	<section class="card" aria-label="Policy sets">
+		<Async res={sets} compact>
+			{#snippet children(rows)}
+				<SetTree rows={treeOrder(rows ?? [])} categories={categories.data ?? []} />
+			{/snippet}
+		</Async>
+	</section>
+	<p class="text-muted mt-3 max-w-3xl text-xs">
+		Patching, security, remote access and agent settings live once, in All devices; every set below can change single fields of them. Alert policies and scheduled scripts can be added to any set and reach every set below it.
+	</p>
+{:else if tab === 'categories'}
+	{#snippet nameCell(c: Category)}
+		<span class="font-medium">{c.name}</span>
+		{#if c.description}<div class="text-muted max-w-md truncate text-xs">{c.description}</div>{/if}
+	{/snippet}
+	{#snippet kindCell(c: Category)}{#if c.builtin}<Badge>Built-in</Badge>{:else}<span class="text-muted">Custom</span>{/if}{/snippet}
+	{#snippet setCell(c: Category)}<a class="link" href={setHref(c.default_set_id)}>{c.default_set_name}</a>{/snippet}
+	{#snippet devCell(c: Category)}<a class="hover:text-accent tabular" href="/agents?category={c.id}" aria-label="{plural(c.devices, 'device')} in {c.name}">{num(c.devices)}</a>{/snippet}
+	{#snippet actCell(c: Category)}
+		{#if can('admin')}
+			<div class="flex justify-end gap-1">
+				<IconButton icon={Pencil} size="sm" label="Edit {c.name}" onclick={() => (editing = c)} />
+				{#if !c.builtin}<IconButton icon={Trash2} size="sm" variant="danger-ghost" label="Delete {c.name}" onclick={() => removeCategory(c)} />{/if}
+			</div>
+		{/if}
+	{/snippet}
 	<DataTable
-		id="policies"
-		caption="Alert policies"
-		{rows}
-		key={(p) => p.id}
-		loading={res.loading}
-		{sort}
-		rowHref={(p) => `/policies/${p.id}`}
+		id="device-categories"
+		caption="Device categories"
+		rows={categories.data ?? []}
+		key={(c) => c.id}
+		loading={categories.loading}
+		scroll={false}
 		columns={[
-			{ id: 'name', label: 'Policy', sort: 'name', cell: nameCell, hideable: false },
-			{ id: 'kind', label: 'Type', sort: 'kind', cell: kindCell, from: 'md' },
-			{ id: 'severity', label: 'Severity', sort: 'severity', cell: sevCell, from: 'sm' },
-			{ id: 'scope', label: 'Applies to', sort: 'scope', cell: scopeCell, from: 'lg' },
-			{ id: 'notify', label: 'Notifies', cell: notifyCell, from: 'xl' },
-			{ id: 'open', label: 'Open', sort: 'open', cell: openCell, align: 'right' },
-			{ id: 'enabled', label: 'On', cell: enabledCell, hideable: false, class: 'w-16' }
-		] satisfies Column<Policy>[]}
+			{ id: 'name', label: 'Category', cell: nameCell, hideable: false },
+			{ id: 'kind', label: 'Kind', cell: kindCell, from: 'md' },
+			{ id: 'set', label: 'Default policy set', cell: setCell },
+			{ id: 'devices', label: 'Devices', cell: devCell, align: 'right' },
+			{ id: 'actions', label: 'Actions', cell: actCell, align: 'right', hideable: false, class: 'w-24' }
+		] satisfies Column<Category>[]}
 	>
 		{#snippet toolbar()}
-			<Input icon={Search} data-search placeholder="Name or rule…" aria-label="Search policies" class="w-full sm:w-64" bind:value={q} />
-			<Select aria-label="Type" class="w-auto" value={kind} onchange={(e) => setParams({ kind: e.currentTarget.value })} options={[{ value: '', label: 'Any type' }, ...Object.entries(kindLabels).map(([value, label]) => ({ value, label }))]} />
+			<p class="text-muted text-xs">New devices land in the built-in category for their OS and platform, and follow it while nobody moves them. Move devices from the Agents list; an enrollment token can name a category too.</p>
 		{/snippet}
-		{#snippet empty()}
-			{#if param('q') || kind}
-				<EmptyState compact title="No policies match" />
-			{:else}
-				<EmptyState icon={ShieldCheck} title="No alert policies yet" description="A policy watches agents for one problem (offline, high CPU, a stopped service, a failed script...) and opens an alert when it happens.">
-					{#snippet action()}{#if canCreate}<Button variant="primary" icon={Plus} href={withClient('/policies/new')}>New policy</Button>{/if}{/snippet}
-				</EmptyState>
-			{/if}
-		{/snippet}
+		{#snippet empty()}<EmptyState compact title="No categories" />{/snippet}
 	</DataTable>
+{:else if tab === 'assignments'}
+	<section class="card" aria-labelledby="assign-h">
+		<header class="panel-head flex-wrap">
+			<div class="min-w-0">
+				<h2 id="assign-h" class="panel-title">Assignments{scoped ? ` for ${scoped.name}` : ''}</h2>
+				<p class="text-muted text-xs">Pick the set each device category uses, for the whole client or one site. A site's choice wins over the client's; empty cells say what applies instead.</p>
+			</div>
+			{#if !scoped}
+				<Select
+					aria-label="Client"
+					class="w-full sm:w-56"
+					value={clientId()}
+					onchange={(e) => goto(`/policies?tab=assignments&client=${e.currentTarget.value}`, { replace: true })}
+					options={[{ value: '', label: 'Choose a client…', disabled: true }, ...clients.list.map((c) => ({ value: c.id, label: c.name }))]}
+				/>
+			{/if}
+		</header>
+		{#if clientId()}
+			{#key clientId()}<AssignmentGrid clientId={clientId()} />{/key}
+		{:else}
+			<EmptyState compact title="Choose a client" description="Assignments belong to one client; pick it above or with the client switcher." />
+		{/if}
+	</section>
 {/if}
 
-<section class="card mt-6" aria-labelledby="mutes-title">
-	<header class="border-border flex min-h-12 flex-wrap items-center gap-2 border-b px-4 py-2">
-		<div class="min-w-0 flex-1">
-			<h2 id="mutes-title" class="panel-title">Maintenance windows</h2>
-			<p class="text-muted text-xs">Alerts that open during these are kept, but nobody is notified and no ticket opens. Snoozes for one agent are set on the agent.</p>
-		</div>
-		{#if can('technician') && clients.list.length}<Button size="sm" icon={BellOff} onclick={() => (addingMute = true)}>Add window</Button>{/if}
-	</header>
-	{#if mutes.data?.length}
-		<ul class="divide-border divide-y">
-			{#each mutes.data as m (m.id)}
-				<li class="flex flex-wrap items-center gap-x-3 gap-y-1 px-4 py-2.5 text-sm">
-					<div class="min-w-0 flex-1">
-						<div class="flex flex-wrap items-center gap-2">
-							{#if m.agent_id}<a class="hover:text-accent font-medium" href="/agents/{m.agent_id}?tab=alerts">{m.target_name}</a>{:else}<span class="font-medium">{m.target_name}</span>{/if}
-							<span class="text-muted">{describeMute(m, datetime)}</span>
-							{#if m.active}<Badge tone="warning">Now</Badge>{/if}
-						</div>
-						{#if m.reason || m.created_by_name}<div class="text-muted text-xs">{[m.reason, m.created_by_name].filter(Boolean).join(' · ')}</div>{/if}
-					</div>
-					{#if can('technician')}<Button size="sm" variant="ghost" onclick={() => removeMute(m)}>{m.ends_at ? 'End' : 'Remove'}</Button>{/if}
-				</li>
-			{/each}
-		</ul>
-	{:else if !mutes.loading}
-		<EmptyState compact title="No maintenance windows" description="Add one for regular work (nightly backups, weekend patching) so planned reboots don't page anyone." />
-	{/if}
-</section>
-
-{#if addingMute}<MuteDialog onclose={() => (addingMute = false)} onsaved={() => mutes.reload()} />{/if}
+{#if newSet}<SetDialog mode="new" client={clientId() || null} onclose={() => (newSet = false)} ondone={(r) => goto(setHref(r.id))} />{/if}
+{#if editing}<CategoryDialog category={editing === 'new' ? null : editing} onclose={() => (editing = null)} onsaved={() => categories.reload()} />{/if}

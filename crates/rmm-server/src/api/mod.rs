@@ -23,6 +23,7 @@ mod packages;
 mod schedules;
 mod patches;
 mod pm;
+pub(crate) mod policies;
 pub(crate) mod portal;
 mod reports;
 mod search;
@@ -79,7 +80,6 @@ pub fn router(attachment_max: u64) -> Router<Arc<AppState>> {
         .route("/clients", get(clients::list).post(clients::create))
         .route("/clients/{id}", get(clients::get).put(clients::rename).delete(clients::remove))
         .route("/clients/{id}/sites", post(clients::create_site))
-        .route("/clients/{id}/desktop", axum::routing::put(clients::update_desktop))
         .route("/sites/{id}", axum::routing::put(clients::rename_site).delete(clients::remove_site))
         .route("/sites/{id}/enrollment-tokens", get(clients::list_tokens).post(clients::create_token))
         .route("/enrollment-tokens/{id}", delete(clients::revoke_token))
@@ -105,8 +105,6 @@ pub fn router(attachment_max: u64) -> Router<Arc<AppState>> {
         .route("/patch-runs", get(patches::runs))
         .route("/patch-runs/{id}", get(patches::run))
         .route("/patch-runs/{id}/cancel", post(patches::cancel_run))
-        .route("/patch-policies", get(patches::policies).post(patches::create_policy))
-        .route("/patch-policies/{id}", axum::routing::put(patches::update_policy).delete(patches::delete_policy))
         .route("/patch-windows", get(patches::windows))
         .route("/sites/{id}/maintenance-window", axum::routing::put(patches::set_window))
         .route("/agents/{id}/security", get(security::for_agent))
@@ -122,8 +120,6 @@ pub fn router(attachment_max: u64) -> Router<Arc<AppState>> {
         .route("/security/detections/{id}", get(security::detection))
         .route("/security/detections/{id}/verdict", post(security::verdict))
         .route("/security/quarantine", get(security::quarantine))
-        .route("/security/policies", get(security::policies).post(security::create_policy))
-        .route("/security/policies/{id}", axum::routing::put(security::update_policy).delete(security::delete_policy))
         .route("/security/exclusions", get(security::exclusions).post(security::create_exclusion))
         .route("/security/exclusions/{id}", delete(security::delete_exclusion))
         .route("/security/rules", get(security::rules))
@@ -131,8 +127,14 @@ pub fn router(attachment_max: u64) -> Router<Arc<AppState>> {
         .route("/security/content", get(security::content).post(security::upload_content))
         .route("/security/content/{id}/promote", post(security::promote_content))
         .route("/security/content/{id}/rollback", post(security::rollback_content))
+        .route("/security/databases", get(security::databases))
+        .route("/security/databases/{id}/promote", post(security::promote_database))
+        .route("/security/databases/{id}/rollback", post(security::rollback_database))
+        .route("/agent/databases/{version}", get(security::agent_database))
         .route("/security/hunt", post(security::hunt))
         .route("/security/prevalence", get(security::prevalence))
+        .route("/security/reputation", get(security::reputation_sources))
+        .route("/security/reputation/rare", get(security::rare))
         .route("/clients/{id}/security", axum::routing::put(security::set_canary))
         .route("/users/{id}/permissions", axum::routing::put(users::update_permissions))
         .route("/agents/{id}/shell", get(crate::shell_ws::handler))
@@ -163,16 +165,28 @@ pub fn router(attachment_max: u64) -> Router<Arc<AppState>> {
         .route("/alerts/{id}", get(alerts::get))
         .route("/alerts/{id}/acknowledge", post(alerts::acknowledge))
         .route("/alerts/{id}/resolve", post(alerts::resolve))
-        .route("/alert-policies", get(alerts::list_policies).post(alerts::create_policy))
-        .route("/alert-policies/{id}", get(alerts::get_policy).put(alerts::update_policy).delete(alerts::remove_policy))
-        .route("/alert-policies/{id}/exclusions/{agent_id}", axum::routing::put(alerts::exclude).delete(alerts::include))
-        .route("/agents/{id}/alert-policies", get(alerts::for_agent))
         .route("/alert-mutes", get(mutes::list).post(mutes::create))
         .route("/alert-mutes/{id}", delete(mutes::remove))
-        .route("/schedules", get(schedules::list).post(schedules::create))
+        .route("/schedules", get(schedules::list))
         .route("/schedules/preview", get(schedules::preview))
-        .route("/schedules/{id}", get(schedules::get).put(schedules::update).delete(schedules::remove))
+        .route("/schedules/{id}", get(schedules::get))
         .route("/schedules/{id}/run", post(schedules::run_now))
+        .route("/policy-sets", get(policies::list_sets).post(policies::create_set))
+        .route("/policy-sets/{id}", get(policies::get_set).put(policies::update_set).delete(policies::delete_set))
+        .route("/policy-sets/{id}/duplicate", post(policies::duplicate_set))
+        .route("/policy-sets/{id}/agents", get(policies::set_agents))
+        .route("/policy-sets/{id}/items", post(policies::create_item))
+        .route("/policy-items/{id}", get(policies::get_item).put(policies::update_item).delete(policies::delete_item))
+        .route("/policy-items/{id}/overrides/{set_id}", axum::routing::put(policies::put_override).delete(policies::delete_override))
+        .route("/policy-items/{id}/exclusions/{agent_id}", axum::routing::put(policies::exclude).delete(policies::include))
+        .route("/device-categories", get(policies::list_categories).post(policies::create_category))
+        .route("/device-categories/{id}", axum::routing::put(policies::update_category).delete(policies::delete_category))
+        .route("/agents/category", post(policies::move_agents))
+        .route("/policy-assignments", get(policies::list_assignments).put(policies::put_assignment))
+        .route("/policy-assignments/{id}", delete(policies::delete_assignment))
+        .route("/agents/{id}/policy", get(policies::get_agent_policy))
+        .route("/agents/{id}/policy-pin", axum::routing::put(policies::put_pin))
+        .route("/agents/{id}/policy-pin/customize", post(policies::customize))
         .route("/agents/{id}/services", get(services::list))
         .route("/agents/{id}/services/refresh", post(services::refresh))
         .route("/agents/{id}/services/control", post(services::control))
@@ -298,6 +312,15 @@ pub fn router(attachment_max: u64) -> Router<Arc<AppState>> {
         // Everything above takes bodies of at most 8 MB; uploads stream to the agent or to storage instead.
         .layer(tower_http::limit::RequestBodyLimitLayer::new(8 * 1024 * 1024))
         .route("/agents/{id}/files/upload", axum::routing::put(tools::upload))
+        // Streamed into storage and checked on the way (security::DATABASE_MAX).
+        .route("/security/databases", post(security::upload_database))
+        // A server-only hash list can be a whole feed (a million hashes is about 65 MB of text).
+        .route(
+            "/security/reputation/lists/{name}",
+            axum::routing::put(security::put_reputation_list)
+                .delete(security::delete_reputation_list)
+                .layer(axum::extract::DefaultBodyLimit::max(security::REPUTATION_LIST_MAX)),
+        )
         .route("/tickets/{id}/attachments", post(tickets::upload).layer(upload_limit(tickets::MAX_UPLOAD_FILES)))
         .route("/portal/tickets", post(portal::create_ticket).layer(upload_limit(portal::MAX_FILES)))
         .route("/portal/tickets/{id}/messages", post(portal::add_message).layer(upload_limit(portal::MAX_FILES)))

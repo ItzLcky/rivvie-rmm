@@ -1,11 +1,12 @@
 <script lang="ts">
 	import { CalendarClock, Play, Plus, Search } from '@lucide/svelte';
 	import { api } from '#lib/api.js';
-	import { ago, datetime, interpreterLabel, osLabels } from '#lib/format.js';
+	import { ago, datetime, interpreterLabel, plural } from '#lib/format.js';
+	import { ROOT_SET } from '#lib/policy/policy.js';
 	import { liveReload } from '#lib/live.svelte.js';
 	import { describeCron } from '#lib/monitoring/labels.js';
 	import { resource } from '#lib/resource.svelte.js';
-	import { clientId, clients, currentClient, withClient } from '#lib/scope.svelte.js';
+	import { clientId, currentClient } from '#lib/scope.svelte.js';
 	import { can } from '#lib/session.svelte.js';
 	import { attempt, toast } from '#lib/toast.svelte.js';
 	import type { Schedule } from '#lib/types.js';
@@ -33,7 +34,7 @@
 	const keyed: Record<string, (s: Schedule) => string | number> = {
 		name: (s) => s.name.toLowerCase(),
 		script: (s) => s.script_name.toLowerCase(),
-		target: (s) => `${s.client_name ?? ''} ${s.site_name ?? ''}`.toLowerCase(),
+		target: (s) => `${s.set_name} ${s.client_name ?? ''} ${s.site_name ?? ''}`.toLowerCase(),
 		next: (s) => (s.enabled && s.next_run_at ? s.next_run_at : '~'),
 		last: (s) => s.last_run_at ?? ''
 	};
@@ -46,7 +47,7 @@
 		return [...list].sort((a, b) => (k(a) < k(b) ? -sign : k(a) > k(b) ? sign : 0));
 	});
 	const mayEdit = (s: Schedule) => (s.client_id ? can('technician') : can('admin'));
-	const canCreate = $derived(can('admin') || (can('technician') && clients.list.length > 0));
+	const newHref = `/policies/sets/${ROOT_SET}?section=schedules&item=new`;
 
 	async function runNow(s: Schedule) {
 		let msg = '';
@@ -61,9 +62,15 @@
 	}
 </script>
 
-<PageHeader title="Schedules" count={res.data ? rows.length : null} description={scoped ? `MSP-wide schedules, plus schedules for ${scoped.name} only.` : 'Scripts that run on a timetable, on every agent of a client or site.'}>
+<PageHeader
+	title="Schedules"
+	count={res.data ? rows.length : null}
+	description={scoped
+		? `Scheduled scripts that can run on ${scoped.name}'s devices.`
+		: 'Scripts that run on a timetable, from every policy set. Each runs on the devices using its set or a set below it; add and change them in the set.'}
+>
 	{#snippet actions()}
-		{#if canCreate}<Button variant="primary" icon={Plus} href={withClient('/schedules/new')}>New schedule</Button>{/if}
+		{#if can('technician')}<Button icon={Plus} href={newHref}>Add in a policy set</Button>{/if}
 	{/snippet}
 </PageHeader>
 
@@ -76,8 +83,8 @@
 	{/snippet}
 	{#snippet scriptCell(s: Schedule)}<a class="hover:text-accent" href="/scripts/{s.script_id}">{s.script_name}</a><div class="text-muted text-xs">{interpreterLabel(s.interpreter)}</div>{/snippet}
 	{#snippet targetCell(s: Schedule)}
-		{#if s.client_name}<Badge>{s.client_name}{s.site_name ? ` › ${s.site_name}` : ''}</Badge>{:else}<Badge tone="accent">All clients</Badge>{/if}
-		{#if s.os_family}<span class="text-muted ml-1 text-xs">{osLabels[s.os_family]}</span>{/if}
+		<a class="hover:text-accent" href="/policies/sets/{s.set_id}?section=schedules&item={s.id}">{s.set_name}</a>
+		<div class="text-muted text-xs">{s.client_name ? `${s.client_name}${s.site_name ? ` › ${s.site_name}` : ''} only · ` : ''}{plural(s.agents, 'device')}</div>
 	{/snippet}
 	{#snippet nextCell(s: Schedule)}
 		{#if !s.enabled}<Badge>Paused</Badge>{:else if s.next_run_at}<span class="whitespace-nowrap" title={datetime(s.next_run_at)}>{datetime(s.next_run_at)}</span>{:else}<span class="text-muted">–</span>{/if}
@@ -102,7 +109,7 @@
 		columns={[
 			{ id: 'name', label: 'Schedule', sort: 'name', cell: nameCell, hideable: false },
 			{ id: 'script', label: 'Script', sort: 'script', cell: scriptCell, from: 'md' },
-			{ id: 'target', label: 'Runs on', sort: 'target', cell: targetCell, from: 'lg' },
+			{ id: 'target', label: 'Policy set', sort: 'target', cell: targetCell, from: 'lg' },
 			{ id: 'next', label: 'Next run', sort: 'next', cell: nextCell, from: 'sm' },
 			{ id: 'last', label: 'Last run', sort: 'last', cell: lastCell },
 			{ id: 'actions', label: '', cell: actionCell, hideable: false, align: 'right', class: 'w-12' }
@@ -115,8 +122,8 @@
 			{#if param('q')}
 				<EmptyState compact title="No schedules match" />
 			{:else}
-				<EmptyState icon={CalendarClock} title="No schedules yet" description="Run a saved script on a timetable: nightly cleanups, weekly reports, hourly checks. Each run's output is kept for as long as you choose.">
-					{#snippet action()}{#if canCreate}<Button variant="primary" icon={Plus} href={withClient('/schedules/new')}>New schedule</Button>{/if}{/snippet}
+				<EmptyState icon={CalendarClock} title="No schedules yet" description="Run a saved script on a timetable: nightly cleanups, weekly reports, hourly checks. Add it to a policy set; it runs on the devices using that set and the sets below it.">
+					{#snippet action()}{#if can('technician')}<Button variant="primary" icon={Plus} href={newHref}>Add in a policy set</Button>{/if}{/snippet}
 				</EmptyState>
 			{/if}
 		{/snippet}

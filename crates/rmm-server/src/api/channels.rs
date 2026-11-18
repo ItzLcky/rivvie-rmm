@@ -7,6 +7,7 @@ use axum::extract::{Path, State};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sqlx::AssertSqlSafe;
 use uuid::Uuid;
 
 use crate::auth::{self, Role, User};
@@ -41,7 +42,7 @@ struct ChannelRow {
 }
 
 const SELECT: &str = "SELECT ch.id, ch.name, ch.kind, ch.config, ch.enabled, ch.created_at,
-       (SELECT count(*) FROM alert_policies p WHERE ch.id = ANY(p.channel_ids)) AS policies
+       (SELECT count(*) FROM policy_items p WHERE p.module = 'alert' AND p.config -> 'channel_ids' ? ch.id::text) AS policies
   FROM notification_channels ch";
 
 fn view(r: ChannelRow, admin: bool) -> ChannelView {
@@ -151,11 +152,26 @@ pub async fn update(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uui
 pub async fn remove(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uuid>) -> ApiResult<Json<Value>> {
     u.require(Role::Admin)?;
     let current = fetch(&st, id).await?;
+    // Out of every alert item and override that names it.
     let mut tx = st.db.begin().await?;
-    sqlx::query("UPDATE alert_policies SET channel_ids = array_remove(channel_ids, $1) WHERE $1 = ANY(channel_ids)")
-        .bind(id)
-        .execute(&mut *tx)
-        .await?;
+    crate::policy::lock(&mut tx).await?;
+    let drop = "jsonb_set(config, '{channel_ids}', coalesce((SELECT jsonb_agg(x) FROM jsonb_array_elements(config -> 'channel_ids') x
+                                                              WHERE x <> to_jsonb($1::text)), '[]'))";
+    let items: Vec<Uuid> = sqlx::query_scalar(AssertSqlSafe(format!(
+        "UPDATE policy_items SET config = {drop} WHERE module = 'alert' AND config -> 'channel_ids' ? $1::text RETURNING id"
+    )))
+    .bind(id)
+    .fetch_all(&mut *tx)
+    .await?;
+    let overridden: Vec<Uuid> = sqlx::query_scalar(AssertSqlSafe(format!(
+        "UPDATE policy_overrides SET config = {drop} WHERE jsonb_typeof(config -> 'channel_ids') = 'array' AND config -> 'channel_ids' ? $1::text
+         RETURNING item_id"
+    )))
+    .bind(id)
+    .fetch_all(&mut *tx)
+    .await?;
+    let touched: Vec<Uuid> = items.into_iter().chain(overridden).collect();
+    crate::policy::rebuild(&mut tx, Some(&touched)).await?;
     sqlx::query("DELETE FROM notification_channels WHERE id = $1").bind(id).execute(&mut *tx).await?;
     tx.commit().await?;
     auth::audit(&st.db, Some(u.id), "channel.delete", Some(("channel", id)), json!({ "name": current.name })).await;

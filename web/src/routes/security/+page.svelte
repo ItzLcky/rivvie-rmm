@@ -6,9 +6,10 @@
 	import { paged } from '#lib/paged.svelte.js';
 	import { resource } from '#lib/resource.svelte.js';
 	import { clientId, currentClient, withClient } from '#lib/scope.svelte.js';
+	import { ROOT_SET } from '#lib/policy/policy.js';
 	import {
-		actionNouns, productLabels, resourceLabel, severityLabels, severityTone, sourceLabels, stateLabels, states, threatStatusLabels, threatStatusTone,
-		verdictLabels, verdictTone
+		actionNouns, databaseStale, riskSummary, foundByHelp, foundByLabels, productLabels, realtimeView, resourceLabel, riskLabels, severityLabels, severityTone, sourceLabels,
+		stateHelp, stateLabels, states, threatStatusLabels, threatStatusTone, verdictLabels, verdictTone
 	} from '#lib/security.js';
 	import { allowed } from '#lib/session.svelte.js';
 	import { attempt, toast } from '#lib/toast.svelte.js';
@@ -29,7 +30,9 @@
 	import Tabs from '#lib/ui/Tabs.svelte';
 	import Status from '#lib/components/Status.svelte';
 	import ProtectionBadge from '#lib/components/security/ProtectionBadge.svelte';
+	import ReputationLists from '#lib/components/security/ReputationLists.svelte';
 	import SecurityContent from '#lib/components/security/SecurityContent.svelte';
+	import SignatureDatabases from '#lib/components/security/SignatureDatabases.svelte';
 	import SecurityHunt from '#lib/components/security/SecurityHunt.svelte';
 	import SecurityQuarantine from '#lib/components/security/SecurityQuarantine.svelte';
 	import SecurityRules from '#lib/components/security/SecurityRules.svelte';
@@ -97,7 +100,7 @@
 <svelte:head><title>Security</title></svelte:head>
 
 <PageHeader title="Security" description={scoped ? `Protection on ${scoped.name}'s agents.` : 'The antivirus each machine already has (Microsoft Defender, ClamAV, XProtect), our own sensor, their findings, and the response to them.'}>
-	{#snippet actions()}<Button icon={ShieldCheck} href={withClient('/policies/new?kind=security')}>Alert on protection</Button>{/snippet}
+	{#snippet actions()}<Button icon={ShieldCheck} href="/policies/sets/{ROOT_SET}?section=alerts&item=new&kind=security">Alert on protection</Button>{/snippet}
 </PageHeader>
 
 {#if summary.data}
@@ -135,15 +138,16 @@
 	{/snippet}
 	{#snippet stateCell(a: SecurityAgentRow)}
 		<span class="inline-flex flex-wrap items-center gap-1">
-			<ProtectionBadge state={a.state} title={a.security_error ?? undefined} />
+			<ProtectionBadge state={a.state} title={a.security_error ?? (a.risks?.length ? a.risks.map((r) => riskLabels[r]).join('; ') : stateHelp[a.state])} />
 			{#if a.isolated}<Badge tone="danger" icon={Network} title="Only the RMM server, DNS and DHCP are reachable">Isolated</Badge>{/if}
 		</span>
+		{#if a.state === 'at_risk' && a.risks?.length}<div class="text-muted text-xs">{riskSummary(a.risks)}</div>{/if}
 		{#if a.running_action}<div class="text-info text-xs">{actionNouns[a.running_action]} running</div>{/if}
 	{/snippet}
 	{#snippet productsCell(a: SecurityAgentRow)}
 		{#each a.products as p (p.kind + p.name)}
 			<div class="truncate">
-				{p.name}{#if p.enabled === false}<span class="text-danger">{' · off'}</span>{:else if p.realtime === false}<span class="text-warning">{' · no real-time'}</span>{/if}
+				{p.name}{#if p.enabled === false}<span class="text-danger">{' · off'}</span>{:else if p.kind === 'rmm' && a.os_family !== 'linux'}<span class="text-muted">{' · scans after start'}</span>{:else if p.realtime === false}<span class="text-warning">{' · no real-time'}</span>{/if}
 			</div>
 		{:else}
 			<span class="text-muted">{a.security_at ? 'None found' : '–'}</span>
@@ -167,7 +171,21 @@
 		{:else}
 			<span class="text-muted">Running</span>
 		{/if}
-		{#if a.sensor?.enabled && (a.content_version ?? a.sensor.content_version)}<div class="text-muted font-mono text-xs">{a.content_version ?? a.sensor.content_version}</div>{/if}
+		{#if a.sensor?.enabled}
+			{@const v = a.sensor.running ? realtimeView(a.sensor.health?.realtime, a.os_family, true, a.prevention) : null}
+			{#if v}
+				<div class="text-xs">{#if v.fault}<Badge tone="warning" title={v.detail ?? undefined}>Real-time {v.label.toLowerCase()}</Badge>{:else}<span class="text-muted" title={v.detail ?? undefined}>Real-time {v.label.charAt(0).toLowerCase() + v.label.slice(1)}</span>{/if}</div>
+			{/if}
+			{#if a.database_version}
+				<div class="flex flex-wrap items-center gap-1 text-xs">
+					<span class="text-muted font-mono">{a.database_version}</span>
+					{#if a.database_built_at}<span class="text-muted" title={datetime(a.database_built_at)}>{ago(a.database_built_at)}</span>{/if}
+					{#if databaseStale(a.database_built_at, a.database_max_age_hours)}<Badge tone="warning" title="Older than the policy's {a.database_max_age_hours} hours">Out of date</Badge>{/if}
+				</div>
+			{:else if a.content_version ?? a.sensor.content_version}
+				<div class="text-muted font-mono text-xs" title="Content version; no signature database yet">{a.content_version ?? a.sensor.content_version}</div>
+			{/if}
+		{/if}
 	{/snippet}
 	{#snippet scanCell(a: SecurityAgentRow)}
 		{#if a.last_scan_at}<span class="whitespace-nowrap" title={datetime(a.last_scan_at)}>{ago(a.last_scan_at)}</span>{:else}<span class="text-muted">–</span>{/if}
@@ -236,9 +254,10 @@
 	{#snippet statusCell(d: SecurityDetection)}
 		<span class="inline-flex flex-wrap gap-1">
 			<Badge tone={!d.resolved_at && d.status === 'active' && !d.audit ? 'danger' : d.audit ? 'neutral' : threatStatusTone[d.status]}>{d.audit && d.status === 'active' ? 'Recorded' : threatStatusLabels[d.status]}</Badge>
+			{#if d.denied}<Badge title="Refused before it ran">Denied</Badge>{/if}
 			{#if d.verdict}<Badge tone={verdictTone[d.verdict]}>{verdictLabels[d.verdict]}</Badge>{/if}
 		</span>
-		<div class="text-muted text-xs">{d.product === 'rmm' ? `${productLabels.rmm} · ${sourceLabels[d.source].toLowerCase()}` : productLabels[d.product]}</div>
+		<div class="text-muted text-xs" title={d.found_by ? foundByHelp[d.found_by] : undefined}>{d.product === 'rmm' ? `${productLabels.rmm} · ${d.found_by ? foundByLabels[d.found_by].toLowerCase() : sourceLabels[d.source].toLowerCase()}` : productLabels[d.product]}</div>
 	{/snippet}
 	{#snippet seenCell(d: SecurityDetection)}<span class="whitespace-nowrap" title={datetime(d.detected_at ?? d.first_seen_at)}>{ago(d.detected_at ?? d.first_seen_at)}</span>{/snippet}
 
@@ -294,6 +313,8 @@
 	<SecurityRules {canManage} />
 {:else if tab === 'content'}
 	<SecurityContent {canManage} />
+	<div class="mt-6"><SignatureDatabases {canManage} /></div>
+	<div class="mt-6"><ReputationLists {canManage} /></div>
 {:else if tab === 'settings'}
 	<SecuritySettings {canManage} />
 {/if}

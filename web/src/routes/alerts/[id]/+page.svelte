@@ -55,7 +55,7 @@
 			title={a.title}
 			crumbs={[{ label: 'Alerts', href: '/alerts' }, { label: a.hostname, href: `/agents/${a.agent_id}?tab=alerts` }, { label: kindLabels[a.kind] }]}
 			menu={[
-				...(a.policy_id ? [{ label: 'Edit policy', icon: Pencil, href: `/policies/${a.policy_id}` }] : []),
+				...(a.policy_id ? [{ label: 'Edit policy', icon: Pencil, href: `/policies/items/${a.policy_id}` }] : []),
 				{ label: 'Copy alert ID', icon: Copy, onSelect: () => navigator.clipboard?.writeText(a.id).then(() => toast.success('Alert ID copied.')) }
 			]}
 		>
@@ -76,7 +76,7 @@
 			<section class="card self-start p-4" aria-label="Details">
 				<h2 class="mb-3 panel-title">Details</h2>
 				<dl class="dl">
-					<dt>Policy</dt><dd>{#if a.policy_id}<a class="link" href="/policies/{a.policy_id}">{a.policy_name}</a>{:else}<span class="text-muted">Deleted</span>{/if}</dd>
+					<dt>Policy</dt><dd>{#if a.policy_id}<a class="link" href="/policies/items/{a.policy_id}">{a.policy_name}</a>{:else}<span class="text-muted">Deleted</span>{/if}</dd>
 					<dt>Type</dt><dd>{kindLabels[a.kind]}</dd>
 					{#if a.ticket}<dt>Ticket</dt><dd><a class="link" href="/tickets/{a.ticket.id}">T-{a.ticket.number}</a></dd>{/if}
 					<dt>Opened</dt><dd>{datetime(a.opened_at)} <span class="text-muted text-xs">({ago(a.opened_at)})</span></dd>

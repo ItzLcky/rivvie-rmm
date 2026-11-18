@@ -69,6 +69,8 @@
 		if (r.error && !r.succeeded) return r.error;
 		return `${r.succeeded} of ${plural(r.updates, 'update')} installed${r.rebooting ? ', restarting' : r.reboot_required ? ', restart pending' : ''}`;
 	}
+	/** The window automatic installs use: the patch policy's own, else the site's. */
+	const winOf = (d: AgentPatches) => d.policy?.window ?? d.window;
 </script>
 
 <Async {res}>
@@ -104,24 +106,22 @@
 				<section class="card p-4" aria-label="Policy">
 					<div class="mb-2 flex items-start justify-between gap-2">
 						<h2 class="panel-title">Policy</h2>
-						<MoreLink href="/patches?tab=policies">Policies</MoreLink>
+						{#if d.policy}<MoreLink href="/policies/sets/{d.policy.set_id}?section=patching">Open</MoreLink>{/if}
 					</div>
 					{#if d.policy}
 						{@const p = d.policy}
-						<p class="text-sm">
-							{p.source === 'site' ? `Site policy (${p.site_name})` : p.source === 'client' ? `Client policy (${p.client_name})` : 'MSP-wide policy'}
-						</p>
+						<p class="text-sm">Patching in <a class="link" href="/policies/sets/{p.set_id}?section=patching">{p.source}</a></p>
 						<p class="text-muted mt-1 text-xs">
 							Approves {[...p.auto_approve_categories.map(categoryLabel), ...p.auto_approve_severities.map((x) => `${x} severity`)].join(', ') || 'nothing automatically'}{p.deferral_days ? ` after ${plural(p.deferral_days, 'day')}` : ''}.
 							{p.auto_install ? 'Installs automatically' : 'Installs only when someone starts it'} · {rebootLabel(p.reboot_policy).toLowerCase()}.
 						</p>
 					{/if}
 				</section>
-				<section class="card p-4" aria-label="Maintenance window">
-					<h2 class="mb-2 panel-title">Maintenance window</h2>
-					<p class="text-sm">{windowLabel(d.window)}</p>
+				<section class="card p-4" aria-label="Install window">
+					<h2 class="mb-2 panel-title">{d.policy?.own_window ? 'Install window' : 'Maintenance window'}</h2>
+					<p class="text-sm">{windowLabel(winOf(d))}</p>
 					<p class="text-muted mt-1 text-xs">
-						{#if !d.window.days?.length}Automatic installs may start whenever updates are eligible.{:else if d.window.open_now}Open now.{:else}Next opens {datetime(d.window.next_start)}.{/if}
+						{#if d.policy?.own_window}The patch policy's own window, not the site's. {/if}{#if !winOf(d).days?.length}Automatic installs may start whenever updates are eligible.{:else if winOf(d).open_now}Open now.{:else}Next opens {datetime(winOf(d).next_start)}.{/if}
 					</p>
 				</section>
 			</div>

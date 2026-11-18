@@ -6,7 +6,7 @@
 	import { liveReload } from '#lib/live.svelte.js';
 	import { resource } from '#lib/resource.svelte.js';
 	import {
-		actionLabels, actionNouns, actionStatusLabels, actionStatusTone, productLabels, resourceLabel, severityLabels, severityTone,
+		actionLabels, actionNouns, foundByHelp, foundByLabels, productLabels, resourceLabel, riskHelp, riskLabels, severityLabels, severityTone,
 		sourceLabels, stateHelp, threatStatusLabels, threatStatusTone, verdictLabels, verdictTone
 	} from '#lib/security.js';
 	import { allowed } from '#lib/session.svelte.js';
@@ -28,7 +28,7 @@
 	import SensorCard from '#lib/components/security/SensorCard.svelte';
 	import TelemetryPanel from '#lib/components/security/TelemetryPanel.svelte';
 
-	let { agentId, hostname }: { agentId: string; hostname: string } = $props();
+	let { agentId, hostname, os }: { agentId: string; hostname: string; os: string } = $props();
 	const res = resource(() => api.get<AgentSecurity>(`/agents/${agentId}/security`));
 	liveReload(() => res.reload(), (e) => e.type === 'security' && e.agent_id === agentId, { debounceMs: 400, pollMs: 60000 });
 
@@ -101,6 +101,7 @@
 {#snippet sevCell(d: SecurityDetection)}<Badge tone={severityTone[d.severity]}>{severityLabels[d.severity]}</Badge>{/snippet}
 {#snippet statusCell(d: SecurityDetection)}
 	<Badge tone={isActive(d) ? 'danger' : d.audit ? 'neutral' : threatStatusTone[d.status]}>{d.audit && d.status === 'active' ? 'Recorded' : threatStatusLabels[d.status]}</Badge>
+	{#if d.denied}<div class="mt-0.5"><Badge title="Refused before it ran">Denied</Badge></div>{/if}
 	{#if d.verdict}<div class="mt-0.5"><Badge tone={verdictTone[d.verdict]}>{verdictLabels[d.verdict]}</Badge></div>{/if}
 	{#if d.resolved_at && d.status === 'active'}<div class="text-muted text-xs">no longer reported</div>{/if}
 {/snippet}
@@ -110,7 +111,7 @@
 {/snippet}
 {#snippet productCell(d: SecurityDetection)}
 	<span class="text-muted">{productLabels[d.product]}</span>
-	{#if d.product === 'rmm'}<div class="text-muted text-xs">{sourceLabels[d.source]}</div>{/if}
+	{#if d.product === 'rmm'}<div class="text-muted text-xs" title={d.found_by ? foundByHelp[d.found_by] : undefined}>{d.found_by ? foundByLabels[d.found_by] : sourceLabels[d.source]}</div>{/if}
 {/snippet}
 
 <Async {res}>
@@ -127,7 +128,13 @@
 		{:else}
 			<div class="mb-4 flex flex-wrap items-center gap-x-3 gap-y-2">
 				<ProtectionBadge state={s.state} />
-				<span class="text-muted text-sm">{stateHelp[s.state]}</span>
+				{#if s.state === 'at_risk' && s.risks?.length}
+					<ul class="flex flex-wrap gap-x-3 gap-y-1 text-sm" aria-label="Why it's at risk">
+						{#each s.risks as r, i (r)}<li title={riskHelp[r]}>{#if i}<span class="text-muted" aria-hidden="true">·&nbsp;</span>{/if}{riskLabels[r]}</li>{/each}
+					</ul>
+				{:else}
+					<span class="text-muted text-sm">{stateHelp[s.state]}</span>
+				{/if}
 				<span class="text-muted text-xs">{s.reported_at ? `Reported ${ago(s.reported_at)}` : 'Waiting for the first report'}</span>
 				<div class="ml-auto flex flex-wrap gap-1.5">
 					<Button size="sm" icon={RefreshCw} disabled={!s.online} title={s.online ? undefined : 'The agent is offline'} onclick={refresh}>Refresh</Button>
@@ -175,7 +182,7 @@
 			{:else}
 				<div class="mb-4 grid gap-4 lg:grid-cols-2">
 					{#if s.sensor_supported}
-						<SensorCard sensor={s.sensor} policy={s.policy} product={sensorProduct} reportedAt={s.sensor_at}>
+						<SensorCard sensor={s.sensor} policy={s.policy} product={sensorProduct} reportedAt={s.sensor_at} {os} database={s.database} maxAgeHours={s.database_max_age_hours}>
 							{#snippet actions()}
 								{#if canRespond && sensorProduct?.actions.length}
 									<div class="flex flex-wrap gap-1.5">

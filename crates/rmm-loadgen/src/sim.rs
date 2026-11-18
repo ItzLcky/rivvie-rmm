@@ -121,6 +121,7 @@ pub fn system(hostname: &str, windows: bool) -> SystemInfo {
         arch: "x86_64".into(),
         agent_version: "0.1.0".into(),
         machine_id: Some(format!("loadgen-{hostname}")),
+        platform: Some(if windows { rmm_proto::Platform::Workstation } else { rmm_proto::Platform::Server }),
     }
 }
 

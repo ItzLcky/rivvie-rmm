@@ -56,7 +56,7 @@ export const nav: NavGroup[] = [
 		items: [
 			{ href: '/alerts', label: 'Alerts', icon: BellRing, key: 'e', scoped: true, badge: 'alerts' },
 			{ href: '/security', label: 'Security', icon: Shield, key: 'v', scoped: true },
-			{ href: '/policies', label: 'Alert policies', icon: ShieldCheck, key: 'p', scoped: true }
+			{ href: '/policies', label: 'Policies', icon: ShieldCheck, key: 'p', scoped: true }
 		]
 	},
 	{

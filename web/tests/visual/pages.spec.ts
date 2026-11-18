@@ -23,8 +23,22 @@ const pages: [string, string][] = [
 	['alerts', '/alerts'],
 	['alert', '/alerts/al-5'],
 	['policies', '/policies'],
-	['policy', '/policies/p-svc'],
-	['policy-new', '/policies/new'],
+	['policies-categories', '/policies?tab=categories'],
+	['policies-assignments', '/policies?tab=assignments&client=c-acme'],
+	['policy-set', '/policies/sets/ps-acme-win'],
+	['policy-set-alert', '/policies/sets/ps-acme-win?section=alerts&item=p-disk'],
+	['policy-set-alert-defined', '/policies/sets/00000000-0000-4000-8001-000000000000?section=alerts&item=p-svc'],
+	['policy-set-patching', '/policies/sets/ps-acme-tills?section=patching'],
+	['policy-set-security', '/policies/sets/00000000-0000-4000-8001-000000000000?section=security'],
+	['policy-set-remote', '/policies/sets/ps-acme-tills?section=remote'],
+	['policy-set-schedule', '/policies/sets/00000000-0000-4000-8001-000000000002?section=schedules&item=sc-1'],
+	['policy-set-schedules-empty', '/policies/sets/ps-dc?section=schedules'],
+	['policy-set-devices', '/policies/sets/ps-acme-win?section=devices'],
+	['policy-set-children', '/policies/sets/00000000-0000-4000-8001-000000000012?section=children'],
+	['policy-new', '/policies/sets/00000000-0000-4000-8001-000000000000?section=alerts&item=new'],
+	['agent-policy', '/agents/a-3?tab=policy'],
+	['agent-policy-assigned', '/agents/a-4?tab=policy'],
+	['client-policies', '/clients/c-acme?tab=policies'],
 	['schedules', '/schedules'],
 	['schedule', '/schedules/sc-2'],
 	['notifications', '/settings/notifications'],
@@ -36,21 +50,21 @@ const pages: [string, string][] = [
 	['agent-security-linux', '/agents/a-3?tab=security'],
 	['agent-security-none', '/agents/a-5?tab=security'],
 	['agent-security-sensor', '/agents/a-1?tab=security'],
+	['agent-security-realtime', '/agents/a-6?tab=security'],
 	['security-detection', '/security/detections/d-5'],
 	['security-detection-file', '/security/detections/d-6'],
+	['security-detection-denied', '/security/detections/d-8'],
 	['security-quarantine', '/security?tab=quarantine&show=all'],
 	['security-hunt', '/security?tab=hunt&sha256=9f2c4e1a7b3d5f60812a4c6e8b0d2f4a6c8e0b2d4f6a8c0e2b4d6f8a0c2e4b6d'],
 	['security-rules', '/security?tab=rules'],
 	['security-content', '/security?tab=content'],
 	['security-settings', '/security?tab=settings'],
-	['policy-new-security', '/policies/new?kind=security'],
-	['policy-new-patch', '/policies/new?kind=patch'],
-	['policy-offline', '/policies/p-off'],
+	['policy-new-security', '/policies/sets/00000000-0000-4000-8001-000000000000?section=alerts&item=new&kind=security'],
 	['patches', '/patches'],
 	['patches-update', '/patches?update=b3c1d2e4-0001'],
 	['patches-compliance', '/patches?tab=compliance'],
 	['patches-compliance-client', '/patches?tab=compliance&client=c-acme'],
-	['patches-policies', '/patches?tab=policies'],
+	['patches-windows', '/patches?tab=windows'],
 	['patches-history', '/patches?tab=history'],
 	['patch-run', '/patches/runs/r-2'],
 	['jobs', '/jobs'],
@@ -86,8 +100,17 @@ const phone: [string, string][] = [
 	['agent-security', '/agents/a-2?tab=security'],
 	['security-detection', '/security/detections/d-5'],
 	['security-rules', '/security?tab=rules'],
+	['security-content', '/security?tab=content'],
+	['security-hunt', '/security?tab=hunt'],
+	['agent-security-realtime', '/agents/a-6?tab=security'],
 	['tickets', '/tickets'],
-	['ticket', '/tickets/t-1']
+	['ticket', '/tickets/t-1'],
+	['policies', '/policies'],
+	['policy-set', '/policies/sets/ps-acme-win'],
+	['policy-set-patching', '/policies/sets/ps-acme-tills?section=patching'],
+	['policy-set-alert', '/policies/sets/ps-acme-win?section=alerts&item=p-disk'],
+	['agent-policy', '/agents/a-3?tab=policy'],
+	['client-policies', '/clients/c-acme?tab=policies']
 ];
 
 const jpeg = readFileSync(new URL('./fixtures/desktop.jpg', import.meta.url));
@@ -162,13 +185,28 @@ for (const theme of ['light', 'dark'] as const) {
 			await expect(page).toHaveScreenshot(`${theme}-palette.png`);
 		});
 
-		test('patch policy editor', async ({ page }) => {
+		test('override an inherited field', async ({ page }) => {
 			await mockApi(page);
-			await page.goto('/patches?tab=policies');
+			await page.goto('/policies/sets/ps-acme-win?section=patching');
 			await settle(page);
-			await page.getByRole('button', { name: 'Edit' }).nth(1).click();
-			await expect(page.getByRole('dialog', { name: 'Policy for Acme Corp' })).toBeVisible();
-			await expect(page).toHaveScreenshot(`${theme}-patch-policy.png`);
+			// Deferral comes from Acme's override; the restart setting is inherited from All devices.
+			const reboot = page.locator('[data-source]').filter({ has: page.getByLabel('Restart after installing') });
+			await expect(reboot).toHaveAttribute('data-source', 'overridden');
+			const window = page.locator('[data-source]').filter({ has: page.getByRole('radio', { name: 'Its own' }) });
+			await expect(window).toHaveAttribute('data-source', 'inherited');
+			await expect(window.getByText('All devices')).toBeVisible();
+			// Editing it makes it this set's override, field by field, before saving.
+			await page.getByRole('radio', { name: 'Its own' }).click();
+			await expect(window).toHaveAttribute('data-source', 'overridden');
+			await expect(window.getByText('Changed')).toBeVisible();
+			await expect(page.getByRole('status').filter({ hasText: 'Unsaved:' })).toContainText('Install window will be overridden in Acme · Windows servers');
+			await expect(page).toHaveScreenshot(`${theme}-policy-set-override.png`);
+			// Reset brings back the inherited value without saving anything else.
+			await window.getByRole('button', { name: 'Reset Install window to inherited' }).click();
+			await expect(window).toHaveAttribute('data-source', 'inherited');
+			await expect(page.getByRole('status').filter({ hasText: 'Unsaved:' })).toHaveCount(0);
+			const r = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa']).analyze();
+			expect(r.violations.filter((v) => v.impact === 'serious' || v.impact === 'critical').map((v) => v.id)).toEqual([]);
 		});
 
 		test('remote desktop', async ({ page }) => {
@@ -222,6 +260,34 @@ for (const theme of ['light', 'dark'] as const) {
 			await expect(page.getByRole('menuitem', { name: /Block/ })).toHaveAttribute('aria-disabled', 'true');
 			await expect(page.getByRole('menuitem', { name: /Block/ })).toHaveAttribute('title', /needs 7 days/);
 			await expect(page).toHaveScreenshot(`${theme}-security-rule-menu.png`);
+		});
+
+		test('security policy in a set', async ({ page }) => {
+			await mockApi(page);
+			await page.goto('/policies/sets/ps-acme-web01?section=security');
+			await settle(page);
+			// Block from All devices, prevention switched off here: nothing is blocked, said plainly.
+			await expect(page.getByText('Nothing will be blocked.')).toBeVisible();
+			await expect(page.getByRole('radio', { name: 'Block' })).toHaveAttribute('aria-checked', 'true');
+			await expect(page.getByLabel('Archive depth', { exact: true })).toHaveValue('3');
+			const prevention = page.locator('[data-source]').filter({ has: page.getByRole('switch', { name: 'Prevention' }) });
+			await expect(prevention).toHaveAttribute('data-source', 'overridden');
+			await expect(page).toHaveScreenshot(`${theme}-policy-set-security-overridden.png`, { fullPage: true });
+			// Turning prevention on makes Block real.
+			await page.getByRole('switch', { name: 'Prevention' }).click();
+			await expect(page.getByText('Nothing will be blocked.')).toHaveCount(0);
+			await expect(page.getByText(/is denied before it runs/)).toBeVisible();
+		});
+
+		test('database rollback dialog', async ({ page }) => {
+			await mockApi(page);
+			await page.goto('/security?tab=content');
+			await settle(page);
+			await page.getByRole('region', { name: 'Signature databases' }).getByRole('button', { name: 'Roll back' }).nth(1).click();
+			const dialog = page.getByRole('dialog', { name: 'Roll back 2026.06.14.2?' });
+			await expect(dialog).toBeVisible();
+			await expect(dialog.getByText(/Agents go back to 2026\.06\.10\.1/)).toBeVisible();
+			await expect(page).toHaveScreenshot(`${theme}-security-database-rollback.png`);
 		});
 
 		test('kill process dialog', async ({ page }) => {

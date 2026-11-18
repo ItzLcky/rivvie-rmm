@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { api } from '#lib/api.js';
+	import { ROOT_SET } from '#lib/policy/policy.js';
 	import { company } from '#lib/session.svelte.js';
 	import { toast } from '#lib/toast.svelte.js';
 	import { resource } from '#lib/resource.svelte.js';
@@ -11,17 +12,16 @@
 
 	interface Settings {
 		company_name: string; session_idle_hours: number | null; session_idle_hours_default: number; require_2fa_all: boolean;
-		auto_update_agents: boolean;
 	}
 
-	let form = $state({ company_name: '', idle: '', require_2fa_all: false, auto_update_agents: false });
+	let form = $state({ company_name: '', idle: '', require_2fa_all: false });
 	let defaultIdle = $state(12);
 	let saved = $state('');
 	let busy = $state(false);
 	let idleError = $state('');
 
 	function apply(s: Settings) {
-		form = { company_name: s.company_name, idle: s.session_idle_hours?.toString() ?? '', require_2fa_all: s.require_2fa_all, auto_update_agents: s.auto_update_agents };
+		form = { company_name: s.company_name, idle: s.session_idle_hours?.toString() ?? '', require_2fa_all: s.require_2fa_all };
 		defaultIdle = s.session_idle_hours_default;
 		company.name = s.company_name;
 		saved = JSON.stringify(form);
@@ -39,8 +39,7 @@
 		try {
 			apply(
 				await api.put<Settings>('/settings', {
-					company_name: form.company_name, session_idle_hours: idle ? Number(idle) : null, require_2fa_all: form.require_2fa_all,
-					auto_update_agents: form.auto_update_agents
+					company_name: form.company_name, session_idle_hours: idle ? Number(idle) : null, require_2fa_all: form.require_2fa_all
 				})
 			);
 			toast.success('Settings saved.');
@@ -76,12 +75,9 @@
 			</section>
 			<section class="card space-y-4 p-5">
 				<h2 class="font-semibold">Agents</h2>
-				<div>
-					<Switch bind:checked={form.auto_update_agents}>Update agents automatically</Switch>
-					<p class="hint ml-11.5">
-						When an agent connects and the server has a newer signed release for its platform, the agent installs it (after its running jobs finish) and rolls back by itself if the new version can't reconnect. A version that failed or rolled back on an agent isn't retried there automatically. Off: update from the Agents page.
-					</p>
-				</div>
+				<p class="text-muted text-sm">
+					Automatic agent updates are part of the agent policy: switch them on or off in <a class="link" href="/policies/sets/{ROOT_SET}?section=agent">All devices</a>, and differently for any set below it (say, servers updated by hand). Without them, update from the Agents page.
+				</p>
 			</section>
 			<div class="flex items-center justify-end gap-3">
 				{#if dirty}<span class="text-warning text-xs">Unsaved changes</span>{/if}

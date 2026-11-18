@@ -27,10 +27,17 @@ const CHUNK_WAIT: Duration = Duration::from_secs(60);
 /// Largest upload accepted.
 const UPLOAD_MAX: u64 = 4 * 1024 * 1024 * 1024;
 
-/// Checks access, the role and that the agent can do this; returns its hostname.
-async fn ready(st: &AppState, u: &User, agent_id: Uuid) -> ApiResult<String> {
+/// Checks access, the role and that the agent can do this; returns its hostname. `files`: the
+/// file tools, which the agent's remote access policy can turn off.
+async fn ready(st: &AppState, u: &User, agent_id: Uuid, files: bool) -> ApiResult<String> {
     u.require(Role::Technician)?;
     super::access::agent(st, u, agent_id).await?;
+    if files {
+        let (policy, set) = crate::policy::remote_access(st, agent_id).await?;
+        if !policy.files_enabled {
+            return Err(ApiError::Denied(format!("file access is turned off for this device by policy set {set}")));
+        }
+    }
     let (hostname, capable): (String, bool) =
         sqlx::query_as("SELECT hostname, $2 = ANY(capabilities) FROM agents WHERE id = $1")
             .bind(agent_id)
@@ -62,7 +69,7 @@ fn unexpected() -> ApiError {
 // ---------------------------------------------------------------------------
 
 pub async fn processes(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uuid>) -> ApiResult<Json<Value>> {
-    ready(&st, &u, id).await?;
+    ready(&st, &u, id, false).await?;
     match ask(&st, id, Request::Processes, SLOW).await? {
         Reply::Processes(list) => Ok(Json(json!({ "processes": list }))),
         _ => Err(unexpected()),
@@ -79,7 +86,7 @@ pub struct KillBody {
 }
 
 pub async fn kill(State(st): State<Arc<AppState>>, u: User, Path((id, pid)): Path<(Uuid, u32)>, Json(b): Json<KillBody>) -> ApiResult<Json<Value>> {
-    ready(&st, &u, id).await?;
+    ready(&st, &u, id, false).await?;
     let res = ask(&st, id, Request::Kill { pid, tree: b.tree }, SLOW).await;
     let name: Option<String> = b.name.map(|n| n.chars().take(200).collect());
     let (ok, message) = match &res {
@@ -115,7 +122,7 @@ fn check_path(path: &str) -> ApiResult<()> {
 }
 
 pub async fn list(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uuid>, Query(q): Query<PathQuery>) -> ApiResult<Json<Value>> {
-    ready(&st, &u, id).await?;
+    ready(&st, &u, id, true).await?;
     check_path(&q.path)?;
     match ask(&st, id, Request::ListDir { path: q.path }, SLOW).await? {
         Reply::Dir(d) => Ok(Json(serde_json::to_value(d).map_err(anyhow::Error::from)?)),
@@ -138,7 +145,7 @@ fn disposition(name: &str) -> String {
 
 /// Streams a file from the agent, a chunk at a time, as the browser reads it.
 pub async fn download(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uuid>, Query(q): Query<PathQuery>) -> ApiResult<Response> {
-    ready(&st, &u, id).await?;
+    ready(&st, &u, id, true).await?;
     check_path(&q.path)?;
     // The first chunk before any headers: a missing file is an error, not a broken download.
     let first = ask(&st, id, Request::ReadFile { path: q.path.clone(), offset: 0, len: CHUNK as u32 }, CHUNK_WAIT).await?;
@@ -184,7 +191,7 @@ pub async fn upload(
     Query(q): Query<PathQuery>,
     body: Body,
 ) -> ApiResult<Json<Value>> {
-    ready(&st, &u, id).await?;
+    ready(&st, &u, id, true).await?;
     check_path(&q.path)?;
     if q.path.trim().is_empty() || q.path.ends_with(['/', '\\']) {
         return Err(ApiError::BadRequest("give the full path of the file to write".into()));

@@ -9,7 +9,9 @@
 //! ```
 //!
 //! `RMM_E2E_DATABASE_URL` must point at a database the user can `CREATE DATABASE` from; each
-//! run creates and drops its own `rmm_e2e_<random>` database. The agent binary defaults to
+//! run creates and drops its own `rmm_e2e_<random>` database. A second test in this file,
+//! `policy_migration`, needs only that database: it builds the schema up to 0021, writes rows of
+//! the old policy model, applies 0022 and checks that the same policies apply to every agent. The agent binary defaults to
 //! the one next to the server binary (`target/debug/rmm-agent`); set `RMM_E2E_AGENT_BIN`
 //! to use another. Linux only: the agent runs bash jobs.
 //!
@@ -322,6 +324,68 @@ impl Api {
         })
         .await;
     }
+
+    async fn put(&self, path: &str, body: Value) -> Value {
+        let (s, v) = self.call(reqwest::Method::PUT, path, Some(body)).await;
+        assert!(s.is_success(), "PUT {path}: {s} {v}");
+        v
+    }
+
+    /// An alert item in All devices from the fields an alert policy had (name, kind, params,
+    /// severity, channels, ticket fields; client and site as the limit).
+    async fn alert_policy_call(&self, b: Value) -> (StatusCode, Value) {
+        self.call(reqwest::Method::POST, &format!("/policy-sets/{ROOT_SET}/items"), Some(alert_item(&b))).await
+    }
+
+    async fn alert_policy(&self, b: Value) -> Value {
+        let (s, v) = self.alert_policy_call(b.clone()).await;
+        assert!(s.is_success(), "creating alert policy {b}: {s} {v}");
+        v
+    }
+
+    /// Replaces an alert item's config (and name, enabled, limit) at its origin.
+    async fn update_alert_policy(&self, id: &str, b: Value) -> (StatusCode, Value) {
+        let mut body = alert_item(&b);
+        body.as_object_mut().unwrap().remove("module");
+        self.call(reqwest::Method::PUT, &format!("/policy-items/{id}"), Some(body)).await
+    }
+
+    async fn delete_policy(&self, id: &str) -> StatusCode {
+        self.call(reqwest::Method::DELETE, &format!("/policy-items/{id}"), None).await.0
+    }
+
+    /// An item as it applies in a set.
+    async fn item_in(&self, set: &str, item: &str) -> Value {
+        let s = self.get(&format!("/policy-sets/{set}")).await;
+        s["policies"].as_array().unwrap().iter().find(|p| p["id"] == item).cloned().unwrap_or_else(|| panic!("{item} in {set}: {s}"))
+    }
+
+    /// Changes some fields of a single-instance item (patch, security, ...) in All devices.
+    async fn set_root_item(&self, item: &str, fields: Value) -> (StatusCode, Value) {
+        let mut config = self.item_in(ROOT_SET, item).await["item_config"].clone();
+        config.as_object_mut().unwrap().extend(fields.as_object().unwrap().clone());
+        self.call(reqwest::Method::PUT, &format!("/policy-items/{item}"), Some(json!({ "config": config }))).await
+    }
+}
+
+const ROOT_SET: &str = "00000000-0000-4000-8001-000000000000";
+const PATCH_ITEM: &str = "00000000-0000-4000-8000-000000000001";
+const SECURITY_ITEM: &str = "00000000-0000-4000-8000-000000000002";
+const REMOTE_ITEM: &str = "00000000-0000-4000-8000-000000000003";
+
+/// The item body for [`Api::alert_policy`].
+fn alert_item(b: &Value) -> Value {
+    let mut config = serde_json::Map::new();
+    for k in ["kind", "params", "severity", "channel_ids", "notify_resolved", "renotify_minutes", "ticket_board_id", "ticket_priority", "ticket_auto_resolve", "run_script_id"] {
+        if let Some(v) = b.get(k) {
+            config.insert(k.into(), v.clone());
+        }
+    }
+    let mut out = json!({ "module": "alert", "name": b["name"], "config": config, "client_id": b.get("client_id"), "site_id": b.get("site_id") });
+    if let Some(e) = b.get("enabled") {
+        out["enabled"] = e.clone();
+    }
+    out
 }
 
 /// An open `/api/events` stream (Server-Sent Events).
@@ -724,7 +788,8 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
     .await;
     assert_eq!(p["status"]["supported"], true, "{p}");
     assert_eq!(p["status"]["provider"], "fake");
-    assert_eq!(p["policy"]["source"], "global");
+    let set_name = admin.get(&format!("/agents/{id1}")).await["policy_set_name"].clone();
+    assert_eq!((p["policy"]["id"].as_str(), &p["policy"]["source"]), (Some(PATCH_ITEM), &set_name), "the patch policy of the agent's set");
     assert_eq!(p["window"]["open_now"], true, "no window: any time");
     let approval = |p: &Value, id: &str| {
         let row = p["patches"].as_array().unwrap().iter().find(|r| r["update_id"] == id).unwrap().clone();
@@ -755,7 +820,7 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
     assert_eq!(s, StatusCode::NOT_FOUND);
     let r = tech.post("/patches/approval", json!({ "decision": "approved", "update_ids": ["drv-1"] })).await;
     assert_eq!(r["changed"], 0, "no rows outside their clients");
-    let (s, _) = tech.call(reqwest::Method::PUT, "/patch-policies/00000000-0000-4000-8000-000000000001", Some(json!({ "reboot_policy": "always" }))).await;
+    let (s, _) = tech.call(reqwest::Method::PUT, &format!("/policy-items/{PATCH_ITEM}"), Some(json!({ "config": { "reboot_policy": "always" } }))).await;
     assert_eq!(s, StatusCode::FORBIDDEN, "the MSP-wide policy is admin-only");
 
     // Install everything approved: sec-1 and upd-1 (drv-1 is declined).
@@ -785,27 +850,38 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
     assert_eq!(c["by"], "site");
     assert_eq!((c["totals"]["compliant"].as_i64(), c["totals"]["installed_30d"].as_i64()), (Some(1), Some(2)), "declined updates don't count: {c}");
 
-    // Policies: a client policy that approves drivers overrides the MSP-wide one; resetting
-    // the manual decline hands drv-1 back to it.
-    let pol = admin
-        .post("/patch-policies", json!({ "client_id": a_id, "auto_approve_categories": ["security", "driver"], "reboot_policy": "if_required" }))
+    // Policies: client A's own set, assigned to its devices of a1's category, overrides the
+    // MSP-wide patch policy to approve drivers; resetting the manual decline hands drv-1 to it.
+    let a1_policy = admin.get(&format!("/agents/{id1}/policy")).await;
+    let (leaf, cat) = (a1_policy["set"]["id"].as_str().unwrap().to_string(), a1_policy["category"]["id"].as_str().unwrap().to_string());
+    let a_set = admin.post("/policy-sets", json!({ "name": "Client A patching", "parent_id": leaf, "client_id": a_id })).await;
+    let a_set_id = a_set["id"].as_str().unwrap().to_string();
+    let (s, v) = admin
+        .call(reqwest::Method::PUT, &format!("/policy-items/{PATCH_ITEM}/overrides/{a_set_id}"), Some(json!({ "config": { "reboot_policy": "sometimes" } })))
         .await;
-    let (s, _) = admin.call(reqwest::Method::POST, "/patch-policies", Some(json!({ "client_id": a_id, "reboot_policy": "never" }))).await;
-    assert_eq!(s, StatusCode::CONFLICT, "one policy per client");
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    admin
+        .put(
+            &format!("/policy-items/{PATCH_ITEM}/overrides/{a_set_id}"),
+            json!({ "config": { "auto_approve_categories": ["security", "driver"], "reboot_policy": "if_required" } }),
+        )
+        .await;
+    let assignment = admin.put("/policy-assignments", json!({ "client_id": a_id, "category_id": cat, "policy_set_id": a_set_id })).await;
     // Resetting one agent goes back to the client-wide decline (a standing decision)...
     admin.post("/patches/approval", json!({ "decision": "pending", "update_ids": ["drv-1"], "agent_ids": [id1] })).await;
     assert_eq!(approval(&admin.get(&format!("/agents/{id1}/patches")).await, "drv-1"), ("declined".into(), "missing".into(), true));
     // ...resetting the client hands it to the policy.
     admin.post("/patches/approval", json!({ "decision": "pending", "update_ids": ["drv-1"], "client_id": a_id })).await;
     let p = admin.get(&format!("/agents/{id1}/patches")).await;
-    assert_eq!(p["policy"]["source"], "client");
+    assert_eq!((p["policy"]["source"].as_str(), p["policy"]["reboot_policy"].as_str()), (Some("Client A patching"), Some("if_required")), "{}", p["policy"]);
     assert_eq!(approval(&p, "drv-1"), ("approved".into(), "missing".into(), false));
-    let pid = pol["id"].as_str().unwrap();
-    let (s, _) = admin.call(reqwest::Method::DELETE, &format!("/patch-policies/{pid}"), None).await;
+    let (s, _) = admin.call(reqwest::Method::DELETE, &format!("/policy-assignments/{}", assignment["id"].as_str().unwrap()), None).await;
     assert!(s.is_success());
-    assert_eq!(approval(&admin.get(&format!("/agents/{id1}/patches")).await, "drv-1").0, "pending");
-    let (s, _) = admin.call(reqwest::Method::DELETE, "/patch-policies/00000000-0000-4000-8000-000000000001", None).await;
-    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(approval(&admin.get(&format!("/agents/{id1}/patches")).await, "drv-1").0, "pending", "back on the MSP-wide policy");
+    let (s, _) = admin.call(reqwest::Method::DELETE, &format!("/policy-sets/{a_set_id}"), None).await;
+    assert!(s.is_success());
+    let (s, _) = admin.call(reqwest::Method::DELETE, &format!("/policy-items/{PATCH_ITEM}"), None).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "the patch policy can't be deleted");
 
     // Maintenance windows.
     let (s, _) = admin.call(reqwest::Method::PUT, &format!("/sites/{a_site}/maintenance-window"), Some(json!({ "days": [1], "start": "02:00", "minutes": 120, "tz": "Mars/Olympus" }))).await;
@@ -830,7 +906,7 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
 
     // Patch alerts: failed installs, and (with reboot_hours) a restart left pending.
     let patch_policy = admin
-        .post("/alert-policies", json!({ "name": "Patching", "kind": "patch", "params": { "failed": true, "reboot_hours": 1 }, "severity": "warning", "client_id": a_id }))
+        .alert_policy(json!({ "name": "Patching", "kind": "patch", "params": { "failed": true, "reboot_hours": 1 }, "severity": "warning", "client_id": a_id }))
         .await;
     let patch_policy_id = patch_policy["id"].as_str().unwrap().to_string();
     // The pending reboot from the first install is an hour "old".
@@ -851,13 +927,7 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
         .to_string(),
     )
     .unwrap();
-    admin
-        .call(
-            reqwest::Method::PUT,
-            "/patch-policies/00000000-0000-4000-8000-000000000001",
-            Some(json!({ "auto_approve_categories": ["security"], "auto_install": true, "reboot_policy": "never" })),
-        )
-        .await;
+    admin.set_root_item(PATCH_ITEM, json!({ "auto_approve_categories": ["security"], "auto_install": true, "reboot_policy": "never" })).await;
     admin.post("/patches/scan", json!({ "agent_ids": [id1] })).await;
     let (api, id) = (&admin, id1.as_str());
     let run = eventually(100, "an automatic install", move || async move {
@@ -893,18 +963,15 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
     admin.post("/patches/scan", json!({ "agent_ids": [id1] })).await;
     let (api, fid) = (&admin, failed["id"].as_str().unwrap().to_string());
     eventually(30, "the failed-install alert to clear", || async { (api.get(&format!("/alerts/{fid}")).await["state"] == "resolved").then_some(()) }).await;
-    let (s, _) = admin.call(reqwest::Method::DELETE, &format!("/alert-policies/{patch_policy_id}"), None).await;
+    let s = admin.delete_policy(&patch_policy_id).await;
     assert!(s.is_success());
     let agent = admin.get(&format!("/agents/{id1}/activity")).await;
     assert!(agent.as_array().unwrap().iter().any(|r| r["action"] == "agent.patch_result"), "results are in the agent's activity");
     // Back to the conservative default so the rest of the run isn't patched behind its back.
-    admin
-        .call(
-            reqwest::Method::PUT,
-            "/patch-policies/00000000-0000-4000-8000-000000000001",
-            Some(json!({ "auto_approve_categories": ["security", "critical", "definition"], "reboot_policy": "never" })),
-        )
+    let (s, v) = admin
+        .set_root_item(PATCH_ITEM, json!({ "auto_approve_categories": ["security", "critical", "definition"], "auto_install": false, "reboot_policy": "never" }))
         .await;
+    assert!(s.is_success(), "{v}");
 
     // An approval for a client stands: an agent that reports the update later gets it approved.
     let r = admin.post("/patches/approval", json!({ "decision": "approved", "update_ids": ["later-1"], "client_id": a_id })).await;
@@ -1034,9 +1101,10 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
     tickets(&url, &admin, &id1, a_id, b_id).await;
     if all {
         security(&admin, dir, &id1, &id3).await;
-        sensor(&url, &admin, db, dir, &id1, a_id).await;
+        sensor(&url, &admin, db, dir, &id1, a_id, b_id).await;
         monitoring(server, &admin, db, dir, &id1, &id3, a_id).await;
         day_to_day(&admin, &tech, db, dir, &id1, &id3, a_id).await;
+        policies(&url, &admin, db, dir, &id1, &id3, a_id, a_site, b_id).await;
     }
     portal_and_sla(&url, &admin, db, a_id, b_id).await;
     billing(&url, &admin, &tech, db, a_id, b_id).await;
@@ -1093,6 +1161,354 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
     Ok(())
 }
 
+/// Policy management (docs/design/policies.md): the tree, inheritance with per-field overrides
+/// and resets, validation against every descendant, assignments at client and site, pins and
+/// "customize", category moves (and enrollment into a category), limits, alerts closing when a
+/// policy stops applying, remote access turned off, run_script_id, and tenant scoping.
+#[allow(clippy::too_many_arguments)]
+async fn policies(url: &str, admin: &Api, db: &sqlx::PgPool, dir: &Path, id1: &str, id3: &str, a_id: &str, a_site: &str, b_id: &str) {
+    const LINUX_SET: &str = "00000000-0000-4000-8001-000000000002";
+    let item = |v: &Value| v["id"].as_str().unwrap().to_string();
+    let find = |list: &Value, id: &str| list.as_array().unwrap().iter().find(|p| p["id"] == id).cloned();
+
+    // --- the tree, the categories, and where a1 sits -------------------------------------------------
+    let sets = admin.get("/policy-sets").await;
+    let root = find(&sets, ROOT_SET).unwrap();
+    assert_eq!((root["builtin"].as_bool(), root["depth"].as_i64(), root["parent_id"].as_str()), (Some(true), Some(0), None), "{root}");
+    assert!(root["defines"].as_array().unwrap().iter().any(|m| m == "patch"), "{root}");
+    assert_eq!(sets.as_array().unwrap().iter().filter(|s| s["builtin"] == true).count(), 10);
+    let cats = admin.get("/device-categories").await;
+    assert_eq!(cats.as_array().unwrap().iter().filter(|c| c["builtin"] == true).count(), 6, "{cats}");
+    let mine = admin.get(&format!("/agents/{id1}/policy")).await;
+    assert_eq!((mine["reason"].as_str(), mine["category"]["builtin"].as_bool(), mine["category"]["manual"].as_bool()), (Some("default"), Some(true), Some(false)), "{mine}");
+    let platform = mine["platform"].as_str().unwrap().to_string();
+    let reported = admin.get(&format!("/agents/{id1}")).await["inventory"]["system"]["platform"].clone();
+    assert_eq!(reported.as_str(), Some(platform.as_str()), "the agent reports its platform and the server keeps it");
+    let (leaf, cat) = (mine["set"]["id"].as_str().unwrap().to_string(), mine["category"]["id"].as_str().unwrap().to_string());
+    assert_eq!(mine["chain"][1]["id"], LINUX_SET, "All devices, Linux, then the leaf: {mine}");
+    assert_eq!(find(&cats, &cat).unwrap()["default_set_id"], leaf.as_str());
+    let listed = admin.get(&format!("/agents?category_id={cat}")).await;
+    assert!(listed["items"].as_array().unwrap().iter().any(|a| a["id"] == id1 && a["policy_set_id"] == leaf.as_str()), "{listed}");
+
+    // --- a client's set, assigned to its devices of a1's category ------------------------------------
+    let a_set = admin.post("/policy-sets", json!({ "name": "A Linux (e2e)", "parent_id": leaf, "client_id": a_id })).await;
+    let a_set_id = item(&a_set);
+    assert_eq!(a_set["depth"], 3);
+    let (s, _) = admin.call(reqwest::Method::POST, "/policy-sets", Some(json!({ "name": "bad", "parent_id": a_set_id, "client_id": b_id }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "below a client's set, only that client's");
+    let assignment = admin.put("/policy-assignments", json!({ "client_id": a_id, "category_id": cat, "policy_set_id": a_set_id })).await;
+    let mine = admin.get(&format!("/agents/{id1}/policy")).await;
+    assert_eq!((mine["reason"].as_str(), mine["set"]["id"].as_str(), mine["assignment_id"].as_str()), (Some("client"), Some(a_set_id.as_str()), assignment["id"].as_str()), "{mine}");
+    assert_eq!(admin.get(&format!("/agents/{id3}/policy")).await["set"]["id"], a_set_id.as_str(), "a3 is in the same category");
+
+    // --- inheritance and per-field overrides ------------------------------------------------------------
+    let cpu = admin
+        .post(
+            &format!("/policy-sets/{LINUX_SET}/items"),
+            json!({ "module": "alert", "name": "CPU (policies e2e)", "client_id": a_id,
+                    "config": { "kind": "cpu", "params": { "threshold": 99, "minutes": 5 }, "severity": "warning" } }),
+        )
+        .await;
+    let cpu_id = item(&cpu);
+    assert_eq!((cpu["status"].as_str(), cpu["origin_set_id"].as_str()), (Some("defined"), Some(LINUX_SET)), "{cpu}");
+    let here = admin.item_in(&a_set_id, &cpu_id).await;
+    assert_eq!((here["status"].as_str(), here["config"]["params"]["threshold"].as_f64()), (Some("inherited"), Some(99.0)), "{here}");
+    assert_eq!(here["sources"]["params.threshold"], LINUX_SET);
+    // One item read by id (links from its alerts): as defined at its origin.
+    let one = admin.get(&format!("/policy-items/{cpu_id}")).await;
+    assert_eq!((one["status"].as_str(), one["origin_set_id"].as_str()), (Some("defined"), Some(LINUX_SET)), "{one}");
+    let ov_path = format!("/policy-items/{cpu_id}/overrides/{a_set_id}");
+    let ov = |config: Value| {
+        let path = ov_path.clone();
+        async move { admin.call(reqwest::Method::PUT, &path, Some(json!({ "config": config }))).await }
+    };
+    let (s, v) = ov(json!({ "params": { "threshold": 500 } })).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("A Linux (e2e)"), "the error names the set: {v}");
+    let (s, v) = ov(json!({ "kind": "memory" })).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "the alert type can't be overridden: {v}");
+    let (s, v) = ov(json!({ "params": { "threshold": 95 }, "severity": "critical" })).await;
+    assert!(s.is_success(), "{v}");
+    assert_eq!((v["status"].as_str(), v["config"]["params"]["threshold"].as_f64(), v["config"]["params"]["minutes"].as_i64()), (Some("overridden"), Some(95.0), Some(5)), "{v}");
+    assert_eq!((v["sources"]["params.threshold"].as_str(), v["sources"]["params.minutes"].as_str()), (Some(a_set_id.as_str()), Some(LINUX_SET)), "{v}");
+    assert_eq!(v["override"]["config"], json!({ "params": { "threshold": 95 }, "severity": "critical" }));
+    // Reset one field: the override without it.
+    let (_, v) = ov(json!({ "params": { "threshold": 95 } })).await;
+    assert_eq!((v["config"]["severity"].as_str(), v["sources"]["severity"].as_str()), (Some("warning"), Some(LINUX_SET)), "{v}");
+    // The origin's own edits still flow down to fields not overridden.
+    let (s, v) = admin
+        .call(reqwest::Method::PUT, &format!("/policy-items/{cpu_id}"), Some(json!({ "config": { "kind": "cpu", "params": { "threshold": 98, "minutes": 7 }, "severity": "info" } })))
+        .await;
+    assert!(s.is_success(), "{v}");
+    let here = admin.item_in(&a_set_id, &cpu_id).await;
+    assert_eq!((here["config"]["params"]["threshold"].as_f64(), here["config"]["params"]["minutes"].as_i64(), here["config"]["severity"].as_str()), (Some(95.0), Some(7), Some("info")), "{here}");
+    let (s, _) = admin.call(reqwest::Method::PUT, &format!("/policy-items/{cpu_id}"), Some(json!({ "config": { "kind": "memory", "params": { "threshold": 98, "minutes": 7 }, "severity": "info" } }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "an item's type can't change");
+    // Reset all.
+    let (s, v) = admin.call(reqwest::Method::DELETE, &format!("/policy-items/{cpu_id}/overrides/{a_set_id}"), None).await;
+    assert!(s.is_success(), "{v}");
+    assert_eq!((v["status"].as_str(), v["config"]["params"]["threshold"].as_f64()), (Some("inherited"), Some(98.0)), "{v}");
+    // Overrides only below the item's own set.
+    let (s, _) = admin.call(reqwest::Method::PUT, &format!("/policy-items/{cpu_id}/overrides/{ROOT_SET}"), Some(json!({ "config": { "severity": "info" } }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(admin.delete_policy(&cpu_id).await, StatusCode::OK);
+
+    // Validation runs against every descendant: All devices' patch window can't go away while a
+    // set below only changes its length.
+    let (s, v) = admin.set_root_item(PATCH_ITEM, json!({ "window": { "days": [6], "start": "22:00", "minutes": 120, "tz": "site" } })).await;
+    assert!(s.is_success(), "{v}");
+    admin.put(&format!("/policy-items/{PATCH_ITEM}/overrides/{a_set_id}"), json!({ "config": { "window": { "minutes": 60 } } })).await;
+    let p = admin.get(&format!("/agents/{id1}/patches")).await;
+    assert_eq!((p["policy"]["own_window"].as_bool(), p["policy"]["window"]["minutes"].as_i64()), (Some(true), Some(60)), "{}", p["policy"]);
+    let (s, v) = admin.set_root_item(PATCH_ITEM, json!({ "window": null })).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("A Linux (e2e)"), "{v}");
+    admin.call(reqwest::Method::DELETE, &format!("/policy-items/{PATCH_ITEM}/overrides/{a_set_id}"), None).await;
+    let (s, v) = admin.set_root_item(PATCH_ITEM, json!({ "window": null })).await;
+    assert!(s.is_success(), "{v}");
+    assert_eq!(admin.get(&format!("/agents/{id1}/patches")).await["policy"]["own_window"], false, "back on the site's window");
+
+    // --- an alert that stops applying closes ---------------------------------------------------------------
+    let off = admin
+        .post(
+            &format!("/policy-sets/{a_set_id}/items"),
+            json!({ "module": "alert", "name": "Offline (policies e2e)", "config": { "kind": "offline", "params": { "minutes": 1 }, "severity": "warning" } }),
+        )
+        .await;
+    let off_id = item(&off);
+    assert_eq!(off["limit"]["client_id"], a_id, "a client's set limits its items to the client");
+    let open_on_a3 = |what: &'static str| {
+        let off_id = off_id.clone();
+        async move {
+            eventually(60, what, || async { alerts_for(admin, &format!("policy_id={off_id}&agent_id={id3}")).await.into_iter().next() }).await
+        }
+    };
+    let closed = |alert: Value, what: &'static str| async move {
+        let aid = alert["id"].as_str().unwrap().to_string();
+        let a = eventually(30, what, || async {
+            let a = admin.get(&format!("/alerts/{aid}")).await;
+            (a["state"] == "resolved").then_some(a)
+        })
+        .await;
+        assert_eq!(a["resolution"], "policy", "{what}: {a}");
+    };
+    let a = open_on_a3("the offline alert from the client's set").await;
+    // Moving a3 to a custom category (whose default is the Linux set) takes it out of the set.
+    let (s, _) = admin.call(reqwest::Method::POST, "/device-categories", Some(json!({ "name": "Kiosks (e2e)", "default_set_id": a_set_id }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "a category's default is an MSP-wide set");
+    let kiosks = admin.post("/device-categories", json!({ "name": "Kiosks (e2e)", "description": "e2e", "default_set_id": LINUX_SET })).await;
+    let kiosks_id = item(&kiosks);
+    let (s, _) = admin.call(reqwest::Method::POST, "/device-categories", Some(json!({ "name": "kiosks (E2E)", "default_set_id": LINUX_SET }))).await;
+    assert_eq!(s, StatusCode::CONFLICT);
+    let moved = admin.post("/agents/category", json!({ "agent_ids": [id3], "category_id": kiosks_id })).await;
+    assert_eq!((moved["changed"].as_i64(), moved["moved"].as_i64()), (Some(1), Some(1)), "{moved}");
+    let a3 = admin.get(&format!("/agents/{id3}/policy")).await;
+    assert_eq!((a3["category"]["id"].as_str(), a3["category"]["manual"].as_bool(), a3["set"]["id"].as_str()), (Some(kiosks_id.as_str()), Some(true), Some(LINUX_SET)), "{a3}");
+    closed(a, "the alert to close when a3 left the set").await;
+    // Back to automatic: the client's set again, and the alert with it.
+    admin.post("/agents/category", json!({ "agent_ids": [id3], "category_id": null })).await;
+    assert_eq!(admin.get(&format!("/agents/{id3}/policy")).await["category"]["id"], cat.as_str());
+    let a = open_on_a3("the offline alert again").await;
+    // A pin beats the assignment.
+    let pinned = admin.put(&format!("/agents/{id3}/policy-pin"), json!({ "policy_set_id": LINUX_SET })).await;
+    assert_eq!((pinned["reason"].as_str(), pinned["set"]["id"].as_str()), (Some("pin"), Some(LINUX_SET)), "{pinned}");
+    closed(a, "the alert to close when a3 was pinned elsewhere").await;
+    let custom = admin.post(&format!("/agents/{id3}/policy-pin/customize"), json!({})).await;
+    let custom_set = custom["set"]["id"].as_str().unwrap().to_string();
+    assert_eq!((custom["reason"].as_str(), custom["chain"][1]["id"].as_str(), custom["pin"]["id"].as_str()), (Some("pin"), Some(LINUX_SET), Some(custom_set.as_str())), "a child of its set: {custom}");
+    assert_eq!(custom["chain"].as_array().unwrap().len(), 3, "{custom}");
+    let (s, v) = admin.call(reqwest::Method::DELETE, &format!("/policy-sets/{custom_set}"), None).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("1 pinned device"), "{v}");
+    admin.put(&format!("/agents/{id3}/policy-pin"), json!({ "policy_set_id": null })).await;
+    let (s, _) = admin.call(reqwest::Method::DELETE, &format!("/policy-sets/{custom_set}"), None).await;
+    assert!(s.is_success());
+    let a = open_on_a3("the offline alert once unpinned").await;
+    // A site assignment beats the client's; the site's set switches the alert off there.
+    let site_set = admin.post("/policy-sets", json!({ "name": "A site (e2e)", "parent_id": a_set_id })).await;
+    let site_set_id = item(&site_set);
+    assert_eq!(site_set["client_id"], a_id, "children of a client's set are the client's");
+    let site_assignment = admin.put("/policy-assignments", json!({ "client_id": a_id, "site_id": a_site, "category_id": cat, "policy_set_id": site_set_id })).await;
+    assert_eq!(admin.get(&format!("/agents/{id3}/policy")).await["reason"], "site");
+    let v = admin.put(&format!("/policy-items/{off_id}/overrides/{site_set_id}"), json!({ "enabled": false, "config": {} })).await;
+    assert_eq!((v["enabled"].as_bool(), v["sources"]["enabled"].as_str()), (Some(false), Some(site_set_id.as_str())), "{v}");
+    closed(a, "the alert to close when the site's set disabled the policy").await;
+    let listed = admin.get(&format!("/policy-assignments?client_id={a_id}")).await;
+    assert_eq!(listed.as_array().unwrap().len(), 2, "{listed}");
+    let (s, v) = admin.call(reqwest::Method::DELETE, &format!("/policy-sets/{site_set_id}"), None).await;
+    assert_eq!(s, StatusCode::CONFLICT, "assigned: {v}");
+    admin.call(reqwest::Method::DELETE, &format!("/policy-assignments/{}", site_assignment["id"].as_str().unwrap()), None).await;
+    assert_eq!(admin.get(&format!("/agents/{id3}/policy")).await["reason"], "client");
+    let a = open_on_a3("the offline alert back on the client's set").await;
+    let devices = admin.get(&format!("/policy-sets/{a_set_id}/agents")).await;
+    assert_eq!(devices["total"], 2, "{devices}");
+    assert!(devices["items"].as_array().unwrap().iter().all(|d| d["reason"] == "client"), "{devices}");
+
+    // --- run_script_id: a script runs when an alert opens --------------------------------------------------
+    let heal = admin.post("/scripts", json!({ "name": "heal (policies e2e)", "interpreter": "bash", "body": "echo healed" })).await;
+    let jf = admin
+        .post(
+            &format!("/policy-sets/{a_set_id}/items"),
+            json!({ "module": "alert", "name": "Jobs fail (policies e2e)",
+                    "config": { "kind": "job_failed", "params": {}, "severity": "info", "run_script_id": heal["id"] } }),
+        )
+        .await;
+    let failing = admin.run_script(id1, "exit 7", 30).await;
+    admin.wait_job(&failing, 30).await;
+    let jf_id = item(&jf);
+    let opened = eventually(30, "the job alert with its script", || async {
+        alerts_for(admin, &format!("policy_id={jf_id}&agent_id={id1}")).await.into_iter().find(|a| a["script_job_id"].is_string())
+    })
+    .await;
+    let healed = admin.wait_job(opened["script_job_id"].as_str().unwrap(), 30).await;
+    assert_eq!((healed["status"].as_str(), healed["stdout"].as_str(), healed["script_id"].as_str()), (Some("succeeded"), Some("healed\n"), heal["id"].as_str()), "{healed}");
+    assert_eq!(admin.delete_policy(&jf_id).await, StatusCode::OK);
+
+    // --- limits ----------------------------------------------------------------------------------------------
+    let b_only = admin
+        .alert_policy(json!({ "name": "B only (policies e2e)", "kind": "offline", "params": { "minutes": 60 }, "severity": "info", "client_id": b_id }))
+        .await;
+    let site_only = admin
+        .alert_policy(json!({ "name": "Site only (policies e2e)", "kind": "offline", "params": { "minutes": 60 }, "severity": "info", "client_id": a_id, "site_id": a_site }))
+        .await;
+    let view = admin.get(&format!("/agents/{id1}/policy")).await;
+    assert_eq!(find(&view["policies"], &item(&b_only)).unwrap()["applies"], false);
+    assert_eq!(find(&view["policies"], &item(&site_only)).unwrap()["applies"], true);
+    let (s, _) = admin
+        .call(reqwest::Method::PUT, &format!("/policy-items/{}", item(&site_only)), Some(json!({ "client_id": b_id, "site_id": a_site })))
+        .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "the site must be the client's");
+
+    // --- remote access turned off by a set ---------------------------------------------------------------------
+    admin.put(&format!("/policy-items/{REMOTE_ITEM}/overrides/{a_set_id}"), json!({ "config": { "files_enabled": false, "shell_enabled": false } })).await;
+    let (s, v) = admin.call(reqwest::Method::GET, &format!("/agents/{id1}/files"), None).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("A Linux (e2e)"), "the message names the set: {v}");
+    let (s, v) = admin.call(reqwest::Method::PUT, &format!("/policy-items/{REMOTE_ITEM}/overrides/{a_set_id}"), Some(json!({ "enabled": false, "config": {} }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "single-instance policies can't be switched off: {v}");
+    admin.call(reqwest::Method::DELETE, &format!("/policy-items/{REMOTE_ITEM}/overrides/{a_set_id}"), None).await;
+    let (s, _) = admin.call(reqwest::Method::GET, &format!("/agents/{id1}/files"), None).await;
+    assert!(s.is_success(), "back on");
+
+    // --- tenant scoping: a technician limited to client B ---------------------------------------------------------
+    admin
+        .post("/users", json!({ "email": "policytech@e2e.test", "name": "Policy tech", "password": "tech-password-123", "role": "technician",
+                                "all_clients": false, "client_ids": [b_id] }))
+        .await;
+    let tech = Api::new(url);
+    tech.post("/auth/login", json!({ "email": "policytech@e2e.test", "password": "tech-password-123" })).await;
+    let theirs = tech.get("/policy-sets").await;
+    assert!(find(&theirs, ROOT_SET).is_some() && find(&theirs, &a_set_id).is_none(), "MSP-wide sets only, not client A's");
+    let root_items = tech.get(&format!("/policy-sets/{ROOT_SET}")).await["policies"].clone();
+    assert!(find(&root_items, &item(&site_only)).is_none() && find(&root_items, &item(&b_only)).is_some(), "client A's items are hidden");
+    for (m, path, body) in [
+        (reqwest::Method::GET, format!("/policy-sets/{a_set_id}"), None),
+        (reqwest::Method::GET, format!("/policy-sets/{a_set_id}/agents"), None),
+        (reqwest::Method::PUT, format!("/policy-sets/{a_set_id}"), Some(json!({ "name": "mine" }))),
+        (reqwest::Method::DELETE, format!("/policy-sets/{a_set_id}"), None),
+        (reqwest::Method::POST, format!("/policy-sets/{a_set_id}/items"), Some(json!({ "module": "alert", "name": "x", "config": {} }))),
+        (reqwest::Method::PUT, format!("/policy-items/{off_id}"), Some(json!({ "name": "mine" }))),
+        (reqwest::Method::DELETE, format!("/policy-items/{off_id}"), None),
+        (reqwest::Method::PUT, format!("/policy-items/{PATCH_ITEM}/overrides/{a_set_id}"), Some(json!({ "config": { "auto_install": true } }))),
+        (reqwest::Method::GET, format!("/policy-assignments?client_id={a_id}"), None),
+        (reqwest::Method::PUT, "/policy-assignments".into(), Some(json!({ "client_id": a_id, "category_id": cat, "policy_set_id": LINUX_SET }))),
+        (reqwest::Method::DELETE, format!("/policy-assignments/{}", assignment["id"].as_str().unwrap()), None),
+        (reqwest::Method::GET, format!("/agents/{id1}/policy"), None),
+        (reqwest::Method::PUT, format!("/agents/{id1}/policy-pin"), Some(json!({ "policy_set_id": null }))),
+        (reqwest::Method::POST, format!("/agents/{id1}/policy-pin/customize"), None),
+        (reqwest::Method::POST, "/agents/category".into(), Some(json!({ "agent_ids": [id1], "category_id": null }))),
+        (reqwest::Method::PUT, format!("/policy-items/{off_id}/exclusions/{id1}"), None),
+    ] {
+        let (s, v) = tech.call(m.clone(), &path, body).await;
+        assert_eq!(s, StatusCode::NOT_FOUND, "{m} {path}: {v}");
+    }
+    assert!(tech.get("/policy-assignments").await.as_array().unwrap().is_empty());
+    for (m, path, body) in [
+        (reqwest::Method::POST, "/policy-sets".to_string(), json!({ "name": "MSP", "parent_id": ROOT_SET })),
+        (reqwest::Method::POST, format!("/policy-sets/{ROOT_SET}/items"), json!({ "module": "alert", "name": "x", "config": { "kind": "offline", "params": { "minutes": 5 }, "severity": "info" } })),
+        (reqwest::Method::PUT, format!("/policy-items/{REMOTE_ITEM}"), json!({ "config": { "desktop_enabled": false, "desktop_consent": false, "shell_enabled": true, "files_enabled": true } })),
+        (reqwest::Method::POST, "/device-categories".to_string(), json!({ "name": "x", "default_set_id": ROOT_SET })),
+        (reqwest::Method::PUT, format!("/policy-items/{SECURITY_ITEM}/overrides/{LINUX_SET}"), json!({ "config": { "prevention": true } })),
+    ] {
+        let (s, v) = tech.call(m.clone(), &path, Some(body)).await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "{m} {path}: {v}");
+    }
+    // Their own client: a set, an override and an item of their own.
+    let b_set = tech.post("/policy-sets", json!({ "name": "B (e2e)", "parent_id": LINUX_SET, "client_id": b_id })).await;
+    let b_set_id = item(&b_set);
+    tech.put(&format!("/policy-items/{PATCH_ITEM}/overrides/{b_set_id}"), json!({ "config": { "deferral_days": 3 } })).await;
+    let (s, _) = tech.call(reqwest::Method::PUT, &format!("/policy-items/{SECURITY_ITEM}/overrides/{b_set_id}"), Some(json!({ "config": { "prevention": true } }))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "the security module also needs security.manage");
+    let b_item = tech
+        .post(&format!("/policy-sets/{ROOT_SET}/items"), json!({ "module": "alert", "name": "B tech's", "client_id": b_id,
+                                                              "config": { "kind": "offline", "params": { "minutes": 30 }, "severity": "info" } }))
+        .await;
+    assert_eq!(b_item["editable"], true);
+    let dup = tech.post(&format!("/policy-sets/{b_set_id}/duplicate"), json!({})).await;
+    assert_eq!((dup["name"].as_str(), dup["overrides"].as_i64(), dup["client_id"].as_str()), (Some("Copy of B (e2e)"), Some(1), Some(b_id)), "{dup}");
+    for id in [item(&dup), b_set_id] {
+        let (s, v) = tech.call(reqwest::Method::DELETE, &format!("/policy-sets/{id}"), None).await;
+        assert!(s.is_success(), "{v}");
+    }
+    assert_eq!(tech.delete_policy(&item(&b_item)).await, StatusCode::OK);
+
+    // --- enrollment into a category, and agents that don't report a platform ----------------------------------------
+    let token = admin.post(&format!("/sites/{a_site}/enrollment-tokens"), json!({ "label": "kiosks", "category_id": kiosks_id })).await;
+    let a4 = Agent::new(dir, "a4").enroll(url, token["token"].as_str().unwrap()).unwrap();
+    let v = admin.get(&format!("/agents/{a4}/policy")).await;
+    assert_eq!((v["category"]["id"].as_str(), v["category"]["manual"].as_bool()), (Some(kiosks_id.as_str()), Some(true)), "{v}");
+    let plain = admin.post(&format!("/sites/{a_site}/enrollment-tokens"), json!({ "label": "plain" })).await;
+    let a5 = Agent::new(dir, "a5").enroll(url, plain["token"].as_str().unwrap()).unwrap();
+    // As an older Windows build would be: no platform, so the OS name decides; once it reports
+    // one, it moves; a manual category stays.
+    let category_of = |agent: String| async move {
+        sqlx::query_scalar::<_, String>("SELECT dc.name FROM agents a JOIN device_categories dc ON dc.id = a.category_id WHERE a.id = $1::uuid")
+            .bind(agent)
+            .fetch_one(db)
+            .await
+            .unwrap()
+    };
+    for (sql, want) in [
+        ("UPDATE agents SET os_family = 'windows', os_name = 'Windows Server 2022 Standard', platform = NULL WHERE id = $1::uuid", "Windows servers"),
+        ("UPDATE agents SET platform = 'workstation' WHERE id = $1::uuid", "Windows workstations"),
+        ("UPDATE agents SET os_name = 'Windows 11 Pro', platform = NULL WHERE id = $1::uuid", "Windows workstations"),
+    ] {
+        sqlx::query(sql).bind(&a5).execute(db).await.unwrap();
+        assert_eq!(category_of(a5.clone()).await, want, "{sql}");
+    }
+    admin.post("/agents/category", json!({ "agent_ids": [a5], "category_id": kiosks_id })).await;
+    sqlx::query("UPDATE agents SET os_name = 'Windows Server 2025', platform = 'server' WHERE id = $1::uuid").bind(&a5).execute(db).await.unwrap();
+    assert_eq!(category_of(a5.clone()).await, "Kiosks (e2e)", "moved by hand: stays");
+    let windows_ws = admin.get(&format!("/agents/{a5}/policy")).await;
+    assert_eq!(windows_ws["set"]["id"], LINUX_SET, "Kiosks' default set");
+    // Deleting the category puts its devices back on automatic.
+    let (s, _) = admin.call(reqwest::Method::DELETE, &format!("/device-categories/{kiosks_id}"), None).await;
+    assert!(s.is_success());
+    assert_eq!(category_of(a5.clone()).await, "Windows servers");
+    assert_eq!(category_of(a4.clone()).await, cats.as_array().unwrap().iter().find(|c| c["id"] == cat.as_str()).unwrap()["name"].as_str().unwrap());
+    let (s, _) = admin.call(reqwest::Method::DELETE, &format!("/device-categories/{cat}"), None).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "built-in categories stay");
+    for agent in [&a4, &a5] {
+        admin.call(reqwest::Method::DELETE, &format!("/agents/{agent}"), None).await;
+    }
+
+    // --- clean up: back to the built-in sets ---------------------------------------------------------------------
+    for id in [item(&b_only), item(&site_only), off_id.clone()] {
+        assert_eq!(admin.delete_policy(&id).await, StatusCode::OK);
+    }
+    let a = admin.get(&format!("/alerts/{}", a["id"].as_str().unwrap())).await;
+    assert_eq!(a["resolution"], "policy", "deleting a policy closes its alerts quietly: {a}");
+    admin.call(reqwest::Method::DELETE, &format!("/policy-assignments/{}", assignment["id"].as_str().unwrap()), None).await;
+    assert_eq!(admin.get(&format!("/agents/{id1}/policy")).await["reason"], "default");
+    for id in [&site_set_id, &a_set_id] {
+        let (s, v) = admin.call(reqwest::Method::DELETE, &format!("/policy-sets/{id}"), None).await;
+        assert!(s.is_success(), "{v}");
+    }
+    let audit = admin.get("/audit?action=policy.override").await;
+    assert!(!audit["items"].as_array().unwrap().is_empty(), "{audit}");
+    println!("policies: ok");
+}
+
 /// Rows written by the previous release (`RMM_E2E_EXPECT`, from `tests/upgrade.rs`) read back
 /// through this release's API after the migrations ran on them.
 async fn previous_release_rows(admin: &Api, path: &str) {
@@ -1113,6 +1529,26 @@ async fn previous_release_rows(admin: &Api, path: &str) {
     let found = admin.get(&format!("/search?q={}", url_escape(&s("hostname")))).await;
     assert!(found.to_string().contains(&s("agent_id")), "search finds the old agent: {found}");
     println!("previous release's rows: ok (client, agent with {} metric samples, ticket T-{})", points.as_array().unwrap().len(), e["ticket_number"]);
+    // Its policies, migrated (written by releases that had the old model; see tests/upgrade.rs).
+    if let Some(alert) = e["alert_policy_id"].as_str() {
+        let linux = admin.item_in("00000000-0000-4000-8001-000000000002", alert).await;
+        assert_eq!((linux["status"].as_str(), linux["limit"]["client_id"].as_str()), (Some("defined"), e["client_id"].as_str()), "the OS-limited alert policy: {linux}");
+        let p = admin.get(&format!("/agents/{}/policy", s("agent_id"))).await;
+        assert_eq!(p["reason"], "site", "the site's sensor policy became a site set: {p}");
+        let name = format!("{} · ", e["client_name"].as_str().unwrap());
+        assert!(p["set"]["name"].as_str().unwrap().starts_with(&name) && p["chain"][3]["name"].as_str().unwrap().starts_with(&name), "{p}");
+        let policies = p["policies"].as_array().unwrap();
+        let module = |m: &str| policies.iter().find(|x| x["module"] == m).unwrap().clone();
+        assert_eq!(module("remote_access")["config"]["desktop_consent"], true, "the client's consent");
+        assert!(policies.iter().any(|x| x["id"] == alert && x["applies"] == true), "{p}");
+        let patch = admin.get(&format!("/agents/{}/patches", s("agent_id"))).await["policy"].clone();
+        assert_eq!((patch["reboot_policy"].as_str(), patch["auto_approve_categories"].clone()), (Some("if_required"), json!(["security", "driver"])), "{patch}");
+        let sec = admin.get(&format!("/agents/{}/security", s("agent_id"))).await["policy"].clone();
+        assert_eq!((sec["quick_scan_hours"].as_i64(), sec["telemetry_mb"].as_i64()), (Some(6), Some(64)), "the site's sensor policy: {sec}");
+        let sched = admin.get(&format!("/schedules/{}", s("schedule_id"))).await;
+        assert_eq!((sched["next_run_at"].as_str(), sched["agents"].as_i64()), (e["schedule_next_run_at"].as_str(), Some(1)), "{sched}");
+        println!("previous release's policies: ok");
+    }
     // The suite counts what it creates (agents, tickets, alerts), so the old client goes once
     // it has been read back: deleting it is a check of its own on the migrated rows' keys.
     admin.call(reqwest::Method::DELETE, &format!("/agents/{}", s("agent_id")), None).await;
@@ -1269,7 +1705,7 @@ async fn wait_action(api: &Api, agent: &str, action_id: &str) -> Value {
     .await
 }
 
-async fn sensor(url: &str, admin: &Api, db: &sqlx::PgPool, dir: &Path, id1: &str, a_id: &str) {
+async fn sensor(url: &str, admin: &Api, db: &sqlx::PgPool, dir: &Path, id1: &str, a_id: &str, b_id: &str) {
     let respond = |action: Value| async move {
         let v = admin.post(&format!("/agents/{id1}/security/respond"), json!({ "action": action })).await;
         v["id"].as_str().unwrap().to_string()
@@ -1278,14 +1714,12 @@ async fn sensor(url: &str, admin: &Api, db: &sqlx::PgPool, dir: &Path, id1: &str
     // --- the sensor follows the policy --------------------------------------------------------
     let s = admin.get(&format!("/agents/{id1}/security")).await;
     assert_eq!((s["sensor_supported"].as_bool(), s["policy"]["enabled"].as_bool()), (Some(true), Some(false)), "{}", s["policy"]);
-    let global = admin.get("/security/policies").await.as_array().unwrap().iter().find(|p| p["client_id"].is_null()).unwrap().clone();
-    let gid = global["id"].as_str().unwrap().to_string();
+    let gid = SECURITY_ITEM.to_string();
     let policy = |enabled: bool| json!({ "sensor_enabled": enabled, "quick_scan_hours": 0, "full_scan_days": 0, "auto_quarantine": true,
                                         "prevention": false, "canaries": true, "telemetry_mb": 16 });
-    let (s, _) = admin.call(reqwest::Method::PUT, &format!("/security/policies/{gid}"), Some(json!({ "sensor_enabled": true, "quick_scan_hours": 0, "full_scan_days": 0,
-        "auto_quarantine": true, "prevention": false, "canaries": true, "telemetry_mb": 1 }))).await;
+    let (s, _) = admin.set_root_item(&gid, json!({ "sensor_enabled": true, "telemetry_mb": 1 })).await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "telemetry below 16 MB");
-    let (s, v) = admin.call(reqwest::Method::PUT, &format!("/security/policies/{gid}"), Some(policy(true))).await;
+    let (s, v) = admin.set_root_item(&gid, policy(true)).await;
     assert!(s.is_success(), "{v}");
     eventually(30, "the sensor to start", || async {
         let s = admin.get(&format!("/agents/{id1}/security")).await;
@@ -1321,7 +1755,7 @@ async fn sensor(url: &str, admin: &Api, db: &sqlx::PgPool, dir: &Path, id1: &str
 
     // A policy that alerts on every new detection and on the sensor going down.
     let pol = admin
-        .post("/alert-policies", json!({ "name": "Sensor", "kind": "security", "severity": "critical",
+        .alert_policy(json!({ "name": "Sensor", "kind": "security", "severity": "critical",
                                           "params": { "threats": "any", "sensor_down": true } }))
         .await;
     let pol_id = pol["id"].as_str().unwrap().to_string();
@@ -1362,6 +1796,9 @@ async fn sensor(url: &str, admin: &Api, db: &sqlx::PgPool, dir: &Path, id1: &str
     let quick = admin.post(&format!("/agents/{id1}/security/actions"), json!({ "action": "quick_scan", "product": "rmm" })).await;
     let a = wait_action(admin, id1, quick["id"].as_str().unwrap()).await;
     assert_eq!(a["status"], "succeeded", "{a}");
+
+    signature_database(url, admin, dir, id1).await;
+    realtime_and_reputation(url, admin, dir, id1, &gid, b_id).await;
 
     // --- behaviour rules, telemetry, hunting ---------------------------------------------------
     admin.run_script(id1, "sh -c 'sleep 4; true' rmm-e2e-marker", 30).await;
@@ -1444,7 +1881,13 @@ ExecStart=/tmp/x
     }
     let triage = respond(json!({ "type": "collect_triage" })).await;
     let a = wait_action(admin, id1, &triage).await;
-    assert!(a["status"] == "succeeded" && a["has_download"] == true, "{a}");
+    assert_eq!(a["status"], "succeeded", "{a}");
+    // The action is marked done before the package is in storage (a big one takes a moment).
+    eventually(20, "the triage package stored", || async {
+        let s = admin.get(&format!("/agents/{id1}/security")).await;
+        s["actions"].as_array().unwrap().iter().find(|x| x["id"] == triage.as_str() && x["has_download"] == true).map(|_| ())
+    })
+    .await;
     let res = admin.http.get(format!("{}/security/actions/{triage}/download", admin.base)).send().await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
     assert!(res.headers()["content-disposition"].to_str().unwrap().contains("triage-"));
@@ -1481,14 +1924,370 @@ ExecStart=/tmp/x
     assert_eq!(s, StatusCode::FORBIDDEN);
 
     // --- switching the sensor off takes the decoys away --------------------------------------------
-    admin.call(reqwest::Method::DELETE, &format!("/alert-policies/{pol_id}"), None).await;
-    admin.call(reqwest::Method::PUT, &format!("/security/policies/{gid}"), Some(policy(false))).await;
+    admin.delete_policy(&pol_id).await;
+    admin.set_root_item(&gid, policy(false)).await;
     eventually(30, "the sensor to stop", || async {
         (admin.get(&format!("/agents/{id1}/security")).await["sensor"]["running"] == false).then_some(())
     })
     .await;
     eventually(20, "decoys removed", || async { (!dir.join("a1-home/.rmm-canary-do-not-touch.docx").exists()).then_some(()) }).await;
     println!("sensor: ok");
+}
+
+/// A signature database signed the way `rmm-sign build-db` does: a hash signature and a YARA
+/// rule, both alerting.
+fn e2e_database(version: &str, marker: &str, hashed: &[u8]) -> Vec<u8> {
+    e2e_database_built(version, marker, hashed, 0)
+}
+
+/// The same, built `age_hours` ago.
+fn e2e_database_built(version: &str, marker: &str, hashed: &[u8], age_hours: i64) -> Vec<u8> {
+    use ed25519_dalek::Signer;
+    use sha2::Digest;
+    let mut b = rmm_scan::db::Builder::new(version, "e2e signatures");
+    b.meta.created_at = chrono::Utc::now() - chrono::Duration::hours(age_hours);
+    b.add_hash(rmm_scan::db::HashSig {
+        algo: rmm_scan::db::Algo::Sha256,
+        digest: sha2::Sha256::digest(hashed).to_vec(),
+        size: None,
+        name: "E2E hashed sample".into(),
+        severity: rmm_proto::security::ThreatSeverity::High,
+    });
+    b.add_yara(&format!(
+        "{}e2e\nrule E2E_Marker {{ meta: id = \"E2E-Y-1\" name = \"E2E YARA marker\" severity = \"high\" confidence = \"high\" mode = \"alert\" mitre = \"T1027\"\n strings: $m = \"{marker}\" condition: $m }}\n",
+        rmm_scan::rules::NAMESPACE_MARKER
+    ));
+    b.meta.rules = vec![rmm_scan::db::RuleInfo {
+        id: "E2E-Y-1".into(),
+        name: "E2E YARA marker".into(),
+        kind: "yara".into(),
+        severity: rmm_proto::security::ThreatSeverity::High,
+        confidence: rmm_content::Confidence::High,
+        mode: rmm_proto::security::RuleMode::Alert,
+        mitre: vec!["T1027".into()],
+        description: String::new(),
+        digest: format!("{version}-{marker}"),
+        source: Some("e2e".into()),
+        licence: None,
+        author: None,
+        reference: None,
+    }];
+    b.meta.yara_rules = 1;
+    let key = ed25519_dalek::SigningKey::from_bytes(&CONTENT_SEED);
+    rmm_scan::db::seal(b.build().unwrap(), version, |m| key.sign(m).to_bytes())
+}
+
+/// One stored member: enough of a zip for the engine.
+fn stored_zip(name: &str, data: &[u8]) -> Vec<u8> {
+    let mut z = b"PK\x03\x04\x14\0\0\0\0\0\0\0\0\0\0\0\0\0".to_vec();
+    z.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    z.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    z.extend_from_slice(&(name.len() as u16).to_le_bytes());
+    z.extend_from_slice(&[0, 0]);
+    z.extend_from_slice(name.as_bytes());
+    z.extend_from_slice(data);
+    let cd_off = z.len() as u32;
+    let mut cd = b"PK\x01\x02\x14\0\x14\0\0\0\0\0\0\0\0\0\0\0\0\0".to_vec();
+    cd.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    cd.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    cd.extend_from_slice(&(name.len() as u16).to_le_bytes());
+    cd.extend_from_slice(&[0; 12]);
+    cd.extend_from_slice(&0u32.to_le_bytes());
+    cd.extend_from_slice(name.as_bytes());
+    z.extend_from_slice(&cd);
+    z.extend_from_slice(b"PK\x05\x06\0\0\0\0\x01\0\x01\0");
+    z.extend_from_slice(&(cd.len() as u32).to_le_bytes());
+    z.extend_from_slice(&cd_off.to_le_bytes());
+    z.extend_from_slice(&[0, 0]);
+    z
+}
+
+/// Antivirus milestone 2 end to end: a signed database uploaded (a tampered one refused),
+/// rolled out to the canary agent, downloaded over HTTP with its credentials, used by scans
+/// (a hash, and a YARA rule inside an archive), the verdict cache, then a rollback that sends
+/// the agent back to the previous file without downloading it again.
+async fn signature_database(url: &str, admin: &Api, dir: &Path, id1: &str) {
+    let upload = |body: Vec<u8>| async move {
+        let res = admin.http.post(format!("{}/security/databases", admin.base)).body(body).send().await.unwrap();
+        (res.status(), res.json::<Value>().await.unwrap_or(Value::Null))
+    };
+    let hashed = b"rmm e2e: this exact file is in the signature database".to_vec();
+    let db1 = e2e_database("e2e-db.1", "RMM-E2E-YARA-MARKER", &hashed);
+    let mut tampered = db1.clone();
+    let n = tampered.len() / 2;
+    tampered[n] ^= 1;
+    let (s, v) = upload(tampered).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("signature") || v["error"].as_str().unwrap().contains("database"), "{v}");
+    let (s, v) = upload(db1.clone()).await;
+    assert!(s.is_success(), "{v}");
+    assert_eq!(v["stage"], "canary");
+    let (s, _) = upload(db1.clone()).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "the same version twice");
+    eventually(60, "the database on the agent", || async {
+        let s = admin.get(&format!("/agents/{id1}/security")).await;
+        (s["sensor"]["database_version"] == "e2e-db.1").then_some(())
+    })
+    .await;
+    eventually(30, "automatic promotion of the database", || async {
+        (admin.get("/security/databases").await["versions"][0]["stage"] == "general").then_some(())
+    })
+    .await;
+    let list = admin.get("/security/databases").await;
+    assert_eq!((list["versions"][0]["hashes"].as_i64(), list["versions"][0]["yara_rules"].as_i64()), (Some(1), Some(1)), "{list}");
+    let rules = admin.get("/security/rules").await;
+    assert!(rules.as_array().unwrap().iter().any(|r| r["id"] == "E2E-Y-1"), "database rules are listed with the others: {rules}");
+
+    // The download endpoint wants the agent's own credentials, and resumes.
+    let cfg = std::fs::read_to_string(dir.join("a1.toml")).unwrap();
+    let secret = cfg.lines().find_map(|l| l.strip_prefix("secret = ")).unwrap().trim_matches('"').to_string();
+    let link = format!("{url}/api/agent/databases/e2e-db.1");
+    let http = reqwest::Client::new();
+    assert_eq!(http.get(&link).send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    let res = http.get(&link).header("X-Rmm-Agent", id1).header("Authorization", "Bearer wrong").send().await.unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    let res = http.get(&link).header("X-Rmm-Agent", id1).header("Authorization", format!("Bearer {secret}")).header("Range", "bytes=8-").send().await.unwrap();
+    assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(res.bytes().await.unwrap(), db1[8..]);
+
+    // A scan finds the listed file by hash and the marker inside an archive by YARA.
+    let d = dir.join("a1-scan/db");
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(d.join("hashed.bin"), &hashed).unwrap();
+    std::fs::write(d.join("bundle.zip"), stored_zip("inner/marker.txt", b"x RMM-E2E-YARA-MARKER x")).unwrap();
+    for i in 0..20 {
+        std::fs::write(d.join(format!("clean-{i}.txt")), format!("an ordinary file {i}")).unwrap();
+    }
+    let scan = |path: PathBuf| async move {
+        let v = admin.post(&format!("/agents/{id1}/security/respond"), json!({ "action": { "type": "scan_path", "path": path.to_string_lossy() } })).await;
+        wait_action(admin, id1, v["id"].as_str().unwrap()).await
+    };
+    let a = scan(d.clone()).await;
+    assert!(a["status"] == "succeeded" && a["message"].as_str().unwrap().starts_with("Found 2 threats"), "{a}");
+    let h = eventually(20, "the hash detection", || async { detections_for(admin, id1, "RMM-HASH").await.into_iter().find(|d| d["name"] == "E2E hashed sample") }).await;
+    let y = eventually(20, "the YARA detection", || async { detections_for(admin, id1, "E2E-Y-1").await.into_iter().next() }).await;
+    assert_eq!((y["status"].as_str(), y["mitre"][0].as_str()), (Some("quarantined"), Some("T1027")), "{y}");
+    assert_eq!(h["status"], "quarantined", "{h}");
+    assert_eq!((h["found_by"].as_str(), h["denied"].as_bool()), (Some("scan"), Some(false)), "how it was found: {h}");
+    let detail = admin.get(&format!("/security/detections/{}", y["id"].as_str().unwrap())).await;
+    assert_eq!((detail["database_version"].as_str(), detail["part"].as_str()), (Some("e2e-db.1"), Some("inner/marker.txt")), "{detail}");
+    assert_eq!(detail["rule"]["id"], "E2E-Y-1", "the rule comes from the database's summary");
+    assert!(!d.join("bundle.zip").exists() && !d.join("hashed.bin").exists(), "both quarantined");
+    // Unchanged clean files aren't read again.
+    let a = scan(d.clone()).await;
+    assert!(a["message"].as_str().unwrap().contains("20 unchanged since a clean scan"), "{a}");
+    let health = &admin.get(&format!("/agents/{id1}/security")).await["sensor"]["health"];
+    assert!(health.is_null() || health["database_version"] == "e2e-db.1", "{health}");
+
+    // A second version, then rolled back: the agent returns to the first without fetching it.
+    let (s, v) = upload(e2e_database("e2e-db.2", "RMM-E2E-YARA-MARKER-2", b"another")).await;
+    assert!(s.is_success(), "{v}");
+    let db2 = v["id"].as_str().unwrap().to_string();
+    eventually(60, "the second database on the agent", || async {
+        (admin.get(&format!("/agents/{id1}/security")).await["sensor"]["database_version"] == "e2e-db.2").then_some(())
+    })
+    .await;
+    let files = || std::fs::read_dir(sensor_dir(dir, "a1", "state").join("security/db")).unwrap().flatten().filter(|e| e.path().extension().is_some_and(|x| x == "rmmdb")).count();
+    assert_eq!(files(), 2, "the previous file is kept to fall back on");
+    let r = admin.post(&format!("/security/databases/{db2}/rollback"), json!({ "reason": "e2e" })).await;
+    assert_eq!(r["ok"], true);
+    eventually(30, "back on the first database", || async {
+        (admin.get(&format!("/agents/{id1}/security")).await["sensor"]["database_version"] == "e2e-db.1").then_some(())
+    })
+    .await;
+    let list = admin.get("/security/databases").await;
+    let stages: Vec<(&str, &str)> = list["versions"].as_array().unwrap().iter().map(|v| (v["version"].as_str().unwrap(), v["stage"].as_str().unwrap())).collect();
+    assert_eq!(stages, [("e2e-db.2", "rolled_back"), ("e2e-db.1", "general")]);
+    let log = std::fs::read_to_string(dir.join("a1.log")).unwrap_or_default();
+    assert!(log.contains("back to the previous version"), "switched without a download");
+    std::fs::remove_dir_all(&d).unwrap();
+    println!("signature database: ok");
+}
+
+/// Antivirus milestones 3 and 5 end to end, as far as an unprivileged agent goes: the real-time
+/// policy reaches the sensor, which says on-access protection is unavailable (no fanotify
+/// without root; `crates/rmm-agent/tests/onaccess.rs` covers it as root) and falls back. Then
+/// the reputation lookup: a program the agent's database doesn't know but a server-only hash
+/// list does is reported (and left alone), its sightings answer "which machines, first when",
+/// within the user's clients only, and database hashes follow the newest database.
+async fn realtime_and_reputation(url: &str, admin: &Api, dir: &Path, id1: &str, gid: &str, b_id: &str) {
+    let policy = |extra: Value| {
+        let mut p = json!({ "sensor_enabled": true, "quick_scan_hours": 0, "full_scan_days": 0, "auto_quarantine": true,
+                            "prevention": false, "canaries": true, "telemetry_mb": 16 });
+        p.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        p
+    };
+    let put = |p: Value| async move {
+        let (s, v) = admin.set_root_item(gid, p).await;
+        (s, v["config"].clone())
+    };
+    let (s, _) = put(policy(json!({ "realtime": "sometimes" }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let (s, _) = put(policy(json!({ "archive_depth": 50 }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let (s, v) = put(policy(json!({ "realtime": "audit", "scan_on_write": false, "archive_depth": 4 }))).await;
+    assert!(s.is_success(), "{v}");
+    assert_eq!((v["realtime"].as_str(), v["scan_on_write"].as_bool(), v["archive_depth"].as_i64()), (Some("audit"), Some(false), Some(4)), "{v}");
+    let (_, v) = put(policy(json!({}))).await;
+    assert_eq!(v["realtime"], "audit", "fields left out stay as they were: {v}");
+    let sec = eventually(30, "the real-time state from the sensor", || async {
+        let s = admin.get(&format!("/agents/{id1}/security")).await;
+        (s["sensor"]["health"]["realtime"]["mode"] == "audit").then_some(s)
+    })
+    .await;
+    let rt = &sec["sensor"]["health"]["realtime"];
+    assert_eq!((rt["state"].as_str(), rt["mechanism"].as_str()), (Some("unavailable"), Some("scan-after-start")), "unprivileged: {rt}");
+    assert!(rt["error"].as_str().unwrap().contains("fanotify"), "{rt}");
+    assert_eq!(sec["policy"]["realtime"], "audit", "{}", sec["policy"]);
+    let collectors = sec["sensor"]["health"]["collectors"].as_array().unwrap();
+    assert!(collectors.iter().any(|c| c[0] == "realtime" && c[1] == "scan-after-start"), "{collectors:?}");
+    let rmm = eventually(30, "the sensor's product with real-time off", || async {
+        let s = admin.get(&format!("/agents/{id1}/security")).await;
+        s["products"].as_array().unwrap().iter().find(|p| p["kind"] == "rmm" && p["realtime"] == false).cloned()
+    })
+    .await;
+    assert_eq!(rmm["enabled"], true);
+
+    // On Linux, real-time protection the policy wants and the machine doesn't have counts against
+    // it (elsewhere `unavailable` is the platform: see the unit tests), and can alert.
+    let s = eventually(30, "at risk for its real-time protection", || async {
+        let s = admin.get(&format!("/agents/{id1}/security")).await;
+        s["risks"].as_array().unwrap().iter().any(|r| r == "sensor_realtime").then_some(s)
+    })
+    .await;
+    assert!(s["state"] == "at_risk" || s["state"] == "threats", "{s}");
+    assert_eq!((s["database"]["version"].as_str(), s["database_max_age_hours"].as_i64()), (Some("e2e-db.1"), Some(72)), "{s}");
+    let fleet = admin.get("/security/agents?limit=200").await;
+    let row = fleet["items"].as_array().unwrap().iter().find(|a| a["id"] == id1).unwrap().clone();
+    assert!(row["risks"].as_array().unwrap().iter().any(|r| r == "sensor_realtime"), "{row}");
+    assert_eq!((row["prevention"].as_bool(), row["database_version"].as_str(), row["database_max_age_hours"].as_i64()), (Some(false), Some("e2e-db.1"), Some(72)), "{row}");
+    assert!(row["database_built_at"].is_string(), "{row}");
+    let engine_pol = admin
+        .alert_policy(json!({ "name": "Our engine", "kind": "security", "severity": "warning",
+                                         "params": { "sensor_realtime": true, "database_stale": true, "threats": "off" } }))
+        .await;
+    let engine_pol = engine_pol["id"].as_str().unwrap().to_string();
+    let engine_alert = |title: &'static str| async move {
+        alerts_for(admin, &format!("agent_id={id1}&kind=security")).await.into_iter().find(|a| a["title"] == title)
+    };
+    let a = eventually(30, "the real-time alert", || engine_alert("Real-time protection not on")).await;
+    assert_eq!((a["details"]["mode"].as_str(), a["details"]["state"].as_str()), (Some("audit"), Some("unavailable")), "{a}");
+
+    let (s, _) = put(policy(json!({ "realtime": "off", "scan_on_write": true, "archive_depth": 5 }))).await;
+    assert!(s.is_success());
+    eventually(30, "the real-time alert to clear with the policy off", || async { engine_alert("Real-time protection not on").await.is_none().then_some(()) }).await;
+    let s = admin.get(&format!("/agents/{id1}/security")).await;
+    assert!(!s["risks"].as_array().unwrap().iter().any(|r| r == "sensor_realtime"), "off by policy isn't a fault: {s}");
+
+    // --- reputation: a server-only hash list, an agent that ran the program ------------------------
+    let d = dir.join("a1-scan/rep");
+    std::fs::create_dir_all(&d).unwrap();
+    let make = |name: &str, marker: &str| {
+        let mut b = std::fs::read("/bin/sleep").unwrap();
+        b.extend_from_slice(marker.as_bytes());
+        let p = d.join(name);
+        std::fs::write(&p, &b).unwrap();
+        std::fs::set_permissions(&p, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        (p, sha256(&b))
+    };
+    let (known, known_h) = make("rep-known", "rmm e2e: known to the server only");
+    let (rare, rare_h) = make("rep-rare", "rmm e2e: known to nobody");
+    let list = format!("# e2e\n{known_h} E2E.Reputation.Sample\n{}\n", "ab".repeat(32));
+    let res = admin.http.put(format!("{}/security/reputation/lists/e2e-list?severity=high", admin.base)).body(list).send().await.unwrap();
+    assert!(res.status().is_success(), "{:?}", res.text().await);
+    let res = admin.http.put(format!("{}/security/reputation/lists/bad?severity=high", admin.base)).body("not a hash\n").send().await.unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    // A whole feed is far bigger than an ordinary request body.
+    let big: String = (0..60_000u32).map(|i| format!("{}\n", sha256(&i.to_le_bytes()))).collect();
+    assert!(big.len() > 3 << 20);
+    let res = admin.http.put(format!("{}/security/reputation/lists/e2e-big?severity=low", admin.base)).body(big).send().await.unwrap();
+    assert!(res.status().is_success(), "{:?}", res.status());
+    assert_eq!(res.json::<Value>().await.unwrap()["hashes"], 60_000);
+    let (s, v) = admin.call(reqwest::Method::DELETE, "/security/reputation/lists/e2e-big", None).await;
+    assert!(s.is_success() && v["hashes"] == 60_000, "{v}");
+    admin.run_script(id1, &format!("{} 6; {} 6", known.display(), rare.display()), 60).await;
+    let det = eventually(90, "the reputation detection", || async { detections_for(admin, id1, "RMM-REPUTATION").await.into_iter().next() }).await;
+    assert_eq!((det["found_by"].as_str(), det["sha256"].as_str(), det["status"].as_str()), (Some("reputation"), Some(known_h.as_str()), Some("active")), "{det}");
+    assert!(det["action_taken"].as_str().unwrap().contains("reported only"), "{det}");
+    assert!(known.exists(), "a reputation answer never quarantines");
+    let p = admin.get(&format!("/security/prevalence?sha256={known_h}")).await;
+    assert_eq!((p["seen_on"].as_i64(), p["agents"][0]["agent_id"].as_str()), (Some(1), Some(id1)), "{p}");
+    assert!(p["agents"][0]["how"].as_str().unwrap().contains("ran") && p["first_seen"].is_string(), "{p}");
+    assert_eq!((p["known"][0]["source"].as_str(), p["known"][0]["name"].as_str()), (Some("list:e2e-list"), Some("E2E.Reputation.Sample")), "{p}");
+    let detail = admin.get(&format!("/security/detections/{}", det["id"].as_str().unwrap())).await;
+    assert_eq!((detail["seen_on"].as_i64(), detail["reputation"][0]["source"].as_str()), (Some(1), Some("list:e2e-list")), "{detail}");
+    let r = eventually(30, "the rare program as a hunting lead", || async {
+        admin.get("/security/reputation/rare?max_agents=1&days=1").await["items"].as_array().unwrap().iter().find(|i| i["sha256"] == rare_h.as_str()).cloned()
+    })
+    .await;
+    assert_eq!(r["agents"][0]["path"], rare.to_string_lossy().as_ref(), "{r}");
+    assert!(
+        !admin.get("/security/reputation/rare?max_agents=5&days=1").await["items"].as_array().unwrap().iter().any(|i| i["sha256"] == known_h.as_str()),
+        "known hashes aren't leads"
+    );
+
+    // Another client's technician learns nothing about these machines.
+    admin
+        .post("/users", json!({ "email": "rep-scoped@e2e.test", "name": "Rep", "password": "rep-password-123", "role": "technician",
+                                "all_clients": false, "client_ids": [b_id] }))
+        .await;
+    let scoped = Api::new(url);
+    scoped.post("/auth/login", json!({ "email": "rep-scoped@e2e.test", "password": "rep-password-123" })).await;
+    let p = scoped.get(&format!("/security/prevalence?sha256={known_h}")).await;
+    assert_eq!((p["seen_on"].as_i64(), p["agents"].as_array().map(Vec::len)), (Some(0), Some(0)), "{p}");
+    assert!(p["first_seen"].is_null(), "{p}");
+    assert!(scoped.get("/security/reputation/rare?max_agents=5&days=1").await["items"].as_array().unwrap().is_empty());
+    let (s, _) = scoped.call(reqwest::Method::GET, &format!("/security/detections/{}", det["id"].as_str().unwrap()), None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    let res = scoped.http.put(format!("{}/security/reputation/lists/x", scoped.base)).body(format!("{known_h}\n")).send().await.unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN, "only unrestricted admins upload lists");
+
+    // The server's set: the list, and the newest database still standing (e2e-db.2 was rolled
+    // back, so its hash is gone again).
+    eventually(60, "database hashes in the reputation set", || async {
+        let r = admin.get("/security/reputation").await;
+        let src: Vec<(String, i64)> = r["sources"].as_array().unwrap().iter().map(|s| (s["source"].as_str().unwrap().to_string(), s["hashes"].as_i64().unwrap())).collect();
+        (src == [("db:e2e-db.1".to_string(), 1), ("list:e2e-list".into(), 2)]).then_some(())
+    })
+    .await;
+
+    // A database older than the policy allows: the agent is at risk and alerts; no limit, neither.
+    let (s, _) = put(policy(json!({ "database_max_age_hours": 9000 }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let (s, v) = put(policy(json!({ "database_max_age_hours": 72 }))).await;
+    assert!(s.is_success() && v["database_max_age_hours"] == 72, "{v}");
+    let (s, v) = admin.call(reqwest::Method::POST, "/security/databases", None).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "an empty upload: {v}");
+    let res = admin.http.post(format!("{}/security/databases", admin.base)).body(e2e_database_built("e2e-db.3", "RMM-E2E-YARA-MARKER-3", b"old", 100)).send().await.unwrap();
+    assert!(res.status().is_success(), "{:?}", res.text().await);
+    let db3 = res.json::<Value>().await.unwrap()["id"].as_str().unwrap().to_string();
+    eventually(60, "the old database on the agent", || async {
+        (admin.get(&format!("/agents/{id1}/security")).await["sensor"]["database_version"] == "e2e-db.3").then_some(())
+    })
+    .await;
+    eventually(60, "at risk for the database's age", || async {
+        let s = admin.get(&format!("/agents/{id1}/security")).await;
+        s["risks"].as_array().unwrap().iter().any(|r| r == "database").then_some(())
+    })
+    .await;
+    let a = eventually(60, "the database alert", || engine_alert("Signature database out of date")).await;
+    assert_eq!(a["details"]["max_age_hours"], 72, "{a}");
+    let (s, _) = put(policy(json!({ "database_max_age_hours": 0 }))).await;
+    assert!(s.is_success());
+    let s = admin.get(&format!("/agents/{id1}/security")).await;
+    assert!(!s["risks"].as_array().unwrap().iter().any(|r| r == "database"), "0: no limit: {s}");
+    eventually(90, "the database alert to clear", || async { engine_alert("Signature database out of date").await.is_none().then_some(()) }).await;
+    let (s, _) = put(policy(json!({ "database_max_age_hours": 72 }))).await;
+    assert!(s.is_success());
+    admin.post(&format!("/security/databases/{db3}/rollback"), json!({ "reason": "e2e: too old" })).await;
+    eventually(30, "back on the first database", || async {
+        (admin.get(&format!("/agents/{id1}/security")).await["sensor"]["database_version"] == "e2e-db.1").then_some(())
+    })
+    .await;
+    let s = admin.delete_policy(&engine_pol).await;
+    assert!(s.is_success());
+    std::fs::remove_dir_all(&d).unwrap();
+    println!("real-time policy and reputation: ok");
 }
 
 /// The fake antivirus state the agent reads (`RMM_SECURITY_FAKE`).
@@ -1540,9 +2339,7 @@ async fn security(admin: &Api, dir: &Path, id1: &str, id3: &str) {
 
     // --- a policy on every condition, alerting on every new detection ---------------------------
     let pol = admin
-        .post(
-            "/alert-policies",
-            json!({ "name": "Protection", "kind": "security", "severity": "critical",
+        .alert_policy(json!({ "name": "Protection", "kind": "security", "severity": "critical",
                     "params": { "unprotected": true, "realtime_off": true, "signature_max_age_hours": 24, "threats": "any" } }),
         )
         .await;
@@ -1611,9 +2408,10 @@ async fn security(admin: &Api, dir: &Path, id1: &str, id3: &str) {
     let all = admin.get(&format!("/security/detections?view=all&agent_id={id1}")).await;
     let old = all["items"].as_array().unwrap().iter().find(|d| d["name"] == "Virus:DOS/EICAR old").unwrap().clone();
     assert!(!old["resolved_at"].is_null(), "a detection the product stopped listing is resolved");
-    let mut body = pol.clone();
+    let mut body = pol["item_config"].clone();
+    body["name"] = pol["name"].clone();
     body["params"]["threats"] = json!("active");
-    let (s, v) = admin.call(reqwest::Method::PUT, &format!("/alert-policies/{pol_id}"), Some(body.clone())).await;
+    let (s, v) = admin.update_alert_policy(&pol_id, body.clone()).await;
     assert!(s.is_success(), "{v}");
     eventually(20, "threat alerts to clear", || async { security_alerts().await.is_empty().then_some(()) }).await;
 
@@ -1663,7 +2461,7 @@ async fn security(admin: &Api, dir: &Path, id1: &str, id3: &str) {
     let actions: Vec<&str> = activity.as_array().unwrap().iter().filter_map(|r| r["action"].as_str()).collect();
     assert!(actions.contains(&"security.quick_scan") && actions.contains(&"security.succeeded"), "{actions:?}");
 
-    let (s, _) = admin.call(reqwest::Method::DELETE, &format!("/alert-policies/{pol_id}"), None).await;
+    let s = admin.delete_policy(&pol_id).await;
     assert!(s.is_success());
     println!("security: ok");
 }
@@ -1741,7 +2539,6 @@ async fn desktop_text(ws: &mut DesktopWs) -> Value {
 async fn desktop(url: &str, admin: &Api, dir: &Path, id1: &str) {
     let a = admin.get(&format!("/agents/{id1}")).await;
     assert!(a["capabilities"].as_array().unwrap().iter().any(|c| c == "desktop"), "{a}");
-    let client_id = a["client_id"].as_str().unwrap().to_string();
 
     admin
         .post(
@@ -1840,9 +2637,12 @@ async fn desktop(url: &str, admin: &Api, dir: &Path, id1: &str) {
     assert!(audit.contains(&"desktop.open".to_string()), "{audit:?}");
 
     // Consent: the user declines, then allows.
-    let (s, _) = admin.call(reqwest::Method::PUT, &format!("/clients/{client_id}/desktop"), Some(json!({ "consent": true }))).await;
-    assert!(s.is_success());
-    assert_eq!(admin.get(&format!("/clients/{client_id}")).await["desktop_consent"], true);
+    // Consent is the remote access policy's (here All devices').
+    let (s, v) = admin.set_root_item(REMOTE_ITEM, json!({ "desktop_consent": true })).await;
+    assert!(s.is_success(), "{v}");
+    let mine = admin.get(&format!("/agents/{id1}/policy")).await;
+    let remote = mine["policies"].as_array().unwrap().iter().find(|p| p["module"] == "remote_access").unwrap().clone();
+    assert_eq!(remote["config"]["desktop_consent"], true, "{remote}");
     let mut answer = log.clone().into_os_string();
     answer.push(".consent");
     std::fs::write(&answer, "deny").unwrap();
@@ -1856,7 +2656,7 @@ async fn desktop(url: &str, admin: &Api, dir: &Path, id1: &str) {
     assert_eq!(desktop_text(&mut ws).await["type"], "info");
     assert_eq!(desktop_frame(&mut ws).await.0, 1);
     drop(ws);
-    admin.call(reqwest::Method::PUT, &format!("/clients/{client_id}/desktop"), Some(json!({ "consent": false }))).await;
+    admin.set_root_item(REMOTE_ITEM, json!({ "desktop_consent": false })).await;
 }
 
 /// Phase 4: notification channels, alert policies, services, log watchers, schedules,
@@ -1882,9 +2682,9 @@ async fn monitoring(server: &mut Server, admin: &Api, db: &sqlx::PgPool, dir: &P
     let policy = |name: &str, kind: &str, params: Value| {
         json!({ "name": name, "kind": kind, "params": params, "severity": "warning", "client_id": a_id, "channel_ids": [ch_id] })
     };
-    let (s, v) = admin.call(reqwest::Method::POST, "/alert-policies", Some(policy("bad", "cpu", json!({ "threshold": 500, "minutes": 5 })))).await;
+    let (s, v) = admin.alert_policy_call(policy("bad", "cpu", json!({ "threshold": 500, "minutes": 5 }))).await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
-    let jf = admin.post("/alert-policies", policy("Jobs fail", "job_failed", json!({}))).await;
+    let jf = admin.alert_policy(policy("Jobs fail", "job_failed", json!({}))).await;
     let failing = admin.run_script(id1, "exit 4", 30).await;
     admin.wait_job(&failing, 30).await;
     let opened = wait_hook(&hooks, "job alert opened", |ev, b| ev == "opened" && b["alert"]["kind"] == "job_failed").await;
@@ -1907,8 +2707,8 @@ async fn monitoring(server: &mut Server, admin: &Api, db: &sqlx::PgPool, dir: &P
     assert!(detail["notifications"].as_array().unwrap().iter().all(|n| n["status"] == "sent"), "{detail}");
 
     // --- memory held over a threshold, and an offline agent ------------------------------------
-    let mem = admin.post("/alert-policies", policy("Memory", "memory", json!({ "threshold": 1, "minutes": 1 }))).await;
-    let off = admin.post("/alert-policies", json!({ "name": "Offline", "kind": "offline", "params": { "minutes": 1 }, "severity": "critical", "client_id": a_id })).await;
+    let mem = admin.alert_policy(policy("Memory", "memory", json!({ "threshold": 1, "minutes": 1 }))).await;
+    let off = admin.alert_policy(json!({ "name": "Offline", "kind": "offline", "params": { "minutes": 1 }, "severity": "critical", "client_id": a_id })).await;
     let mem_id = mem["id"].as_str().unwrap().to_string();
     let (api, m) = (admin, mem_id.as_str());
     let mem_alert = eventually(120, "memory alert", move || async move {
@@ -1930,7 +2730,7 @@ async fn monitoring(server: &mut Server, admin: &Api, db: &sqlx::PgPool, dir: &P
     // Raising the threshold out of reach clears the memory alert at the next check.
     let mut edit = policy("Memory", "memory", json!({ "threshold": 100, "minutes": 1 }));
     edit["notify_resolved"] = json!(false);
-    let (s, v) = admin.call(reqwest::Method::PUT, &format!("/alert-policies/{mem_id}"), Some(edit)).await;
+    let (s, v) = admin.update_alert_policy(&mem_id, edit).await;
     assert!(s.is_success(), "{v}");
     let (api, aid) = (admin, mem_alert["id"].as_str().unwrap().to_string());
     eventually(30, "memory alert to clear", || async { (api.get(&format!("/alerts/{aid}")).await["state"] == "resolved").then_some(()) }).await;
@@ -1941,7 +2741,7 @@ async fn monitoring(server: &mut Server, admin: &Api, db: &sqlx::PgPool, dir: &P
     assert_eq!(alerts_for(admin, "state=acknowledged").await.len(), 1);
     admin.post("/alerts/bulk", json!({ "ids": [off_alert_id], "action": "resolve" })).await;
     assert_eq!(admin.get(&format!("/alerts/{off_alert_id}")).await["resolution"], "manual");
-    let (s, _) = admin.call(reqwest::Method::DELETE, &format!("/alert-policies/{off_id}"), None).await;
+    let s = admin.delete_policy(&off_id).await;
     assert!(s.is_success());
 
     // --- services (systemd hosts only) ---------------------------------------------------------
@@ -1963,7 +2763,7 @@ async fn monitoring(server: &mut Server, admin: &Api, db: &sqlx::PgPool, dir: &P
         assert!(r["message"].as_str().unwrap().contains("no service named"), "{r}");
         if let Some(stopped) = list.iter().find(|s| s["state"] == "stopped") {
             let name = stopped["name"].as_str().unwrap();
-            let sp = admin.post("/alert-policies", policy("Service down", "service", json!({ "services": [name] }))).await;
+            let sp = admin.alert_policy(policy("Service down", "service", json!({ "services": [name] }))).await;
             let sp_id = sp["id"].as_str().unwrap().to_string();
             let (api, p) = (admin, sp_id.as_str());
             let a = eventually(20, "service alert", move || async move {
@@ -1973,7 +2773,7 @@ async fn monitoring(server: &mut Server, admin: &Api, db: &sqlx::PgPool, dir: &P
             assert_eq!(a["details"]["service"], name);
             let alerting = admin.get(&format!("/agents/{id1}/services")).await["alerting"].clone();
             assert_eq!(alerting, json!([name]));
-            admin.call(reqwest::Method::DELETE, &format!("/alert-policies/{sp_id}"), None).await;
+            admin.delete_policy(&sp_id).await;
             let a = admin.get(&format!("/alerts/{}", a["id"].as_str().unwrap())).await;
             assert_eq!(a["resolution"], "policy", "deleting a policy closes its alerts quietly");
         }
@@ -1981,7 +2781,7 @@ async fn monitoring(server: &mut Server, admin: &Api, db: &sqlx::PgPool, dir: &P
 
     // --- log watcher (needs a journal this user can read) ------------------------------------------
     let marker = format!("rmm-e2e-{}", uuid::Uuid::new_v4().simple());
-    let lp = admin.post("/alert-policies", policy("Marker", "log", json!({ "min_level": "error", "pattern": marker }))).await;
+    let lp = admin.alert_policy(policy("Marker", "log", json!({ "min_level": "error", "pattern": marker }))).await;
     tokio::time::sleep(Duration::from_secs(2)).await; // the watcher set reaches the agent
     let lj = admin.run_script(id1, &format!("logger -p user.err '{marker}' || true"), 30).await;
     admin.wait_job(&lj, 30).await;
@@ -2011,25 +2811,30 @@ async fn monitoring(server: &mut Server, admin: &Api, db: &sqlx::PgPool, dir: &P
         }
         None => println!("no log match (journal not readable by this user?); skipping the log watcher check"),
     }
-    admin.call(reqwest::Method::DELETE, &format!("/alert-policies/{lp_id}"), None).await;
-    admin.call(reqwest::Method::DELETE, &format!("/alert-policies/{}", jf["id"].as_str().unwrap()), None).await;
+    admin.delete_policy(&lp_id).await;
+    admin.delete_policy(jf["id"].as_str().unwrap()).await;
 
     // --- schedules -------------------------------------------------------------------------------
     let script = admin.post("/scripts", json!({ "name": "scheduled", "interpreter": "bash", "body": "echo scheduled \"$1\"" })).await;
     let preview = admin.get("/schedules/preview?cron=0%203%20*%20*%201&timezone=Europe/Berlin").await;
     assert_eq!(preview["runs"].as_array().unwrap().len(), 5, "{preview}");
+    // A scheduled script is a `schedule` item, here in All devices limited to client A.
     let (s, v) = admin
-        .call(reqwest::Method::POST, "/schedules", Some(json!({ "name": "bad", "script_id": script["id"], "cron": "every day", "client_id": a_id })))
+        .call(
+            reqwest::Method::POST,
+            &format!("/policy-sets/{ROOT_SET}/items"),
+            Some(json!({ "module": "schedule", "name": "bad", "client_id": a_id, "config": { "script_id": script["id"], "cron": "every day" } })),
+        )
         .await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
     let sched = admin
         .post(
-            "/schedules",
-            json!({ "name": "Nightly", "script_id": script["id"], "client_id": a_id, "cron": "0 3 * * *", "timezone": "America/Chicago",
-                    "args": ["x1"], "retain_days": 1 }),
+            &format!("/policy-sets/{ROOT_SET}/items"),
+            json!({ "module": "schedule", "name": "Nightly", "client_id": a_id,
+                    "config": { "script_id": script["id"], "cron": "0 3 * * *", "timezone": "America/Chicago", "args": ["x1"], "retain_days": 1 } }),
         )
         .await;
-    assert!(sched["next_run_at"].is_string(), "{sched}");
+    assert!(sched["schedule"]["next_run_at"].is_string(), "{sched}");
     let sid = sched["id"].as_str().unwrap().to_string();
     let r = admin.post(&format!("/schedules/{sid}/run"), json!({})).await;
     assert_eq!((r["sent"].as_i64(), r["queued"].as_i64()), (Some(1), Some(1)), "online agent gets it, offline one queues: {r}");
@@ -2042,7 +2847,7 @@ async fn monitoring(server: &mut Server, admin: &Api, db: &sqlx::PgPool, dir: &P
     let listed = admin.get("/schedules").await;
     assert_eq!(listed[0]["name"], "Nightly");
     // A due schedule runs on its own and moves to its next time.
-    sqlx::query("UPDATE schedules SET next_run_at = now() - interval '1 minute' WHERE id = $1::uuid").bind(&sid).execute(db).await.unwrap();
+    sqlx::query("UPDATE policy_schedule_state SET next_run_at = now() - interval '1 minute' WHERE item_id = $1::uuid").bind(&sid).execute(db).await.unwrap();
     let (api, s) = (admin, sid.as_str());
     eventually(40, "the scheduler to run a due schedule", move || async move {
         let v = api.get(&format!("/schedules/{s}")).await;
@@ -2392,13 +3197,11 @@ async fn tickets(url: &str, admin: &Api, id1: &str, a_id: &str, b_id: &str) {
 
     // --- an alert policy files a ticket, resolves it, reopens it ---------------------------------------------
     let pol = admin
-        .post(
-            "/alert-policies",
-            json!({ "name": "Ticket on failure", "kind": "job_failed", "params": {}, "severity": "warning", "client_id": a_id,
+        .alert_policy(json!({ "name": "Ticket on failure", "kind": "job_failed", "params": {}, "severity": "warning", "client_id": a_id,
                     "ticket_board_id": alerts_board, "ticket_priority": 2, "ticket_auto_resolve": true }),
         )
         .await;
-    assert_eq!(pol["ticket_board_id"], alerts_board.as_str());
+    assert_eq!(pol["config"]["ticket_board_id"], alerts_board.as_str());
     let fail = admin.run_script(id1, "exit 3", 30).await;
     admin.wait_job(&fail, 30).await;
     let pid = pol["id"].as_str().unwrap().to_string();
@@ -2437,7 +3240,7 @@ async fn tickets(url: &str, admin: &Api, id1: &str, a_id: &str, b_id: &str) {
     let t = admin.get(&format!("/tickets/{at_id}")).await;
     assert_eq!(t["status_category"], "open", "touched tickets aren't auto-resolved");
     assert!(events_of(&t, "alert").iter().any(|e| e["data"]["state"] == "resolved"), "the clear is still noted");
-    admin.call(reqwest::Method::DELETE, &format!("/alert-policies/{pid}"), None).await;
+    admin.delete_policy(&pid).await;
     // --- IMAP (optional): RMM_E2E_IMAP=host:imap_port:smtp_port of a GreenMail container -----------
     if let Ok(spec) = std::env::var("RMM_E2E_IMAP") {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -2496,10 +3299,10 @@ async fn day_to_day(admin: &Api, tech: &Api, db: &sqlx::PgPool, dir: &Path, id1:
     assert_eq!((snooze["active"].as_bool(), snooze["target_name"].is_string()), (Some(true), true), "{snooze}");
     assert_eq!(admin.get(&format!("/agents/{id3}")).await["alerts_muted"], true);
     let off = admin
-        .post("/alert-policies", json!({ "name": "Offline (e2e)", "kind": "offline", "params": { "minutes": 1 }, "severity": "critical",
+        .alert_policy(json!({ "name": "Offline (e2e)", "kind": "offline", "params": { "minutes": 1 }, "severity": "critical",
                                          "client_id": a_id, "channel_ids": [ch_id], "renotify_minutes": 15 }))
         .await;
-    assert_eq!(off["renotify_minutes"], 15);
+    assert_eq!(off["config"]["renotify_minutes"], 15);
     let off_id = off["id"].as_str().unwrap().to_string();
     let (api, o) = (admin, off_id.as_str());
     let held = eventually(120, "the offline alert, held back", move || async move {
@@ -2529,24 +3332,24 @@ async fn day_to_day(admin: &Api, tech: &Api, db: &sqlx::PgPool, dir: &Path, id1:
     assert_eq!(reminders, 1, "acknowledged alerts aren't repeated");
 
     // --- leave one agent out of a policy --------------------------------------------------------
-    let p = admin.call(reqwest::Method::PUT, &format!("/alert-policies/{off_id}/exclusions/{id3}"), Some(json!({}))).await;
+    let p = admin.call(reqwest::Method::PUT, &format!("/policy-items/{off_id}/exclusions/{id3}"), Some(json!({}))).await;
     assert!(p.0.is_success(), "{p:?}");
-    assert_eq!(p.1["excluded"][0]["id"], id3, "{}", p.1);
+    assert_eq!(p.1["limit"]["excluded"][0]["id"], id3, "{}", p.1);
     let al = admin.get(&format!("/alerts/{held_id}")).await;
     assert_eq!((al["state"].as_str(), al["resolution"].as_str()), (Some("resolved"), Some("policy")), "{al}");
-    let covering = admin.get(&format!("/agents/{id3}/alert-policies")).await;
-    let row = covering.as_array().unwrap().iter().find(|r| r["id"] == off_id.as_str()).unwrap().clone();
-    assert_eq!((row["excluded"].as_bool(), row["level"].as_str()), (Some(true), Some("client")), "{row}");
+    let covering = admin.get(&format!("/agents/{id3}/policy")).await;
+    let row = covering["policies"].as_array().unwrap().iter().find(|r| r["id"] == off_id.as_str()).unwrap().clone();
+    assert_eq!((row["excluded"].as_bool(), row["applies"].as_bool(), row["limit"]["client_id"].as_str()), (Some(true), Some(false), Some(a_id)), "{row}");
     tokio::time::sleep(Duration::from_secs(5)).await;
     assert!(alerts_for(admin, &format!("policy_id={off_id}")).await.iter().all(|a| a["agent_id"] != id3), "excluded agents don't alert");
-    let (s, _) = admin.call(reqwest::Method::DELETE, &format!("/alert-policies/{off_id}/exclusions/{id3}"), None).await;
+    let (s, _) = admin.call(reqwest::Method::DELETE, &format!("/policy-items/{off_id}/exclusions/{id3}"), None).await;
     assert!(s.is_success());
     let (api, o) = (admin, off_id.as_str());
     eventually(30, "the offline alert to return once included again", move || async move {
         alerts_for(api, &format!("policy_id={o}")).await.into_iter().find(|a| a["agent_id"] == id3)
     })
     .await;
-    let (s, _) = admin.call(reqwest::Method::DELETE, &format!("/alert-policies/{off_id}"), None).await;
+    let s = admin.delete_policy(&off_id).await;
     assert!(s.is_success());
 
     // --- weekly windows -------------------------------------------------------------------------
@@ -2561,7 +3364,7 @@ async fn day_to_day(admin: &Api, tech: &Api, db: &sqlx::PgPool, dir: &Path, id1:
 
     // --- an agent that stops reporting its protection state ---------------------------------------
     let stale = admin
-        .post("/alert-policies", json!({ "name": "Silent AV (e2e)", "kind": "security", "params": { "threats": "off", "stale_hours": 2 }, "severity": "warning", "client_id": a_id }))
+        .alert_policy(json!({ "name": "Silent AV (e2e)", "kind": "security", "params": { "threats": "off", "stale_hours": 2 }, "severity": "warning", "client_id": a_id }))
         .await;
     let stale_id = stale["id"].as_str().unwrap().to_string();
     sqlx::query("UPDATE agents SET security_at = now() - interval '3 hours', connected_at = now() - interval '3 hours' WHERE id = $1::uuid")
@@ -2578,7 +3381,7 @@ async fn day_to_day(admin: &Api, tech: &Api, db: &sqlx::PgPool, dir: &Path, id1:
     admin.post(&format!("/agents/{id1}/security/refresh"), json!({})).await;
     let (api, sid) = (admin, silent["id"].as_str().unwrap().to_string());
     eventually(30, "a fresh report to clear it", || async { (api.get(&format!("/alerts/{sid}")).await["state"] == "resolved").then_some(()) }).await;
-    let (s, _) = admin.call(reqwest::Method::DELETE, &format!("/alert-policies/{stale_id}"), None).await;
+    let s = admin.delete_policy(&stale_id).await;
     assert!(s.is_success());
 
     // --- processes --------------------------------------------------------------------------------
@@ -3567,4 +4370,225 @@ async fn billing(url: &str, admin: &Api, tech: &Api, db: &sqlx::PgPool, a_id: &s
     let ov = admin.get("/billing/overview").await;
     assert!(ov["currencies"].as_array().unwrap().iter().any(|c| c["currency"] == "USD"), "{ov}");
     println!("time, contracts, invoices, accounting, projects, schedule, docs, reports: ok");
+}
+
+/// The policy migration (0022) on a database with old-model rows in every shape: MSP-wide,
+/// client and site policies, OS limits, excluded agents, desktop consent, schedules with run
+/// state, open alerts. What applied to each agent before must apply after.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Postgres: see the module docs"]
+async fn policy_migration() {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let admin_url = std::env::var("RMM_E2E_DATABASE_URL").expect("set RMM_E2E_DATABASE_URL (see the test's module docs)");
+    let db_name = format!("rmm_e2e_mig_{}", uuid::Uuid::new_v4().simple());
+    let mut admin_conn = sqlx::PgConnection::connect(&admin_url).await.unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {db_name}"))).execute(&mut admin_conn).await.unwrap();
+    let db_url = format!("{}/{db_name}", admin_url.rsplit_once('/').unwrap().0);
+    let db = sqlx::PgPool::connect(&db_url).await.unwrap();
+
+    let all = sqlx::migrate!("./migrations");
+    let mut before = sqlx::migrate!("./migrations");
+    before.migrations = std::borrow::Cow::Owned(all.migrations.iter().filter(|m| m.version < 22).cloned().collect());
+    before.run(&db).await.unwrap();
+
+    // --- the old model, in every shape ---------------------------------------------------------------
+    let seed = r#"
+        UPDATE company_settings SET auto_update_agents = true;
+        INSERT INTO clients (id, name, desktop_consent) VALUES
+            ('c1000000-0000-4000-8000-000000000000', 'Consent Co', true),
+            ('c2000000-0000-4000-8000-000000000000', 'Site Policies Ltd', false),
+            ('c3000000-0000-4000-8000-000000000000', 'Plain Inc', false);
+        INSERT INTO sites (id, client_id, name) VALUES
+            ('51000000-0000-4000-8000-000000000000', 'c1000000-0000-4000-8000-000000000000', 'HQ'),
+            ('52000000-0000-4000-8000-00000000000a', 'c2000000-0000-4000-8000-000000000000', 'North'),
+            ('52000000-0000-4000-8000-00000000000b', 'c2000000-0000-4000-8000-000000000000', 'South'),
+            ('53000000-0000-4000-8000-000000000000', 'c3000000-0000-4000-8000-000000000000', 'Main');
+        INSERT INTO agents (id, site_id, secret_hash, hostname, os_family, os_name) VALUES
+            ('a1000000-0000-4000-8000-000000000001', '51000000-0000-4000-8000-000000000000', '\x00', 'c1-winsrv', 'windows', 'Windows Server 2022 Standard'),
+            ('a1000000-0000-4000-8000-000000000002', '51000000-0000-4000-8000-000000000000', '\x00', 'c1-win11', 'windows', 'Windows 11 Pro'),
+            ('a1000000-0000-4000-8000-000000000003', '51000000-0000-4000-8000-000000000000', '\x00', 'c1-mac', 'macos', 'macOS 15'),
+            ('a2000000-0000-4000-8000-000000000001', '52000000-0000-4000-8000-00000000000a', '\x00', 'c2n-linux', 'linux', 'Ubuntu 24.04'),
+            ('a2000000-0000-4000-8000-000000000002', '52000000-0000-4000-8000-00000000000a', '\x00', 'c2n-win', 'windows', 'Windows 10 Pro'),
+            ('a2000000-0000-4000-8000-000000000003', '52000000-0000-4000-8000-00000000000b', '\x00', 'c2s-linux', 'linux', 'Debian 12'),
+            ('a2000000-0000-4000-8000-000000000004', '52000000-0000-4000-8000-00000000000b', '\x00', 'c2s-other', 'other', 'FreeBSD 14'),
+            ('a3000000-0000-4000-8000-000000000001', '53000000-0000-4000-8000-000000000000', '\x00', 'c3-linux', 'linux', 'Rocky 9'),
+            ('a3000000-0000-4000-8000-000000000002', '53000000-0000-4000-8000-000000000000', '\x00', 'c3-win', 'windows', 'Windows Server 2019');
+        UPDATE patch_policies SET auto_install = true, deferral_days = 2, auto_approve_severities = '{critical}' WHERE client_id IS NULL;
+        INSERT INTO patch_policies (id, client_id, site_id, auto_approve_categories, reboot_policy, deferral_days, auto_install) VALUES
+            ('99000000-0000-4000-8000-000000000001', 'c1000000-0000-4000-8000-000000000000', NULL, '{security,driver}', 'if_required', 0, false),
+            ('99000000-0000-4000-8000-000000000002', 'c2000000-0000-4000-8000-000000000000', '52000000-0000-4000-8000-00000000000a', '{}', 'always', 7, true);
+        UPDATE security_policies SET quick_scan_hours = 12, realtime = 'audit' WHERE client_id IS NULL;
+        INSERT INTO security_policies (id, client_id, site_id, sensor_enabled, telemetry_mb, database_max_age_hours) VALUES
+            ('98000000-0000-4000-8000-000000000001', 'c1000000-0000-4000-8000-000000000000', NULL, true, 256, 24);
+        INSERT INTO security_policies (id, client_id, site_id, prevention, realtime, archive_depth) VALUES
+            ('98000000-0000-4000-8000-000000000002', 'c2000000-0000-4000-8000-000000000000', '52000000-0000-4000-8000-00000000000b', true, 'block', 9);
+        INSERT INTO notification_channels (id, name, kind, config) VALUES ('cc000000-0000-4000-8000-000000000000', 'ops', 'webhook', '{"url": "http://127.0.0.1:9"}');
+        INSERT INTO alert_policies (id, name, kind, params, severity, client_id, site_id, os_family, excluded_agents, channel_ids, enabled, renotify_minutes) VALUES
+            ('a0000000-0000-4000-8000-000000000001', 'Offline everywhere', 'offline', '{"minutes": 10}', 'critical', NULL, NULL, NULL, '{}', '{cc000000-0000-4000-8000-000000000000}', true, 60),
+            ('a0000000-0000-4000-8000-000000000002', 'Windows CPU', 'cpu', '{"threshold": 90, "minutes": 5}', 'warning', NULL, NULL, 'windows', '{a2000000-0000-4000-8000-000000000002}', '{}', true, NULL),
+            ('a0000000-0000-4000-8000-000000000003', 'Consent Co disk', 'disk', '{"threshold": 80, "minutes": 5}', 'warning', 'c1000000-0000-4000-8000-000000000000', NULL, NULL, '{}', '{}', true, NULL),
+            ('a0000000-0000-4000-8000-000000000004', 'North services', 'service', '{"services": ["nginx"]}', 'warning', 'c2000000-0000-4000-8000-000000000000', '52000000-0000-4000-8000-00000000000a', NULL, '{}', '{}', true, NULL),
+            ('a0000000-0000-4000-8000-000000000005', 'Linux memory (off)', 'memory', '{"threshold": 95, "minutes": 10}', 'info', NULL, NULL, 'linux', '{}', '{}', false, NULL),
+            ('a0000000-0000-4000-8000-000000000006', 'Linux disk', 'disk', '{"threshold": 95, "minutes": 10}', 'info', NULL, NULL, 'linux', '{}', '{}', true, NULL),
+            ('a0000000-0000-4000-8000-000000000007', 'Mac offline', 'offline', '{"minutes": 30}', 'info', 'c1000000-0000-4000-8000-000000000000', NULL, 'macos', '{}', '{}', true, NULL);
+        INSERT INTO alerts (id, policy_id, agent_id, kind, severity, title) VALUES
+            ('ae000000-0000-4000-8000-000000000001', 'a0000000-0000-4000-8000-000000000001', 'a3000000-0000-4000-8000-000000000002', 'offline', 'critical', 'Offline for more than 10 minutes'),
+            ('ae000000-0000-4000-8000-000000000002', 'a0000000-0000-4000-8000-000000000002', 'a1000000-0000-4000-8000-000000000001', 'cpu', 'warning', 'CPU at or above 90% for 5 minutes');
+        INSERT INTO scripts (id, name, interpreter, body) VALUES ('5c000000-0000-4000-8000-000000000000', 'nightly', 'bash', 'true');
+        INSERT INTO schedules (id, name, script_id, client_id, site_id, os_family, cron, timezone, args, enabled, next_run_at, last_run_at) VALUES
+            ('5d000000-0000-4000-8000-000000000001', 'Linux nightly', '5c000000-0000-4000-8000-000000000000', NULL, NULL, 'linux', '0 3 * * *', 'UTC', '["x"]', true,
+             '2030-01-01 03:00+00', '2029-12-31 03:00+00'),
+            ('5d000000-0000-4000-8000-000000000002', 'South weekly', '5c000000-0000-4000-8000-000000000000', 'c2000000-0000-4000-8000-000000000000',
+             '52000000-0000-4000-8000-00000000000b', NULL, '0 4 * * 1', 'Europe/Berlin', '[]', false, NULL, NULL);
+        INSERT INTO jobs (id, agent_id, script_id, interpreter, body, timeout_secs, schedule_id) VALUES
+            ('70000000-0000-4000-8000-000000000001', 'a3000000-0000-4000-8000-000000000001', '5c000000-0000-4000-8000-000000000000', 'bash', 'true', 60,
+             '5d000000-0000-4000-8000-000000000001');
+    "#;
+    sqlx::raw_sql(seed).execute(&db).await.unwrap();
+
+    type Snapshot = BTreeMap<String, Value>;
+    let patch_sql = "SELECT agent_id::text, jsonb_build_object('sev', auto_approve_severities, 'cat', auto_approve_categories, 'defer', deferral_days,
+                            'install', auto_install, 'reboot', reboot_policy) FROM agent_patch_policy";
+    let snapshot = |sql: String| {
+        let db = db.clone();
+        async move { sqlx::query_as::<_, (String, Value)>(sqlx::AssertSqlSafe(sql)).fetch_all(&db).await.unwrap().into_iter().collect::<Snapshot>() }
+    };
+    let sec_cols = "jsonb_build_object('sensor', p.sensor_enabled, 'quick', p.quick_scan_hours, 'full', p.full_scan_days, 'quarantine', p.auto_quarantine,
+                    'prevention', p.prevention, 'canaries', p.canaries, 'mb', p.telemetry_mb, 'realtime', p.realtime, 'write', p.scan_on_write,
+                    'depth', p.archive_depth, 'db_age', p.database_max_age_hours)";
+    let old_patch = snapshot(patch_sql.into()).await;
+    let old_sec = snapshot(format!(
+        "SELECT a.id::text, (SELECT {sec_cols} FROM security_policies p
+                              WHERE p.site_id = a.site_id OR (p.site_id IS NULL AND p.client_id = s.client_id) OR p.client_id IS NULL
+                              ORDER BY (p.site_id IS NOT NULL) DESC, (p.client_id IS NOT NULL) DESC LIMIT 1)
+           FROM agents a JOIN sites s ON s.id = a.site_id"
+    ))
+    .await;
+    let old_alerts = snapshot(
+        "SELECT a.id::text, coalesce((SELECT jsonb_agg(p.id::text ORDER BY p.id) FROM alert_policies p
+                                       WHERE p.enabled AND (p.client_id IS NULL OR p.client_id = s.client_id) AND (p.site_id IS NULL OR p.site_id = a.site_id)
+                                         AND (p.os_family IS NULL OR p.os_family = a.os_family) AND NOT (a.id = ANY(p.excluded_agents))), '[]')
+           FROM agents a JOIN sites s ON s.id = a.site_id"
+            .into(),
+    )
+    .await;
+    let old_schedules = snapshot(
+        "SELECT sc.id::text, jsonb_build_object('enabled', sc.enabled, 'next', sc.next_run_at, 'last', sc.last_run_at, 'agents',
+                coalesce((SELECT jsonb_agg(a.id::text ORDER BY a.id) FROM agents a JOIN sites s ON s.id = a.site_id
+                           WHERE (sc.client_id IS NULL OR s.client_id = sc.client_id) AND (sc.site_id IS NULL OR a.site_id = sc.site_id)
+                             AND (sc.os_family IS NULL OR a.os_family = sc.os_family)), '[]'))
+           FROM schedules sc"
+            .into(),
+    )
+    .await;
+    let old_consent = snapshot("SELECT a.id::text, to_jsonb(c.desktop_consent) FROM agents a JOIN sites s ON s.id = a.site_id JOIN clients c ON c.id = s.client_id".into()).await;
+    assert_eq!(old_patch.len(), 9);
+
+    // --- 0022 ----------------------------------------------------------------------------------------------------
+    all.run(&db).await.unwrap();
+
+    assert_eq!(snapshot(patch_sql.into()).await, old_patch, "the same patch policy applies to every agent");
+    let new_sec = snapshot(format!("SELECT p.agent_id::text, {sec_cols} FROM agent_security_policy p")).await;
+    assert_eq!(new_sec, old_sec, "the same sensor policy applies to every agent");
+    let new_alerts = snapshot(
+        "SELECT a.id::text, coalesce((SELECT jsonb_agg(ap.item_id::text ORDER BY ap.item_id) FROM agent_policy ap
+                                       WHERE ap.agent_id = a.id AND ap.module = 'alert' AND ap.enabled), '[]')
+           FROM agents a"
+            .into(),
+    )
+    .await;
+    assert_eq!(new_alerts, old_alerts, "the same alert policies (same ids) cover every agent");
+    let new_schedules = snapshot(
+        "SELECT i.id::text, jsonb_build_object('enabled', i.enabled, 'next', ss.next_run_at, 'last', ss.last_run_at, 'agents',
+                coalesce((SELECT jsonb_agg(ap.agent_id::text ORDER BY ap.agent_id) FROM agent_policy ap WHERE ap.item_id = i.id), '[]'))
+           FROM policy_items i JOIN policy_schedule_state ss ON ss.item_id = i.id WHERE i.module = 'schedule'"
+            .into(),
+    )
+    .await;
+    assert_eq!(new_schedules, old_schedules, "schedules keep their targets and run state");
+    let new_consent = snapshot(
+        "SELECT a.id::text, e.config -> 'desktop_consent' FROM agents a
+           JOIN policy_effective e ON e.set_id = a.policy_set_id AND e.item_id = '00000000-0000-4000-8000-000000000003'"
+            .into(),
+    )
+    .await;
+    assert_eq!(new_consent, old_consent, "desktop consent per agent");
+    let auto: Vec<bool> = sqlx::query_scalar(
+        "SELECT (e.config ->> 'auto_update')::boolean FROM agents a JOIN policy_effective e ON e.set_id = a.policy_set_id
+          WHERE e.item_id = '00000000-0000-4000-8000-000000000004'",
+    )
+    .fetch_all(&db)
+    .await
+    .unwrap();
+    assert!(auto.len() == 9 && auto.iter().all(|a| *a), "auto-update carried over");
+
+    // Same alerts open under the same policy ids; foreign keys re-pointed.
+    let open: BTreeSet<(String, String)> = sqlx::query_as("SELECT id::text, policy_id::text FROM alerts WHERE resolved_at IS NULL")
+        .fetch_all(&db)
+        .await
+        .unwrap()
+        .into_iter()
+        .collect();
+    assert_eq!(
+        open,
+        [("ae000000-0000-4000-8000-000000000001", "a0000000-0000-4000-8000-000000000001"), ("ae000000-0000-4000-8000-000000000002", "a0000000-0000-4000-8000-000000000002")]
+            .into_iter()
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .collect()
+    );
+    let job_schedule: Option<String> = sqlx::query_scalar("SELECT schedule_id::text FROM jobs WHERE id = '70000000-0000-4000-8000-000000000001'").fetch_one(&db).await.unwrap();
+    assert_eq!(job_schedule.as_deref(), Some("5d000000-0000-4000-8000-000000000001"));
+    let channels: Value = sqlx::query_scalar("SELECT policy_config('a0000000-0000-4000-8000-000000000001', 'a3000000-0000-4000-8000-000000000002') -> 'channel_ids'")
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert_eq!(channels, json!(["cc000000-0000-4000-8000-000000000000"]));
+
+    // Categories by OS and the old server rule; client and site sets assigned where needed.
+    let cats: Snapshot = snapshot(
+        "SELECT a.hostname, jsonb_build_object('category', dc.name, 'platform', a.platform, 'set', ps.name)
+           FROM agents a JOIN device_categories dc ON dc.id = a.category_id JOIN policy_sets ps ON ps.id = a.policy_set_id"
+            .into(),
+    )
+    .await;
+    let want = |cat: &str, platform: &str, set: &str| json!({ "category": cat, "platform": platform, "set": set });
+    assert_eq!(cats["c1-winsrv"], want("Windows servers", "server", "Consent Co · Windows servers"));
+    assert_eq!(cats["c1-win11"], want("Windows workstations", "workstation", "Consent Co · Windows workstations"));
+    assert_eq!(cats["c1-mac"], want("macOS workstations", "workstation", "Consent Co · macOS workstations"));
+    assert_eq!(cats["c2n-linux"], want("Linux servers", "server", "Site Policies Ltd · North · Linux servers"));
+    assert_eq!(cats["c2s-linux"], want("Linux servers", "server", "Site Policies Ltd · South · Linux servers"));
+    // 'other' goes to Linux servers; its platform is billing's old guess (not a server).
+    assert_eq!(cats["c2s-other"], want("Linux servers", "workstation", "Site Policies Ltd · South · Linux servers"));
+    assert_eq!(cats["c3-linux"], want("Linux servers", "server", "Linux servers"));
+    assert_eq!(cats["c3-win"], want("Windows servers", "server", "Windows servers"));
+    // Only what differs went into the overrides.
+    let c1_patch: Value = sqlx::query_scalar(
+        "SELECT o.config FROM policy_overrides o JOIN policy_sets ps ON ps.id = o.set_id
+          WHERE ps.name = 'Consent Co · Windows servers' AND o.item_id = '00000000-0000-4000-8000-000000000001'",
+    )
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert_eq!(c1_patch, json!({ "auto_approve_severities": [], "auto_approve_categories": ["security", "driver"], "deferral_days": 0,
+                                 "auto_install": false, "reboot_policy": "if_required" }));
+    // A new agent goes through the trigger: category, platform guess, set.
+    sqlx::query(
+        "INSERT INTO agents (id, site_id, secret_hash, hostname, os_family, os_name) VALUES
+            (gen_random_uuid(), '51000000-0000-4000-8000-000000000000', '\\x00', 'c1-new', 'windows', 'Windows Server 2025')",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    let new_one = snapshot(
+        "SELECT a.hostname, jsonb_build_object('category', dc.name, 'platform', a.platform, 'set', ps.name)
+           FROM agents a JOIN device_categories dc ON dc.id = a.category_id JOIN policy_sets ps ON ps.id = a.policy_set_id WHERE a.hostname = 'c1-new'"
+            .into(),
+    )
+    .await;
+    assert_eq!(new_one["c1-new"], want("Windows servers", "server", "Consent Co · Windows servers"));
+
+    db.close().await;
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE IF EXISTS {db_name} WITH (FORCE)"))).execute(&mut admin_conn).await.unwrap();
+    println!("policy migration: ok");
 }

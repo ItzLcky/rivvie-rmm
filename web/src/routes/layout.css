@@ -5,118 +5,123 @@
  * bg-accent...), never raw palette colours, so both themes and later white-labelling only
  * touch this file. Light is the base; [data-theme='dark'] on <html> swaps the values.
  * static/theme.js sets that attribute before first paint from the saved choice (or the OS).
- */
-/*
- * Design tokens. Components use the role names (bg-surface, text-muted, border-border,
- * bg-accent...), never raw palette colours, so both themes and later white-labelling only
- * touch this file. Light is the base; [data-theme='dark'] on <html> swaps the values.
- * static/theme.js sets that attribute before first paint from the saved choice (or the OS).
  *
- * Look: an enterprise console. A deep-navy navigation rail (navy in both themes), white
- * panels on a cool slate page, one blue accent. Neutrals are all one cool slate family.
- * Shape rule: controls, buttons and menu items 6px (rounded-md); badges 4px (rounded);
- * panels 10px (.card, rounded-panel); menus and popovers 8px (rounded-lg); dialogs 12px.
+ * Look (Rivvie): calm and confident. A deep-ink navigation rail (ink in both themes), white
+ * cards with a hairline border and no shadow on a soft off-white page, and one teal accent
+ * family. Amber is only for "needs attention"; red only for real failures. No gradients.
+ * Teal fills (--cta) carry ink text; teal as text uses the deep shade (--accent) on light.
+ * Shape rule: controls, buttons and menu items 8px (rounded-md); badges are pills; panels
+ * 14px (.card, rounded-panel); menus and popovers 10px (rounded-lg); dialogs 20px.
  */
 :root {
-	--surface: #f2f4f7; /* page background */
-	--raised: #ffffff; /* panels, menus, dialogs */
-	--sunken: #f6f7f9; /* table headers, input wells, code */
-	--hover: #eef1f5;
-	--border: #e2e6ec;
-	--border-strong: #c8cfd9;
-	--fg: #0f1b2d;
-	--muted: #546072; /* secondary text: 6.4:1 on white */
-	--subtle: #8792a2; /* placeholders and decoration only, not for meaningful text */
-	--accent: #1660d6;
-	--accent-hover: #114fb4;
-	--accent-soft: #e8effc;
+	--surface: #f3f5f4; /* page background */
+	--raised: #ffffff; /* cards, menus, dialogs */
+	--sunken: #f6f8f7; /* table headers, input wells, code */
+	--hover: #e6eeec; /* section tint */
+	--border: #dde4e2;
+	--border-strong: #b9c6c4;
+	--fg: #10222a;
+	--muted: #4a5e63; /* secondary text: 6.6:1 on white */
+	--subtle: #7f9295; /* placeholders and decoration only, not for meaningful text */
+	--accent: #0f766e; /* teal deep: links, icons, selected states on light */
+	--accent-hover: #0b4f4a;
+	--accent-soft: #e3f3f0; /* light mint: deep-teal text on it stays above 4.5:1 */
 	--on-accent: #ffffff;
-	--success: #14784a;
-	--success-soft: #e2f3ea;
+	--accent-ink: #0b4f4a; /* text on mint */
+	--cta: #14b8a6; /* the main call to action */
+	--cta-hover: #2cc5b4;
+	--on-cta: #0c1b21;
+	--success: #0f766e;
+	--success-soft: #dcefeb;
 	--warning: #985700;
-	--warning-soft: #fcf0dc;
+	--warning-soft: #fdf1c9;
+	--warning-dot: #d97706;
 	--danger: #c22b25;
 	--on-danger: #ffffff;
 	--danger-soft: #fbe7e5;
-	--info: #22649f;
-	--info-soft: #e4eef8;
-	--focus: #1660d6;
-	--overlay: rgb(10 20 36 / 0.5);
-	/* Shadows are tinted with the navy of the text, never neutral black. */
-	--shadow: 0 1px 2px rgb(15 27 45 / 0.05), 0 1px 3px rgb(15 27 45 / 0.06);
-	--shadow-lg: 0 16px 36px -10px rgb(15 27 45 / 0.24), 0 4px 10px -4px rgb(15 27 45 / 0.08);
-	/* The navigation rail is dark navy in both themes. */
-	--nav-bg: #0d1b2f;
-	--nav-border: #1a2a42;
-	--nav-fg: #e7ecf3;
-	--nav-muted: #93a1b6;
-	--nav-label: #8a99af;
+	--info: #2f5562;
+	--info-soft: #e6eeec;
+	--focus: #0f766e;
+	--overlay: rgb(12 27 33 / 0.55);
+	/* Cards are flat. Only floating layers (menus, dialogs) cast an ink-tinted shadow. */
+	--shadow: 0 0 #0000;
+	--shadow-lg: 0 24px 48px -12px rgb(12 27 33 / 0.28), 0 4px 10px -4px rgb(12 27 33 / 0.1);
+	/* The navigation rail is ink in both themes. */
+	--nav-bg: #0c1b21;
+	--nav-border: #22404a;
+	--nav-fg: #e8efee;
+	--nav-muted: #b7c7c5;
+	--nav-label: #8fa7a6;
 	--nav-hover: rgb(255 255 255 / 0.06);
-	--nav-active: rgb(255 255 255 / 0.1);
-	--nav-indicator: #5b9aff;
+	--nav-active: #13272f;
+	--nav-indicator: #5eead4;
 	/* Charts get their own roles so series stay distinguishable in both themes. */
-	--chart-1: #1660d6;
-	--chart-2: #8a46c8;
-	--chart-3: #0f8a7e;
-	--chart-grid: #e6e9ee;
-	--terminal-bg: #0b1320;
-	--terminal-fg: #e6edf3;
+	--chart-1: #0f766e;
+	--chart-2: #6d5bd0;
+	--chart-3: #3a7ca5;
+	--chart-grid: #e3e9e7;
+	--terminal-bg: #0c1b21;
+	--terminal-fg: #e8efee;
 	--syntax-keyword: #a626a4;
 	--syntax-string: #276b2a;
-	--syntax-comment: #5f6975;
+	--syntax-comment: #5c6f73;
 	--syntax-number: #9c4a08;
-	--syntax-variable: #1e5bb8;
+	--syntax-variable: #0f6d8a;
 	--syntax-function: #7343c9;
 	color-scheme: light;
 }
 
 [data-theme='dark'] {
-	--surface: #0a0f17;
-	--raised: #111823;
-	--sunken: #0d131c;
-	--hover: #19212d;
-	--border: #212b39;
-	--border-strong: #313d4e;
-	--fg: #e6ebf2;
-	--muted: #9ba6b5;
-	--subtle: #6a7586;
-	/* Lighter and less saturated than the light accent: bright blue on black is hard to read. */
-	--accent: #6ea3ff;
-	--accent-hover: #8ab5ff;
-	--accent-soft: #15223a;
-	--on-accent: #07111f;
-	--success: #55c48c;
-	--success-soft: #10271c;
-	--warning: #e3a84a;
-	--warning-soft: #2c2210;
+	--surface: #0c1b21; /* ink */
+	--raised: #13272f; /* ink raised */
+	--sunken: #0f2128;
+	--hover: #1a313a;
+	--border: #22404a;
+	--border-strong: #2f5561;
+	--fg: #eef3f2;
+	--muted: #b7c7c5;
+	--subtle: #7f9897;
+	--accent: #5eead4; /* teal light: links and active states on dark */
+	--accent-hover: #99f6e4;
+	--accent-soft: #123a3a;
+	--on-accent: #0c1b21;
+	--accent-ink: #5eead4;
+	--cta: #14b8a6;
+	--cta-hover: #2dd4bf;
+	--on-cta: #0c1b21;
+	--success: #5eead4;
+	--success-soft: #10302f;
+	--warning: #fcd34d;
+	--warning-soft: #2e2710;
+	--warning-dot: #fcd34d;
 	--danger: #f2756c;
 	--on-danger: #1a0a09;
-	--danger-soft: #311716;
-	--info: #6fb0ea;
-	--info-soft: #122334;
-	--focus: #6ea3ff;
-	--overlay: rgb(2 6 12 / 0.65);
-	--shadow: 0 1px 2px rgb(0 0 0 / 0.35);
-	--shadow-lg: 0 18px 44px -10px rgb(0 0 0 / 0.65), 0 4px 10px -4px rgb(0 0 0 / 0.4);
-	--nav-bg: #0b1422;
-	--nav-border: #18243a;
-	--nav-fg: #e3e9f2;
-	--nav-muted: #8e9cb1;
-	--nav-label: #8494ab;
+	--danger-soft: #331b1b;
+	--info: #a9c6cf;
+	--info-soft: #17303a;
+	--focus: #5eead4;
+	--overlay: rgb(3 10 13 / 0.7);
+	--shadow: 0 0 #0000;
+	--shadow-lg: 0 30px 60px rgb(0 0 0 / 0.35), 0 4px 10px -4px rgb(0 0 0 / 0.4);
+	--nav-bg: #08141a;
+	--nav-border: #1b343d;
+	--nav-fg: #e8efee;
+	--nav-muted: #b7c7c5;
+	--nav-label: #86a09f;
 	--nav-hover: rgb(255 255 255 / 0.05);
-	--nav-active: rgb(110 163 255 / 0.14);
-	--nav-indicator: #6ea3ff;
-	--chart-1: #6ea3ff;
-	--chart-2: #c39bf0;
-	--chart-3: #4fc7b5;
-	--chart-grid: #1f2834;
-	--terminal-bg: #070b12;
-	--terminal-fg: #e4e8ee;
+	--nav-active: #13272f;
+	--nav-indicator: #5eead4;
+	--chart-1: #5eead4;
+	--chart-2: #b3a6f5;
+	--chart-3: #7cb8e0;
+	--chart-grid: #1f3a43;
+	--terminal-bg: #08141a;
+	--terminal-fg: #e8efee;
 	--syntax-keyword: #d197f2;
 	--syntax-string: #9ad08b;
-	--syntax-comment: #7d8693;
+	--syntax-comment: #86a09f;
 	--syntax-number: #f2b072;
-	--syntax-variable: #8fb6ff;
+	--syntax-variable: #7fd3ea;
 	--syntax-function: #c2a4ff;
 	color-scheme: dark;
 }
@@ -132,7 +137,8 @@
 }
 
 @theme inline {
-	--font-sans: 'Geist Variable', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+	--font-sans: 'IBM Plex Sans Variable', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+	--font-display: 'Space Grotesk Variable', 'IBM Plex Sans Variable', ui-sans-serif, system-ui, sans-serif;
 	--font-mono: 'Geist Mono Variable', ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace;
 
 	--color-surface: var(--surface);
@@ -148,6 +154,11 @@
 	--color-accent-hover: var(--accent-hover);
 	--color-accent-soft: var(--accent-soft);
 	--color-on-accent: var(--on-accent);
+	--color-accent-ink: var(--accent-ink);
+	--color-cta: var(--cta);
+	--color-cta-hover: var(--cta-hover);
+	--color-on-cta: var(--on-cta);
+	--color-warning-dot: var(--warning-dot);
 	--color-success: var(--success);
 	--color-success-soft: var(--success-soft);
 	--color-warning: var(--warning);
@@ -167,7 +178,11 @@
 	--color-nav-active: var(--nav-active);
 	--color-nav-indicator: var(--nav-indicator);
 
-	--radius-panel: 10px;
+	--radius-md: 8px;
+	--radius-lg: 10px;
+	--radius-xl: 20px;
+	--radius-2xl: 24px;
+	--radius-panel: 14px;
 
 	--shadow-card: var(--shadow);
 	--shadow-pop: var(--shadow-lg);
@@ -191,6 +206,17 @@
 	h2,
 	h3 {
 		text-wrap: balance;
+	}
+	/* Headings are Space Grotesk: bold, tight tracking, short line-height. */
+	h1 {
+		@apply font-display font-bold;
+		letter-spacing: -0.025em;
+		line-height: 1.1;
+	}
+	h2,
+	h3 {
+		@apply font-display;
+		letter-spacing: -0.015em;
 	}
 	p {
 		text-wrap: pretty;
@@ -225,14 +251,18 @@
 		@apply border-border flex min-h-12 items-center justify-between gap-3 border-b px-4 py-2.5;
 	}
 	.panel-title {
-		@apply text-fg text-[0.9375rem] font-semibold tracking-tight;
+		@apply text-fg font-display text-[0.9375rem] font-semibold tracking-[-0.01em];
+	}
+	/* A small uppercase teal label above a title or a group. */
+	.eyebrow {
+		@apply text-accent text-[0.6875rem] font-semibold tracking-[0.12em] uppercase;
 	}
 	.link {
-		@apply text-accent decoration-accent/40 hover:decoration-accent underline underline-offset-2;
+		@apply text-accent hover:text-accent-hover decoration-accent/40 hover:decoration-accent-hover underline underline-offset-2;
 	}
 	/* Form controls share one look; Input/Select/Textarea components apply these. */
 	.control {
-		@apply border-border-strong bg-raised text-fg placeholder:text-subtle shadow-card h-8 w-full rounded-md border px-2.5 text-sm transition-[border-color,box-shadow] outline-none hover:border-[color-mix(in_srgb,var(--border-strong)_70%,var(--fg))];
+		@apply border-border-strong bg-raised text-fg placeholder:text-subtle h-9 w-full rounded-md border px-3 text-sm transition-[border-color,box-shadow] outline-none hover:border-[color-mix(in_srgb,var(--border-strong)_70%,var(--fg))];
 		@apply focus-visible:border-accent focus-visible:ring-accent/25 focus-visible:ring-3 focus-visible:outline-none;
 		@apply disabled:bg-sunken disabled:text-muted disabled:cursor-not-allowed;
 		@apply aria-invalid:border-danger;

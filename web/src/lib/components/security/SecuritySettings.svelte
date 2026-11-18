@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Pencil, Plus, Trash2 } from '@lucide/svelte';
+	import { Plus, ShieldCheck, Trash2 } from '@lucide/svelte';
 	import { api } from '#lib/api.js';
 	import { confirmAction } from '#lib/confirm.svelte.js';
 	import { ago, datetime } from '#lib/format.js';
@@ -7,9 +7,8 @@
 	import { clientId, clients, loadClients } from '#lib/scope.svelte.js';
 	import { exclusionKindHints, exclusionKindLabels } from '#lib/security.js';
 	import { attempt, toast } from '#lib/toast.svelte.js';
-	import type { ExclusionKind, ExclusionRow, SecurityPolicyRow } from '#lib/types.js';
-	import Async from '#lib/ui/Async.svelte';
-	import Badge from '#lib/ui/Badge.svelte';
+	import type { ExclusionKind, ExclusionRow } from '#lib/types.js';
+	import { ROOT_SET } from '#lib/policy/policy.js';
 	import Button from '#lib/ui/Button.svelte';
 	import DataTable, { type Column } from '#lib/ui/DataTable.svelte';
 	import EmptyState from '#lib/ui/EmptyState.svelte';
@@ -18,28 +17,12 @@
 	import Input from '#lib/ui/Input.svelte';
 	import Select from '#lib/ui/Select.svelte';
 	import Switch from '#lib/ui/Switch.svelte';
-	import SensorPolicyEditor from './SensorPolicyEditor.svelte';
 
-	/** Sensor policies, exclusions and canary clients. Changing them needs security.manage. */
+	/** Exclusions and canary clients (the security policy itself is in policy sets). Changing them needs security.manage. */
 	let { canManage }: { canManage: boolean } = $props();
 	$effect(() => {
 		loadClients();
 	});
-
-	// --- Policies -------------------------------------------------------------------------------
-	const policies = resource(() => api.get<SecurityPolicyRow[]>('/security/policies'));
-	let editing = $state<{ policy: SecurityPolicyRow | null } | null>(null);
-	const shown = $derived((policies.data ?? []).filter((p) => !clientId() || !p.client_id || p.client_id === clientId()));
-	const scope = (p: { client_name: string | null; site_name: string | null }) => (p.site_name ? `${p.client_name} › ${p.site_name}` : (p.client_name ?? 'MSP-wide'));
-	async function removePolicy(p: SecurityPolicyRow) {
-		const ok = await confirmAction({
-			title: `Delete the security policy for ${scope(p)}?`,
-			message: `Its agents fall back to the ${p.site_id ? 'client’s policy, or the MSP-wide one' : 'MSP-wide policy'}.`,
-			confirmLabel: 'Delete policy',
-			danger: true
-		});
-		if (ok && (await attempt(() => api.del(`/security/policies/${p.id}`), 'Policy deleted.'))) policies.reload();
-	}
 
 	// --- Exclusions -----------------------------------------------------------------------------
 	const exclusions = resource(() => api.get<ExclusionRow[]>('/security/exclusions'));
@@ -98,50 +81,18 @@
 	}
 </script>
 
-<!-- Policies -->
+<!-- The security policy lives in policy sets now. -->
 <section class="card mb-6" aria-labelledby="sp-h">
-	<header class="border-border flex flex-wrap items-center gap-x-3 gap-y-2 min-h-12 border-b px-4 py-3">
-		<div class="min-w-0 flex-1">
-			<h2 id="sp-h" class="panel-title">Sensor policies</h2>
-			<p class="text-muted text-xs">The most specific one applies to each agent: site, then client, then MSP-wide.</p>
+	<header class="panel-head">
+		<div class="min-w-0">
+			<h2 id="sp-h" class="panel-title">Security policy</h2>
+			<p class="text-muted text-xs">Our sensor, prevention, real-time protection, scans and quarantine.</p>
 		</div>
-		{#if canManage}<Button size="sm" icon={Plus} onclick={() => (editing = { policy: null })}>New policy</Button>{/if}
+		<Button size="sm" icon={ShieldCheck} href="/policies/sets/{ROOT_SET}?section=security">Open in All devices</Button>
 	</header>
-	<Async res={policies} compact>
-		{#snippet children()}
-			<ul class="divide-border divide-y">
-				{#each shown as p (p.id)}
-					<li class="flex flex-wrap items-start gap-x-4 gap-y-2 px-4 py-3">
-						<div class="min-w-0 flex-1">
-							<div class="text-sm font-medium">{scope(p)}</div>
-							<div class="mt-1 flex flex-wrap gap-1.5 text-xs">
-								{#if p.sensor_enabled}
-									<Badge>Sensor on</Badge>
-									{#if p.prevention}<Badge tone="accent">Prevention</Badge>{:else}<Badge>Detect only</Badge>{/if}
-									{#if p.auto_quarantine}<Badge>Auto-quarantine</Badge>{/if}
-									{#if p.canaries}<Badge>Decoy files</Badge>{/if}
-									<Badge>{p.quick_scan_hours ? `Quick scan every ${p.quick_scan_hours} h` : 'No quick scans'}</Badge>
-									<Badge>{p.full_scan_days ? `Full scan every ${p.full_scan_days} d` : 'No full scans'}</Badge>
-									<Badge>{p.telemetry_mb} MB telemetry</Badge>
-								{:else}
-									<Badge>Sensor off</Badge>
-								{/if}
-							</div>
-							<p class="text-muted mt-1 text-xs">Updated <span title={datetime(p.updated_at)}>{ago(p.updated_at)}</span>{p.updated_by_name ? ` by ${p.updated_by_name}` : ''}</p>
-						</div>
-						{#if canManage}
-							<div class="flex gap-1">
-								<Button size="sm" icon={Pencil} onclick={() => (editing = { policy: p })}>Edit</Button>
-								{#if p.client_id}<IconButton icon={Trash2} label="Delete policy for {scope(p)}" size="sm" onclick={() => removePolicy(p)} />{/if}
-							</div>
-						{/if}
-					</li>
-				{:else}
-					<li><EmptyState compact title="No policies" /></li>
-				{/each}
-			</ul>
-		{/snippet}
-	</Async>
+	<p class="text-muted p-4 text-sm">
+		It's set once in All devices and changed field by field in any policy set below it: a set for one client's servers, or for one machine. Exclusions and rule modes below aren't part of it.
+	</p>
 </section>
 
 <!-- Exclusions -->
@@ -216,13 +167,3 @@
 		<EmptyState compact title="No clients yet" />
 	{/if}
 </section>
-
-{#if editing}
-	<SensorPolicyEditor
-		policy={editing.policy}
-		template={policies.data?.find((p) => !p.client_id)}
-		taken={(policies.data ?? []).filter((p) => p.client_id).map((p) => `${p.client_id}:${p.site_id ?? ''}`)}
-		onclose={() => (editing = null)}
-		onsaved={() => policies.reload()}
-	/>
-{/if}

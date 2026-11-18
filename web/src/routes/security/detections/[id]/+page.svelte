@@ -1,13 +1,13 @@
 <script lang="ts">
 	import { page } from '$app/state';
-	import { BellRing, Check, Copy, ExternalLink, FileX2, History, Network, PackageOpen, RotateCcw, Search, ShieldQuestion, Skull, Unplug, X } from '@lucide/svelte';
+	import { Ban, BellRing, Check, Copy, ExternalLink, FileX2, History, Network, PackageOpen, RotateCcw, Search, ShieldQuestion, Skull, Unplug, X } from '@lucide/svelte';
 	import { api } from '#lib/api.js';
 	import { ago, cx, datetime, plural } from '#lib/format.js';
 	import { liveReload } from '#lib/live.svelte.js';
 	import { resource } from '#lib/resource.svelte.js';
 	import {
-		confidenceLabels, eventKindLabels, mitreUrl, modeLabels, productLabels, resourceLabel, severityLabels, severityTone, sourceLabels, splitContext,
-		threatStatusLabels, threatStatusTone, verdictLabels, verdictTone
+		confidenceLabels, eventKindLabels, foundByHelp, foundByLabels, mitreUrl, modeLabels, productLabels, reputationSourceLabel, resourceLabel, severityLabels,
+		severityTone, sourceLabels, splitContext, threatStatusLabels, threatStatusTone, verdictLabels, verdictTone
 	} from '#lib/security.js';
 	import { allowed } from '#lib/session.svelte.js';
 	import { toast } from '#lib/toast.svelte.js';
@@ -145,6 +145,7 @@
 				<Badge tone={active ? 'danger' : d.audit ? 'neutral' : threatStatusTone[d.status]}>{d.audit && d.status === 'active' ? 'Recorded' : threatStatusLabels[d.status]}</Badge>
 				{#if d.verdict}<Badge tone={verdictTone[d.verdict]}>{verdictLabels[d.verdict]}</Badge>{/if}
 				{#if d.audit}<Badge title="Recorded by a rule in audit mode: no alert and no action were taken">Audit only</Badge>{/if}
+				{#if d.denied}<Badge icon={Ban} title="Real-time protection refused to run it">Denied before it ran</Badge>{/if}
 				{#if d.isolated}<Badge tone="danger" icon={Network}>Isolated</Badge>{/if}
 				<span class="inline-flex flex-wrap items-center gap-x-2">
 					<a class="link" href="/agents/{d.agent_id}?tab=security">{d.hostname}</a>
@@ -157,6 +158,16 @@
 			{/snippet}
 		</PageHeader>
 
+		{#if d.denied}
+			<p class="border-border bg-sunken mb-4 rounded-md border px-3 py-2 text-sm" role="status">
+				<span class="font-semibold">Denied before it ran.</span>
+				<span class="text-muted">Real-time protection refused to start this program{d.status === 'quarantined' ? ' and quarantined the file' : ''}. Whatever started it is still running; check the process tree.</span>
+			</p>
+		{:else if d.found_by === 'reputation'}
+			<p class="border-border bg-sunken text-muted mb-4 rounded-md border px-3 py-2 text-sm" role="status">
+				The server’s reputation list knows this file. Reputation answers aren’t signed, so they only alert: nothing was blocked or quarantined. Quarantine it from here if it’s what it looks like.
+			</p>
+		{/if}
 		{#if d.audit}
 			<p class="border-border bg-sunken text-muted mb-4 rounded-md border px-3 py-2 text-sm" role="status">
 				The rule that found this is in audit mode: it was recorded, but nothing was blocked and no alert was raised. Use what you see here to decide whether the rule can be switched to alert or block.
@@ -193,8 +204,14 @@
 							title="No process context"
 							description={d.source === 'product'
 								? 'The antivirus reported this; it doesn’t send process context. Load the events around the time from the timeline below.'
-								: d.source === 'file'
-									? 'A scan found this file on disk; no running process was involved. The timeline shows what touched it.'
+								: d.denied
+									? 'It was refused before it ran, so there’s no process of its own. The timeline shows what tried to start it.'
+									: d.found_by === 'on_exec'
+										? 'It was checked as it started; the agent sent no process context with it. The timeline shows what ran around then.'
+										: d.found_by === 'reputation'
+											? 'The reputation lookup reported it after it ran. The timeline shows what it did.'
+											: d.source === 'file'
+												? `${d.found_by === 'on_write' ? 'It was scanned after it was written' : 'A scan found this file on disk'}; no running process was involved. The timeline shows what touched it.`
 									: 'The agent sent no context with this detection.'}
 						/>
 					{/if}
@@ -222,7 +239,14 @@
 				<section class="card" aria-labelledby="prev-h">
 					<header class="border-border min-h-12 border-b px-4 py-3">
 						<h2 id="prev-h" class="panel-title">Seen elsewhere</h2>
-						<p class="text-muted text-xs">Other machines with the same file, from detections and quarantine. Hunting also asks the agents’ telemetry.</p>
+						{#if d.sha256 && d.seen_on !== undefined}
+							<p class="text-sm">
+								Seen on <span class="font-semibold tabular">{plural(d.seen_on, 'machine')}</span>{#if d.first_seen}, first <span title={datetime(d.first_seen)}>{ago(d.first_seen)}</span>{/if}.
+								<span class="text-muted text-xs">Counted in the clients you can see: where it ran, was detected or was quarantined.</span>
+							</p>
+						{:else}
+							<p class="text-muted text-xs">Other machines with the same file, from detections and quarantine. Hunting also asks the agents’ telemetry.</p>
+						{/if}
 					</header>
 					{#if !d.sha256}
 						<p class="text-muted px-4 py-3 text-sm">This detection has no file hash to compare.</p>
@@ -232,13 +256,23 @@
 								<li class="flex flex-wrap items-baseline gap-x-3 gap-y-0.5 px-4 py-2 text-sm">
 									<a class="hover:text-accent font-medium" href="/agents/{p.agent_id}?tab=security">{p.hostname}</a>
 									<span class="text-muted text-xs">{p.client_name}</span>
-									<span class="text-muted min-w-0 flex-1 text-xs">{p.how}</span>
+									<span class="text-muted min-w-0 flex-1 text-xs">{p.how}{#if p.path}<span class="block font-mono break-all">{p.path}</span>{/if}</span>
 									<span class="text-muted text-xs" title={datetime(p.first_seen)}>first {ago(p.first_seen)}</span>
 								</li>
 							{/each}
 						</ul>
 					{:else}
 						<p class="text-muted px-4 py-3 text-sm">Only seen on {d.hostname}.</p>
+					{/if}
+					{#if d.reputation?.length}
+						<div class="border-border border-t px-4 py-3">
+							<h3 class="text-muted mb-1 text-xs font-medium">Known to the server’s reputation set</h3>
+							<ul class="space-y-0.5 text-sm">
+								{#each d.reputation as r (r.source)}
+									<li class="flex flex-wrap items-baseline gap-x-2"><span class="font-medium break-all">{r.name}</span><Badge tone={severityTone[r.severity]}>{severityLabels[r.severity]}</Badge><span class="text-muted text-xs">{reputationSourceLabel(r.source)}</span></li>
+								{/each}
+							</ul>
+						</div>
 					{/if}
 				</section>
 
@@ -317,7 +351,10 @@
 					<h2 id="details-h" class="mb-3 panel-title">Details</h2>
 					<dl class="dl">
 						<dt>Found by</dt>
-						<dd>{productLabels[d.product]}{#if d.product === 'rmm'}<span class="text-muted">{' · '}{sourceLabels[d.source]}</span>{/if}</dd>
+						<dd>
+							{productLabels[d.product]}{#if d.product === 'rmm'}<span class="text-muted">{' · '}{sourceLabels[d.source]}</span>{/if}
+							{#if d.found_by}<span class="text-muted block text-xs" title={foundByHelp[d.found_by]}>{foundByLabels[d.found_by]}</span>{/if}
+						</dd>
 						<dt>Detected</dt>
 						<dd><span title={datetime(d.detected_at ?? d.first_seen_at)}>{ago(d.detected_at ?? d.first_seen_at)}</span>{#if d.last_seen_at !== d.first_seen_at}<span class="text-muted block text-xs">last reported {ago(d.last_seen_at)}</span>{/if}</dd>
 						{#if d.resolved_at}<dt>Resolved</dt><dd><span title={datetime(d.resolved_at)}>{ago(d.resolved_at)}</span></dd>{/if}
@@ -329,6 +366,8 @@
 							<dd class="flex items-start gap-1"><span class="min-w-0 font-mono text-xs break-all">{d.sha256}</span><CopyButton text={d.sha256} label="Copy hash" /></dd>
 						{/if}
 						{#if d.content_version}<dt>Content</dt><dd class="font-mono text-xs">{d.content_version}</dd>{/if}
+						{#if d.database_version}<dt>Database</dt><dd class="font-mono text-xs">{d.database_version}</dd>{/if}
+						{#if d.part}<dt>Matched in</dt><dd class="font-mono text-xs break-all">{d.part}</dd>{/if}
 					</dl>
 					{#if d.resources.length}
 						<h3 class="text-muted mt-4 mb-1 text-xs font-medium">Resources</h3>

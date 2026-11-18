@@ -116,18 +116,18 @@ async fn enroll(
     let mut tx = state.db.begin().await.map_err(db_err)?;
 
     // Atomically consume one use of the token.
-    let site_id: Option<Uuid> = sqlx::query_scalar(
+    let row: Option<(Uuid, Option<Uuid>)> = sqlx::query_as(
         "UPDATE enrollment_tokens SET uses = uses + 1
           WHERE token_hash = $1
             AND (expires_at IS NULL OR expires_at > now())
             AND (max_uses IS NULL OR uses < max_uses)
-          RETURNING site_id",
+          RETURNING site_id, category_id",
     )
     .bind(token_hash(token))
     .fetch_optional(&mut *tx)
     .await
     .map_err(db_err)?;
-    let Some(site_id) = site_id else {
+    let Some((site_id, category)) = row else {
         return Err("invalid or expired enrollment token".into());
     };
 
@@ -147,13 +147,18 @@ async fn enroll(
     };
 
     let secret = random_token();
+    // The trigger on agents places it in its category (the token's, else the built-in one for
+    // its OS and platform) and resolves its policy set.
     let agent_id: Uuid = sqlx::query_scalar(
-        "INSERT INTO agents (id, site_id, secret_hash, machine_id, hostname, os_family, os_name, os_version, kernel_version, arch, agent_version)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+        "INSERT INTO agents (id, site_id, secret_hash, machine_id, hostname, os_family, os_name, os_version, kernel_version, arch, agent_version,
+                             platform, category_id, category_manual)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$13 IS NOT NULL)
          ON CONFLICT (id)
          DO UPDATE SET secret_hash = EXCLUDED.secret_hash, machine_id = EXCLUDED.machine_id, hostname = EXCLUDED.hostname,
                        os_family = EXCLUDED.os_family, os_name = EXCLUDED.os_name, os_version = EXCLUDED.os_version,
-                       kernel_version = EXCLUDED.kernel_version, arch = EXCLUDED.arch, agent_version = EXCLUDED.agent_version
+                       kernel_version = EXCLUDED.kernel_version, arch = EXCLUDED.arch, agent_version = EXCLUDED.agent_version,
+                       platform = EXCLUDED.platform,
+                       category_id = coalesce($13, agents.category_id), category_manual = agents.category_manual OR $13 IS NOT NULL
          RETURNING id",
     )
     .bind(reuse.unwrap_or_else(Uuid::new_v4))
@@ -167,6 +172,8 @@ async fn enroll(
     .bind(&sys.kernel_version)
     .bind(&sys.arch)
     .bind(&sys.agent_version)
+    .bind(sys.platform.map(|p| p.as_str()))
+    .bind(category)
     .fetch_one(&mut *tx)
     .await
     .map_err(db_err)?;
@@ -188,7 +195,7 @@ async fn enroll(
     Ok((agent_id, secret))
 }
 
-async fn authenticate(state: &AppState, agent_id: Uuid, secret: &str) -> anyhow::Result<bool> {
+pub(crate) async fn authenticate(state: &AppState, agent_id: Uuid, secret: &str) -> anyhow::Result<bool> {
     let stored: Option<Vec<u8>> =
         sqlx::query_scalar("SELECT secret_hash FROM agents WHERE id = $1").bind(agent_id).fetch_optional(&state.db).await?;
     Ok(stored.is_some_and(|h| bool::from(h.ct_eq(&token_hash(secret)))))
@@ -383,7 +390,7 @@ pub fn parse_interpreter(s: &str) -> Option<Interpreter> {
 }
 
 async fn on_message(
-    state: &AppState,
+    state: &Arc<AppState>,
     agent_id: Uuid,
     client_id: Uuid,
     reply: &mpsc::WeakSender<ServerMsg>,
@@ -548,6 +555,12 @@ async fn on_message(
             crate::security::ingest_triage_chunk(state, agent_id, request_id, offset, data).await?
         }
         AgentMsg::ToolReply { request_id, reply } => state.hub.complete_tool(agent_id, request_id, reply),
+        AgentMsg::ReputationQuery { hashes } => {
+            let known = crate::security::reputation_query(state, agent_id, &hashes).await?;
+            if let Some(tx) = reply.upgrade() {
+                let _ = tx.send(ServerMsg::ReputationResult { known }).await;
+            }
+        }
         AgentMsg::Pong { .. } => {}
         AgentMsg::Enroll { .. } | AgentMsg::Auth { .. } => {}
     }
@@ -587,6 +600,7 @@ fn message_type(m: &AgentMsg) -> usize {
         AgentMsg::TelemetryResult { .. } => 27,
         AgentMsg::TriageChunk { .. } => 28,
         AgentMsg::ToolReply { .. } => 29,
+        AgentMsg::ReputationQuery { .. } => 30,
     }
 }
 
@@ -632,12 +646,17 @@ async fn store_metrics(state: &AppState, agent_id: Uuid, m: &Metrics) -> anyhow:
     Ok(())
 }
 
-async fn store_inventory(state: &AppState, agent_id: Uuid, inv: &Inventory) -> anyhow::Result<()> {
+/// Also where the server learns the agent's platform on every connect (inventory is requested
+/// then): a change of OS or platform can move an automatically placed agent to another
+/// category, and so to another policy set.
+async fn store_inventory(state: &Arc<AppState>, agent_id: Uuid, inv: &Inventory) -> anyhow::Result<()> {
     let s = &inv.system;
-    sqlx::query(
-        "UPDATE agents SET inventory = $2, inventory_at = now(), hostname = $3, os_family = $4, os_name = $5,
-                os_version = $6, kernel_version = $7, arch = $8, last_seen_at = now()
-          WHERE id = $1",
+    let (before, after): (Uuid, Uuid) = sqlx::query_as(
+        "WITH old AS (SELECT id, policy_set_id FROM agents WHERE id = $1 FOR UPDATE)
+         UPDATE agents a SET inventory = $2, inventory_at = now(), hostname = $3, os_family = $4, os_name = $5,
+                os_version = $6, kernel_version = $7, arch = $8, platform = $9, last_seen_at = now()
+           FROM old WHERE a.id = old.id
+          RETURNING old.policy_set_id, a.policy_set_id",
     )
     .bind(agent_id)
     .bind(serde_json::to_value(inv)?)
@@ -647,7 +666,12 @@ async fn store_inventory(state: &AppState, agent_id: Uuid, inv: &Inventory) -> a
     .bind(&s.os_version)
     .bind(&s.kernel_version)
     .bind(&s.arch)
-    .execute(&state.db)
+    .bind(s.platform.map(|p| p.as_str()))
+    .fetch_one(&state.db)
     .await?;
+    if before != after {
+        info!(%agent_id, from = %before, to = %after, "agent moved to another policy set");
+        crate::policy::changed(state, crate::policy::Change::agents(vec![agent_id])).await;
+    }
     Ok(())
 }

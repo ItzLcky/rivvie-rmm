@@ -78,6 +78,44 @@ pub struct Store {
     dir: PathBuf,
 }
 
+/// Why a file must never be quarantined automatically, if it mustn't: the operating system's
+/// own binaries and libraries, and our agent. A false positive there would break the machine
+/// or cut it off from the console, which is worse than the miss. A technician can still
+/// quarantine such a file by hand.
+///
+/// The path is judged both with `.`/`..` resolved lexically and, when it exists, fully
+/// resolved (links followed), so neither `/tmp/../usr/bin/x` nor a link into a system
+/// directory slips past.
+pub fn guarded(path: &Path) -> Option<&'static str> {
+    let forms: Vec<PathBuf> = [Some(crate::fsutil::normalize(path)), fs::canonicalize(path).ok()].into_iter().flatten().collect();
+    let resolve = |p: &Path| fs::canonicalize(p).unwrap_or_else(|_| crate::fsutil::normalize(p));
+    if let Ok(me) = std::env::current_exe() {
+        let me = [crate::fsutil::normalize(&me), resolve(&me)];
+        if forms.iter().any(|f| me.contains(f)) {
+            return Some("it is the RMM agent");
+        }
+    }
+    let state = crate::config::state_dir();
+    let state = [crate::fsutil::normalize(&state), resolve(&state)];
+    if forms.iter().any(|f| state.iter().any(|s| f.starts_with(s))) {
+        return Some("it is the RMM agent's own state");
+    }
+    let system: &[&str] = if cfg!(windows) {
+        &["c:/windows/system32/", "c:/windows/syswow64/", "c:/windows/winsxs/", "c:/windows/explorer.exe", "c:/windows/servicing/", "c:/windows/boot/"]
+    } else if cfg!(target_os = "macos") {
+        &["/system/", "/usr/bin/", "/usr/sbin/", "/usr/lib/", "/bin/", "/sbin/"]
+    } else {
+        &["/bin/", "/sbin/", "/usr/bin/", "/usr/sbin/", "/usr/lib/", "/usr/lib64/", "/usr/libexec/", "/lib/", "/lib64/", "/boot/"]
+    };
+    let os_file = |f: &PathBuf| {
+        let p = f.to_string_lossy().replace('\\', "/").to_ascii_lowercase();
+        // `canonicalize` on Windows gives `\\?\C:\...`.
+        let p = p.strip_prefix("//?/").unwrap_or(&p);
+        system.iter().any(|s| p.starts_with(s))
+    };
+    forms.iter().any(os_file).then_some("it is an operating system file")
+}
+
 /// Largest file that can be quarantined.
 pub const MAX_SIZE: u64 = 512 * 1024 * 1024;
 
@@ -314,6 +352,34 @@ mod tests {
         assert!(store.list().is_empty() && !file.exists());
         assert!(store.quarantine(&root, None, None).is_err(), "directories aren't quarantined");
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn system_files_and_the_agent_are_guarded() {
+        assert!(guarded(&std::env::current_exe().unwrap()).is_some());
+        if cfg!(target_os = "linux") {
+            assert!(guarded(Path::new("/usr/bin/ls")).is_some() && guarded(Path::new("/lib64/libc.so.6")).is_some());
+            assert!(guarded(Path::new("/home/u/Downloads/x")).is_none() && guarded(Path::new("/tmp/x")).is_none());
+        }
+        if cfg!(windows) {
+            assert!(guarded(Path::new("C:\\Windows\\System32\\kernel32.dll")).is_some());
+            assert!(guarded(Path::new("C:\\Users\\x\\Downloads\\a.exe")).is_none());
+            assert!(guarded(Path::new("C:\\Users\\x\\..\\..\\Windows\\System32\\x.dll")).is_some());
+        }
+    }
+
+    #[test]
+    fn dotdot_doesnt_disguise_a_guarded_path() {
+        if cfg!(unix) {
+            // Doesn't exist (lexical) and does (resolved).
+            assert!(guarded(Path::new("/tmp/../usr/bin/no-such-file-rmm")).is_some());
+            assert!(guarded(Path::new("/tmp/./../usr/bin/../bin/sh")).is_some());
+            assert!(guarded(Path::new("/usr/bin/../../tmp/x")).is_none());
+        }
+        let me = std::env::current_exe().unwrap();
+        let dir = me.parent().unwrap();
+        let disguised = dir.join("..").join(dir.file_name().unwrap()).join(me.file_name().unwrap());
+        assert_eq!(guarded(&disguised), Some("it is the RMM agent"));
     }
 
     #[cfg(unix)]

@@ -2,18 +2,18 @@
 	export type ButtonVariant = 'primary' | 'secondary' | 'ghost' | 'danger' | 'danger-ghost';
 	export type ButtonSize = 'xs' | 'sm' | 'md';
 	export const buttonBase =
-		'inline-flex shrink-0 cursor-pointer items-center justify-center gap-1.5 rounded-md font-medium whitespace-nowrap transition-[background-color,border-color,color,box-shadow,transform] duration-150 select-none active:translate-y-px disabled:cursor-not-allowed disabled:opacity-50 aria-disabled:pointer-events-none aria-disabled:opacity-50';
+		'inline-flex shrink-0 cursor-pointer items-center justify-center gap-1.5 rounded-md font-semibold whitespace-nowrap transition-[background-color,border-color,color,box-shadow,transform] duration-150 select-none active:translate-y-px disabled:cursor-not-allowed disabled:opacity-50 aria-disabled:pointer-events-none aria-disabled:opacity-50';
 	export const buttonVariants: Record<ButtonVariant, string> = {
-		primary: 'bg-accent text-on-accent hover:bg-accent-hover shadow-[inset_0_1px_0_rgb(255_255_255/0.14),var(--shadow)]',
-		secondary: 'border border-border-strong bg-raised text-fg hover:bg-hover hover:border-[color-mix(in_srgb,var(--border-strong)_70%,var(--fg))] shadow-card',
+		primary: 'bg-cta text-on-cta hover:bg-cta-hover',
+		secondary: 'border-[1.5px] border-[color-mix(in_srgb,var(--fg)_30%,transparent)] bg-transparent text-fg hover:border-fg hover:bg-hover/60',
 		ghost: 'text-muted hover:bg-hover hover:text-fg',
-		danger: 'bg-danger text-on-danger hover:opacity-90 shadow-card',
+		danger: 'bg-danger text-on-danger hover:opacity-90',
 		'danger-ghost': 'text-danger hover:bg-danger-soft'
 	};
 	export const buttonSizes: Record<ButtonSize, string> = {
 		xs: 'h-6 px-2 text-xs [&_svg]:size-3.5',
 		sm: 'h-7 px-2.5 text-xs [&_svg]:size-3.5',
-		md: 'h-8 px-3.5 text-sm [&_svg]:size-4'
+		md: 'h-9 px-4 text-sm [&_svg]:size-4'
 	};
 </script>
 

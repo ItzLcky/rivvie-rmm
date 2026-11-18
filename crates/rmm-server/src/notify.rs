@@ -251,7 +251,7 @@ async fn render(st: &AppState, alert_id: Uuid, event: &str) -> Result<Message, S
         "SELECT al.id, al.agent_id, a.hostname, c.name AS client_name, s.name AS site_name, p.name AS policy_name, al.kind,
                 al.severity, al.title, al.details, al.occurrences, al.opened_at, al.resolved_at, al.resolution
            FROM alerts al JOIN agents a ON a.id = al.agent_id JOIN sites s ON s.id = a.site_id JOIN clients c ON c.id = s.client_id
-           LEFT JOIN alert_policies p ON p.id = al.policy_id
+           LEFT JOIN policy_items p ON p.id = al.policy_id
           WHERE al.id = $1",
     )
     .bind(alert_id)

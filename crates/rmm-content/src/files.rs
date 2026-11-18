@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
 
-use crate::{Bundle, Condition, Error, FileRule, HashIoc};
+use crate::{Bundle, Condition, Error, FileRule, HashIoc, Pattern};
 
 /// Files larger than this aren't read unless a rule asks for more.
 pub const DEFAULT_MAX_SIZE: u64 = 32 * 1024 * 1024;
@@ -19,6 +19,8 @@ struct Automaton {
 pub struct FileMatcher {
     hashes: HashMap<String, HashIoc>,
     rules: Vec<FileRule>,
+    /// Each rule's required leading bytes (`FileRule::header`), by rule index.
+    headers: Vec<Option<Vec<u8>>>,
     exact: Option<Automaton>,
     nocase: Option<Automaton>,
     max_size: u64,
@@ -50,10 +52,12 @@ impl FileMatcher {
                 if p.nocase { nocase.push((b, (ri, si))) } else { exact.push((b, (ri, si))) }
             }
         }
+        let headers = rules.iter().map(|r| r.header.as_ref().map(Pattern::bytes).transpose()).collect::<Result<Vec<_>, _>>()?;
         let max_size = rules.iter().filter_map(|r| r.max_size).max().unwrap_or(DEFAULT_MAX_SIZE).max(DEFAULT_MAX_SIZE);
         Ok(FileMatcher {
             hashes: hashes.iter().map(|h| (h.sha256.to_ascii_lowercase(), h.clone())).collect(),
             rules: rules.to_vec(),
+            headers,
             exact: build(exact, false)?,
             nocase: build(nocase, true)?,
             max_size,
@@ -88,6 +92,11 @@ impl FileMatcher {
                 if r.max_size.is_some_and(|m| data.len() as u64 > m) {
                     return false;
                 }
+                if let Some(h) = &self.headers[*ri]
+                    && !data.starts_with(h)
+                {
+                    return false;
+                }
                 let n = hits.iter().filter(|h| **h).count();
                 match r.condition {
                     Condition::Any => n >= 1,
@@ -105,7 +114,7 @@ impl FileMatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Confidence, Pattern};
+    use crate::Confidence;
     use rmm_proto::security::{RuleMode, ThreatSeverity};
 
     fn rule(id: &str, strings: Vec<Pattern>, condition: Condition) -> FileRule {
@@ -119,6 +128,7 @@ mod tests {
             strings,
             condition,
             max_size: None,
+            header: None,
             tests: vec![],
         }
     }
@@ -142,6 +152,12 @@ mod tests {
         assert_eq!(ids(b"invoke-MIMIKATZ"), ["nocase"]);
         assert_eq!(ids(b"a1 c3"), ["two"]);
         assert!(ids(b"a1 harmless").is_empty());
+        // A header must lead the content, not merely appear in it.
+        let mut pe = rule("pe", vec![text("evil", false)], Condition::Any);
+        pe.header = Some(Pattern { text: None, hex: Some("4d 5a".into()), nocase: false });
+        let m = FileMatcher::with_rules(&[], &[pe]).unwrap();
+        assert_eq!(m.scan(b"MZ\x90\0 evil").len(), 1);
+        assert!(m.scan(b"text quoting MZ and evil").is_empty());
         let h = HashIoc { sha256: "AB".repeat(32), name: "x".into(), severity: ThreatSeverity::Severe };
         let m = FileMatcher::with_rules(&[h], &[]).unwrap();
         assert!(m.hash(&"ab".repeat(32)).is_some() && m.hash(&"cd".repeat(32)).is_none());

@@ -14,7 +14,7 @@
 	import EmptyState from '#lib/ui/EmptyState.svelte';
 	import Input from '#lib/ui/Input.svelte';
 	import Select from '#lib/ui/Select.svelte';
-	import { withClient } from '#lib/scope.svelte.js';
+	import { ROOT_SET } from '#lib/policy/policy.js';
 
 	/** Log entries that matched this agent's log policies (watchers run on the agent). */
 	let { agentId }: { agentId: string } = $props();
@@ -80,7 +80,7 @@
 					title={search || level ? 'No entries match' : 'No matched entries'}
 					description={search || level ? undefined : 'Add an “Event log match” alert policy to watch the journal (Linux) or the Event Log (Windows) for entries you care about.'}
 				>
-					{#snippet action()}{#if !search && !level}<Button size="sm" href={withClient('/policies/new?kind=log')}>New log policy</Button>{/if}{/snippet}
+					{#snippet action()}{#if !search && !level}<Button size="sm" href="/policies/sets/{ROOT_SET}?section=alerts&item=new&kind=log">New log policy</Button>{/if}{/snippet}
 				</EmptyState>
 			{/if}
 		{/snippet}

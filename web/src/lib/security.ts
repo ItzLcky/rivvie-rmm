@@ -1,7 +1,8 @@
 import type {
-	ContentStage, DetectionSource, EventKind, ExclusionKind, ProductKind, ProtectionState, QuarantineState, ResponseActionName, RuleMode, SecurityAction,
-	SecurityActionRow, SecurityActionStatus, TelemetryEvent, ThreatSeverity, ThreatStatus, Verdict
+	ContentStage, DetectionSource, EventKind, ExclusionKind, FoundBy, ProductKind, ProtectionState, QuarantineState, RealtimeHealth, RealtimeMode,
+	ResponseActionName, RuleMode, SecurityAction, SecurityActionRow, SecurityActionStatus, SecurityRisk, TelemetryEvent, ThreatSeverity, ThreatStatus, Verdict
 } from '#lib/types.js';
+import { osLabels } from '#lib/format.js';
 import type { Tone } from '#lib/ui/Badge.svelte';
 
 export const stateLabels: Record<ProtectionState, string> = {
@@ -15,7 +16,7 @@ export const stateLabels: Record<ProtectionState, string> = {
 export const stateHelp: Record<ProtectionState, string> = {
 	threats: 'The antivirus reports a threat it hasn’t dealt with.',
 	unprotected: 'No antivirus product is switched on.',
-	at_risk: 'Real-time protection is off, or the signatures are more than 3 days old.',
+	at_risk: 'Real-time protection is off, signatures are out of date, or our sensor isn’t protecting as its policy asks.',
 	unknown: 'The agent hasn’t reported its protection yet (older agents never do).',
 	protected: 'Antivirus on, scanning in real time, with current signatures.'
 };
@@ -172,3 +173,82 @@ export function splitContext(context: TelemetryEvent[]): { trigger: TelemetryEve
 }
 
 export const confidenceLabels: Record<'low' | 'medium' | 'high', string> = { low: 'Low', medium: 'Medium', high: 'High' };
+
+/** Why an agent is at risk, as a short phrase and a sentence. */
+export const riskLabels: Record<SecurityRisk, string> = {
+	realtime_off: 'No real-time scanning',
+	signatures: 'Signatures out of date',
+	database: 'Signature database out of date',
+	sensor_realtime: 'Our real-time protection isn’t on'
+};
+/** Risks as one phrase: "No real-time scanning, signature database out of date". */
+export function riskSummary(risks: SecurityRisk[]): string {
+	return risks.map((r, i) => (i ? riskLabels[r].charAt(0).toLowerCase() + riskLabels[r].slice(1) : riskLabels[r])).join(', ');
+}
+export const riskHelp: Record<SecurityRisk, string> = {
+	realtime_off: 'No antivirus on the machine scans files as they’re opened.',
+	signatures: 'No antivirus on the machine has signatures from the last 3 days (ours: within its policy’s limit).',
+	database: 'Our signature database is older than the security policy allows.',
+	sensor_realtime: 'The security policy turns on real-time protection, but it isn’t running on this Linux machine.'
+};
+
+export const realtimeModeLabels: Record<RealtimeMode, string> = { off: 'Off', audit: 'Audit', block: 'Block' };
+/** What each real-time mode does, for the policy editor. `block` depends on prevention. */
+export function realtimeModeHelp(mode: RealtimeMode, prevention: boolean): string {
+	switch (mode) {
+		case 'off':
+			return 'Nothing is decided on access. Programs are still scanned just after they start, and files by the scheduled scans.';
+		case 'audit':
+			return 'Every program is checked before it runs, as Block would, but nothing is denied, killed or quarantined on access. Detections say what Block would have done: use it to see the cost and the catches first.';
+		case 'block':
+			return prevention
+				? 'A program matching a known-bad hash or a high-confidence rule in block mode is denied before it runs. Other matches raise a detection and alert.'
+				: 'Prevention is off, so Block denies nothing: programs run, matches raise a detection and alert, and auto-quarantine (if on) moves the file afterwards. Turn Prevention on for Block to deny.';
+	}
+}
+/**
+ * Our real-time protection on one machine, for a status line. `fault`: it should be on and
+ * isn't, on Linux (elsewhere it doesn't exist yet, which is shown plainly and isn't a fault).
+ */
+export function realtimeView(rt: RealtimeHealth | null | undefined, os: string, running: boolean, prevention?: boolean): { label: string; detail: string | null; fault: boolean } | null {
+	if (!rt) return null;
+	if (rt.mode === 'off') return { label: 'Off by policy', detail: 'Programs are scanned just after they start.', fault: false };
+	if (os !== 'linux') {
+		return { label: `Not available on ${osLabels[os] ?? os}`, detail: 'Programs are scanned just after they start; blocking before they run is Linux only for now.', fault: false };
+	}
+	if (!running) return { label: 'Not running', detail: 'The sensor isn’t running, so nothing is checked on access.', fault: true };
+	if (rt.state !== 'on') return { label: 'Unavailable', detail: rt.error ?? 'Programs are scanned just after they start instead.', fault: true };
+	const how = `${rt.mechanism}${rt.filesystems ? `, ${rt.filesystems} ${rt.filesystems === 1 ? 'filesystem' : 'filesystems'}` : ''}`;
+	if (rt.mode === 'audit') return { label: 'On, audit only', detail: `${how}. Decides every program but never denies.`, fault: false };
+	return prevention === false
+		? { label: 'On, but prevention off', detail: `${how}. Matches alert; nothing is denied until prevention is on.`, fault: false }
+		: { label: 'On, blocking', detail: `${how}.`, fault: false };
+}
+
+export const foundByLabels: Record<FoundBy, string> = { on_exec: 'As it started', on_write: 'After it was written', scan: 'Scan', reputation: 'Reputation lookup' };
+export const foundByHelp: Record<FoundBy, string> = {
+	on_exec: 'Checked as the program started: before it ran with real-time protection on, just after otherwise.',
+	on_write: 'Scanned after it was written (real-time scan on write, or a watched folder).',
+	scan: 'Found by an on-demand or scheduled scan.',
+	reputation: 'The server’s hash list knows it. Reputation answers aren’t signed, so they only ever alert.'
+};
+
+/** Our database is older than the policy's limit (hours; 0 = none). */
+export function databaseStale(builtAt: string | null | undefined, maxAgeHours: number, now = Date.now()): boolean {
+	return !!builtAt && maxAgeHours > 0 && now - Date.parse(builtAt) > maxAgeHours * 3_600_000;
+}
+/** `hits` of `hits + misses` as a whole percentage, or null with nothing to count. */
+export function rate(hits: number, misses: number): number | null {
+	const n = hits + misses;
+	return n ? Math.round((100 * hits) / n) : null;
+}
+/** Microseconds as "40 µs", "3.6 ms". */
+export function micros(us: number): string {
+	return us < 1000 ? `${us} µs` : `${(us / 1000).toFixed(us < 10_000 ? 1 : 0)} ms`;
+}
+/** `list:abuse-ch` → "abuse-ch" (an uploaded list); `db:2026.06.15.1` → "Database 2026.06.15.1". */
+export function reputationSourceLabel(source: string): string {
+	if (source.startsWith('list:')) return source.slice(5);
+	if (source.startsWith('db:')) return `Database ${source.slice(3)}`;
+	return source;
+}

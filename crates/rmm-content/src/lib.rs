@@ -119,6 +119,11 @@ pub struct FileRule {
     /// Skip larger files (bytes).
     #[serde(default)]
     pub max_size: Option<u64>,
+    /// The content must start with these bytes (`{"hex": "4d 5a"}`: a Windows program), so a
+    /// rule for a binary doesn't fire on documents, rule files or this bundle quoting its
+    /// strings. Agents older than the field ignore it and match as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header: Option<Pattern>,
     #[serde(default)]
     pub tests: Vec<FileTest>,
 }

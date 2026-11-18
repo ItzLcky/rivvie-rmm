@@ -135,11 +135,6 @@ pub fn cycles_due(
     out
 }
 
-/// Whether an agent counts as a server: Windows Server editions and Linux hosts.
-pub fn is_server(os_family: &str, os_name: &str) -> bool {
-    os_family.eq_ignore_ascii_case("linux") || os_name.to_ascii_lowercase().contains("server")
-}
-
 // ---------------------------------------------------------------------------
 // Rates and coverage
 // ---------------------------------------------------------------------------
@@ -320,9 +315,10 @@ pub async fn draft_for_client(db: &mut PgConnection, client: Uuid, from: NaiveDa
     .bind(to)
     .fetch_all(&mut *db)
     .await?;
-    // Devices are counted once per run: enrolled agents under the client now.
-    let agents: Vec<(String, String)> =
-        sqlx::query_as("SELECT a.os_family, a.os_name FROM agents a JOIN sites s ON s.id = a.site_id WHERE s.client_id = $1")
+    // Devices are counted once per run: enrolled agents under the client now, servers and
+    // workstations by the platform the agent reports (or the server's guess for older builds).
+    let agents: Vec<String> =
+        sqlx::query_scalar("SELECT a.platform FROM agents a JOIN sites s ON s.id = a.site_id WHERE s.client_id = $1")
             .bind(client)
             .fetch_all(&mut *db)
             .await?;
@@ -342,7 +338,7 @@ pub async fn draft_for_client(db: &mut PgConnection, client: Uuid, from: NaiveDa
             let prorated = if fraction < 1000 { format!(", prorated {}%", (fraction + 5) / 10) } else { String::new() };
             match c.kind.as_str() {
                 "per_device" => {
-                    let servers = agents.iter().filter(|(f, n)| is_server(f, n)).count() as i64;
+                    let servers = agents.iter().filter(|p| *p == "server").count() as i64;
                     let workstations = agents.len() as i64 - servers;
                     let count = match c.device_filter.as_str() {
                         "servers" => servers,
@@ -581,13 +577,5 @@ mod tests {
         assert!(cycles_due("monthly", d("2026-01-01"), Some(d("2026-10-31")), d("2026-11-01"), d("2026-11-30")).is_empty());
         // Starts after the period: nothing.
         assert!(cycles_due("monthly", d("2027-01-05"), None, d("2026-11-01"), d("2026-11-30")).is_empty());
-    }
-
-    #[test]
-    fn servers_and_workstations() {
-        assert!(is_server("windows", "Windows Server 2022 Standard"));
-        assert!(is_server("linux", "Ubuntu 24.04"));
-        assert!(!is_server("windows", "Windows 11 Pro"));
-        assert!(!is_server("macos", "macOS 15"));
     }
 }

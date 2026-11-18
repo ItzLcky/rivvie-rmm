@@ -2,7 +2,7 @@
 //! can reuse allocations and compute CPU usage deltas between samples.
 
 use chrono::Utc;
-use rmm_proto::{DiskInfo, DiskUsage, Inventory, Metrics, NetInterface, OsFamily, SystemInfo};
+use rmm_proto::{DiskInfo, DiskUsage, Inventory, Metrics, NetInterface, OsFamily, Platform, SystemInfo};
 use sysinfo::{CpuRefreshKind, Disks, MemoryRefreshKind, Networks, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System, Users};
 
 use crate::software;
@@ -123,6 +123,7 @@ pub fn system_info() -> SystemInfo {
         arch: System::cpu_arch(),
         agent_version: AGENT_VERSION.to_string(),
         machine_id: machine_id(),
+        platform: platform(),
     }
 }
 
@@ -187,4 +188,66 @@ fn machine_id() -> Option<String> {
 #[cfg(not(any(target_os = "linux", windows)))]
 fn machine_id() -> Option<String> {
     None
+}
+
+/// DMI chassis types of portable machines: portable, laptop, notebook, hand held, sub notebook,
+/// tablet, convertible, detachable.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const PORTABLE_CHASSIS: [u32; 8] = [8, 9, 10, 11, 14, 30, 31, 32];
+
+/// Linux: a workstation when the chassis is portable or the machine boots to a desktop
+/// (`graphical.target`), otherwise a server.
+#[cfg(target_os = "linux")]
+fn platform() -> Option<Platform> {
+    let chassis = std::fs::read_to_string("/sys/class/dmi/id/chassis_type").ok().and_then(|s| s.trim().parse::<u32>().ok());
+    // `systemctl get-default` without running it: the default.target link, admin's first.
+    let target = ["/etc/systemd/system/default.target", "/usr/lib/systemd/system/default.target", "/lib/systemd/system/default.target"]
+        .iter()
+        .find_map(|p| std::fs::read_link(p).ok())
+        .and_then(|t| t.file_name().map(|n| n.to_string_lossy().into_owned()));
+    Some(linux_platform(chassis, target.as_deref()))
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn linux_platform(chassis: Option<u32>, default_target: Option<&str>) -> Platform {
+    if chassis.is_some_and(|c| PORTABLE_CHASSIS.contains(&c)) || default_target == Some("graphical.target") {
+        Platform::Workstation
+    } else {
+        Platform::Server
+    }
+}
+
+/// Windows: `ProductType` is `WinNT` on client editions, `ServerNT` or `LanmanNT` (a domain
+/// controller) on servers.
+#[cfg(windows)]
+fn platform() -> Option<Platform> {
+    use winreg::{RegKey, enums::HKEY_LOCAL_MACHINE};
+    let product: String = RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey("SYSTEM\\CurrentControlSet\\Control\\ProductOptions")
+        .and_then(|k| k.get_value("ProductType"))
+        .ok()?;
+    Some(if product.eq_ignore_ascii_case("WinNT") { Platform::Workstation } else { Platform::Server })
+}
+
+#[cfg(target_os = "macos")]
+fn platform() -> Option<Platform> {
+    Some(Platform::Workstation)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+fn platform() -> Option<Platform> {
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn linux_platform_from_chassis_and_target() {
+        assert_eq!(linux_platform(Some(10), Some("multi-user.target")), Platform::Workstation, "a notebook");
+        assert_eq!(linux_platform(Some(3), Some("graphical.target")), Platform::Workstation, "a desktop");
+        assert_eq!(linux_platform(Some(17), Some("multi-user.target")), Platform::Server, "a rack server");
+        assert_eq!(linux_platform(None, None), Platform::Server, "a VM or container");
+    }
 }

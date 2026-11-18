@@ -1,6 +1,6 @@
 # Roadmap
 
-Last reviewed 2026-11-15.
+Last reviewed 2026-11-18.
 
 ## Where things stand
 
@@ -13,7 +13,8 @@ Last reviewed 2026-11-15.
 | 5. Patch management | Done |
 | 6. Remote desktop | v1 done (X11 and Windows GDI) |
 | 7. PSA | Milestones 1-7 done (blocks 4 and 6 below); password vault not built |
-| 8. Endpoint protection | Milestones 1-7 done; Windows and macOS sensor untested |
+| 8. Endpoint protection | Milestones 1-7 done; Windows and macOS sensor untested. Own antivirus engine ([design](design/antivirus.md)): scan engine, signature databases, Linux on-access blocking, reputation and console built 2026-11-15; Windows real-time collection not built |
+| 9. Policy management | Done 2026-11-18 ([design](design/policies.md)): device categories, one tree of policy sets with per-field overrides, assignments per client and site, single-device pins; replaces the four separate policy mechanisms |
 
 What's built works end to end on Linux and is covered by unit tests, the e2e suite (`crates/rmm-server/tests/e2e.rs`) and the Playwright visual and accessibility tests. The biggest gap is that **no Windows code path has run on a real Windows host.** Windows is where most MSP fleets are, so that comes first.
 
@@ -21,7 +22,9 @@ What's built works end to end on Linux and is covered by unit tests, the e2e sui
 
 **Current block: production readiness** (the open items of block 2 below; spec in [design/production-readiness.md](design/production-readiness.md)). Built 2026-11-15 and verified locally except where noted below; waiting for the first CI run. Blocks 3, 4 and 6 are done. Block 1 is higher priority but waits on real Windows machines, and the outside security review waits on a reviewer. The load test ([research/load-test-2026-11.md](research/load-test-2026-11.md)) says one node holds 10,000 agents, so horizontal scaling isn't urgent; the dashboard and search queries are what to fix first (see block 2). Block 5 follows.
 
-Design records: [PSA](design/psa.md), [endpoint protection](design/endpoint-protection.md), [production readiness](design/production-readiness.md), [UI survey](research/rmm-ui-survey.md), [load test](research/load-test-2026-11.md).
+**Policy management is done** (not one of the numbered blocks: it was pulled forward because block 5's automation policies and block 7's software deployment both need somewhere to live). Every device is in a category and uses one policy set; alert policies, scheduled scripts, patching, the security policy, remote access and automatic agent updates all moved into sets, and the old per-feature policy tables, routes and editors are gone. Verified: unit tests for the merge, field sources, resolution order and validation; the e2e `policies` section and the `policy_migration` test (old rows in, same policies out); the visual and accessibility suite on the new screens in both themes and on phones; and one click-through against a real server and agent (child set, one overridden field, client assignment, customize and pin, reset, unpin). Not verified: the `upgrade` job on GitHub, and anything on Windows.
+
+Design records: [PSA](design/psa.md), [endpoint protection](design/endpoint-protection.md), [production readiness](design/production-readiness.md), [policy management](design/policies.md), [UI survey](research/rmm-ui-survey.md), [load test](research/load-test-2026-11.md).
 
 ## Next
 
@@ -88,7 +91,7 @@ Done 2026-11-12 (migration `0016_portal_sla.sql`); covered by unit tests and the
 - [ ] **API keys and a public REST API** with OpenAPI docs, scoped by permission set and client. Webhooks out for ticket and alert events. Other tools and the PSA integrations below build on it.
 - [ ] **SSO for technicians**: OIDC first (Entra ID and Google cover most MSPs), SAML later. Map groups to roles and clients. Passkeys (WebAuthn) as a second factor.
 - [ ] **Tags, custom fields and agent notes**, then **saved views** built on the existing URL state. Custom fields can be filled by scripts (script output → field), which is how MSPs track things we don't collect.
-- [ ] **Automation policies**: run scripts on enrollment, on a schedule or when an alert opens (self-healing), per client/site/OS like the other policies.
+- [ ] **Automation policies**: run scripts on enrollment, on a schedule or when an alert opens (self-healing). Partly done by policy management: scheduled scripts are items of policy sets, and an alert policy's `run_script_id` runs a script once when its alert opens (the alert links the job). Left: run on enrollment and other event triggers, and a script that runs once per device rather than on a timetable.
 - [ ] Audit log export and a syslog/SIEM stream.
 
 ### 6. PSA milestones 5-7: time, contracts and billing
@@ -164,3 +167,7 @@ Contacts and client email domains; boards with statuses mapped to categories; P1
 - **Prerequisites:** permission sets (`security.read/respond/manage`, `users.permissions`), signed content bundles verified on every agent, persisted sensor and response buffers, `RMM_DATA_KEY` encryption at rest for detection context.
 - **Sensor** (separate process supervised by the agent): file scanning with hashes and rules, quarantine and restore, exclusions; process, network, file-of-interest, autorun and module telemetry in a local store queried from the console; a behaviour rule engine with 27 starter rules (audit mode by default), tests and a benign corpus; response (kill tree, quarantine, isolate host, triage package); investigation UI with process tree, timeline, hunting and hash prevalence; prevention only for proven rules, with canary rollout, automatic rollback and a fleet-wide kill switch.
 - ClamAV was tested against real ClamAV 1.5.4; nftables/iptables isolation and the Linux process connector were tested as root.
+
+### Phase 9: Policy management
+
+One model instead of four ([design](design/policies.md), [API](design/policies-api.md)). Six built-in device categories (OS × workstation/server, from what the agent reports) plus custom ones filled by hand or by an enrollment token. Policy sets form one tree under *All devices*, MSP-wide or belonging to one client; a device uses its pin, else its site's or client's assignment for its category, else the category's default. Alert and schedule items can live in any set; patching, security, remote access and agent settings live once at the root. Sets below override single fields (`policy_effective` holds the merged result, rebuilt in the same transaction), and every write is validated against every set it reaches. New with it: a patch policy's own install window, remote access switches enforced where sessions start, `run_script_id` on alerts, and the platform report in the agent. The data migration (`0022_policies.sql`) turns client and site policies into client-owned child sets. Web: the Policies page (sets tree, categories, assignments grid), the set page with inherited / overridden / defined-here on every policy and field and one-click reset, the client Policies tab, the agent Policy section, category column, filter and bulk move on the agents list, a category on enrollment tokens.

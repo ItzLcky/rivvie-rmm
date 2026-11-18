@@ -78,6 +78,7 @@ pub async fn run_forever(cfg: Config, config_path: std::path::PathBuf, mut shutd
     let watchers = Arc::new(LogWatchers::default());
     let patches = Arc::new(patch::Manager::new());
     let sensor = security::supervisor::Supervisor::new();
+    sensor.set_server(cfg.server_url.clone(), cfg.agent_id, cfg.secret.clone());
     tokio::spawn(sensor.clone().run());
     tokio::spawn(keep_isolation(cfg.server_url.clone()));
     let security = Arc::new(security::Manager::new(sensor, cfg.server_url.clone()));
@@ -313,7 +314,9 @@ async fn handle(msg: ServerMsg, ctx: &Ctx, shells: &mut HashMap<Uuid, ShellSessi
             tokio::task::spawn_blocking(move || s.set_content(version, bundle, signature));
         }
         ServerMsg::SensorPolicy(p) => ctx.security.sensor().set_policy(p),
+        ServerMsg::Database { offer } => ctx.security.sensor().set_database(offer),
         ServerMsg::SensorDetectionAck { id } => ctx.security.sensor().ack(&id),
+        ServerMsg::ReputationResult { known } => ctx.security.sensor().reputation(known),
         ServerMsg::Response { request_id, action } => {
             tokio::spawn(ctx.security.clone().respond(request_id, action));
         }
@@ -380,6 +383,7 @@ fn capabilities() -> Vec<String> {
         rmm_proto::patch::CAPABILITY.to_string(),
         rmm_proto::security::CAPABILITY.to_string(),
         rmm_proto::security::SENSOR_CAPABILITY.to_string(),
+        rmm_proto::security::SIGDB_CAPABILITY.to_string(),
         rmm_proto::tools::CAPABILITY.to_string(),
     ];
     if cfg!(any(target_os = "linux", windows)) || std::env::var_os("RMM_DESKTOP_FAKE").is_some() {

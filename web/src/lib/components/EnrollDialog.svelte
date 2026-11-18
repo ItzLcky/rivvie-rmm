@@ -6,6 +6,7 @@
 	import { resource } from '#lib/resource.svelte.js';
 	import { attempt, toast } from '#lib/toast.svelte.js';
 	import type { Client, Site } from '#lib/types.js';
+	import type { Category } from '#lib/policy/types.js';
 	import Button from '#lib/ui/Button.svelte';
 	import CodeBlock from '#lib/ui/CodeBlock.svelte';
 	import EmptyState from '#lib/ui/EmptyState.svelte';
@@ -16,7 +17,7 @@
 	import Select from '#lib/ui/Select.svelte';
 	import Skeleton from '#lib/ui/Skeleton.svelte';
 
-	interface Token { id: string; label: string; max_uses: number | null; uses: number; expires_at: string | null; created_at: string }
+	interface Token { id: string; label: string; max_uses: number | null; uses: number; expires_at: string | null; created_at: string; category_id?: string | null; category_name?: string | null }
 	interface AgentDownload { id: string; label: string; file_name: string; size: number; sha256: string; url: string }
 	interface NewToken {
 		token: string; expires_at: string | null; max_uses: number | null; install: { linux: string; windows: string };
@@ -32,6 +33,8 @@
 	let label = $state('');
 	let maxUses = $state<number | null>(null);
 	let expiresHours = $state(168);
+	let categoryId = $state('');
+	const categories = resource(() => api.get<Category[]>('/device-categories'));
 	let busy = $state<'' | 'token' | 'package'>('');
 
 	async function create(purpose: 'package' | null) {
@@ -40,8 +43,8 @@
 			created = await api.post<NewToken>(
 				`/sites/${site.id}/enrollment-tokens`,
 				purpose
-					? { label: label || 'Agent package', purpose, max_uses: maxUses || null, expires_in_hours: expiresHours || null }
-					: { label, max_uses: maxUses || null, expires_in_hours: expiresHours }
+					? { label: label || 'Agent package', purpose, max_uses: maxUses || null, expires_in_hours: expiresHours || null, category_id: categoryId || null }
+					: { label, max_uses: maxUses || null, expires_in_hours: expiresHours, category_id: categoryId || null }
 			);
 			await tokens.reload();
 		} catch (e) {
@@ -98,7 +101,7 @@
 
 		<section>
 			<h3 class="mb-2 text-sm font-semibold">New enrollment token</h3>
-			<div class="grid gap-3 sm:grid-cols-3">
+			<div class="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
 				<Field label="Label" id="tok-label"><Input id="tok-label" bind:value={label} placeholder="e.g. Office rollout" /></Field>
 				<Field label="Max uses" id="tok-uses"><Input id="tok-uses" type="number" min="1" bind:value={maxUses} placeholder="Unlimited" /></Field>
 				<Field label="Expires" id="tok-exp">
@@ -114,7 +117,11 @@
 						]}
 					/>
 				</Field>
+				<Field label="Device category" id="tok-cat">
+					<Select id="tok-cat" class="w-full" bind:value={categoryId} options={[{ value: '', label: 'Automatic' }, ...(categories.data ?? []).filter((c) => !c.builtin).map((c) => ({ value: c.id, label: c.name }))]} />
+				</Field>
 			</div>
+			<p class="hint">Automatic puts each machine in the built-in category for its OS and platform. A custom category (kiosks, SQL servers) places every machine enrolled with this token there.</p>
 			<div class="mt-3 flex flex-wrap gap-2">
 				<Button variant="primary" icon={KeyRound} loading={busy === 'token'} onclick={() => create(null)}>Create token</Button>
 				<Button icon={Package} loading={busy === 'package'} onclick={() => create('package')} title="Limited to 50 uses and 30 days unless set above, with .msi, .deb and .rpm downloads">Create package</Button>
@@ -142,11 +149,12 @@
 			{#if tokens.data?.length}
 				<div class="border-border overflow-x-auto rounded-lg border">
 					<table class="table">
-						<thead><tr><th>Label</th><th>Uses</th><th>Expires</th><th>Created</th><th></th></tr></thead>
+						<thead><tr><th>Label</th><th>Category</th><th>Uses</th><th>Expires</th><th>Created</th><th></th></tr></thead>
 						<tbody>
 							{#each tokens.data as t (t.id)}
 								<tr>
 									<td>{t.label || '–'}</td>
+									<td class="text-muted">{t.category_name ?? 'Automatic'}</td>
 									<td class="tabular">{t.uses}{t.max_uses ? ` / ${t.max_uses}` : ''}</td>
 									<td class="text-muted text-xs">{t.expires_at ? datetime(t.expires_at) : 'never'}</td>
 									<td class="text-muted text-xs">{ago(t.created_at)}</td>

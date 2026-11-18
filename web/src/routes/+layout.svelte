@@ -1,6 +1,7 @@
 <script lang="ts">
 	import './layout.css';
-	import '@fontsource-variable/geist';
+	import '@fontsource-variable/ibm-plex-sans';
+	import '@fontsource-variable/space-grotesk';
 	import '@fontsource-variable/geist-mono';
 	import favicon from '#lib/assets/favicon.svg';
 	import { Tooltip } from 'bits-ui';

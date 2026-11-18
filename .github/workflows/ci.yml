@@ -17,10 +17,12 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Clippy (agent + proto + sign)
-        run: cargo clippy -p rmm-agent -p rmm-proto -p rmm-sign --all-targets -- -D warnings
-      - name: Test (agent + proto + sign)
-        run: cargo test -p rmm-agent -p rmm-proto -p rmm-sign
+      - name: Clippy (agent + proto + sign + scan engine + content)
+        run: cargo clippy -p rmm-agent -p rmm-proto -p rmm-sign -p rmm-scan -p rmm-content --all-targets -- -D warnings
+      - name: Clippy (scan engine and agent without YARA)
+        run: cargo clippy -p rmm-scan -p rmm-agent --no-default-features --all-targets -- -D warnings
+      - name: Test (agent + proto + sign + scan engine + content)
+        run: cargo test -p rmm-agent -p rmm-proto -p rmm-sign -p rmm-scan -p rmm-content
       - name: Server and load generator (Linux only)
         if: runner.os == 'Linux'
         run: cargo clippy -p rmm-server -p rmm-loadgen --all-targets -- -D warnings && cargo test -p rmm-server -p rmm-loadgen
@@ -32,6 +34,26 @@ jobs:
           path: |
             target/release/rmm-agent
             target/release/rmm-agent.exe
+
+  # On-access protection (fanotify) as root: a denied exec, an allowed one, a written file
+  # quarantined, the deadline path, audit mode, a stopped and killed sensor releasing what it
+  # held, restarts. See crates/rmm-agent/tests/onaccess.rs (locally: scripts/test-onaccess.sh).
+  onaccess:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the test as the runner user
+        id: build
+        run: |
+          bin=$(cargo test -p rmm-agent --test onaccess --no-run --message-format=json \
+                | jq -r 'select(.reason == "compiler-artifact" and .target.name == "onaccess" and .executable != null) | .executable')
+          test -x "$bin"
+          echo "bin=$bin" >> "$GITHUB_OUTPUT"
+      - name: On-access tests (root)
+        run: sudo "${{ steps.build.outputs.bin }}" --ignored --test-threads=1 --nocapture
 
   # The real server against Postgres, with real agent processes: enrollment reuse/takeover,
   # jobs across server restarts, lost/expired jobs, headers, per-client access, packages,

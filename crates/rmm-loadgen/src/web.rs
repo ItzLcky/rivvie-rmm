@@ -15,6 +15,9 @@ use uuid::Uuid;
 use crate::sim::Dispatched;
 use crate::stats::Stats;
 
+/// The root policy set (fixed id, from migration 0022).
+const ALL_DEVICES: &str = "00000000-0000-4000-8001-000000000000";
+
 pub struct Api {
     pub http: reqwest::Client,
     pub base: String,
@@ -72,11 +75,11 @@ impl Api {
         Ok(Some(secret))
     }
 
-    /// MSP-wide offline, CPU, memory and disk policies (once), so every alert evaluation has
+    /// MSP-wide offline, CPU, memory and disk policies (once, as alert items of All devices), so every alert evaluation has
     /// the whole fleet to check.
     pub async fn ensure_policies(&self) -> Result<()> {
-        let (_, have) = self.call(reqwest::Method::GET, "/alert-policies", None).await?;
-        if have.as_array().into_iter().flatten().any(|p| p["name"].as_str().is_some_and(|n| n.starts_with("Loadgen"))) {
+        let (_, have) = self.call(reqwest::Method::GET, &format!("/policy-sets/{ALL_DEVICES}"), None).await?;
+        if have["policies"].as_array().into_iter().flatten().any(|p| p["name"].as_str().is_some_and(|n| n.starts_with("Loadgen"))) {
             return Ok(());
         }
         for (name, kind, params) in [
@@ -85,7 +88,11 @@ impl Api {
             ("Loadgen memory", "memory", json!({ "threshold": 95, "minutes": 10 })),
             ("Loadgen disk", "disk", json!({ "threshold": 90, "minutes": 5 })),
         ] {
-            self.post("/alert-policies", json!({ "name": name, "kind": kind, "params": params, "severity": "warning" })).await?;
+            self.post(
+                &format!("/policy-sets/{ALL_DEVICES}/items"),
+                json!({ "module": "alert", "name": name, "config": { "kind": kind, "params": params, "severity": "warning" } }),
+            )
+            .await?;
         }
         Ok(())
     }

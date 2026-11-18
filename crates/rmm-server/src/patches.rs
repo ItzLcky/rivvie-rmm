@@ -6,8 +6,8 @@
 //! agent sends after every install is authoritative (anything it still lists is `missing`
 //! or stays `failed`, anything it doesn't is `installed`).
 //!
-//! Approvals: the policy that applies to the agent (site, else client, else the MSP-wide
-//! one: the `agent_patch_policy` view) approves by severity or category. A person's decision
+//! Approvals: the patch policy of the agent's policy set (the `agent_patch_policy` view over
+//! `policy_effective`) approves by severity or category. A person's decision
 //! (`approval_manual`) is kept when policies change.
 
 use std::sync::Arc;
@@ -512,8 +512,8 @@ pub async fn scheduler_tick(st: &AppState) -> anyhow::Result<()> {
         }
     }
 
-    // Automatic installs: online agents whose policy installs automatically, inside their
-    // site's window, with nothing in flight and something eligible. All-or-nothing agents
+    // Automatic installs: online agents whose policy installs automatically, inside its window
+    // (the policy's own, else the site's), with nothing in flight and something eligible. All-or-nothing agents
     // (pacman) only when everything they'd install is eligible.
     let sql = format!(
         "SELECT a.id, pol.reboot_policy, array_agg(p.update_id ORDER BY p.update_id)
@@ -522,7 +522,7 @@ pub async fn scheduler_tick(st: &AppState) -> anyhow::Result<()> {
            JOIN agent_patch_policy pol ON pol.agent_id = a.id
            JOIN patches p ON p.agent_id = a.id
           WHERE a.online AND $1 = ANY(a.capabilities) AND pol.auto_install AND a.patch_scan_error IS NULL
-            AND in_maintenance_window(s.maint_days, s.maint_start, s.maint_minutes, s.maint_tz, now())
+            AND in_maintenance_window(pol.maint_days, pol.maint_start, pol.maint_minutes, pol.maint_tz, now())
             AND NOT EXISTS (SELECT 1 FROM patch_runs r WHERE r.agent_id = a.id
                              AND (r.status IN ('queued', 'sent') OR (r.trigger = 'policy' AND r.created_at > now() - interval '30 minutes')))
             AND {ELIGIBLE}

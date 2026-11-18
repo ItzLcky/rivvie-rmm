@@ -3,11 +3,22 @@
 //! switched off per client.
 //!
 //! It records telemetry into a local, size-capped store, runs behaviour rules on every event,
-//! scans files (on demand, on a schedule, and every program as it starts) against the signed
-//! content bundle, watches ransomware decoys, and in block mode stops what high-confidence
-//! rules catch. It talks to the agent over stdin/stdout, one JSON message per line.
+//! scans files (on demand, on a schedule, and every program as it starts) with the scan engine
+//! (`rmm-scan`: the signed signature database, plus the content bundle's legacy hashes and
+//! file rules), watches ransomware decoys, and in block mode stops what high-confidence rules
+//! catch. It talks to the agent over stdin/stdout, one JSON message per line.
+//!
+//! On Linux as root, real-time protection decides every exec before it runs and scans files
+//! after they're written (`onaccess`, fanotify); elsewhere, and where fanotify isn't available,
+//! programs are scanned just after they start.
+//!
+//! The database arrives as a path (the agent downloads and verifies it, see
+//! `security::supervisor`), with the previous version as a fallback: if the newest doesn't
+//! load, the sensor runs the one before and says so.
 
 pub mod netconn;
+#[cfg(target_os = "linux")]
+pub mod onaccess;
 pub mod policy;
 pub mod procs;
 pub mod scan;
@@ -17,17 +28,18 @@ pub mod watch;
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use rmm_content::engine::Engine;
 use rmm_content::files::FileMatcher;
-use rmm_content::{Bundle, Confidence};
-use rmm_proto::security::{RuleMode, SensorDetection, SensorHealth, SensorPolicy, ThreatSeverity, ThreatStatus};
+use rmm_content::Bundle;
+use rmm_scan::cache::Cache;
+use rmm_scan::{Engine, Match};
+use rmm_proto::security::{RealtimeHealth, RealtimeMode, RuleMode, SensorDetection, SensorHealth, SensorPolicy, ThreatSeverity, ThreatStatus, found_by};
 use rmm_proto::telemetry::{Event, EventKind, NetEvent, Proc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -41,10 +53,29 @@ pub(crate) use watch::expand as watch_expand;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum ToSensor {
-    /// The policy and the verified content bundle (JSON). Sent first, and on every change.
-    Configure { policy: SensorPolicy, content: Option<String> },
+    /// The policy, the verified content bundle (JSON) and the signature database (`None`:
+    /// unchanged). Sent first, and on every change.
+    Configure {
+        policy: SensorPolicy,
+        content: Option<String>,
+        #[serde(default)]
+        database: Option<DbSet>,
+    },
     Scan { request_id: Option<Uuid>, kind: scan::Kind, path: Option<String> },
     Shutdown,
+}
+
+/// The signature database to load, and the one to fall back on.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DbSet {
+    pub current: Option<DbFile>,
+    pub previous: Option<DbFile>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DbFile {
+    pub version: String,
+    pub path: std::path::PathBuf,
 }
 
 /// Sensor -> agent.
@@ -52,11 +83,18 @@ pub enum ToSensor {
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum FromSensor {
     Ready,
-    Health(SensorHealth),
+    Health(Box<SensorHealth>),
     Detection(Box<SensorDetection>),
     ScanDone { request_id: Option<Uuid>, ok: bool, message: String },
     /// Something was quarantined: the agent re-sends the list.
     QuarantineChanged,
+    /// Which signature database is loaded now, and why the newer one isn't if it isn't.
+    Database { version: Option<String>, error: Option<String> },
+    /// Every few seconds: the agent kills a sensor that goes quiet (stopped or wedged), since
+    /// with real-time protection on, programs could be waiting on it.
+    Alive,
+    /// A program ran whose hash the local content found nothing in: for the reputation lookup.
+    Seen { sha256: String, path: String },
 }
 
 type Out = Arc<Mutex<std::io::Stdout>>;
@@ -75,13 +113,21 @@ enum Input {
     Live(procs::Live),
     Tick,
     ScanFinished(scan::Kind),
+    #[cfg(target_os = "linux")]
+    OnAccess(onaccess::Hit),
 }
 
-/// Content compiled for use.
+/// The behaviour content in use.
 struct Content {
     bundle: Bundle,
-    matcher: FileMatcher,
 }
+
+fn cache_path() -> Option<std::path::PathBuf> {
+    crate::config::state_subdir("sensor").ok().map(|d| d.join("verdicts.bin"))
+}
+
+/// Clean verdicts kept, at most (16 bytes each).
+const CACHE_ENTRIES: usize = 500_000;
 
 #[derive(Default, Serialize, Deserialize)]
 struct Schedule {
@@ -104,6 +150,22 @@ fn lower_priority() {
     unsafe {
         use windows::Win32::System::Threading::{BELOW_NORMAL_PRIORITY_CLASS, GetCurrentProcess, SetPriorityClass};
         let _ = SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
+    }
+}
+
+/// Puts the calling thread back at normal priority, where the OS lets us (root on Linux).
+pub(crate) fn normal_thread_priority() {
+    #[cfg(target_os = "linux")]
+    // SAFETY: changes this thread's own nice value.
+    unsafe {
+        libc::setpriority(libc::PRIO_PROCESS, libc::gettid() as libc::id_t, 0);
+    }
+    #[cfg(windows)]
+    // SAFETY: changes the priority of the calling thread (a pseudo handle, never closed).
+    unsafe {
+        use windows::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL};
+        // In a below-normal process, "above normal" is one step under a normal thread.
+        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
     }
 }
 
@@ -132,9 +194,18 @@ pub fn main() -> Result<()> {
     }
     {
         let tx = tx.clone();
+        let out = out.clone();
         std::thread::Builder::new().name("tick".into()).spawn(move || {
-            loop {
+            // The agent kills a sensor it doesn't hear from: this thread must get the CPU on a
+            // busy machine, although the sensor runs at low priority.
+            normal_thread_priority();
+            let alive = crate::security::supervisor::ALIVE_EVERY.as_secs().max(1);
+            for n in 1u64.. {
                 std::thread::sleep(Duration::from_secs(1));
+                // From this thread, not the main loop: a long scan there isn't a hang.
+                if n.is_multiple_of(alive) {
+                    emit(&out, &FromSensor::Alive);
+                }
                 if tx.send(Input::Tick).is_err() {
                     return;
                 }
@@ -165,7 +236,13 @@ struct Sensor {
     overrides: HashMap<String, RuleMode>,
     excl: Exclusions,
     content: Option<Arc<Content>>,
-    engine: Engine,
+    /// The signature database (verified) and the scan engine over it and the bundle.
+    db: Option<Arc<rmm_scan::db::Database>>,
+    scanner: Option<Arc<Engine>>,
+    cache: Arc<Mutex<Cache>>,
+    files_scanned: Arc<AtomicU64>,
+    cache_hits: Arc<AtomicU64>,
+    engine: rmm_content::engine::Engine,
     table: procs::Table,
     poller: procs::Poller,
     hashes: procs::HashCache,
@@ -185,6 +262,16 @@ struct Sensor {
     canaries: watch::Canaries,
     reported: HashMap<String, Instant>,
     scanning: Arc<AtomicBool>,
+    /// What real-time decisions are made with (swapped on every content or policy change).
+    #[cfg(target_os = "linux")]
+    rt_rules: Arc<std::sync::RwLock<Arc<onaccess::Rules>>>,
+    #[cfg(target_os = "linux")]
+    onaccess: Option<onaccess::Handle>,
+    /// Why real-time protection isn't on when the policy wants it.
+    rt_error: Option<String>,
+    /// Hashes already passed on for the reputation lookup, and ones the local content matched.
+    seen: std::collections::HashSet<String>,
+    local_hits: std::collections::HashSet<String>,
     schedule: Schedule,
     ticks: u64,
     /// Polling slows down (x2, x4...) when the sensor uses too much CPU.
@@ -204,7 +291,12 @@ impl Sensor {
             overrides: HashMap::new(),
             excl: Exclusions::default(),
             content: None,
-            engine: Engine::new(&[]),
+            db: None,
+            scanner: None,
+            cache: Arc::new(Mutex::new(Cache::new([0; 16], CACHE_ENTRIES))),
+            files_scanned: Arc::new(AtomicU64::new(0)),
+            cache_hits: Arc::new(AtomicU64::new(0)),
+            engine: rmm_content::engine::Engine::new(&[]),
             table: procs::Table::default(),
             poller: procs::Poller::new()?,
             hashes: procs::HashCache::default(),
@@ -223,6 +315,18 @@ impl Sensor {
             canaries: watch::Canaries::default(),
             reported: HashMap::new(),
             scanning: Arc::new(AtomicBool::new(false)),
+            #[cfg(target_os = "linux")]
+            rt_rules: Arc::new(std::sync::RwLock::new(Arc::new(onaccess::Rules {
+                engine: None,
+                policy: SensorPolicy::default(),
+                overrides: HashMap::new(),
+                excl: Exclusions::default(),
+            }))),
+            #[cfg(target_os = "linux")]
+            onaccess: None,
+            rt_error: None,
+            seen: Default::default(),
+            local_hits: Default::default(),
             schedule,
             ticks: 0,
             slow: 1,
@@ -243,10 +347,13 @@ impl Sensor {
         let _ = self.net.diff(netconn::list());
         for input in rx {
             match input {
-                Input::Cmd(ToSensor::Configure { policy, content }) => self.configure(policy, content),
+                Input::Cmd(ToSensor::Configure { policy, content, database }) => self.configure(policy, content, database),
                 Input::Cmd(ToSensor::Scan { request_id, kind, path }) => self.start_scan(request_id, kind, path),
                 Input::Cmd(ToSensor::Shutdown) => {
+                    #[cfg(target_os = "linux")]
+                    drop(self.onaccess.take());
                     self.store.flush();
+                    self.save_cache();
                     if !self.policy.enabled {
                         self.canaries.remove_all();
                     }
@@ -259,6 +366,8 @@ impl Sensor {
                 }
                 Input::Live(procs::Live::Exit(pid)) => self.ended(pid),
                 Input::Tick => self.tick(),
+                #[cfg(target_os = "linux")]
+                Input::OnAccess(hit) => self.on_access(hit),
                 Input::ScanFinished(kind) => {
                     match kind {
                         scan::Kind::Quick => self.schedule.last_quick = Some(Utc::now()),
@@ -274,27 +383,186 @@ impl Sensor {
         Ok(())
     }
 
-    fn configure(&mut self, policy: SensorPolicy, content: Option<String>) {
+    fn configure(&mut self, policy: SensorPolicy, content: Option<String>, database: Option<DbSet>) {
         self.overrides = policy.rule_modes.iter().cloned().collect();
         self.excl = Exclusions::from_policy(&policy);
         self.store.set_max(u64::from(policy.telemetry_mb.clamp(16, 4096)) * 1024 * 1024);
+        let mut rebuild = policy.archive_depth != self.policy.archive_depth && self.scanner.is_some();
+        self.policy = policy.clone();
         if let Some(json) = content {
-            match Bundle::parse(json.as_bytes()).and_then(|b| Ok(Content { matcher: FileMatcher::new(&b)?, bundle: b })) {
-                Ok(c) => {
-                    tracing::info!(version = %c.bundle.version, rules = c.bundle.rule_count(), "sensor content loaded");
-                    self.engine = Engine::new(&c.bundle.behaviour_rules);
-                    self.exec_checked.clear();
-                    self.content = Some(Arc::new(c));
+            match Bundle::parse(json.as_bytes()) {
+                Ok(b) => {
+                    tracing::info!(version = %b.version, rules = b.rule_count(), "sensor content loaded");
+                    self.engine = rmm_content::engine::Engine::new(&b.behaviour_rules);
+                    self.content = Some(Arc::new(Content { bundle: b }));
+                    rebuild = true;
                 }
                 Err(e) => tracing::error!("sensor: content rejected: {e}"),
             }
+        }
+        if let Some(set) = database {
+            self.load_database(set);
+        } else if rebuild && let Err(e) = self.rebuild_scanner() {
+            tracing::error!("sensor: file rules: {e}");
         }
         if policy.enabled && policy.canaries {
             self.canaries.plant();
         } else {
             self.canaries.remove_all();
         }
-        self.policy = policy;
+        self.sync_rules();
+        self.sync_realtime();
+        // So the console sees the new real-time state now, not at the next minute.
+        self.health();
+    }
+
+    /// Hands the current engine and policy to the real-time workers.
+    fn sync_rules(&mut self) {
+        #[cfg(target_os = "linux")]
+        {
+            let r = onaccess::Rules { engine: self.scanner.clone(), policy: self.policy.clone(), overrides: self.overrides.clone(), excl: self.excl.clone() };
+            *self.rt_rules.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(r);
+        }
+    }
+
+    /// Starts, restarts or stops on-access protection to match the policy.
+    fn sync_realtime(&mut self) {
+        let want = self.policy.enabled && self.policy.realtime != RealtimeMode::Off;
+        #[cfg(target_os = "linux")]
+        {
+            if !want {
+                if self.onaccess.take().is_some() {
+                    tracing::info!("on-access protection off");
+                }
+                self.rt_error = None;
+                return;
+            }
+            if self.onaccess.as_ref().is_some_and(|h| h.scan_on_write == self.policy.scan_on_write) {
+                return;
+            }
+            drop(self.onaccess.take());
+            let (hits, rx) = mpsc::channel();
+            let tx = self.tx.clone();
+            let _ = std::thread::Builder::new().name("onaccess-hits".into()).spawn(move || {
+                for h in rx {
+                    if tx.send(Input::OnAccess(h)).is_err() {
+                        return;
+                    }
+                }
+            });
+            match onaccess::start(self.rt_rules.clone(), self.cache.clone(), hits, self.policy.scan_on_write) {
+                Ok(h) => {
+                    self.onaccess = Some(h);
+                    self.rt_error = None;
+                }
+                Err(e) => {
+                    if self.rt_error.as_deref() != Some(&e) {
+                        tracing::warn!("on-access protection unavailable, scanning programs after they start instead: {e}");
+                    }
+                    self.rt_error = Some(e);
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.rt_error = want.then(|| "on-access protection is Linux only; programs are scanned after they start".to_string());
+        }
+    }
+
+    /// Exec permission events decided this program before it ran.
+    fn decided(&self, p: &Proc) -> bool {
+        #[cfg(target_os = "linux")]
+        return self.onaccess.as_ref().is_some_and(|h| p.exe.as_deref().is_some_and(|e| h.decides(e)));
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = p;
+            false
+        }
+    }
+
+    /// The scan engine over the current database and bundle. The verdict cache follows its
+    /// generation: a new engine starts from the clean verdicts of that same generation only.
+    fn rebuild_scanner(&mut self) -> Result<(), String> {
+        let legacy = match &self.content {
+            Some(c) => Some((c.bundle.version.clone(), FileMatcher::new(&c.bundle).map_err(|e| e.to_string())?)),
+            None => None,
+        };
+        let mut limits = rmm_scan::Limits::default();
+        if self.policy.archive_depth > 0 {
+            limits.max_depth = self.policy.archive_depth.min(20);
+        }
+        let engine = Engine::new(self.db.clone(), legacy, limits)?;
+        self.exec_checked.clear();
+        if !engine.has_signatures() {
+            self.scanner = None;
+            self.sync_rules();
+            return Ok(());
+        }
+        let generation = rmm_scan::cache::generation(&[&engine.generation()]);
+        let mut c = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        if c.generation() != generation {
+            let _ = c.save();
+            *c = match cache_path() {
+                Some(p) => Cache::load(&p, generation, CACHE_ENTRIES),
+                None => Cache::new(generation, CACHE_ENTRIES),
+            };
+        }
+        drop(c);
+        if engine.yara_unsupported() {
+            tracing::warn!("this agent was built without YARA: the database's rules are skipped, its hashes still match");
+        }
+        self.scanner = Some(Arc::new(engine));
+        self.sync_rules();
+        Ok(())
+    }
+
+    /// Loads the newest database that verifies and compiles, else the previous one.
+    fn load_database(&mut self, set: DbSet) {
+        let key = crate::security::supervisor::pubkey();
+        let mut errors = Vec::new();
+        let old = self.db.take();
+        let mut loaded = None;
+        for f in [set.current, set.previous].into_iter().flatten() {
+            let opened = key
+                .as_deref()
+                .ok_or_else(|| "this agent was built without a release key".to_string())
+                .and_then(|k| rmm_scan::db::Database::open(&f.path, k).map_err(|e| e.to_string()))
+                .and_then(|d| if d.version() == f.version { Ok(d) } else { Err(format!("the file says version {}", d.version())) });
+            let started = Instant::now();
+            match opened {
+                Ok(d) => {
+                    self.db = Some(Arc::new(d));
+                    match self.rebuild_scanner() {
+                        Ok(()) => {
+                            tracing::info!(version = %f.version, secs = started.elapsed().as_secs_f32(), yara = self.scanner.as_ref().map_or(0, |s| s.yara_rules()), "signature database loaded");
+                            loaded = Some(f.version.clone());
+                            break;
+                        }
+                        Err(e) => errors.push(format!("database {}: {e}", f.version)),
+                    }
+                }
+                Err(e) => errors.push(format!("database {}: {e}", f.version)),
+            }
+            self.db = None;
+        }
+        if loaded.is_none() && !errors.is_empty() {
+            // Neither loads: keep running what we had.
+            self.db = old;
+            let _ = self.rebuild_scanner();
+            loaded = self.db.as_ref().map(|d| d.version().to_string());
+        } else if loaded.is_none() {
+            let _ = self.rebuild_scanner();
+        }
+        for e in &errors {
+            tracing::error!("sensor: {e}");
+        }
+        emit(&self.out, &FromSensor::Database { version: loaded, error: (!errors.is_empty()).then(|| errors.join("; ")) });
+    }
+
+    fn save_cache(&self) {
+        if let Err(e) = self.cache.lock().unwrap_or_else(|e| e.into_inner()).save() {
+            tracing::warn!("verdict cache: {e}");
+        }
     }
 
     fn every(&self, secs: u64) -> bool {
@@ -347,6 +615,7 @@ impl Sensor {
         if self.ticks.is_multiple_of(60) {
             self.scheduled_scans();
             self.health();
+            self.save_cache();
         }
         if self.ticks.is_multiple_of(3600) {
             self.users.refresh();
@@ -380,7 +649,17 @@ impl Sensor {
         if cfg!(windows) {
             collectors.push(("registry".into(), "poll".into()));
         }
-        let rules = self.content.as_ref().map_or(0, |c| c.bundle.rule_count() as u32);
+        if self.scanner.is_some() {
+            collectors.push(("scan".into(), if rmm_scan::YARA { "rmm-scan".into() } else { "rmm-scan (no YARA)".into() }));
+        }
+        let realtime = self.realtime_health();
+        if let Some(r) = &realtime
+            && r.mode != RealtimeMode::Off
+        {
+            collectors.push(("realtime".into(), r.mechanism.clone()));
+        }
+        let yara = self.scanner.as_ref().map_or(0, |s| s.yara_rules() as u32);
+        let rules = self.content.as_ref().map_or(0, |c| c.bundle.rule_count() as u32) + yara;
         let h = SensorHealth {
             events_total: self.events_total,
             events_per_min: self.minute.len() as f64,
@@ -391,8 +670,34 @@ impl Sensor {
             collectors,
             canaries: self.canaries.count() as u32,
             last_scan: self.schedule.last_quick.max(self.schedule.last_full),
+            database_version: self.db.as_ref().map(|d| d.version().to_string()),
+            yara_rules: yara,
+            hash_signatures: self.db.as_ref().map_or(0, |d| d.meta().sha256 + d.meta().md5 + d.meta().sha1),
+            files_scanned: self.files_scanned.load(Ordering::Relaxed),
+            cache_hits: self.cache_hits.load(Ordering::Relaxed),
+            realtime,
         };
-        emit(&self.out, &FromSensor::Health(h));
+        emit(&self.out, &FromSensor::Health(Box::new(h)));
+    }
+
+    fn realtime_health(&self) -> Option<RealtimeHealth> {
+        let mode = self.policy.realtime;
+        let mut r = RealtimeHealth { mode, scan_on_write: self.policy.scan_on_write, error: self.rt_error.clone(), ..Default::default() };
+        #[cfg(target_os = "linux")]
+        if let Some(h) = &self.onaccess {
+            let s = &h.stats;
+            let n = |a: &AtomicU64| a.load(Ordering::Relaxed);
+            (r.p50_us, r.p99_us) = s.percentiles();
+            r.state = "on".into();
+            r.mechanism = "fanotify".into();
+            r.filesystems = h.filesystems.load(Ordering::Relaxed) as u32;
+            (r.decisions, r.denied, r.cache_hits, r.timeouts, r.overloaded) = (n(&s.decisions), n(&s.denied), n(&s.cache_hits), n(&s.timeouts), n(&s.overloaded));
+            (r.write_scans, r.write_dropped) = (n(&s.write_scans), n(&s.write_dropped));
+            return Some(r);
+        }
+        r.state = if mode == RealtimeMode::Off { "off".into() } else { "unavailable".into() };
+        r.mechanism = "scan-after-start".into();
+        Some(r)
     }
 
     fn scheduled_scans(&mut self) {
@@ -413,8 +718,27 @@ impl Sensor {
         }
         let parent = self.table.get(p.ppid).cloned();
         self.table.insert(p.clone());
-        self.exec_check(&p);
+        // With exec permission events, it was decided before it ran (unless it's on a
+        // filesystem they don't cover: network, FUSE).
+        if !self.decided(&p) {
+            self.exec_check(&p);
+        }
+        self.seen(&p);
         self.event(procs::start_event(p, parent));
+    }
+
+    /// Passes a program's hash on for the reputation lookup, once, unless our own content
+    /// already matched it.
+    fn seen(&mut self, p: &Proc) {
+        let (Some(sha), Some(exe)) = (&p.sha256, &p.exe) else { return };
+        if !self.policy.reputation || self.local_hits.contains(sha) || self.seen.contains(sha) {
+            return;
+        }
+        if self.seen.len() > 200_000 {
+            self.seen.clear();
+        }
+        self.seen.insert(sha.clone());
+        emit(&self.out, &FromSensor::Seen { sha256: sha.clone(), path: exe.clone() });
     }
 
     fn ended(&mut self, pid: u32) {
@@ -477,6 +801,19 @@ impl Sensor {
         self.content.as_ref().map(|c| c.bundle.version.clone())
     }
 
+    fn database_version(&self) -> Option<String> {
+        self.db.as_ref().map(|d| d.version().to_string())
+    }
+
+    fn scanner<'a>(&'a self, engine: &'a Engine) -> scan::Scanner<'a> {
+        scan::Scanner::new(engine, &self.excl, Some(&self.cache))
+    }
+
+    fn count(&self, s: &scan::Scanner) {
+        self.files_scanned.fetch_add(s.scanned, Ordering::Relaxed);
+        self.cache_hits.fetch_add(s.cached, Ordering::Relaxed);
+    }
+
     /// The process, its ancestors, then related recent events (same process tree, last 10
     /// minutes), newest last.
     fn context(&self, e: &Event) -> Vec<Event> {
@@ -504,6 +841,12 @@ impl Sensor {
     }
 
     fn report(&mut self, d: SensorDetection) {
+        if let Some(h) = d.sha256.as_ref().filter(|_| d.source == "file") {
+            if self.local_hits.len() > 100_000 {
+                self.local_hits.clear();
+            }
+            self.local_hits.insert(h.clone());
+        }
         if self.reported.get(&d.id).is_some_and(|t| t.elapsed() < Duration::from_secs(600)) {
             return;
         }
@@ -578,8 +921,12 @@ impl Sensor {
             user: e.process.as_ref().and_then(|p| p.user.clone()),
             detected_at: e.ts,
             content_version: self.content_version(),
+            database_version: self.database_version(),
+            part: None,
             context: self.context(e),
             quarantine_id,
+            found_by: None,
+            denied: false,
         };
         self.report(d);
     }
@@ -607,47 +954,70 @@ impl Sensor {
             user: None,
             detected_at: now,
             content_version: self.content_version(),
+            database_version: self.database_version(),
+            part: None,
             context: std::iter::once(trigger).chain(recent).collect(),
             quarantine_id: None,
+            found_by: None,
+            denied: false,
         };
         self.report(d);
     }
 
     // --- files -------------------------------------------------------------------------------
 
-    /// Checks a program as it starts, once per image hash.
+    /// Checks a program just after it starts, once per image hash (where real-time protection
+    /// doesn't decide it before it runs).
     fn exec_check(&mut self, p: &Proc) {
-        let (Some(content), Some(exe), Some(sha)) = (self.content.clone(), p.exe.clone(), p.sha256.clone()) else { return };
+        let (Some(engine), Some(exe), Some(sha)) = (self.scanner.clone(), p.exe.clone(), p.sha256.clone()) else { return };
         if self.excl.process(p) || self.exec_checked.get(&sha) == Some(&false) {
             return;
         }
-        let mut s = scan::Scanner { matcher: &content.matcher, excl: &self.excl, scanned: 0 };
-        let Some(f) = s.file(Path::new(&exe)) else {
+        let mut s = self.scanner(&engine);
+        let found = s.file(Path::new(&exe));
+        self.count(&s);
+        let Some(f) = found else {
             self.exec_checked.insert(sha, false);
             return;
         };
-        let (rule_id, name, severity, mode, mitre) = finding_meta(&f, &self.policy, &self.overrides, &self.excl);
-        if mode == RuleMode::Disabled {
-            return;
-        }
-        let mut action = None;
+        self.exec_detection(p, &f, false, None, true);
+    }
+
+    /// A program that matched as it was started. `denied`: refused before it ran. `hold`: why
+    /// nothing may be done (audit mode). `running`: it runs (so a blocking verdict kills it).
+    fn exec_detection(&mut self, p: &Proc, f: &scan::Finding, denied: bool, hold: Option<&str>, running: bool) {
+        let Some((m, mode)) = best(f, &self.policy, &self.overrides, &self.excl) else { return };
+        let exe = f.path.to_string_lossy().into_owned();
+        let (rule_id, name, severity, mitre) = (m.id.clone(), m.name.clone(), m.severity, m.mitre.clone());
+        let mut actions: Vec<String> = Vec::new();
         let mut status = ThreatStatus::Active;
         let mut quarantine_id = None;
-        if mode == RuleMode::Block {
-            action = Some(kill(p));
-            if action.as_deref() == Some("killed") {
+        let would_quarantine = mode == RuleMode::Block || (mode == RuleMode::Alert && self.policy.auto_quarantine && severity <= ThreatSeverity::High);
+        if denied {
+            actions.push("denied before it ran".into());
+            status = ThreatStatus::Blocked;
+        } else if let Some(why) = hold.filter(|_| mode == RuleMode::Block || would_quarantine) {
+            actions.push(format!("nothing done: {why}"));
+        } else if mode == RuleMode::Block && running {
+            let k = kill(p);
+            if k == "killed" {
                 status = ThreatStatus::Blocked;
             }
+            actions.push(k);
         }
-        if mode == RuleMode::Block || (mode == RuleMode::Alert && self.policy.auto_quarantine && severity <= ThreatSeverity::High) {
-            match quarantine::Store::open().and_then(|q| q.quarantine(Path::new(&exe), Some(name.clone()), None)) {
-                Ok(item) => {
-                    quarantine_id = Some(item.id);
-                    status = ThreatStatus::Quarantined;
-                    action = Some(action.map_or("quarantined".to_string(), |a| format!("{a}, quarantined")));
-                    emit(&self.out, &FromSensor::QuarantineChanged);
+        if hold.is_none() && would_quarantine {
+            if let Some(why) = quarantine::guarded(&f.path) {
+                actions.push(format!("not quarantined: {why}"));
+            } else {
+                match quarantine::Store::open().and_then(|q| q.quarantine(&f.path, Some(name.clone()), None)) {
+                    Ok(item) => {
+                        quarantine_id = Some(item.id);
+                        status = ThreatStatus::Quarantined;
+                        actions.push("quarantined".into());
+                        emit(&self.out, &FromSensor::QuarantineChanged);
+                    }
+                    Err(e) => actions.push(format!("couldn't quarantine: {e:#}")),
                 }
-                Err(e) => action = Some(format!("{}couldn't quarantine: {e:#}", action.map(|a| format!("{a}; ")).unwrap_or_default())),
             }
         }
         let mut ev = procs::start_event(p.clone(), self.table.get(p.ppid).cloned());
@@ -661,25 +1031,59 @@ impl Sensor {
             mitre,
             status,
             audit: mode == RuleMode::Audit,
-            action_taken: action,
+            action_taken: (!actions.is_empty()).then(|| actions.join(", ")),
             resources: vec![exe],
             sha256: Some(f.sha256.clone()),
-            process: Some(p.command_line.clone()),
+            process: Some(if p.command_line.is_empty() { p.name.clone() } else { p.command_line.clone() }),
             user: p.user.clone(),
             detected_at: Utc::now(),
             content_version: self.content_version(),
+            database_version: self.database_version(),
+            part: m.part.clone(),
             context: self.context(&ev),
             quarantine_id,
+            found_by: Some(found_by::ON_EXEC.into()),
+            denied,
         };
         self.report(d);
     }
 
+    /// What a real-time worker found.
+    #[cfg(target_os = "linux")]
+    fn on_access(&mut self, h: onaccess::Hit) {
+        let audit = (self.policy.realtime != RealtimeMode::Block).then_some("real-time protection is in audit mode");
+        match h.what {
+            onaccess::HitKind::Exec { pid, denied, late, ino, size } => {
+                // Denied: the process still runs what it ran before. Allowed after the
+                // deadline: it runs the file now, unless the pid is already something else.
+                let mut p = procs::read_proc(pid, &self.users).unwrap_or(Proc { pid, ..Default::default() });
+                let running = late && onaccess::runs(pid, ino, size);
+                if late {
+                    tracing::info!(pid, running, path = %h.finding.path.display(), "on-access: verdict after the deadline");
+                }
+                p.sha256 = Some(h.finding.sha256.clone());
+                self.exec_detection(&p, &h.finding, denied, audit, running);
+            }
+            onaccess::HitKind::Write { package_manager } => {
+                let hold = audit.or(package_manager.then_some("written by the package manager"));
+                if let Some(d) = file_detection(&h.finding, &self.policy, &self.overrides, &self.excl, (self.content_version(), self.database_version()), found_by::ON_WRITE, hold) {
+                    if d.quarantine_id.is_some() {
+                        emit(&self.out, &FromSensor::QuarantineChanged);
+                    }
+                    self.report(d);
+                }
+            }
+        }
+    }
+
     /// One file, outside a scan (it just appeared in a watched place).
     fn scan_one(&mut self, path: &Path) {
-        let Some(content) = self.content.clone() else { return };
-        let mut s = scan::Scanner { matcher: &content.matcher, excl: &self.excl, scanned: 0 };
-        if let Some(f) = s.file(path) {
-            let d = file_detection(&f, &self.policy, &self.overrides, &self.excl, self.content_version());
+        let Some(engine) = self.scanner.clone() else { return };
+        let mut s = self.scanner(&engine);
+        let found = s.file(path);
+        self.count(&s);
+        if let Some(f) = found {
+            let d = file_detection(&f, &self.policy, &self.overrides, &self.excl, (self.content_version(), self.database_version()), found_by::ON_WRITE, None);
             if let Some(d) = d {
                 if d.quarantine_id.is_some() {
                     emit(&self.out, &FromSensor::QuarantineChanged);
@@ -690,8 +1094,8 @@ impl Sensor {
     }
 
     fn start_scan(&mut self, request_id: Option<Uuid>, kind: scan::Kind, path: Option<String>) {
-        let Some(content) = self.content.clone() else {
-            emit(&self.out, &FromSensor::ScanDone { request_id, ok: false, message: "no detection content yet: the server hasn't sent a signed bundle".into() });
+        let Some(engine) = self.scanner.clone() else {
+            emit(&self.out, &FromSensor::ScanDone { request_id, ok: false, message: "no detection content yet: the server hasn't sent a signed bundle or signature database".into() });
             return;
         };
         if self.scanning.swap(true, Ordering::SeqCst) {
@@ -709,11 +1113,12 @@ impl Sensor {
         };
         let (out, policy, overrides, excl, busy, tx) =
             (self.out.clone(), self.policy.clone(), self.overrides.clone(), self.excl.clone(), self.scanning.clone(), self.tx.clone());
-        let version = self.content_version();
+        let (cache, files_scanned, cache_hits) = (self.cache.clone(), self.files_scanned.clone(), self.cache_hits.clone());
+        let version = (self.content_version(), self.database_version());
         tracing::info!(?kind, roots = roots.len(), "scan started");
         let _ = std::thread::Builder::new().name("scan".into()).spawn(move || {
             let started = Instant::now();
-            let mut s = scan::Scanner { matcher: &content.matcher, excl: &excl, scanned: 0 };
+            let mut s = scan::Scanner::new(&engine, &excl, Some(&cache));
             let mut found = 0u32;
             let mut quarantined = 0u32;
             let mut n = 0u64;
@@ -721,7 +1126,7 @@ impl Sensor {
                 s.walk(
                     root,
                     &mut |f| {
-                        if let Some(d) = file_detection(&f, &policy, &overrides, &excl, version.clone()) {
+                        if let Some(d) = file_detection(&f, &policy, &overrides, &excl, version.clone(), found_by::SCAN, None) {
                             found += 1;
                             if d.quarantine_id.is_some() {
                                 quarantined += 1;
@@ -740,9 +1145,16 @@ impl Sensor {
                     },
                 );
             }
+            files_scanned.fetch_add(s.scanned, Ordering::Relaxed);
+            cache_hits.fetch_add(s.cached, Ordering::Relaxed);
+            let _ = cache.lock().unwrap_or_else(|e| e.into_inner()).save();
+            let files = match s.cached {
+                0 => format!("{} files", s.scanned),
+                c => format!("{} files, {c} unchanged since a clean scan", s.scanned + c),
+            };
             let mut message = match found {
-                0 => format!("No threats found ({} files in {}s)", s.scanned, started.elapsed().as_secs()),
-                n => format!("Found {n} threat{} ({} files in {}s)", if n == 1 { "" } else { "s" }, s.scanned, started.elapsed().as_secs()),
+                0 => format!("No threats found ({files} in {}s)", started.elapsed().as_secs()),
+                n => format!("Found {n} threat{} ({files} in {}s)", if n == 1 { "" } else { "s" }, started.elapsed().as_secs()),
             };
             if quarantined > 0 {
                 message.push_str(&format!("; {quarantined} quarantined"));
@@ -754,22 +1166,36 @@ impl Sensor {
     }
 }
 
-fn finding_meta(f: &scan::Finding, policy: &SensorPolicy, overrides: &HashMap<String, RuleMode>, excl: &Exclusions) -> (String, String, ThreatSeverity, RuleMode, Vec<String>) {
-    match &f.hit {
-        // Known-bad hashes are as certain as it gets.
-        scan::Hit::Hash(h) => {
-            ("RMM-HASH".to_string(), h.name.clone(), h.severity, effective_mode(policy, overrides, excl, "RMM-HASH", RuleMode::Alert, Confidence::High), vec![])
-        }
-        scan::Hit::Rule(r) => (r.id.clone(), r.name.clone(), r.severity, effective_mode(policy, overrides, excl, &r.id, r.mode, r.confidence), r.mitre.clone()),
-    }
+/// The match a finding is reported as, and the mode it runs in: the one that acts most
+/// (block, then alert, then audit; disabled ones never), then the most severe, then hashes
+/// before rules before heuristics. `None` when every match is switched off.
+fn best<'a>(f: &'a scan::Finding, policy: &SensorPolicy, overrides: &HashMap<String, RuleMode>, excl: &Exclusions) -> Option<(&'a Match, RuleMode)> {
+    let rank = |k: rmm_scan::Kind| match k {
+        rmm_scan::Kind::Hash | rmm_scan::Kind::BundleHash => 0,
+        rmm_scan::Kind::Yara | rmm_scan::Kind::BundleRule => 1,
+        rmm_scan::Kind::Heuristic => 2,
+    };
+    f.matches
+        .iter()
+        .map(|m| (m, effective_mode(policy, overrides, excl, &m.id, m.mode, m.confidence)))
+        .filter(|(_, mode)| *mode != RuleMode::Disabled)
+        // Severity orders most severe first.
+        .min_by_key(|(m, mode)| (std::cmp::Reverse(*mode), m.severity, rank(m.kind)))
 }
 
-/// A detection for a file a scan found, quarantining it when the policy says so.
-fn file_detection(f: &scan::Finding, policy: &SensorPolicy, overrides: &HashMap<String, RuleMode>, excl: &Exclusions, version: Option<String>) -> Option<SensorDetection> {
-    let (rule_id, name, severity, mode, mitre) = finding_meta(f, policy, overrides, excl);
-    if mode == RuleMode::Disabled {
-        return None;
-    }
+/// A detection for a file a scan found, quarantining it when the policy says so, unless
+/// `hold` says why it mustn't be.
+fn file_detection(
+    f: &scan::Finding,
+    policy: &SensorPolicy,
+    overrides: &HashMap<String, RuleMode>,
+    excl: &Exclusions,
+    (version, database_version): (Option<String>, Option<String>),
+    how: &str,
+    hold: Option<&str>,
+) -> Option<SensorDetection> {
+    let (m, mode) = best(f, policy, overrides, excl)?;
+    let (rule_id, name, severity, mitre) = (m.id.clone(), m.name.clone(), m.severity, m.mitre.clone());
     let path = f.path.to_string_lossy().into_owned();
     let mut status = ThreatStatus::Active;
     let mut action = None;
@@ -777,7 +1203,11 @@ fn file_detection(f: &scan::Finding, policy: &SensorPolicy, overrides: &HashMap<
     // Severity orders most severe first: `<= High` means high or severe.
     let quarantine = mode == RuleMode::Block || (mode == RuleMode::Alert && policy.auto_quarantine && severity <= ThreatSeverity::High);
     let id = format!("{rule_id}:{}", f.sha256);
-    if quarantine {
+    if let Some(why) = hold.filter(|_| quarantine) {
+        action = Some(format!("not quarantined: {why}"));
+    } else if let Some(why) = quarantine.then(|| quarantine::guarded(&f.path)).flatten() {
+        action = Some(format!("not quarantined: {why}"));
+    } else if quarantine {
         match quarantine::Store::open().and_then(|q| q.quarantine(&f.path, Some(name.clone()), Some(id.clone()))) {
             Ok(item) => {
                 status = ThreatStatus::Quarantined;
@@ -787,7 +1217,7 @@ fn file_detection(f: &scan::Finding, policy: &SensorPolicy, overrides: &HashMap<
             Err(e) => action = Some(format!("couldn't quarantine: {e:#}")),
         }
     }
-    let mut ev = watch::file_event("scan", &f.path);
+    let mut ev = watch::file_event(if how == found_by::SCAN { "scan" } else { "write" }, &f.path);
     ev.file.as_mut().unwrap().sha256 = Some(f.sha256.clone());
     Some(SensorDetection {
         id: format!("{id}:{path}"),
@@ -805,8 +1235,12 @@ fn file_detection(f: &scan::Finding, policy: &SensorPolicy, overrides: &HashMap<
         user: None,
         detected_at: Utc::now(),
         content_version: version,
+        database_version,
+        part: m.part.clone(),
         context: vec![ev],
         quarantine_id,
+        found_by: Some(how.into()),
+        denied: false,
     })
 }
 
@@ -822,5 +1256,41 @@ pub fn kill(p: &Proc) -> String {
         Some(x) if x.kill() => "killed".into(),
         Some(_) => "couldn't kill it".into(),
         None => "already exited".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rmm_content::Confidence;
+    use rmm_proto::security::Exclusion;
+
+    fn m(id: &str, kind: rmm_scan::Kind, severity: ThreatSeverity, mode: RuleMode, confidence: Confidence) -> Match {
+        Match { kind, id: id.into(), name: id.into(), severity, confidence, mode, mitre: vec![], part: None }
+    }
+
+    #[test]
+    fn the_reported_match_and_its_mode() {
+        use rmm_scan::Kind::*;
+        let f = scan::Finding {
+            path: "/tmp/x".into(),
+            sha256: "00".repeat(32),
+            matches: vec![
+                m("RMM-H-0002", Heuristic, ThreatSeverity::Moderate, RuleMode::Audit, Confidence::Medium),
+                m("Y-ALERT", Yara, ThreatSeverity::Moderate, RuleMode::Alert, Confidence::Medium),
+                m("Y-BLOCK", Yara, ThreatSeverity::Low, RuleMode::Block, Confidence::High),
+                m("Y-SEVERE", Yara, ThreatSeverity::Severe, RuleMode::Alert, Confidence::Medium),
+            ],
+        };
+        let none = HashMap::new();
+        let id = |p: &SensorPolicy, o: &HashMap<String, RuleMode>, e: &Exclusions| best(&f, p, o, e).map(|(m, mode)| (m.id.clone(), mode));
+        let off = SensorPolicy::default();
+        assert_eq!(id(&off, &none, &Exclusions::default()), Some(("Y-SEVERE".into(), RuleMode::Alert)), "without prevention nothing blocks: most severe alert");
+        let on = SensorPolicy { prevention: true, ..Default::default() };
+        assert_eq!(id(&on, &none, &Exclusions::default()), Some(("Y-BLOCK".into(), RuleMode::Block)), "high confidence, prevention on: it blocks");
+        let kill: HashMap<String, RuleMode> = [("Y-BLOCK".to_string(), RuleMode::Disabled), ("Y-SEVERE".into(), RuleMode::Disabled), ("Y-ALERT".into(), RuleMode::Disabled)].into();
+        assert_eq!(id(&on, &kill, &Exclusions::default()), Some(("RMM-H-0002".into(), RuleMode::Audit)), "the kill switch leaves the audit heuristic");
+        let excl = Exclusions::from_policy(&SensorPolicy { exclusions: vec![Exclusion { kind: rmm_proto::security::ExclusionKind::Rule, value: "RMM-H-0002".into() }], ..Default::default() });
+        assert_eq!(id(&on, &kill, &excl), None, "every match switched off: no detection");
     }
 }

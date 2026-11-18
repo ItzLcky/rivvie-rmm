@@ -23,6 +23,26 @@ pub fn checked_absolute(path: &Path) -> Result<PathBuf> {
     Ok(path.to_path_buf())
 }
 
+/// `path` with `.` and `..` resolved lexically (no filesystem access, links not followed).
+pub fn normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => match out.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    out.pop();
+                }
+                // `..` at the root stays at the root.
+                Some(Component::RootDir | Component::Prefix(_)) => {}
+                _ => out.push(".."),
+            },
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
 /// Opens `path` with `opts` without following a symbolic link (or other reparse point) at
 /// its final component. On unix a link there fails the open (`ELOOP`), and `O_NONBLOCK`
 /// keeps a FIFO planted at the path from blocking it (it changes nothing for regular files).
@@ -60,5 +80,17 @@ mod tests {
         // `..` inside a name is just a name.
         let dots = if cfg!(windows) { "C:\\a..b" } else { "/tmp/a..b" };
         assert!(checked_absolute(Path::new(dots)).is_ok());
+    }
+
+    #[test]
+    fn lexical_normalisation() {
+        if cfg!(unix) {
+            assert_eq!(normalize(Path::new("/tmp/../usr/./bin/x")), Path::new("/usr/bin/x"));
+            assert_eq!(normalize(Path::new("/../../bin/sh")), Path::new("/bin/sh"));
+            assert_eq!(normalize(Path::new("a/../../b")), Path::new("../b"));
+        }
+        if cfg!(windows) {
+            assert_eq!(normalize(Path::new("C:\\Temp\\..\\Windows\\System32\\x.dll")), Path::new("C:\\Windows\\System32\\x.dll"));
+        }
     }
 }

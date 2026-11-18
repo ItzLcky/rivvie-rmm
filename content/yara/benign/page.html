@@ -1,0 +1,4 @@
+<!doctype html>
+<html><head><title>Status</title>
+<script>document.addEventListener('DOMContentLoaded', () => { fetch('/api/status').then(r => r.json()).then(s => { document.title = s.ok ? 'OK' : 'Down'; }); });</script>
+</head><body><h1>Status</h1></body></html>

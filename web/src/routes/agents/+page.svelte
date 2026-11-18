@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { CloudDownload, Play, Plus, Search, X } from '@lucide/svelte';
+	import { CloudDownload, FolderInput, Play, Plus, Search, X } from '@lucide/svelte';
 	import { api } from '#lib/api.js';
 	import { ago, num, plural } from '#lib/format.js';
 	import { liveReload, onLive } from '#lib/live.svelte.js';
@@ -10,6 +10,8 @@
 	import { attempt, toast } from '#lib/toast.svelte.js';
 	import { confirmAction } from '#lib/confirm.svelte.js';
 	import type { AgentSummary, Page, Release } from '#lib/types.js';
+	import type { Category } from '#lib/policy/types.js';
+	import CategoryChange from '#lib/components/policy/CategoryChange.svelte';
 	import { param, qs, setParams, sortState } from '#lib/url.svelte.js';
 	import Button from '#lib/ui/Button.svelte';
 	import DataTable, { type Column } from '#lib/ui/DataTable.svelte';
@@ -52,6 +54,8 @@
 			client_id: clientId(),
 			site_id: param('site'),
 			os: param('os'),
+			category_id: param('category'),
+			policy_set_id: param('set'),
 			health: param('health') || (views[view] as { health?: string }).health,
 			q: param('q'),
 			sort: sort.key,
@@ -106,13 +110,16 @@
 	// A count for every view, under the other filters (client, site, OS, search): one cheap
 	// limit=1 request each, refreshed when agents go online or offline.
 	const viewCounts = resource(async () => {
-		const base = { client_id: clientId(), site_id: param('site'), os: param('os'), q: param('q'), limit: 1 };
+		const base = { client_id: clientId(), site_id: param('site'), os: param('os'), category_id: param('category'), policy_set_id: param('set'), q: param('q'), limit: 1 };
 		const keys = Object.keys(views) as View[];
 		const pages = await Promise.all(keys.map((k) => api.get<Page<AgentSummary>>(`/agents${qs({ ...views[k], ...base })}`)));
 		return Object.fromEntries(keys.map((k, i) => [k, `${num(pages[i].total)}${pages[i].total_exact ? '' : '+'}`])) as Record<View, string>;
 	});
 	liveReload(() => viewCounts.reload(), (e) => e.type === 'agent' && !e.last_metrics, { debounceMs: 1500 });
-	const filtered = $derived(!!(param('q') || param('os') || param('site') || param('health') || view !== 'all'));
+	const filtered = $derived(!!(param('q') || param('os') || param('site') || param('health') || param('category') || param('set') || view !== 'all'));
+
+	const categories = resource(() => api.get<Category[]>('/device-categories'));
+	let categorizing = $state(false);
 </script>
 
 <PageHeader
@@ -161,12 +168,14 @@
 	{#snippet diskCell(a: AgentSummary)}{#if a.last_metrics}<UsageBar bar={false} value={a.disk_max_pct} />{:else}<span class="text-muted" aria-label="no data">–</span>{/if}{/snippet}
 	{#snippet seenCell(a: AgentSummary)}<span class="text-muted whitespace-nowrap">{a.online ? 'now' : ago(a.last_seen_at)}</span>{/snippet}
 	{#snippet versionCell(a: AgentSummary)}<span class="text-muted font-mono text-[13px]">{a.agent_version}</span>{/snippet}
+	{#snippet categoryCell(a: AgentSummary)}<span class="text-muted whitespace-nowrap">{a.category_name ?? '–'}</span>{/snippet}
+	{#snippet setCell(a: AgentSummary)}{#if a.policy_set_id}<a class="text-muted hover:text-fg whitespace-nowrap" href="/policies/sets/{a.policy_set_id}">{a.policy_set_name}</a>{:else}<span class="text-muted">–</span>{/if}{/snippet}
 	{#snippet enrolledCell(a: AgentSummary)}<span class="text-muted">{ago(a.enrolled_at)}</span>{/snippet}
 
 	<DataTable
 		id="agents"
 		caption="Agents"
-		activeFilters={[param('site'), param('os'), param('health')].filter(Boolean).length}
+		activeFilters={[param('site'), param('os'), param('health'), param('category'), param('set')].filter(Boolean).length}
 		rows={list.rows}
 		key={(a) => a.id}
 		loading={list.loading}
@@ -179,6 +188,8 @@
 			{ id: 'hostname', label: 'Hostname', sort: 'hostname', cell: hostCell, hideable: false },
 			{ id: 'client', label: scoped ? 'Site' : 'Client / site', sort: 'client', cell: clientCell, from: 'md' },
 			{ id: 'os', label: 'OS', sort: 'os', cell: osCell, from: 'lg' },
+			{ id: 'category', label: 'Category', sort: 'category', cell: categoryCell, from: 'lg' },
+			{ id: 'set', label: 'Policy set', cell: setCell, defaultHidden: true },
 			{ id: 'status', label: 'Status', sort: 'status', cell: statusCell, from: 'md' },
 			{ id: 'health', label: 'Health', sort: 'health', cell: healthCell, from: 'sm' },
 			{ id: 'cpu', label: 'CPU', sort: 'cpu', cell: cpuCell, align: 'right', from: 'xl' },
@@ -214,18 +225,29 @@
 					{ value: 'macos', label: 'macOS' }
 				]}
 			/>
+			<Select
+				aria-label="Device category"
+				class="w-full sm:w-auto"
+				value={param('category')}
+				onchange={(e) => setParams({ category: e.currentTarget.value })}
+				options={[{ value: '', label: 'Any category' }, ...(categories.data ?? []).map((c) => ({ value: c.id, label: c.name }))]}
+			/>
+			{#if param('set')}
+				<Button size="sm" variant="ghost" iconRight={X} onclick={() => setParams({ set: null })}>Policy set: {list.rows[0]?.policy_set_name ?? 'one set'}</Button>
+			{/if}
 			{#if param('health')}
 				<Button size="sm" variant="ghost" iconRight={X} onclick={() => setParams({ health: null })}>Health: {param('health').replace(',', ', ')}</Button>
 			{/if}
 		{/snippet}
 		{#snippet bulk(n)}
 			{#if can('technician')}<Button size="sm" variant="primary" icon={Play} onclick={() => (running = true)}>Run script</Button>{/if}
+			{#if can('technician')}<Button size="sm" icon={FolderInput} onclick={() => (categorizing = true)}>Change category</Button>{/if}
 			{#if can('admin') && outdated > 0}<Button size="sm" icon={CloudDownload} onclick={() => rollout([...selected])}>Update agent{n === 1 ? '' : 's'}</Button>{/if}
 		{/snippet}
 		{#snippet empty()}
 			{#if filtered}
 				<EmptyState title="No agents match" description="Try another view or clear the filters.">
-					{#snippet action()}<Button size="sm" onclick={() => { q = ''; setParams({ q: null, os: null, site: null, health: null, view: null }); }}>Clear filters</Button>{/snippet}
+					{#snippet action()}<Button size="sm" onclick={() => { q = ''; setParams({ q: null, os: null, site: null, health: null, category: null, set: null, view: null }); }}>Clear filters</Button>{/snippet}
 				</EmptyState>
 			{:else}
 				<EmptyState title={scoped ? `No agents for ${scoped.name} yet` : 'No agents yet'} description="Create an enrollment token for a site and run the install command on each machine.">
@@ -252,6 +274,9 @@
 	</DataTable>
 {/if}
 
+{#if categorizing}
+	<CategoryChange agentIds={[...selected]} onclose={() => (categorizing = false)} ondone={() => ((selected = new Set()), list.reload(), viewCounts.reload())} />
+{/if}
 {#if running}
 	<RunScript agents={[...picked.values()]} onclose={() => (running = false)} />
 {/if}

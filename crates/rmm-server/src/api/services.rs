@@ -104,7 +104,7 @@ pub async fn log_events(State(st): State<Arc<AppState>>, u: User, Path(id): Path
     Ok(Json(
         sqlx::query_as(
             "SELECT l.id, l.ts, l.received_at, l.level, l.source, l.event_id, l.message, l.policy_id, p.name AS policy_name, l.alert_id
-               FROM log_events l LEFT JOIN alert_policies p ON p.id = l.policy_id
+               FROM log_events l LEFT JOIN policy_items p ON p.id = l.policy_id
               WHERE l.agent_id = $1 AND ($2::bigint IS NULL OR l.id < $2) AND ($3::text IS NULL OR l.level = $3)
                 AND ($4::text IS NULL OR l.message ILIKE '%' || $4 || '%' OR l.source ILIKE '%' || $4 || '%')
               ORDER BY l.id DESC LIMIT 200",

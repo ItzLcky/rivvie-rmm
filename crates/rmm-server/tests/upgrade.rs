@@ -120,11 +120,36 @@ async fn seed_previous_release() {
         json!({ "subject": "Printer jammed before the upgrade", "description": "Filed on the previous release.", "client_id": client_id, "agent_ids": [agent_id] }),
     )
     .await;
+    // Policies of the old model, for the new one's migration (docs/design/policies.md): a
+    // client- and OS-limited alert policy, the client's own patch policy, a site's sensor policy,
+    // a scheduled script, and remote desktop consent.
+    let put = |p: &str, b: Value| call(&http, reqwest::Method::PUT, format!("{api}{p}"), Some(b));
+    let alert = post(
+        "/alert-policies",
+        json!({ "name": "Upgraded offline", "kind": "offline", "params": { "minutes": 10 }, "severity": "warning", "client_id": client_id, "os_family": "linux" }),
+    )
+    .await;
+    post("/patch-policies", json!({ "client_id": client_id, "auto_approve_categories": ["security", "driver"], "reboot_policy": "if_required" })).await;
+    post(
+        "/security/policies",
+        json!({ "client_id": client_id, "site_id": site_id, "sensor_enabled": false, "quick_scan_hours": 6, "full_scan_days": 7,
+                "auto_quarantine": true, "prevention": false, "canaries": true, "telemetry_mb": 64 }),
+    )
+    .await;
+    let script = post("/scripts", json!({ "name": "Upgraded nightly", "interpreter": "bash", "body": "true" })).await;
+    let schedule = post(
+        "/schedules",
+        json!({ "name": "Upgraded nightly", "script_id": script["id"], "client_id": client_id, "cron": "0 2 * * *", "timezone": "UTC" }),
+    )
+    .await;
+    put(&format!("/clients/{client_id}/desktop"), json!({ "consent": true })).await;
+
     let expect = json!({
         "admin_email": ADMIN_EMAIL,
         "client_id": client_id, "client_name": "Upgraded Client Ltd", "site_id": site_id,
         "agent_id": agent_id, "hostname": hostname, "metric_samples": samples,
         "ticket_id": ticket["id"], "ticket_number": ticket["number"], "ticket_subject": "Printer jammed before the upgrade",
+        "alert_policy_id": alert["id"], "schedule_id": schedule["id"], "schedule_next_run_at": schedule["next_run_at"],
     });
     std::fs::write(&out, serde_json::to_vec_pretty(&expect).unwrap()).unwrap();
     let _ = std::fs::remove_dir_all(&dir);

@@ -1,6 +1,6 @@
 [package]
 name = "rmm-sign"
-description = "Offline signing tool for agent self-update releases"
+description = "Offline signing tool: agent releases, detection content and signature databases"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,6 +9,7 @@ publish = false
 [dependencies]
 rmm-proto.workspace = true
 rmm-content.workspace = true
+rmm-scan = { workspace = true, features = ["yara"] }
 anyhow.workspace = true
 clap.workspace = true
 hex.workspace = true

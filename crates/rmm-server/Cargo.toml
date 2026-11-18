@@ -8,6 +8,8 @@ license.workspace = true
 [dependencies]
 rmm-proto.workspace = true
 rmm-content.workspace = true
+# The signature database format only (no YARA engine on the server).
+rmm-scan.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 serde.workspace = true

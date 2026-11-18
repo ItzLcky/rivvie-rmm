@@ -7,11 +7,18 @@ import type { Page, Route } from '@playwright/test';
 export const NOW = new Date('2026-06-15T14:30:00Z');
 const ago = (mins: number) => new Date(NOW.getTime() - mins * 60_000).toISOString();
 
+/** Policy sets: the built-in ones keep the server's fixed ids (the web links to All devices by id). */
+const B = '00000000-0000-4000-8001-0000000000';
+const SET = {
+	root: `${B}00`, win: `${B}01`, linux: `${B}02`, mac: `${B}03`, winWs: `${B}11`, winSrv: `${B}12`, linWs: `${B}21`, linSrv: `${B}22`, macWs: `${B}31`, macSrv: `${B}32`,
+	dc: 'ps-dc', acmeWin: 'ps-acme-win', acmeTills: 'ps-acme-tills', web01: 'ps-acme-web01'
+};
+
 const clients = [
-	{ id: 'c-acme', name: 'Acme Corp', created_at: ago(60 * 24 * 200), desktop_consent: true },
-	{ id: 'c-globex', name: 'Globex', created_at: ago(60 * 24 * 90), desktop_consent: false },
-	{ id: 'c-initech', name: 'Initech', created_at: ago(60 * 24 * 30), desktop_consent: false },
-	{ id: 'c-umbrella', name: 'Umbrella Health', created_at: ago(60 * 24 * 3), desktop_consent: true }
+	{ id: 'c-acme', name: 'Acme Corp', created_at: ago(60 * 24 * 200) },
+	{ id: 'c-globex', name: 'Globex', created_at: ago(60 * 24 * 90) },
+	{ id: 'c-initech', name: 'Initech', created_at: ago(60 * 24 * 30) },
+	{ id: 'c-umbrella', name: 'Umbrella Health', created_at: ago(60 * 24 * 3) }
 ];
 const sites = [
 	{ id: 's-acme-hq', client_id: 'c-acme', name: 'Head office' },
@@ -120,9 +127,9 @@ const logEvents = [
 	{ id: 29, ts: ago(240), level: 'error', source: 'kernel', event_id: null, message: 'Out of memory: Killed process 1022 (node)', policy_name: 'Kernel OOM killer', alert_id: null }
 ];
 const schedules = [
-	{ id: 'sc-1', name: 'Nightly disk report', script_id: 's-disk', script_name: 'Disk usage report', interpreter: 'bash', client_id: null, client_name: null, site_id: null, site_name: null, os_family: 'linux', cron: '0 2 * * *', timezone: 'Europe/London', args: [], timeout_secs: null, retain_days: 30, enabled: true, next_run_at: ago(-60 * 11 - 30), last_run_at: ago(60 * 12 + 30), last_run: { succeeded: 3, failed: 1 } },
-	{ id: 'sc-2', name: 'Clear print queue', script_id: 's-spool', script_name: 'Restart print spooler', interpreter: 'powershell', client_id: 'c-acme', client_name: 'Acme Corp', site_id: 's-acme-wh', site_name: 'Warehouse', os_family: 'windows', cron: '30 6 * * 1-5', timezone: 'America/Chicago', args: [], timeout_secs: 120, retain_days: 7, enabled: true, next_run_at: ago(-60 * 21), last_run_at: ago(60 * 3), last_run: { succeeded: 1, queued: 1 } },
-	{ id: 'sc-3', name: 'Weekly update check', script_id: 's-upd', script_name: 'Pending updates', interpreter: 'python', client_id: null, client_name: null, site_id: null, site_name: null, os_family: null, cron: '0 3 * * 0', timezone: 'UTC', args: ['--security'], timeout_secs: 600, retain_days: 90, enabled: false, next_run_at: ago(-60 * 24 * 3), last_run_at: null, last_run: {} }
+	{ id: 'sc-1', name: 'Nightly disk report', set_id: SET.linux, script_id: 's-disk', script_name: 'Disk usage report', interpreter: 'bash', client_id: null, client_name: null, site_id: null, site_name: null, cron: '0 2 * * *', timezone: 'Europe/London', args: [], timeout_secs: null, retain_days: 30, enabled: true, agents: 3, next_run_at: ago(-60 * 11 - 30), last_run_at: ago(60 * 12 + 30), last_run: { succeeded: 3, failed: 1 } },
+	{ id: 'sc-2', name: 'Clear print queue', set_id: SET.win, script_id: 's-spool', script_name: 'Restart print spooler', interpreter: 'powershell', client_id: 'c-acme', client_name: 'Acme Corp', site_id: 's-acme-wh', site_name: 'Warehouse', cron: '30 6 * * 1-5', timezone: 'America/Chicago', args: [], timeout_secs: 120, retain_days: 7, enabled: true, agents: 1, next_run_at: ago(-60 * 21), last_run_at: ago(60 * 3), last_run: { succeeded: 1, queued: 1 } },
+	{ id: 'sc-3', name: 'Weekly update check', set_id: SET.root, script_id: 's-upd', script_name: 'Pending updates', interpreter: 'python', client_id: null, client_name: null, site_id: null, site_name: null, cron: '0 3 * * 0', timezone: 'UTC', args: ['--security'], timeout_secs: 600, retain_days: 90, enabled: false, agents: 7, next_run_at: ago(-60 * 24 * 3), last_run_at: null, last_run: {} }
 ].map((s, i) => ({ ...s, created_by_name: 'Dana Admin', created_at: ago(60 * 24 * (40 - i)), updated_at: ago(60 * 24 * (5 - i)) }));
 const mutes = [
 	{ id: 'm-1', client_id: null, site_id: null, agent_id: 'a-4', owner_client_id: 'c-acme', target_name: 'acme-pos-07', starts_at: null, ends_at: ago(-60 * 3), days: null, start_time: null, minutes: null, tz: 'UTC', reason: 'Replacing the till', created_by_name: 'Terry Tech', created_at: ago(60), active: true, ended: false },
@@ -272,15 +279,6 @@ function updateGroups() {
 		};
 	});
 }
-const policyRow = (o: Record<string, unknown>) => ({
-	id: 'p-global', client_id: null, site_id: null, client_name: null, site_name: null, auto_approve_severities: [], auto_approve_categories: ['security', 'critical', 'definition'],
-	deferral_days: 0, auto_install: false, reboot_policy: 'never', updated_by_name: 'Dana Admin', updated_at: ago(60 * 24 * 6), agents: 4, ...o
-});
-const patchPolicies = [
-	policyRow({}),
-	policyRow({ id: 'p-acme', client_id: 'c-acme', client_name: 'Acme Corp', auto_approve_severities: ['critical'], deferral_days: 2, auto_install: true, reboot_policy: 'if_required', agents: 3, updated_at: ago(60 * 26) }),
-	policyRow({ id: 'p-acme-wh', client_id: 'c-acme', site_id: 's-acme-wh', client_name: 'Acme Corp', site_name: 'Warehouse', auto_approve_categories: ['security', 'definition'], auto_install: true, reboot_policy: 'always', agents: 1, updated_at: ago(60 * 5) })
-];
 const windowRow = (s: (typeof sites)[number]) => {
 	const set = s.client_id === 'c-acme';
 	return {
@@ -318,7 +316,7 @@ function agentPatches(a: Agent) {
 	return {
 		status: { supported: a.id !== 'a-7', online: a.online, os_family: a.os_family, provider: a.os_family === 'windows' ? 'wua' : 'apt', all_or_nothing: false,
 			scanned_at: a.id === 'a-7' ? null : ago(95), scan_requested_at: null, scan_error: null, reboot_pending: a.id === 'a-1' },
-		policy: { ...(a.client_id === 'c-acme' ? (a.site_id === 's-acme-wh' ? patchPolicies[2] : patchPolicies[1]) : patchPolicies[0]), source: a.client_id === 'c-acme' ? (a.site_id === 's-acme-wh' ? 'site' : 'client') : 'global' },
+		policy: agentPatchPolicy(a, windowRow(site)),
 		window: windowRow(site), patches: rows, runs: runs.filter((r) => r.agent_id === a.id)
 	};
 }
@@ -475,7 +473,9 @@ function securityRow(a: Agent) {
 		signatures_updated_at: sigs[0] ?? null, last_scan_at: scans[0] ?? null,
 		active_threats: allDetections.filter((d) => d.agent_id === a.id && d.status === 'active' && !d.resolved_at && !d.audit).length,
 		running_action: a.id === 'a-2' ? 'quick_scan' : null,
-		isolated: sensors[a.id].isolated, sensor: sensors[a.id].sensor, content_version: (sensors[a.id].sensor?.content_version as string | null) ?? null
+		isolated: sensors[a.id].isolated, sensor: sensors[a.id].sensor, content_version: (sensors[a.id].sensor?.content_version as string | null) ?? null,
+		risks: risks[a.id] ?? [], database_version: agentDb(a.id)?.version ?? null, database_built_at: agentDb(a.id)?.built_at ?? null, database_max_age_hours: 72,
+		prevention: !!sensors[a.id].policy.prevention
 	};
 }
 function securitySummary(client: string | null) {
@@ -487,29 +487,66 @@ function securitySummary(client: string | null) {
 // --- security: our sensor, response, investigation (Phase 8, milestones 2-7) -------------------
 const HASH_BEACON = '9f2c4e1a7b3d5f60812a4c6e8b0d2f4a6c8e0b2d4f6a8c0e2b4d6f8a0c2e4b6d';
 const HASH_DROPPER = '3b7a91c2d4e6f8a0b2c4d6e8f0a2b4c6d8e0f2a4b6c8d0e2f4a6b8c0d2e4f6a8';
+const HASH_MINER = 'e8a3c1f0b9d7e5c3a1f9e7d5c3b1a9f8e6d4c2b0a8f6e4d2c0b8a6f4e2d0c8b6';
 const sensorPolicy = (o: Record<string, unknown> = {}) => ({
 	enabled: true, quick_scan_hours: 24, full_scan_days: 7, auto_quarantine: true, prevention: true, telemetry_mb: 256, canaries: true,
-	exclusions: [{ kind: 'path', value: 'D:\\Backups\\' }], rule_modes: [], ...o
+	exclusions: [{ kind: 'path', value: 'D:\\Backups\\' }], rule_modes: [], realtime: 'block', scan_on_write: true, archive_depth: 5, reputation: true, ...o
+});
+const DB_GENERAL = '2026.06.14.2';
+const DB_OLD = '2026.06.10.1';
+/** Real-time protection as the sensor reports it. */
+const realtime = (o: Record<string, unknown> = {}) => ({
+	mode: 'block', state: 'unavailable', mechanism: 'scan-after-start', error: 'on-access protection is Linux only; programs are scanned after they start', scan_on_write: true,
+	filesystems: 0, decisions: 0, denied: 0, cache_hits: 0, timeouts: 0, overloaded: 0, write_scans: 0, write_dropped: 0, p50_us: 0, p99_us: 0, ...o
 });
 const health = (o: Record<string, unknown> = {}) => ({
 	events_total: 1_284_330, events_per_min: 212.4, store_bytes: 141 * 2 ** 20, cpu_percent: 0.8, rss_bytes: 38 * 2 ** 20, rules: 64,
-	collectors: [['process', 'etw'], ['network', 'etw'], ['file', 'etw'], ['registry', 'etw']], canaries: 6, last_scan: ago(60 * 5), ...o
+	collectors: [['process', 'etw'], ['network', 'etw'], ['file', 'etw'], ['registry', 'etw'], ['realtime', 'scan-after-start']], canaries: 6, last_scan: ago(60 * 5),
+	database_version: DB_GENERAL, yara_rules: 3_015, hash_signatures: 1_046_210, files_scanned: 48_211, cache_hits: 391_877, realtime: realtime(), ...o
 });
+const linuxCollectors = [['process', 'proc-connector'], ['network', 'poll'], ['file', 'fanotify']];
 const sensors: Record<string, { sensor: Record<string, unknown> | null; policy: Record<string, unknown>; isolated: boolean }> = {
 	'a-1': { sensor: { enabled: true, running: true, restarts: 4, content_version: '2026.06.14.1', error: null, isolated: false, health: health({ events_per_min: 96.1, cpu_percent: 1.4 }) }, policy: sensorPolicy(), isolated: false },
 	'a-2': { sensor: { enabled: true, running: true, restarts: 0, content_version: '2026.06.14.1', error: null, isolated: true, health: health() }, policy: sensorPolicy(), isolated: true },
-	'a-3': { sensor: { enabled: true, running: false, restarts: 2, content_version: '2026.06.10.2', error: 'fanotify: permission denied (the agent needs CAP_SYS_ADMIN)', isolated: false, health: null }, policy: sensorPolicy({ prevention: false, canaries: false }), isolated: false },
-	'a-4': { sensor: { enabled: true, running: true, restarts: 0, content_version: '2026.06.10.2', error: null, isolated: false, health: health({ events_per_min: 40 }) }, policy: sensorPolicy(), isolated: false },
+	'a-3': {
+		sensor: {
+			enabled: true, running: true, restarts: 2, content_version: '2026.06.10.2', error: null, isolated: false, database_version: DB_GENERAL,
+			health: health({ events_per_min: 58.2, collectors: [...linuxCollectors, ['realtime', 'scan-after-start']], canaries: 0, files_scanned: 9_120, cache_hits: 61_004, realtime: realtime({ error: 'fanotify_init: Operation not permitted (the agent needs CAP_SYS_ADMIN; is it in a container?)' }) })
+		},
+		policy: sensorPolicy({ canaries: false }), isolated: false
+	},
+	'a-4': { sensor: { enabled: true, running: false, restarts: 1, content_version: '2026.06.10.2', error: 'the sensor exited (status 137); restarting in 30 s', isolated: false, health: null }, policy: sensorPolicy({ prevention: false }), isolated: false },
 	'a-5': { sensor: { enabled: false, running: false, restarts: 0, content_version: null, error: null, isolated: false, health: null }, policy: sensorPolicy({ enabled: false }), isolated: false },
-	'a-6': { sensor: { enabled: true, running: true, restarts: 0, content_version: '2026.06.14.1', error: null, isolated: false, health: health({ collectors: [['process', 'proc-connector'], ['network', 'poll'], ['file', 'fanotify']], canaries: 0 }) }, policy: sensorPolicy({ canaries: false }), isolated: false },
+	'a-6': {
+		sensor: {
+			enabled: true, running: true, restarts: 0, content_version: '2026.06.14.1', error: `signature database ${DB_GENERAL}: download failed: connection reset by peer (retrying in 10 min)`, isolated: false, database_version: DB_OLD,
+			health: health({
+				collectors: [...linuxCollectors, ['realtime', 'fanotify']], canaries: 0, database_version: DB_OLD, hash_signatures: 980_112, yara_rules: 2_870, files_scanned: 21_402, cache_hits: 188_950,
+				realtime: realtime({ state: 'on', mechanism: 'fanotify', error: null, filesystems: 3, decisions: 18_204, denied: 1, cache_hits: 17_311, timeouts: 2, write_scans: 52_117, p50_us: 14, p99_us: 3_600 })
+			})
+		},
+		policy: sensorPolicy({ canaries: false }), isolated: false
+	},
 	'a-7': { sensor: null, policy: sensorPolicy(), isolated: false }
 };
-const rmmProduct = (a: string): Prod => ({
-	kind: 'rmm', name: 'RMM sensor', version: '0.4.2', enabled: true, realtime: true, signature_version: '2026.06.14.1', signatures_updated_at: ago(60 * 20),
-	signatures_current: null, last_quick_scan_at: ago(60 * 5), last_full_scan_at: ago(60 * 24 * 3), tamper_protection: null, actions: ['quick_scan', 'full_scan'], detail: a === 'a-1' ? 'Engine 0.4.2' : null
+const rmmProduct = (a: string, o: Partial<Prod> = {}): Prod => ({
+	kind: 'rmm', name: 'RMM sensor', version: '0.4.2', enabled: true, realtime: false, signature_version: DB_GENERAL, signatures_updated_at: ago(60 * 22),
+	signatures_current: null, last_quick_scan_at: ago(60 * 5), last_full_scan_at: ago(60 * 24 * 3), tamper_protection: null, actions: ['quick_scan', 'full_scan'], detail: a === 'a-1' ? 'Engine 0.4.2' : null, ...o
 });
 security['a-1'].products.push(rmmProduct('a-1'));
 security['a-2'].products.push(rmmProduct('a-2'));
+security['a-3'].products.push(rmmProduct('a-3'));
+security['a-6'].products.push(rmmProduct('a-6', { realtime: true, signature_version: DB_OLD, signatures_updated_at: ago(60 * 24 * 5) }));
+/** Why each agent is at risk (the server's `risks`). */
+const risks: Record<string, string[]> = { 'a-3': ['realtime_off', 'sensor_realtime'], 'a-6': ['signatures', 'database'] };
+const dbBuilt: Record<string, string> = { [DB_GENERAL]: ago(60 * 22), [DB_OLD]: ago(60 * 24 * 5) };
+function agentDb(a: string) {
+	const z = sensors[a].sensor as { database_version?: string; health?: { database_version?: string } | null } | null;
+	const v = z?.database_version ?? z?.health?.database_version;
+	if (!v) return null;
+	const general = v === DB_GENERAL;
+	return { version: v, built_at: dbBuilt[v], stage: general ? 'general' : 'retired', hashes: general ? 1_046_210 : 980_112, yara_rules: general ? 3_015 : 2_870, size: general ? 39_604_224 : 37_311_488 };
+}
 const proc = (pid: number, ppid: number, name: string, exe: string, cmd: string, started: number, user = 'ACME\\jsmith', sha256?: string) => ({ pid, ppid, name, exe, command_line: cmd, user, sha256, started_at: ago(started) });
 const pExplorer = proc(3120, 2988, 'explorer.exe', 'C:\\Windows\\explorer.exe', 'C:\\Windows\\Explorer.EXE', 60 * 6);
 const pWord = proc(5544, 3120, 'WINWORD.EXE', 'C:\\Program Files\\Microsoft Office\\root\\Office16\\WINWORD.EXE', '"C:\\Program Files\\Microsoft Office\\root\\Office16\\WINWORD.EXE" /n "C:\\Users\\jsmith\\Downloads\\Invoice_0614.docm"', 28);
@@ -527,15 +564,17 @@ const contextD5 = [
 const extraDetections = [
 	{ id: 'd-5', agent_id: 'a-2', product: 'rmm', source: 'behaviour', name: 'Office application started an encoded PowerShell command', severity: 'high', status: 'active', resources: ['process:_pid:6120'], process: pPs.exe, username: 'ACME\\jsmith', detected_at: ago(27), first_seen_at: ago(27), last_seen_at: ago(27), resolved_at: null, rule_id: 'RMM-B-0007', mitre: ['T1059.001', 'T1566.001'], audit: false, action_taken: null, sha256: null, verdict: null },
 	{ id: 'd-6', agent_id: 'a-2', product: 'rmm', source: 'file', name: 'Known-bad file: Cobalt Strike beacon', severity: 'severe', status: 'quarantined', resources: ['file:_C:\\Users\\jsmith\\AppData\\Local\\Temp\\upd4412.exe'], process: null, username: 'ACME\\jsmith', detected_at: ago(26), first_seen_at: ago(26), last_seen_at: ago(26), resolved_at: ago(26), rule_id: 'RMM-F-0002', mitre: ['T1071.001'], audit: false, action_taken: 'Quarantined automatically', sha256: HASH_BEACON, verdict: 'true_positive' },
-	{ id: 'd-7', agent_id: 'a-1', product: 'rmm', source: 'behaviour', name: 'Scheduled task created from a temp folder', severity: 'moderate', status: 'active', resources: [], process: 'C:\\Windows\\System32\\schtasks.exe', username: 'ACME\\dana', detected_at: ago(60 * 9), first_seen_at: ago(60 * 9), last_seen_at: ago(60 * 9), resolved_at: null, rule_id: 'RMM-B-0031', mitre: ['T1053.005'], audit: true, action_taken: null, sha256: null, verdict: 'benign' }
+	{ id: 'd-7', agent_id: 'a-1', product: 'rmm', source: 'behaviour', name: 'Scheduled task created from a temp folder', severity: 'moderate', status: 'active', resources: [], process: 'C:\\Windows\\System32\\schtasks.exe', username: 'ACME\\dana', detected_at: ago(60 * 9), first_seen_at: ago(60 * 9), last_seen_at: ago(60 * 9), resolved_at: null, rule_id: 'RMM-B-0031', mitre: ['T1053.005'], audit: true, action_taken: null, sha256: null, verdict: 'benign' },
+	{ id: 'd-8', agent_id: 'a-6', product: 'rmm', source: 'file', name: 'CoinMiner.XMRig', severity: 'high', status: 'quarantined', resources: ['/var/tmp/.cache/kswapd0'], process: '/var/tmp/.cache/kswapd0 --donate-level 1 -o pool.example:443', username: 'postgres', detected_at: ago(50), first_seen_at: ago(50), last_seen_at: ago(50), resolved_at: ago(50), rule_id: 'RMM-HASH', mitre: ['T1496'], audit: false, action_taken: 'denied before it ran, quarantined', sha256: HASH_MINER, verdict: null, found_by: 'on_exec', denied: true }
 ].map((d) => {
 	const a = agents.find((x) => x.id === d.agent_id)!;
 	return { ...d, hostname: a.hostname, client_id: a.client_id, client_name: a.client_name, site_name: a.site_name };
 });
 const allDetections = [
-	...extraDetections.slice(0, 2),
-	...detections.map((d) => ({ ...d, source: 'product', rule_id: null, mitre: [] as string[], audit: false, action_taken: d.status === 'active' ? null : d.status === 'quarantined' ? 'Quarantined' : 'Removed', sha256: d.id === 'd-3' ? '275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f' : null, verdict: d.id === 'd-3' ? 'benign' : null })),
-	extraDetections[2]
+	...extraDetections.slice(0, 2).map((d) => ({ ...d, found_by: d.source === 'file' ? 'scan' : null, denied: false })),
+	extraDetections[3],
+	...detections.map((d) => ({ ...d, source: 'product', rule_id: null, mitre: [] as string[], audit: false, action_taken: d.status === 'active' ? null : d.status === 'quarantined' ? 'Quarantined' : 'Removed', sha256: d.id === 'd-3' ? '275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f' : null, verdict: d.id === 'd-3' ? 'benign' : null, found_by: null, denied: false })),
+	{ ...extraDetections[2], found_by: null, denied: false }
 ].sort((x, y) => Date.parse(y.detected_at) - Date.parse(x.detected_at));
 const quarantine = [
 	{ id: 'q-1', agent_id: 'a-2', path: 'C:\\Users\\jsmith\\AppData\\Local\\Temp\\upd4412.exe', sha256: HASH_BEACON, size: 284_672, reason: 'Known-bad file: Cobalt Strike beacon (RMM-F-0002)', quarantined_at: ago(26), state: 'quarantined', updated_at: ago(26) },
@@ -571,9 +610,18 @@ function agentSecurity(a: Agent) {
 		supported: a.id !== 'a-7', online: a.online, state: s.state, reported_at: s.reported === null ? null : ago(s.reported), error: null, products: s.products,
 		detections: allDetections.filter((d) => d.agent_id === a.id), actions: securityActions[a.id] ?? [],
 		sensor_supported: a.id !== 'a-7', sensor: z.sensor, sensor_at: z.sensor ? ago(1) : null, content_version: (z.sensor?.content_version as string | null) ?? null,
-		isolated: z.isolated, policy: z.policy, quarantine: quarantine.filter((q) => q.agent_id === a.id && q.state === 'quarantined')
+		isolated: z.isolated, policy: z.policy, quarantine: quarantine.filter((q) => q.agent_id === a.id && q.state === 'quarantined'),
+		risks: risks[a.id] ?? [], database: agentDb(a.id), database_max_age_hours: 72
 	};
 }
+const minerPrevalence = [
+	{ agent_id: 'a-5', hostname: 'globex-app01', client_name: 'Globex', first_seen: ago(60 * 24 * 2 + 40), how: 'ran', path: '/tmp/.X11-unix/.k/kswapd0' },
+	{ agent_id: 'a-6', hostname: 'globex-db01', client_name: 'Globex', first_seen: ago(50), how: 'detected, quarantined', path: '/var/tmp/.cache/kswapd0' }
+];
+const minerReputation = [
+	{ name: 'CoinMiner.XMRig', severity: 'high', source: `db:${DB_OLD}`, added_at: ago(60 * 24 * 5) },
+	{ name: 'xmrig', severity: 'high', source: 'list:malwarebazaar-full', added_at: ago(60 * 24 * 2) }
+];
 function detectionDetail(id: string) {
 	const d = allDetections.find((x) => x.id === id)!;
 	const a = agents.find((x) => x.id === d.agent_id)!;
@@ -582,7 +630,9 @@ function detectionDetail(id: string) {
 		...d, os_family: a.os_family, online: a.online, isolated: sensors[a.id].isolated, context: isD5 ? contextD5 : [], context_unavailable: false,
 		content_version: d.product === 'rmm' ? '2026.06.14.1' : null, notes: d.verdict ? 'Confirmed with the user: opened an invoice from an unknown sender.' : null,
 		verdict_by_name: d.verdict ? 'Dana Admin' : null, verdict_at: d.verdict ? ago(15) : null, quarantine_id: d.id === 'd-6' ? 'q-1' : null,
-		prevalence: d.sha256 === HASH_BEACON || isD5 ? [{ agent_id: 'a-4', hostname: 'acme-pos-07', client_name: 'Acme Corp', first_seen: ago(60 * 3), how: 'Quarantined (RMM-F-0002)' }] : [],
+		prevalence: d.sha256 === HASH_BEACON || isD5 ? [{ agent_id: 'a-4', hostname: 'acme-pos-07', client_name: 'Acme Corp', first_seen: ago(60 * 3), how: 'Quarantined (RMM-F-0002)' }] : d.id === 'd-8' ? minerPrevalence : [],
+		...(d.sha256 === HASH_BEACON ? { seen_on: 2, first_seen: ago(60 * 3), reputation: [] } : d.id === 'd-8' ? { seen_on: 2, first_seen: ago(60 * 24 * 2 + 40), reputation: minerReputation } : d.sha256 ? { seen_on: 1, first_seen: d.first_seen_at, reputation: [] } : {}),
+		database_version: d.product === 'rmm' && d.source === 'file' ? (d.id === 'd-8' ? DB_OLD : DB_GENERAL) : null, part: null,
 		actions: isD5 ? securityActions['a-2'].filter((x) => ['sa-6', 'sa-7', 'sa-9'].includes(x.id as string)) : [],
 		alert: isD5 ? { id: 'al-5', title: 'Threat: Office application started an encoded PowerShell command', state: 'open' } : null,
 		rule: isD5 ? { id: 'RMM-B-0007', name: 'Office spawns encoded PowerShell', description: 'A Microsoft Office application started PowerShell with an encoded command, the usual first step of a malicious macro.', kind: 'behaviour', event: 'process', severity: 'high', confidence: 'high', mode: 'alert', mitre: ['T1059.001', 'T1566.001'], digest: 'c0ffee' } : null
@@ -611,10 +661,33 @@ const contentVersions = [
 	contentVersion('cv-2', '2026.06.12.1', 'rolled_back', 60 * 24 * 3, { description: 'Broader LOLBin rules.', rule_count: 63, stage_changed_at: ago(60 * 24 * 3 - 120), stage_reason: 'RMM-B-0029 fired on every msiexec install', uploaded_by_name: 'Terry Tech' }),
 	contentVersion('cv-1', '2026.06.10.2', 'retired', 60 * 24 * 5, { description: 'Starter content.', rule_count: 58, hashes: 17_950, stage_changed_at: ago(60 * 2), stage_reason: 'Replaced by 2026.06.14.1', agents: 2 })
 ];
-const securityPolicies = [
-	{ id: 'sp-global', client_id: null, client_name: null, site_id: null, site_name: null, sensor_enabled: true, quick_scan_hours: 24, full_scan_days: 7, auto_quarantine: true, prevention: true, canaries: true, telemetry_mb: 256, updated_by_name: 'Dana Admin', updated_at: ago(60 * 24 * 6) },
-	{ id: 'sp-globex', client_id: 'c-globex', client_name: 'Globex', site_id: null, site_name: null, sensor_enabled: true, quick_scan_hours: 12, full_scan_days: 0, auto_quarantine: true, prevention: false, canaries: false, telemetry_mb: 512, updated_by_name: 'Terry Tech', updated_at: ago(60 * 30) },
-	{ id: 'sp-umbrella', client_id: 'c-umbrella', client_name: 'Umbrella Health', site_id: 's-umbrella', site_name: 'Clinic', sensor_enabled: false, quick_scan_hours: 24, full_scan_days: 7, auto_quarantine: true, prevention: false, canaries: false, telemetry_mb: 256, updated_by_name: 'Dana Admin', updated_at: ago(60 * 24 * 2) }
+const av = (o: Record<string, unknown> = {}) => ({ realtime: 'block', scan_on_write: true, archive_depth: 5, database_max_age_hours: 72, ...o });
+const dbSources = [
+	{ name: 'content/yara', kind: 'yara', entries: 15 },
+	{ name: 'yara-forge-core', kind: 'yara', entries: 3_000 },
+	{ name: 'malwarebazaar-recent.csv', kind: 'sha256-list', entries: 1_043_844 },
+	{ name: 'main.hdb', kind: 'clamav-hdb', entries: 2_366 }
+];
+const sigDb = (id: string, version: string, stage: string, mins: number, o: Record<string, unknown> = {}) => ({
+	id, version, sha256: contentVersion(id, version, stage, mins).sha256.split('').reverse().join(''), size: 39_604_224, description: '', hashes: 1_046_210, yara_rules: 3_015,
+	rule_count: 3_019, sources: dbSources, built_at: ago(mins + 15), stage, stage_reason: null, stored: true, uploaded_by_name: 'Dana Admin', uploaded_at: ago(mins),
+	stage_changed_at: ago(mins), agents: 0, ...o
+});
+const signatureDatabases = [
+	sigDb('sd-4', '2026.06.15.1', 'canary', 85, { description: 'Daily build: MalwareBazaar to 15 June, YARA Forge core 20260614.', hashes: 1_048_576, yara_rules: 3_022, rule_count: 3_026, size: 39_731_200 }),
+	sigDb('sd-3', DB_GENERAL, 'general', 60 * 22, { description: 'Daily build.', stage_changed_at: ago(60 * 2), stage_reason: 'Soaked 24 h on 1 canary client without problems', agents: 4 }),
+	sigDb('sd-2', '2026.06.12.1', 'rolled_back', 60 * 24 * 3, { description: 'Adds YARA Forge extended.', yara_rules: 7_912, rule_count: 7_916, size: 44_040_192, stored: false, stage_changed_at: ago(60 * 24 * 3 - 90), stage_reason: 'RMM-Y-0021 fired on /usr/bin/parallel on 9 machines', uploaded_by_name: 'Terry Tech' }),
+	sigDb('sd-1', DB_OLD, 'retired', 60 * 24 * 5, { hashes: 980_112, yara_rules: 2_870, rule_count: 2_874, size: 37_311_488, stage_changed_at: ago(60 * 22), stage_reason: `Replaced by ${DB_GENERAL}`, agents: 1, sources: dbSources.slice(0, 3) })
+];
+const reputationSources = [
+	{ source: 'db:2026.06.15.1', hashes: 1_048_576, added_at: ago(80) },
+	{ source: 'list:malwarebazaar-full', hashes: 912_440, added_at: ago(60 * 24 * 2) },
+	{ source: 'list:incident-2026-06', hashes: 14, added_at: ago(60 * 6) }
+];
+const rarePrograms = [
+	{ sha256: '5d41c0a8e2f9b7d3c1a0e8f6d4b2a0c8e6f4d2b0a8c6e4f2d0b8a6c4e2f0d8b6', seen_on: 1, first_seen: ago(42), agents: [{ agent_id: 'a-3', hostname: 'acme-web01', client_name: 'Acme Corp', path: '/tmp/.ICE-unix/kworkerd' }] },
+	{ sha256: '0c9e7a5b3d1f8e6c4a2b0d9f7e5c3a1b8d6f4e2c0a9b7d5f3e1c8a6b4d2f0e9c', seen_on: 1, first_seen: ago(60 * 5), agents: [{ agent_id: 'a-1', hostname: 'acme-dc01', client_name: 'Acme Corp', path: 'C:\\Users\\dana\\Downloads\\WinDirStat-2.0.1-setup.exe' }] },
+	{ sha256: '7f1e3d5c7b9a1e3d5c7b9a2f4e6d8c0b2a4f6e8d0c2b4a6f8e0d2c4b6a8f0e2d', seen_on: 2, first_seen: ago(60 * 26), agents: [{ agent_id: 'a-5', hostname: 'globex-app01', client_name: 'Globex', path: '/opt/backup/bin/pg-dump-wrapper' }, { agent_id: 'a-6', hostname: 'globex-db01', client_name: 'Globex', path: '/opt/backup/bin/pg-dump-wrapper' }] }
 ];
 const exclusions = [
 	{ id: 'ex-1', client_id: null, client_name: null, kind: 'path', value: 'D:\\Backups\\', comment: 'Veeam repository; scanned by the backup server', created_by_name: 'Dana Admin', created_at: ago(60 * 24 * 20) },
@@ -633,9 +706,233 @@ function hunt(body: Record<string, unknown>) {
 				{ agent_id: 'a-2', hostname: 'acme-fs01', client_name: 'Acme Corp', truncated: false, events: contextD5.filter((e) => e.kind === 'file' || (e.kind === 'process' && (e.process as { pid: number }).pid === 7012)) },
 				{ agent_id: 'a-1', hostname: 'acme-dc01', client_name: 'Acme Corp', truncated: false, events: [ev(51210, 60 * 3, 'file', 'create', { process: proc(812, 3120, 'msedge.exe', 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe', 'msedge.exe', 60 * 5, 'ACME\\dana'), file: { path: 'C:\\Users\\dana\\Downloads\\upd4412.exe', sha256: HASH_BEACON } })] }
 			],
-			searched: 4, offline: 1, errors: [{ agent_id: 'a-3', hostname: 'acme-web01', error: 'the sensor isn’t running' }]
+			searched: 4, offline: 1, errors: [{ agent_id: 'a-3', hostname: 'acme-web01', error: 'timed out after 10 s' }]
 		}
 	};
+}
+
+// --- policy management ------------------------------------------------------------------------
+type Cfg = Record<string, unknown>;
+interface PSet { id: string; parent_id: string | null; client_id: string | null; name: string; description: string; builtin: boolean }
+const pset = (id: string, parent: string | null, name: string, o: Partial<PSet> = {}): PSet => ({ id, parent_id: parent, client_id: null, name, description: '', builtin: !id.startsWith('ps-'), ...o });
+const policySets: PSet[] = [
+	pset(SET.root, null, 'All devices'),
+	pset(SET.win, SET.root, 'Windows'), pset(SET.linux, SET.root, 'Linux'), pset(SET.mac, SET.root, 'macOS'),
+	pset(SET.winWs, SET.win, 'Windows workstations'), pset(SET.winSrv, SET.win, 'Windows servers'),
+	pset(SET.linWs, SET.linux, 'Linux workstations'), pset(SET.linSrv, SET.linux, 'Linux servers'),
+	pset(SET.macWs, SET.mac, 'macOS workstations'), pset(SET.macSrv, SET.mac, 'macOS servers'),
+	pset(SET.dc, SET.winSrv, 'Domain controllers', { description: 'Never restart by themselves; patched by hand on Sundays.' }),
+	pset(SET.acmeWin, SET.winSrv, 'Acme · Windows servers', { client_id: 'c-acme', description: 'Acme installs critical updates itself, two days late.' }),
+	pset(SET.acmeTills, SET.winWs, 'Acme · Warehouse tills', { client_id: 'c-acme', description: 'Point-of-sale machines: Sunday night installs, ask before remote control.' }),
+	pset(SET.web01, SET.linSrv, 'acme-web01', { client_id: 'c-acme', description: 'Customized for acme-web01' })
+];
+const C = '00000000-0000-4000-8002-0000000000';
+const categories = [
+	{ id: `${C}11`, name: 'Windows workstations', os_family: 'windows', platform: 'workstation', default_set_id: SET.winWs },
+	{ id: `${C}12`, name: 'Windows servers', os_family: 'windows', platform: 'server', default_set_id: SET.winSrv },
+	{ id: `${C}21`, name: 'Linux workstations', os_family: 'linux', platform: 'workstation', default_set_id: SET.linWs },
+	{ id: `${C}22`, name: 'Linux servers', os_family: 'linux', platform: 'server', default_set_id: SET.linSrv },
+	{ id: `${C}31`, name: 'macOS workstations', os_family: 'macos', platform: 'workstation', default_set_id: SET.macWs },
+	{ id: `${C}32`, name: 'macOS servers', os_family: 'macos', platform: 'server', default_set_id: SET.macSrv },
+	{ id: 'cat-kiosk', name: 'Kiosks', os_family: null, platform: null, default_set_id: SET.winWs, description: 'Shared machines in shops and warehouses' }
+].map((c) => ({ description: '', ...c, builtin: c.id !== 'cat-kiosk', created_at: ago(60 * 24 * 30), updated_at: ago(60 * 24 * 30) }));
+const assignments = [
+	{ id: 'as-1', client_id: 'c-acme', site_id: null as string | null, category_id: `${C}12`, policy_set_id: SET.acmeWin, updated_at: ago(60 * 24 * 2) },
+	{ id: 'as-2', client_id: 'c-acme', site_id: 's-acme-wh' as string | null, category_id: 'cat-kiosk', policy_set_id: SET.acmeTills, updated_at: ago(60 * 24) }
+];
+/** Where each agent sits: category (by hand?), pin, platform. */
+const placement: Record<string, { cat: string; manual?: boolean; pin?: string; platform: 'workstation' | 'server' }> = {
+	'a-1': { cat: `${C}12`, platform: 'server' }, 'a-2': { cat: `${C}12`, platform: 'server' }, 'a-3': { cat: `${C}22`, pin: SET.web01, platform: 'server' },
+	'a-4': { cat: 'cat-kiosk', manual: true, platform: 'workstation' }, 'a-5': { cat: `${C}22`, platform: 'server' }, 'a-6': { cat: `${C}22`, platform: 'server' },
+	'a-7': { cat: `${C}11`, platform: 'workstation' }
+};
+const setOf = (id: string) => policySets.find((x) => x.id === id)!;
+function resolveSet(a: Agent): { set: string; reason: 'pin' | 'site' | 'client' | 'default'; assignment: string | null } {
+	const pl = placement[a.id];
+	if (pl.pin) return { set: pl.pin, reason: 'pin', assignment: null };
+	const site = assignments.find((x) => x.site_id === a.site_id && x.category_id === pl.cat);
+	if (site) return { set: site.policy_set_id, reason: 'site', assignment: site.id };
+	const cl = assignments.find((x) => x.client_id === a.client_id && !x.site_id && x.category_id === pl.cat);
+	if (cl) return { set: cl.policy_set_id, reason: 'client', assignment: cl.id };
+	return { set: categories.find((c) => c.id === pl.cat)!.default_set_id, reason: 'default', assignment: null };
+}
+for (const a of agents) {
+	const pl = placement[a.id];
+	const r = resolveSet(a);
+	Object.assign(a, { platform: pl.platform, category_id: pl.cat, category_name: categories.find((c) => c.id === pl.cat)!.name, policy_set_id: r.set, policy_set_name: setOf(r.set).name });
+}
+const agentSet = (a: Agent) => (a as Agent & { policy_set_id: string }).policy_set_id;
+
+const PATCH_ITEM = '00000000-0000-4000-8000-000000000001';
+const SECURITY_ITEM = '00000000-0000-4000-8000-000000000002';
+const REMOTE_ITEM = '00000000-0000-4000-8000-000000000003';
+const AGENT_ITEM = '00000000-0000-4000-8000-000000000004';
+interface PItem { id: string; set: string; module: string; name: string; enabled: boolean; config: Cfg; client_id: string | null; site_id: string | null; excluded: { id: string; hostname: string }[] }
+const alertSet: Record<string, string> = { 'p-off': SET.root, 'p-disk': SET.root, 'p-cpu': SET.root, 'p-svc': SET.root, 'p-job': SET.linux, 'p-log': SET.linux };
+const alertConfig = (p: (typeof policies)[number]): Cfg => ({
+	kind: p.kind, params: p.params, severity: p.severity, channel_ids: p.channel_ids, notify_resolved: p.notify_resolved, renotify_minutes: p.renotify_minutes,
+	ticket_board_id: null, ticket_priority: 3, ticket_auto_resolve: false, run_script_id: null
+});
+const items: PItem[] = [
+	...policies.map((p) => ({ id: p.id, set: alertSet[p.id], module: 'alert', name: p.name, enabled: p.enabled, config: alertConfig(p), client_id: p.client_id, site_id: p.site_id, excluded: p.excluded })),
+	{ id: 'p-veeam', set: SET.acmeWin, module: 'alert', name: 'Backup service stopped', enabled: true, client_id: 'c-acme', site_id: null, excluded: [],
+		config: { kind: 'service', params: { services: ['VeeamBackupSvc'], auto_only: false, exclude: [] }, severity: 'critical', channel_ids: ['ch-mail'], notify_resolved: true, renotify_minutes: null, ticket_board_id: 'b-alerts', ticket_priority: 2, ticket_auto_resolve: true, run_script_id: null } },
+	...schedules.map((x) => ({ id: x.id, set: x.set_id, module: 'schedule', name: x.name, enabled: x.enabled, client_id: x.client_id, site_id: x.site_id, excluded: [], config: { script_id: x.script_id, cron: x.cron, timezone: x.timezone, args: x.args, timeout_secs: x.timeout_secs, retain_days: x.retain_days } })),
+	{ id: PATCH_ITEM, set: SET.root, module: 'patch', name: 'Patching', enabled: true, client_id: null, site_id: null, excluded: [],
+		config: { auto_approve_severities: [], auto_approve_categories: ['security', 'critical', 'definition'], deferral_days: 0, auto_install: false, reboot_policy: 'never', window: null } },
+	{ id: SECURITY_ITEM, set: SET.root, module: 'security', name: 'Security', enabled: true, client_id: null, site_id: null, excluded: [],
+		config: { sensor_enabled: true, quick_scan_hours: 24, full_scan_days: 7, auto_quarantine: true, prevention: true, canaries: true, telemetry_mb: 256, realtime: 'block', scan_on_write: true, archive_depth: 5, database_max_age_hours: 72 } },
+	{ id: REMOTE_ITEM, set: SET.root, module: 'remote_access', name: 'Remote access', enabled: true, client_id: null, site_id: null, excluded: [], config: { desktop_enabled: true, desktop_consent: false, shell_enabled: true, files_enabled: true } },
+	{ id: AGENT_ITEM, set: SET.root, module: 'agent', name: 'Agent', enabled: true, client_id: null, site_id: null, excluded: [], config: { auto_update: true } }
+];
+const overrides: { item: string; set: string; enabled: boolean | null; config: Cfg }[] = [
+	{ item: PATCH_ITEM, set: SET.acmeWin, enabled: null, config: { auto_approve_severities: ['critical'], deferral_days: 2, auto_install: true, reboot_policy: 'if_required' } },
+	{ item: 'p-disk', set: SET.acmeWin, enabled: null, config: { params: { threshold: 95 }, severity: 'warning' } },
+	{ item: PATCH_ITEM, set: SET.acmeTills, enabled: null, config: { auto_install: true, reboot_policy: 'always', window: { days: [0], start: '02:00', minutes: 180, tz: 'site' } } },
+	{ item: REMOTE_ITEM, set: SET.acmeTills, enabled: null, config: { desktop_consent: true } },
+	{ item: SECURITY_ITEM, set: SET.linSrv, enabled: null, config: { canaries: false, telemetry_mb: 512 } },
+	{ item: SECURITY_ITEM, set: SET.web01, enabled: null, config: { prevention: false, archive_depth: 3 } },
+	{ item: 'p-off', set: SET.dc, enabled: null, config: { renotify_minutes: 30 } },
+	{ item: 'p-svc', set: SET.web01, enabled: false, config: {} },
+	{ item: AGENT_ITEM, set: SET.winSrv, enabled: null, config: { auto_update: false } },
+	{ item: PATCH_ITEM, set: SET.dc, enabled: null, config: { auto_install: false, reboot_policy: 'never' } }
+];
+
+const isObj = (v: unknown): v is Cfg => typeof v === 'object' && v !== null && !Array.isArray(v);
+/** The server's merge rule: objects merge key by key, everything else replaces. */
+function merge(base: unknown, over: unknown): unknown {
+	if (!isObj(base) || !isObj(over)) return over;
+	const out: Cfg = { ...base };
+	for (const [k, v] of Object.entries(over)) out[k] = k in base ? merge(base[k], v) : v;
+	return out;
+}
+/** Which set each leaf's value comes from (policy::field_sources). */
+function fieldSources(origin: string, config: Cfg, ovs: { set: string; config: Cfg }[]): Record<string, string> {
+	const out: Record<string, string> = {};
+	const leaves = (v: unknown, prefix: string) => {
+		if (isObj(v) && Object.keys(v).length) for (const [k, x] of Object.entries(v)) leaves(x, prefix ? `${prefix}.${k}` : k);
+		else if (prefix) out[prefix] = origin;
+	};
+	leaves(config, '');
+	const apply = (o: Cfg, prefix: string, set: string) => {
+		for (const [k, v] of Object.entries(o)) {
+			const p = prefix ? `${prefix}.${k}` : k;
+			if (isObj(v) && Object.keys(v).length) {
+				delete out[p];
+				apply(v, p, set);
+			} else {
+				for (const key of Object.keys(out)) if (key.startsWith(`${p}.`)) delete out[key];
+				out[p] = set;
+			}
+		}
+	};
+	for (const o of ovs) apply(o.config, '', o.set);
+	return out;
+}
+function chainOf(id: string): PSet[] {
+	const out: PSet[] = [];
+	for (let s: PSet | undefined = setOf(id); s; s = s.parent_id ? setOf(s.parent_id) : undefined) out.unshift(s);
+	return out;
+}
+const moduleOrder = ['alert', 'schedule', 'patch', 'security', 'remote_access', 'agent'];
+function itemView(it: PItem, chain: PSet[], agent?: Agent) {
+	const ids = chain.map((c) => c.id);
+	const at = ids.indexOf(it.set);
+	if (at < 0) return null;
+	const here = ids[ids.length - 1];
+	const ovs = overrides.filter((o) => o.item === it.id && ids.indexOf(o.set) > at).sort((x, y) => ids.indexOf(x.set) - ids.indexOf(y.set));
+	let config: unknown = it.config;
+	let enabled = it.enabled;
+	for (const o of ovs) {
+		config = merge(config, o.config);
+		if (o.enabled != null) enabled = o.enabled;
+	}
+	const sources = fieldSources(it.set, it.config, ovs);
+	sources.enabled = [...ovs].reverse().find((o) => o.enabled != null)?.set ?? it.set;
+	const mine = ovs.find((o) => o.set === here);
+	const client = clients.find((c) => c.id === it.client_id);
+	const site = sites.find((x) => x.id === it.site_id);
+	const sched = schedules.find((x) => x.id === it.id);
+	return {
+		id: it.id, module: it.module, name: it.name, origin_set_id: it.set, origin_set_name: setOf(it.set).name,
+		status: it.set === here ? 'defined' : mine ? 'overridden' : 'inherited', enabled, config, item_enabled: it.enabled, item_config: it.config, sources,
+		override: mine ? { enabled: mine.enabled, config: mine.config, updated_at: ago(60 * 24) } : null,
+		limit: { client_id: it.client_id, client_name: client?.name ?? null, site_id: it.site_id, site_name: site?.name ?? null, excluded: it.excluded },
+		editable: true, overridable: it.set !== here,
+		open_alerts: alerts.filter((x) => x.policy_id === it.id && x.state !== 'resolved' && (!agent || x.agent_id === agent.id)).length,
+		schedule: sched ? { next_run_at: sched.next_run_at, last_run_at: sched.last_run_at } : null,
+		...(agent ? { applies: (!it.client_id || it.client_id === agent.client_id) && (!it.site_id || it.site_id === agent.site_id) && !it.excluded.some((x) => x.id === agent.id), excluded: it.excluded.some((x) => x.id === agent.id) } : {})
+	};
+}
+function itemViews(chain: PSet[], agent?: Agent) {
+	return items
+		.map((it) => itemView(it, chain, agent))
+		.filter((v): v is NonNullable<typeof v> => !!v)
+		.sort((x, y) => moduleOrder.indexOf(x.module) - moduleOrder.indexOf(y.module) || x.name.toLowerCase().localeCompare(y.name.toLowerCase()));
+}
+function setRow(x: PSet) {
+	const mine = items.filter((i) => i.set === x.id);
+	const ovs = overrides.filter((o) => o.set === x.id);
+	return {
+		...x, client_name: clients.find((c) => c.id === x.client_id)?.name ?? null, depth: chainOf(x.id).length - 1,
+		devices: agents.filter((a) => agentSet(a) === x.id).length, items: mine.length, overrides: ovs.length,
+		defines: [...new Set(mine.map((i) => i.module))], overrides_modules: [...new Set(ovs.map((o) => items.find((i) => i.id === o.item)!.module))],
+		default_for: categories.filter((c) => c.default_set_id === x.id).map((c) => c.id), created_at: ago(60 * 24 * 30), updated_at: ago(60 * 24 * 2)
+	};
+}
+const chainEntry = (x: PSet) => ({ id: x.id, name: x.name, client_id: x.client_id, builtin: x.builtin });
+const setSort = (a: PSet, b: PSet) => Number(b.builtin) - Number(a.builtin) || Number(!!a.client_id) - Number(!!b.client_id) || a.name.toLowerCase().localeCompare(b.name.toLowerCase());
+function agentPolicy(a: Agent) {
+	const pl = placement[a.id];
+	const r = resolveSet(a);
+	const chain = chainOf(r.set);
+	const cat = categories.find((c) => c.id === pl.cat)!;
+	return {
+		agent_id: a.id, hostname: a.hostname, client_id: a.client_id, site_id: a.site_id, platform: pl.platform,
+		category: { id: cat.id, name: cat.name, builtin: cat.builtin, manual: !!pl.manual }, set: chainEntry(setOf(r.set)), reason: r.reason, assignment_id: r.assignment,
+		pin: pl.pin ? chainEntry(setOf(pl.pin)) : null, chain: chain.map(chainEntry), policies: itemViews(chain, a)
+	};
+}
+function agentPatchPolicy(a: Agent, site: { days: number[] | null; start: string | null; minutes: number | null; tz: string; open_now: boolean; next_start: string | null }) {
+	const set = agentSet(a);
+	const eff = itemView(items.find((i) => i.id === PATCH_ITEM)!, chainOf(set))!.config as Cfg & { window: { days: number[]; start: string; minutes: number; tz: string } | null };
+	const own = !!eff.window;
+	const window = eff.window ? { ...eff.window, tz: eff.window.tz === 'site' ? site.tz : eff.window.tz, open_now: false, next_start: '2026-06-21T07:00:00.000Z' } : site;
+	return { ...eff, id: PATCH_ITEM, set_id: set, source: setOf(set).name, own_window: own, window };
+}
+const scheduleOut = (x: (typeof schedules)[number]) => ({ ...x, set_name: setOf(x.set_id).name });
+/** GET routes of the policy API; undefined when `path` isn't one, null for an unknown set. */
+function policyRoute(path: string, q: URLSearchParams): unknown {
+	let m: RegExpMatchArray | null;
+	if (path === '/policy-sets') {
+		const cid = q.get('client_id');
+		return [...policySets].sort(setSort).filter((x) => !cid || !x.client_id || x.client_id === cid).map(setRow);
+	}
+	if ((m = path.match(/^\/policy-sets\/([^/]+)$/))) {
+		const x = policySets.find((y) => y.id === m![1]);
+		if (!x) return null;
+		const chain = chainOf(x.id);
+		return { ...setRow(x), chain: chain.map(chainEntry), children: policySets.filter((y) => y.parent_id === x.id).sort(setSort).map(setRow), policies: itemViews(chain), editable: true };
+	}
+	if ((m = path.match(/^\/policy-sets\/([^/]+)\/agents$/))) {
+		const list = agents.filter((a) => agentSet(a) === m![1]).map((a) => ({
+			id: a.id, hostname: a.hostname, online: a.online, os_family: a.os_family, platform: placement[a.id].platform, client_id: a.client_id, client_name: a.client_name,
+			site_id: a.site_id, site_name: a.site_name, category_id: placement[a.id].cat, category_name: categories.find((c) => c.id === placement[a.id].cat)!.name, reason: resolveSet(a).reason
+		}));
+		return page(list, Number(q.get('limit') ?? 50));
+	}
+	if ((m = path.match(/^\/policy-items\/([^/]+)$/))) {
+		const it = items.find((i) => i.id === m![1]);
+		return it ? itemView(it, chainOf(it.set)) : null;
+	}
+	if (path === '/device-categories') return categories.map((c) => ({ ...c, default_set_name: setOf(c.default_set_id).name, devices: agents.filter((a) => placement[a.id].cat === c.id).length }));
+	if (path === '/policy-assignments') {
+		return assignments
+			.filter((x) => !q.get('client_id') || x.client_id === q.get('client_id'))
+			.map((x) => ({ ...x, client_name: clients.find((c) => c.id === x.client_id)!.name, site_name: sites.find((y) => y.id === x.site_id)?.name ?? null, category_name: categories.find((c) => c.id === x.category_id)!.name, policy_set_name: setOf(x.policy_set_id).name }));
+	}
+	if ((m = path.match(/^\/agents\/([^/]+)\/policy$/))) return agentPolicy(agents.find((a) => a.id === m![1])!);
+	return undefined;
 }
 
 const admin = { id: 'u-1', email: 'dana@northwind.example', name: 'Dana Admin', role: 'admin', totp_enabled: true, mfa_setup_required: false, client_ids: null, preferences: {}, permissions: ['security.read', 'security.respond', 'security.manage'] };
@@ -666,6 +963,8 @@ export async function mockApi(p: Page, opts: { signedIn?: boolean } = {}) {
 			if (q.get('health')) list = list.filter((a) => q.get('health')!.split(',').includes(a.health));
 			if (q.get('new_days')) list = list.filter((a) => Date.parse(a.enrolled_at) > NOW.getTime() - Number(q.get('new_days')) * 86_400_000);
 			if (q.get('os')) list = list.filter((a) => a.os_family === q.get('os'));
+			if (q.get('category_id')) list = list.filter((a) => a.category_id === q.get('category_id'));
+			if (q.get('policy_set_id')) list = list.filter((a) => a.policy_set_id === q.get('policy_set_id'));
 			if (q.get('q')) list = list.filter((a) => a.hostname.includes(q.get('q')!));
 			return json(page(list, Number(q.get('limit') ?? 50)));
 		}
@@ -686,10 +985,20 @@ export async function mockApi(p: Page, opts: { signedIn?: boolean } = {}) {
 			const t = q.get('q')?.toLowerCase();
 			return json(quarantine.filter((x) => (q.get('state') === 'all' || x.state === 'quarantined') && (!q.get('client_id') || x.client_id === q.get('client_id')) && (!t || `${x.path} ${x.hostname} ${x.sha256}`.toLowerCase().includes(t))));
 		}
-		if (path === '/security/prevalence') return json({ sha256: q.get('sha256'), agents: q.get('sha256') === HASH_BEACON ? detectionDetail('d-6').prevalence.concat([{ agent_id: 'a-2', hostname: 'acme-fs01', client_name: 'Acme Corp', first_seen: ago(26), how: 'Detected and quarantined (RMM-F-0002)' }]) : [] });
+		if (path === '/security/prevalence') {
+			const beacon = q.get('sha256') === HASH_BEACON;
+			const agents = beacon ? detectionDetail('d-6').prevalence.concat([{ agent_id: 'a-2', hostname: 'acme-fs01', client_name: 'Acme Corp', first_seen: ago(26), how: 'ran, detected, quarantined', path: 'C:\\Users\\jsmith\\AppData\\Local\\Temp\\upd4412.exe' }]) : [];
+			return json({ sha256: q.get('sha256'), agents, seen_on: agents.length, first_seen: beacon ? ago(60 * 3) : null, known: beacon ? [{ name: 'CobaltStrike.Beacon', severity: 'severe', source: `db:2026.06.15.1`, added_at: ago(80) }] : [] });
+		}
+		if (path === '/security/databases') return json({ versions: signatureDatabases, soak_minutes: 1440, verifies_signatures: false });
+		if (path === '/security/reputation') return json({ sources: reputationSources });
+		if (path === '/security/reputation/rare') {
+			const max = Number(q.get('max_agents') ?? 1);
+			const client = q.get('client_id') ? clients.find((c) => c.id === q.get('client_id'))?.name : null;
+			return json({ items: rarePrograms.filter((r) => r.seen_on <= max && (!client || r.agents.some((a) => a.client_name === client))) });
+		}
 		if (path === '/security/rules') return json(rules);
 		if (path === '/security/content') return json({ versions: contentVersions, canary_clients: 1, soak_minutes: 1440, verifies_signatures: false });
-		if (path === '/security/policies') return json(securityPolicies);
 		if (path === '/security/exclusions') return json(exclusions);
 		if (path === '/security/summary') return json(securitySummary(q.get('client_id')));
 		if (path === '/security/agents') {
@@ -727,7 +1036,6 @@ export async function mockApi(p: Page, opts: { signedIn?: boolean } = {}) {
 			}));
 		}
 		if (path === '/patches/compliance') return json(compliance(q.get('client_id')));
-		if (path === '/patch-policies') return json(patchPolicies);
 		if (path === '/patch-windows') return json(sites.map(windowRow));
 		if (path === '/patch-runs') return json(runs.filter((r) => (!q.get('agent_id') || r.agent_id === q.get('agent_id')) && (!q.get('status') || q.get('status')!.split(',').flatMap((s) => (s === 'active' ? ['queued', 'sent'] : [s])).includes(r.status))));
 		if ((m = path.match(/^\/patch-runs\/([^/]+)$/))) {
@@ -753,10 +1061,10 @@ export async function mockApi(p: Page, opts: { signedIn?: boolean } = {}) {
 					{ ...admin, id: 'u-3', email: 'sam@northwind.example', name: 'Sam Security', role: 'readonly', totp_enabled: true, client_ids: null, permissions: ['security.read', 'security.respond', 'security.manage'] }
 				].map((u) => ({ ...u, disabled: false, last_login_at: ago(60), all_clients: u.role === 'admin' || u.client_ids === null, client_ids: u.client_ids ?? [] }))
 			);
-		if (path === '/settings') return json({ company_name: 'Northwind IT', session_idle_hours: null, session_idle_hours_default: 12, require_2fa_all: false, auto_update_agents: true });
+		if (path === '/settings') return json({ company_name: 'Northwind IT', session_idle_hours: null, session_idle_hours_default: 12, require_2fa_all: false });
 		if (path === '/auth/totp') return json({ enabled: true, required: true, recovery_codes_left: 8 });
 		if (path === '/auth/sessions') return json([{ id: 'x1', created_at: ago(600), last_seen_at: ago(0), expires_at: ago(-6000), user_agent: 'Mozilla/5.0 (X11; Linux x86_64) Chrome/140.0', current: true }]);
-		if (path.match(/^\/sites\/[^/]+\/enrollment-tokens$/)) return json([{ id: 't1', label: 'Office rollout', max_uses: 50, uses: 12, expires_at: ago(-60 * 24 * 20), created_at: ago(60 * 24 * 10) }]);
+		if (path.match(/^\/sites\/[^/]+\/enrollment-tokens$/)) return json([{ id: 't1', label: 'Office rollout', max_uses: 50, uses: 12, expires_at: ago(-60 * 24 * 20), created_at: ago(60 * 24 * 10), category_id: null, category_name: null }, { id: 't2', label: 'Warehouse tills', max_uses: null, uses: 3, expires_at: null, created_at: ago(60 * 24 * 4), category_id: 'cat-kiosk', category_name: 'Kiosks' }]);
 		if (path === '/alerts/summary') return json(alertSummary(q.get('client_id')));
 		if (path === '/alerts') {
 			const st = q.get('state') ?? 'active';
@@ -772,28 +1080,20 @@ export async function mockApi(p: Page, opts: { signedIn?: boolean } = {}) {
 			const a = alerts.find((x) => x.id === m![1])!;
 			return json({ ...a, notifications: deliveries.filter((d) => d.alert_id === a.id).map(({ channel_id, alert_id, alert_title, hostname, next_attempt_at, ...d }) => ({ ...d, channel_kind: channels.find((c) => c.id === channel_id)!.kind })), log_events: [] });
 		}
-		if (path === '/alert-policies') return json(policies);
-		if ((m = path.match(/^\/agents\/([^/]+)\/alert-policies$/))) {
-			const a = agents.find((x) => x.id === m![1])!;
-			return json(
-				policies
-					.filter((p) => (!p.client_id || p.client_id === a.client_id) && (!p.site_id || p.site_id === a.site_id) && (!p.os_family || p.os_family === a.os_family))
-					.map((p) => ({ id: p.id, name: p.name, kind: p.kind, severity: p.severity, enabled: p.enabled, level: p.site_id ? 'site' : p.client_id ? 'client' : 'msp', excluded: p.excluded.some((x) => x.id === a.id), editable: true, open_alerts: alerts.filter((al) => al.policy_id === p.id && al.agent_id === a.id && al.state !== 'resolved').length }))
-			);
-		}
 		if (path === '/alert-mutes') {
 			const list = mutes.filter((x) => (!q.get('client_id') || x.owner_client_id === q.get('client_id')) && (!q.get('agent_id') || x.agent_id === q.get('agent_id') || x.site_id === agents.find((a) => a.id === q.get('agent_id'))?.site_id));
 			return json(list);
 		}
 		if ((m = path.match(/^\/agents\/([^/]+)\/processes$/))) return json({ processes });
 		if ((m = path.match(/^\/agents\/([^/]+)\/files$/))) return json(listing(q.get('path') ?? ''));
-		if ((m = path.match(/^\/alert-policies\/([^/]+)$/))) return json(pol(m![1]));
 		if (path === '/notification-channels') return json(channels);
 		if (path === '/notifications') return json(deliveries);
 		if (path === '/settings/smtp') return json({ host: 'smtp.office365.com', port: 587, security: 'starttls', username: 'rmm@northwind.example', password_set: true, from: 'Northwind RMM <rmm@northwind.example>' });
-		if (path === '/schedules') return json(schedules);
+		const pr = policyRoute(path, q);
+		if (pr !== undefined) return pr === null ? json({ error: 'policy set not found' }, 404) : json(pr);
+		if (path === '/schedules') return json(schedules.map(scheduleOut));
 		if (path === '/schedules/preview') return json({ runs: [1, 2, 3, 4, 5].map((d) => new Date(Date.UTC(2026, 5, 15 + d, 2, 0)).toISOString()) });
-		if ((m = path.match(/^\/schedules\/([^/]+)$/))) return json(schedules.find((x) => x.id === m![1]));
+		if ((m = path.match(/^\/schedules\/([^/]+)$/))) return json(scheduleOut(schedules.find((x) => x.id === m![1])!));
 		if (path.match(/^\/agents\/[^/]+\/services$/)) return json({ services, services_at: ago(3), alerting: ['nginx.service'] });
 		if (path.match(/^\/agents\/[^/]+\/log-events$/)) return json(logEvents);
 		if (path === '/tickets/summary') return json({ open: 4, mine: 1, unassigned: 2, triage: 1, waiting: 1, team: 0, breached: 0 });

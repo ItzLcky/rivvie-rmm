@@ -1,0 +1,31 @@
+[package]
+name = "rmm-scan"
+description = "The sensor's file scan engine: hashing, type identification, container recursion, PE/ELF features, YARA, heuristics, the signature database and the verdict cache"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["yara"]
+# YARA evaluation (boreal, with its pe/elf/macho and hash modules). About 1.5 MB of agent
+# binary; without it, databases still load and hash signatures still match, and YARA rules
+# are reported as unsupported.
+yara = ["dep:boreal"]
+
+[dependencies]
+rmm-proto.workspace = true
+rmm-content.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+sha2.workspace = true
+hex.workspace = true
+ed25519-dalek.workspace = true
+thiserror.workspace = true
+md-5 = "0.11"
+sha1 = "0.11"
+flate2 = "1"
+bzip2 = "0.6"
+lzma-rs = "0.3"
+memmap2 = "0.9"
+boreal = { version = "1.4", default-features = false, features = ["object", "hash"], optional = true }

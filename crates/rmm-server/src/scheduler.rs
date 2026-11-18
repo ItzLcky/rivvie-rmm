@@ -1,6 +1,8 @@
-//! Scheduled scripts: cron expressions evaluated in the schedule's time zone.
+//! Scheduled scripts (`schedule` items of the policy sets): cron expressions evaluated in the
+//! schedule's time zone. An item runs on every agent whose set it reaches, within its limit,
+//! where it is enabled (overrides may switch it off below, or change its args and timeout).
 //!
-//! Every [`TICK`], due schedules are claimed (`FOR UPDATE SKIP LOCKED`, so a second server
+//! Every [`TICK`], due schedules (`policy_schedule_state`) are claimed (`FOR UPDATE SKIP LOCKED`, so a second server
 //! process would never double-run one), moved to their next time, and run: one job per
 //! targeted agent. An agent that still has a queued or running job from the same schedule is
 //! skipped, so an offline machine collects one pending run, not one per tick. A server that
@@ -12,9 +14,11 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use rmm_proto::ScriptJob;
+use serde_json::{Value, json};
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use crate::policy::ScheduleConfig;
 use crate::state::AppState;
 
 const TICK: Duration = Duration::from_secs(15);
@@ -61,17 +65,24 @@ pub async fn run(st: Arc<AppState>) {
 /// Moves every due schedule to its next run and returns their ids.
 async fn claim_due(st: &AppState) -> sqlx::Result<Vec<Uuid>> {
     let mut tx = st.db.begin().await?;
-    let due: Vec<(Uuid, String, String)> = sqlx::query_as(
-        "SELECT id, cron, timezone FROM schedules WHERE enabled AND next_run_at <= now() ORDER BY next_run_at FOR UPDATE SKIP LOCKED",
+    // Due, and enabled in at least one set (overrides can turn an item on below its own set).
+    let due: Vec<(Uuid, Value)> = sqlx::query_as(
+        "SELECT ss.item_id, i.config FROM policy_schedule_state ss JOIN policy_items i ON i.id = ss.item_id
+          WHERE ss.next_run_at <= now() AND EXISTS (SELECT 1 FROM policy_effective e WHERE e.item_id = i.id AND e.enabled)
+          ORDER BY ss.next_run_at FOR UPDATE OF ss SKIP LOCKED",
     )
     .fetch_all(&mut *tx)
     .await?;
     let now = Utc::now();
     let mut ids = Vec::with_capacity(due.len());
-    for (id, cron, tz) in due {
+    for (id, config) in due {
         // Computed from now, not from the missed time: missed runs collapse into this one.
-        let next = next_run(&cron, &tz, now).inspect_err(|e| warn!(schedule = %id, "{e}; disabling")).ok();
-        sqlx::query("UPDATE schedules SET next_run_at = $2, last_run_at = now(), enabled = enabled AND $2 IS NOT NULL WHERE id = $1")
+        let next = serde_json::from_value::<ScheduleConfig>(config)
+            .map_err(|e| e.to_string())
+            .and_then(|c| next_run(&c.cron, &c.timezone, now))
+            .inspect_err(|e| warn!(schedule = %id, "{e}; it won't run again until it's edited"))
+            .ok();
+        sqlx::query("UPDATE policy_schedule_state SET next_run_at = $2, last_run_at = now() WHERE item_id = $1")
             .bind(id)
             .bind(next)
             .execute(&mut *tx)
@@ -92,54 +103,36 @@ pub struct RunResult {
 
 /// Starts one run of a schedule now. `by` is the user who pressed Run now, if any.
 pub async fn run_schedule(st: &AppState, id: Uuid, by: Option<Uuid>) -> anyhow::Result<RunResult> {
-    #[allow(clippy::type_complexity)]
-    let (client_id, site_id, os_family, script_id, args, timeout, interp, body, script_timeout, script_client, name): (
-        Option<Uuid>,
-        Option<Uuid>,
-        Option<String>,
-        Uuid,
-        serde_json::Value,
-        Option<i32>,
-        String,
-        String,
-        i32,
-        Option<Uuid>,
-        String,
-    ) = sqlx::query_as(
-        "SELECT sc.client_id, sc.site_id, sc.os_family, sc.script_id, sc.args, sc.timeout_secs,
-                s.interpreter, s.body, s.timeout_secs, s.client_id, sc.name
-           FROM schedules sc JOIN scripts s ON s.id = sc.script_id WHERE sc.id = $1",
-    )
-    .bind(id)
-    .fetch_one(&st.db)
-    .await?;
+    let (name, config): (String, Value) =
+        sqlx::query_as("SELECT name, config FROM policy_items WHERE id = $1 AND module = 'schedule'").bind(id).fetch_one(&st.db).await?;
+    let c: ScheduleConfig = serde_json::from_value(config)?;
+    let (interp, body, script_timeout, script_client): (String, String, i32, Option<Uuid>) =
+        sqlx::query_as("SELECT interpreter, body, timeout_secs, client_id FROM scripts WHERE id = $1").bind(c.script_id).fetch_one(&st.db).await?;
     let interpreter =
         crate::agent_ws::parse_interpreter(&interp).ok_or_else(|| anyhow::anyhow!("script has unknown interpreter {interp}"))?;
-    let timeout = timeout.unwrap_or(script_timeout).clamp(1, 86400);
-    let arg_list: Vec<String> = serde_json::from_value(args.clone()).unwrap_or_default();
 
-    // A client's own script only ever runs on that client's agents.
-    let targets: Vec<(Uuid, Uuid, bool)> = sqlx::query_as(
-        "SELECT a.id, s.client_id,
-                EXISTS (SELECT 1 FROM jobs j WHERE j.agent_id = a.id AND j.schedule_id = $5 AND j.status IN ('queued', 'sent'))
-           FROM agents a JOIN sites s ON s.id = a.site_id
-          WHERE ($1::uuid IS NULL OR s.client_id = $1) AND ($2::uuid IS NULL OR a.site_id = $2)
-            AND ($3::text IS NULL OR a.os_family = $3) AND ($4::uuid IS NULL OR s.client_id = $4)",
+    // Each agent with its own set's args and timeout. A client's own script only ever runs on
+    // that client's agents.
+    let targets: Vec<(Uuid, Uuid, bool, Value)> = sqlx::query_as(
+        "SELECT ap.agent_id, s.client_id,
+                EXISTS (SELECT 1 FROM jobs j WHERE j.agent_id = ap.agent_id AND j.schedule_id = $1 AND j.status IN ('queued', 'sent')),
+                ap.config
+           FROM agent_policy ap JOIN agents a ON a.id = ap.agent_id JOIN sites s ON s.id = a.site_id
+          WHERE ap.item_id = $1 AND ap.enabled AND ($2::uuid IS NULL OR s.client_id = $2)",
     )
-    .bind(client_id)
-    .bind(site_id)
-    .bind(&os_family)
-    .bind(script_client)
     .bind(id)
+    .bind(script_client)
     .fetch_all(&st.db)
     .await?;
 
     let mut result = RunResult::default();
-    for (agent_id, agent_client, busy) in targets {
+    for (agent_id, agent_client, busy, config) in targets {
         if busy {
             result.skipped += 1;
             continue;
         }
+        let here: ScheduleConfig = serde_json::from_value(config).unwrap_or_else(|_| c.clone());
+        let timeout = here.timeout_secs.unwrap_or(script_timeout).clamp(1, 86400);
         let job_id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO jobs (id, agent_id, script_id, interpreter, body, args, timeout_secs, created_by, schedule_id)
@@ -147,16 +140,16 @@ pub async fn run_schedule(st: &AppState, id: Uuid, by: Option<Uuid>) -> anyhow::
         )
         .bind(job_id)
         .bind(agent_id)
-        .bind(script_id)
+        .bind(c.script_id)
         .bind(&interp)
         .bind(&body)
-        .bind(&args)
+        .bind(json!(here.args))
         .bind(timeout)
         .bind(by)
         .bind(id)
         .execute(&st.db)
         .await?;
-        let job = ScriptJob { job_id, interpreter, script: body.clone(), args: arg_list.clone(), timeout_secs: timeout as u32 };
+        let job = ScriptJob { job_id, interpreter, script: body.clone(), args: here.args, timeout_secs: timeout as u32 };
         match crate::api::deliver_job(st, agent_id, agent_client, job).await? {
             "sent" => result.sent += 1,
             _ => result.queued += 1,

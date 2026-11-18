@@ -1,5 +1,6 @@
 //! Patch management API: updates across the fleet and per agent, approvals, installs,
-//! compliance, policies and maintenance windows. Everything is limited to the clients the
+//! compliance and maintenance windows (the patch policy itself is the `patch` module of the
+//! policy sets, `api::policies`). Everything is limited to the clients the
 //! user can see.
 
 use std::sync::Arc;
@@ -7,7 +8,7 @@ use std::sync::Arc;
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use chrono::{DateTime, NaiveTime, Utc};
-use rmm_proto::patch::{Category, RebootPolicy, Severity};
+use rmm_proto::patch::RebootPolicy;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::AssertSqlSafe;
@@ -20,8 +21,6 @@ use crate::state::AppState;
 
 /// Most severe first; unrated last.
 const SEVERITY_RANK: &str = "coalesce(array_position(ARRAY['critical','important','moderate','low'], p.severity), 5)";
-/// The MSP-wide policy, created by the migration. It can be edited but not deleted.
-const GLOBAL_POLICY: Uuid = Uuid::from_u128(0x00000000_0000_4000_8000_000000000001);
 
 fn csv(s: &Option<String>) -> Option<Vec<String>> {
     s.as_deref().filter(|s| !s.is_empty()).map(|s| s.split(',').map(str::trim).map(str::to_string).collect())
@@ -225,32 +224,24 @@ pub struct PatchStatus {
     reboot_pending: bool,
 }
 
+/// The patch policy an agent runs with: its policy set's `patch` config.
 #[derive(Serialize, sqlx::FromRow)]
 pub struct Policy {
+    /// The patch item.
     id: Uuid,
-    client_id: Option<Uuid>,
-    site_id: Option<Uuid>,
-    client_name: Option<String>,
-    site_name: Option<String>,
+    /// The agent's policy set, and its name.
+    set_id: Uuid,
+    source: String,
     auto_approve_severities: Vec<String>,
     auto_approve_categories: Vec<String>,
     deferral_days: i32,
     auto_install: bool,
     reboot_policy: String,
-    updated_by_name: Option<String>,
-    updated_at: DateTime<Utc>,
-    /// Agents it applies to (within the user's clients).
-    #[sqlx(default)]
-    agents: i64,
-    /// For an agent's effective policy: `site`, `client` or `global`.
-    #[sqlx(default)]
-    source: Option<String>,
+    /// The policy has a window of its own (below); otherwise the site's applies.
+    own_window: bool,
+    /// The window automatic installs use, as `{days, start, minutes, tz}` (days null: none).
+    window: serde_json::Value,
 }
-
-const POLICY_COLS: &str = "p.id, p.client_id, p.site_id, c.name AS client_name, s.name AS site_name, p.auto_approve_severities,
-       p.auto_approve_categories, p.deferral_days, p.auto_install, p.reboot_policy, us.name AS updated_by_name, p.updated_at";
-const POLICY_JOINS: &str =
-    "LEFT JOIN clients c ON c.id = p.client_id LEFT JOIN sites s ON s.id = p.site_id LEFT JOIN users us ON us.id = p.updated_by";
 
 #[derive(Serialize, sqlx::FromRow)]
 pub struct Window {
@@ -298,9 +289,15 @@ pub async fn for_agent(State(st): State<Arc<AppState>>, u: User, Path(id): Path<
           ORDER BY p.state = 'installed', {SEVERITY_RANK}, p.category <> 'security', lower(p.title)"
     );
     let patches: Vec<AgentPatch> = sqlx::query_as(AssertSqlSafe(sql)).bind(id).fetch_all(&st.db).await?;
-    let policy: Option<Policy> = sqlx::query_as(AssertSqlSafe(format!(
-        "SELECT {POLICY_COLS}, ap.source FROM agent_patch_policy ap JOIN patch_policies p ON p.id = ap.id {POLICY_JOINS} WHERE ap.agent_id = $1"
-    )))
+    let policy: Option<Policy> = sqlx::query_as(
+        "SELECT ap.id, ap.set_id, ap.source, ap.auto_approve_severities, ap.auto_approve_categories, ap.deferral_days, ap.auto_install,
+                ap.reboot_policy, ap.own_window,
+                jsonb_build_object('days', ap.maint_days, 'start', to_char(ap.maint_start, 'HH24:MI'), 'minutes', ap.maint_minutes,
+                                   'tz', ap.maint_tz,
+                                   'open_now', in_maintenance_window(ap.maint_days, ap.maint_start, ap.maint_minutes, ap.maint_tz, now()),
+                                   'next_start', next_maintenance_window(ap.maint_days, ap.maint_start, ap.maint_tz, now())) AS window
+           FROM agent_patch_policy ap WHERE ap.agent_id = $1",
+    )
     .bind(id)
     .fetch_optional(&st.db)
     .await?;
@@ -776,190 +773,6 @@ pub async fn compliance(State(st): State<Arc<AppState>>, u: User, Query(q): Quer
         "reboot_pending": sum(|r| r.reboot_pending), "scan_errors": sum(|r| r.scan_errors), "installed_30d": sum(|r| r.installed_30d),
     });
     Ok(Json(json!({ "totals": totals, "rows": rows, "by": if q.client_id.is_some() { "site" } else { "client" } })))
-}
-
-// ---------------------------------------------------------------------------
-// Policies
-// ---------------------------------------------------------------------------
-
-pub async fn policies(State(st): State<Arc<AppState>>, u: User) -> ApiResult<Json<Vec<Policy>>> {
-    let sql = format!(
-        "SELECT {POLICY_COLS},
-                (SELECT count(*) FROM agent_patch_policy ap JOIN agents a ON a.id = ap.agent_id JOIN sites s2 ON s2.id = a.site_id
-                  WHERE ap.id = p.id AND ($1::uuid[] IS NULL OR s2.client_id = ANY($1))) AS agents
-           FROM patch_policies p {POLICY_JOINS}
-          WHERE p.client_id IS NULL OR $1::uuid[] IS NULL OR p.client_id = ANY($1)
-          ORDER BY p.client_id IS NOT NULL, lower(c.name), p.site_id IS NOT NULL, lower(s.name)"
-    );
-    Ok(Json(sqlx::query_as(AssertSqlSafe(sql)).bind(u.scope()).fetch_all(&st.db).await?))
-}
-
-#[derive(Deserialize)]
-pub struct PolicyBody {
-    /// Creating only: the scope. Neither = not allowed (there is one MSP-wide policy).
-    client_id: Option<Uuid>,
-    site_id: Option<Uuid>,
-    #[serde(default)]
-    auto_approve_severities: Vec<String>,
-    #[serde(default)]
-    auto_approve_categories: Vec<String>,
-    #[serde(default)]
-    deferral_days: i32,
-    #[serde(default)]
-    auto_install: bool,
-    reboot_policy: String,
-}
-
-impl PolicyBody {
-    fn validate(&self) -> ApiResult<()> {
-        if let Some(bad) = self.auto_approve_severities.iter().find(|s| Severity::parse(s).is_none()) {
-            return Err(ApiError::BadRequest(format!("unknown severity {bad}")));
-        }
-        if let Some(bad) = self.auto_approve_categories.iter().find(|s| Category::parse(s).is_none()) {
-            return Err(ApiError::BadRequest(format!("unknown category {bad}")));
-        }
-        if !(0..=365).contains(&self.deferral_days) {
-            return Err(ApiError::BadRequest("deferral_days must be 0-365".into()));
-        }
-        if RebootPolicy::parse(&self.reboot_policy).is_none() {
-            return Err(ApiError::BadRequest("reboot_policy must be never, if_required or always".into()));
-        }
-        Ok(())
-    }
-}
-
-/// Who may change a policy: admins for the MSP-wide one, technicians with access otherwise.
-fn may_edit(u: &User, client_id: Option<Uuid>) -> ApiResult<()> {
-    match client_id {
-        None => u.require(Role::Admin),
-        Some(c) => {
-            u.require(Role::Technician)?;
-            super::access::client(u, c)
-        }
-    }
-}
-
-/// Agents a policy at this scope can affect (None = all).
-async fn scope_agents(st: &AppState, client_id: Option<Uuid>, site_id: Option<Uuid>) -> sqlx::Result<Option<Vec<Uuid>>> {
-    if client_id.is_none() {
-        return Ok(None);
-    }
-    Ok(Some(
-        sqlx::query_scalar(
-            "SELECT a.id FROM agents a JOIN sites s ON s.id = a.site_id WHERE s.client_id = $1 AND ($2::uuid IS NULL OR s.id = $2)",
-        )
-        .bind(client_id)
-        .bind(site_id)
-        .fetch_all(&st.db)
-        .await?,
-    ))
-}
-
-async fn after_policy_change(st: &AppState, client_id: Option<Uuid>, site_id: Option<Uuid>) -> ApiResult<()> {
-    let agents = scope_agents(st, client_id, site_id).await?;
-    core::apply_policies(&mut *st.db.acquire().await?, agents.as_deref()).await?;
-    // The MSP-wide policy can touch every agent; pages showing them refetch on their own.
-    if let Some(a) = &agents {
-        publish_agents(st, a).await?;
-    }
-    Ok(())
-}
-
-pub async fn create_policy(State(st): State<Arc<AppState>>, u: User, Json(b): Json<PolicyBody>) -> ApiResult<Json<serde_json::Value>> {
-    b.validate()?;
-    let client_id = match (b.client_id, b.site_id) {
-        (_, Some(site)) => {
-            let c = super::access::site(&st, &u, site).await?;
-            if b.client_id.is_some_and(|x| x != c) {
-                return Err(ApiError::BadRequest("the site belongs to a different client".into()));
-            }
-            c
-        }
-        (Some(c), None) => c,
-        (None, None) => return Err(ApiError::BadRequest("a new policy needs a client or a site; edit the MSP-wide policy instead".into())),
-    };
-    may_edit(&u, Some(client_id))?;
-    let id = Uuid::new_v4();
-    let res = sqlx::query(
-        "INSERT INTO patch_policies (id, client_id, site_id, auto_approve_severities, auto_approve_categories, deferral_days,
-                                     auto_install, reboot_policy, updated_by)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
-    )
-    .bind(id)
-    .bind(client_id)
-    .bind(b.site_id)
-    .bind(&b.auto_approve_severities)
-    .bind(&b.auto_approve_categories)
-    .bind(b.deferral_days)
-    .bind(b.auto_install)
-    .bind(&b.reboot_policy)
-    .bind(u.id)
-    .execute(&st.db)
-    .await;
-    if let Err(sqlx::Error::Database(e)) = &res
-        && e.is_unique_violation()
-    {
-        return Err(ApiError::Conflict("there is already a policy for this client or site".into()));
-    }
-    res?;
-    after_policy_change(&st, Some(client_id), b.site_id).await?;
-    auth::audit(&st.db, Some(u.id), "patch.policy_create", None, json!({ "id": id, "client_id": client_id, "site_id": b.site_id })).await;
-    Ok(Json(json!({ "id": id })))
-}
-
-pub async fn update_policy(
-    State(st): State<Arc<AppState>>,
-    u: User,
-    Path(id): Path<Uuid>,
-    Json(b): Json<PolicyBody>,
-) -> ApiResult<Json<serde_json::Value>> {
-    b.validate()?;
-    let (client_id, site_id) = policy_scope(&st, &u, id).await?;
-    may_edit(&u, client_id)?;
-    sqlx::query(
-        "UPDATE patch_policies SET auto_approve_severities = $2, auto_approve_categories = $3, deferral_days = $4, auto_install = $5,
-                reboot_policy = $6, updated_by = $7, updated_at = now()
-          WHERE id = $1",
-    )
-    .bind(id)
-    .bind(&b.auto_approve_severities)
-    .bind(&b.auto_approve_categories)
-    .bind(b.deferral_days)
-    .bind(b.auto_install)
-    .bind(&b.reboot_policy)
-    .bind(u.id)
-    .execute(&st.db)
-    .await?;
-    after_policy_change(&st, client_id, site_id).await?;
-    auth::audit(
-        &st.db,
-        Some(u.id),
-        "patch.policy_update",
-        None,
-        json!({ "id": id, "client_id": client_id, "site_id": site_id, "auto_install": b.auto_install, "reboot_policy": b.reboot_policy,
-                "categories": b.auto_approve_categories, "severities": b.auto_approve_severities, "deferral_days": b.deferral_days }),
-    )
-    .await;
-    Ok(Json(json!({ "ok": true })))
-}
-
-pub async fn delete_policy(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uuid>) -> ApiResult<Json<serde_json::Value>> {
-    if id == GLOBAL_POLICY {
-        return Err(ApiError::BadRequest("the MSP-wide policy can't be deleted".into()));
-    }
-    let (client_id, site_id) = policy_scope(&st, &u, id).await?;
-    may_edit(&u, client_id)?;
-    sqlx::query("DELETE FROM patch_policies WHERE id = $1 AND client_id IS NOT NULL").bind(id).execute(&st.db).await?;
-    after_policy_change(&st, client_id, site_id).await?;
-    auth::audit(&st.db, Some(u.id), "patch.policy_delete", None, json!({ "id": id, "client_id": client_id, "site_id": site_id })).await;
-    Ok(Json(json!({ "ok": true })))
-}
-
-/// A visible policy's client and site.
-async fn policy_scope(st: &AppState, u: &User, id: Uuid) -> ApiResult<(Option<Uuid>, Option<Uuid>)> {
-    let row: Option<(Option<Uuid>, Option<Uuid>)> =
-        sqlx::query_as("SELECT client_id, site_id FROM patch_policies WHERE id = $1").bind(id).fetch_optional(&st.db).await?;
-    row.filter(|(c, _)| c.is_none_or(|c| u.can_see_client(c))).ok_or(ApiError::NotFound("policy"))
 }
 
 // ---------------------------------------------------------------------------

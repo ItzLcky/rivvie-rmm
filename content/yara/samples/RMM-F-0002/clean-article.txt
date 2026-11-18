@@ -1,0 +1,1 @@
+Mimikatz is a credential theft tool; defenders should watch for privilege::debug being used.

@@ -22,6 +22,9 @@ pub const CAPABILITY: &str = "security";
 /// Capability for the sensor, content bundles, response actions and telemetry queries.
 pub const SENSOR_CAPABILITY: &str = "sensor";
 
+/// The agent downloads signature databases ([`crate::ServerMsg::Database`]).
+pub const SIGDB_CAPABILITY: &str = "sigdb";
+
 /// Most detections the agent sends per report (newest first).
 pub const MAX_DETECTIONS: usize = 200;
 
@@ -362,7 +365,126 @@ pub struct SensorPolicy {
     /// Server overrides of the bundle's rule modes (the kill switch is `Disabled`).
     #[serde(default)]
     pub rule_modes: Vec<(String, RuleMode)>,
+    /// On-access protection (Linux fanotify; elsewhere scan after start).
+    #[serde(default)]
+    pub realtime: RealtimeMode,
+    /// With real-time protection on: scan files as they're written and closed.
+    #[serde(default)]
+    pub scan_on_write: bool,
+    /// Containers inside containers, at most (0: the engine's default).
+    #[serde(default)]
+    pub archive_depth: u32,
+    /// The server answers [`crate::AgentMsg::ReputationQuery`] (servers that predate it leave
+    /// this false, and the agent doesn't ask).
+    #[serde(default)]
+    pub reputation: bool,
 }
+
+/// Real-time (on-access) protection. `Audit` decides every exec as `Block` would, but never
+/// denies or acts: it shows what blocking would do, at the same cost.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum RealtimeMode {
+    #[default]
+    Off,
+    Audit,
+    Block,
+}
+
+impl RealtimeMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RealtimeMode::Off => "off",
+            RealtimeMode::Audit => "audit",
+            RealtimeMode::Block => "block",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "off" => RealtimeMode::Off,
+            "audit" => RealtimeMode::Audit,
+            "block" => RealtimeMode::Block,
+            _ => return None,
+        })
+    }
+}
+
+/// How a file detection was found.
+pub mod found_by {
+    /// Checked as a program was started (before it ran with fanotify, else just after).
+    pub const ON_EXEC: &str = "on_exec";
+    /// Checked after it was written (fanotify close-write, or a watched folder).
+    pub const ON_WRITE: &str = "on_write";
+    /// An on-demand or scheduled scan.
+    pub const SCAN: &str = "scan";
+    /// The server's reputation lookup knows the hash (alert only: the answer isn't signed).
+    pub const REPUTATION: &str = "reputation";
+}
+
+/// On-access protection as it runs, for the console.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct RealtimeHealth {
+    /// What the policy asks for.
+    pub mode: RealtimeMode,
+    /// `on`, `off` (the policy), `unavailable` (no fanotify permission events: the reason is in
+    /// `error`, and programs are scanned just after they start).
+    pub state: String,
+    /// `fanotify`, `scan-after-start`.
+    pub mechanism: String,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub scan_on_write: bool,
+    /// Filesystems watched.
+    #[serde(default)]
+    pub filesystems: u32,
+    /// Exec decisions made, and of those: denied, answered from the verdict cache, allowed
+    /// because the scan ran past its deadline, and allowed at once because the workers were all
+    /// busy (both then scanned in the background).
+    #[serde(default)]
+    pub decisions: u64,
+    #[serde(default)]
+    pub denied: u64,
+    #[serde(default)]
+    pub cache_hits: u64,
+    #[serde(default)]
+    pub timeouts: u64,
+    #[serde(default)]
+    pub overloaded: u64,
+    /// Files scanned after being written, and writes not scanned because the queue was full or
+    /// the kernel's queue overflowed.
+    #[serde(default)]
+    pub write_scans: u64,
+    #[serde(default)]
+    pub write_dropped: u64,
+    /// Median and 99th-percentile decision time over the last minute, microseconds.
+    #[serde(default)]
+    pub p50_us: u64,
+    #[serde(default)]
+    pub p99_us: u64,
+}
+
+/// A hash the agent has seen run, for the server's reputation lookup and fleet prevalence.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HashSeen {
+    pub sha256: String,
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+/// A hash the server knows as malicious.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HashKnown {
+    pub sha256: String,
+    pub name: String,
+    pub severity: ThreatSeverity,
+    /// `db:<version>` or `list:<name>`.
+    pub source: String,
+}
+
+/// Most hashes per [`crate::AgentMsg::ReputationQuery`].
+pub const REPUTATION_BATCH: usize = 500;
 
 /// Something the sensor found: a file a scan matched, or behaviour a rule matched.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -395,11 +517,23 @@ pub struct SensorDetection {
     pub detected_at: DateTime<Utc>,
     #[serde(default)]
     pub content_version: Option<String>,
+    #[serde(default)]
+    pub database_version: Option<String>,
+    /// Where in the file the match was (`archive.zip>dir/a.exe>VBA/Module1`), when it wasn't
+    /// the file itself.
+    #[serde(default)]
+    pub part: Option<String>,
     /// The process and its ancestors, then related events, for the investigation view.
     #[serde(default)]
     pub context: Vec<crate::telemetry::Event>,
     #[serde(default)]
     pub quarantine_id: Option<uuid::Uuid>,
+    /// [`found_by`]: `on_exec`, `on_write`, `scan`, `reputation`; `None` for behaviour.
+    #[serde(default)]
+    pub found_by: Option<String>,
+    /// The program was stopped before it ran (an exec denied on access).
+    #[serde(default)]
+    pub denied: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -419,6 +553,21 @@ pub struct SensorHealth {
     pub canaries: u32,
     #[serde(default)]
     pub last_scan: Option<DateTime<Utc>>,
+    /// The signature database loaded, and what it holds.
+    #[serde(default)]
+    pub database_version: Option<String>,
+    #[serde(default)]
+    pub yara_rules: u32,
+    #[serde(default)]
+    pub hash_signatures: u64,
+    /// Files read and checked since the sensor started, and files skipped because the verdict
+    /// cache knew them clean.
+    #[serde(default)]
+    pub files_scanned: u64,
+    #[serde(default)]
+    pub cache_hits: u64,
+    #[serde(default)]
+    pub realtime: Option<RealtimeHealth>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -430,6 +579,10 @@ pub struct SensorStatus {
     pub restarts: u32,
     #[serde(default)]
     pub content_version: Option<String>,
+    /// The signature database the sensor runs (it may be the previous one, kept as a fallback,
+    /// when the newest didn't load).
+    #[serde(default)]
+    pub database_version: Option<String>,
     /// Why content or the sensor isn't working.
     #[serde(default)]
     pub error: Option<String>,
@@ -491,6 +644,21 @@ impl ResponseAction {
 pub const TRIAGE_CHUNK: usize = 512 * 1024;
 /// Largest triage package the agent builds.
 pub const TRIAGE_MAX: u64 = 64 * 1024 * 1024;
+
+/// A signature database offered to an agent: fetched from `/api/agent/databases/{version}`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DatabaseOffer {
+    pub version: String,
+    pub size: u64,
+    /// Of the whole file, signature included.
+    pub sha256: String,
+}
+
+/// What a signature database's ed25519 signature covers: its version and the SHA-256 of the
+/// file up to the signature.
+pub fn database_signed_message(version: &str, body_sha256_hex: &str) -> Vec<u8> {
+    format!("rmm-sigdb-v1\n{version}\n{}\n", body_sha256_hex.to_ascii_lowercase()).into_bytes()
+}
 
 /// Signed bytes of a content bundle: the agent verifies the signature over this with the
 /// release key it was built with, so a compromised server can't push its own rules.

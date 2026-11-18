@@ -291,10 +291,11 @@ struct AlertTicketCtx {
 async fn alert_ctx(db: &PgPool, alert_id: Uuid) -> sqlx::Result<Option<AlertTicketCtx>> {
     sqlx::query_as(
         "SELECT al.policy_id, al.agent_id, al.key, al.title, al.severity, al.details, a.hostname, s.client_id, a.site_id,
-                p.ticket_board_id AS board_id, p.ticket_priority AS priority, p.ticket_auto_resolve AS auto_resolve, al.resolution
-           FROM alerts al JOIN alert_policies p ON p.id = al.policy_id JOIN agents a ON a.id = al.agent_id
-           JOIN sites s ON s.id = a.site_id
-          WHERE al.id = $1",
+                (c ->> 'ticket_board_id')::uuid AS board_id, coalesce((c ->> 'ticket_priority')::smallint, 3::smallint) AS priority,
+                coalesce((c ->> 'ticket_auto_resolve')::boolean, false) AS auto_resolve, al.resolution
+           FROM alerts al JOIN agents a ON a.id = al.agent_id JOIN sites s ON s.id = a.site_id
+           CROSS JOIN LATERAL policy_config(al.policy_id, al.agent_id) c
+          WHERE al.id = $1 AND al.policy_id IS NOT NULL",
     )
     .bind(alert_id)
     .fetch_optional(db)

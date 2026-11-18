@@ -2,6 +2,7 @@ mod collect;
 mod config;
 mod conn;
 mod desktop;
+mod fetch;
 mod fsutil;
 mod jobs;
 mod logwatch;
@@ -92,6 +93,9 @@ enum Cmd {
     /// The endpoint protection sensor, started and supervised by the agent.
     #[command(hide = true)]
     Sensor,
+    /// The sensor supervisor alone, on the stored policy, without a server (for tests).
+    #[command(hide = true)]
+    SuperviseSensor,
     /// Entry point used by the Windows Service Control Manager.
     #[command(hide = true)]
     Service,
@@ -128,6 +132,16 @@ fn main() -> Result<()> {
             .with_ansi(false)
             .init();
         return sensor::main();
+    }
+
+    if let Cmd::SuperviseSensor = cli.cmd {
+        // stdout carries the status lines.
+        tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+            .with_writer(std::io::stderr)
+            .with_ansi(false)
+            .init();
+        return security::supervisor::standalone();
     }
 
     if let Cmd::UpdateWatchdog = cli.cmd {
@@ -204,7 +218,7 @@ fn main() -> Result<()> {
         }
         Cmd::Patches { install, no_refresh } => patch::cli(&install, !no_refresh),
         Cmd::Security { run } => security::cli(run.as_deref()),
-        Cmd::Service | Cmd::UpdateWatchdog | Cmd::DesktopHelper | Cmd::Sensor => unreachable!(),
+        Cmd::Service | Cmd::UpdateWatchdog | Cmd::DesktopHelper | Cmd::Sensor | Cmd::SuperviseSensor => unreachable!(),
     }
 }
 

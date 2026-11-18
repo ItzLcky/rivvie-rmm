@@ -3,8 +3,8 @@
 //! Everything is limited to the clients the user can see.
 //!
 //! Permissions: `security.read` to see anything here, `security.respond` for scans and
-//! response actions and verdicts, `security.manage` for policies, exclusions, rule modes and
-//! content. Roles grant defaults (read-only: read; technician: + respond; admin: all).
+//! response actions and verdicts, `security.manage` for exclusions, rule modes and content
+//! (and for the `security` module of the policy sets, `api::policies`). Roles grant defaults (read-only: read; technician: + respond; admin: all).
 
 use std::sync::Arc;
 
@@ -23,19 +23,94 @@ use crate::paging::{self, Page, PageQuery, Plan, SortKey};
 use crate::security::{self as core, StartError};
 use crate::state::AppState;
 
+/// A column of the security policy that applies to agent `a` (its policy set's), as
+/// `core::sensor_policy` reads it.
+macro_rules! policy_col {
+    ($col:literal) => {
+        concat!("(SELECT p.", $col, " FROM agent_security_policy p WHERE p.agent_id = a.id)")
+    };
+}
+/// How old our signature database may be on agent `a`, hours (0 = no limit).
+macro_rules! db_max_age {
+    () => {
+        concat!("coalesce(", policy_col!("database_max_age_hours"), ", 72)")
+    };
+}
+/// Product `sp` of agent `a` has current signatures: our sensor (its database, or its content
+/// before it has one) within the policy's limit, other products within 72 hours or by Security
+/// Center's verdict. Without a date it counts as current.
+macro_rules! sp_fresh {
+    () => {
+        concat!(
+            "(CASE WHEN sp.kind = 'rmm' THEN (sp.signatures_updated_at IS NULL OR ",
+            db_max_age!(),
+            " = 0 OR sp.signatures_updated_at > now() - make_interval(hours => ",
+            db_max_age!(),
+            "))
+               ELSE coalesce(sp.signatures_updated_at > now() - interval '72 hours', sp.signatures_current, true) END)"
+        )
+    };
+}
+/// Each reason agent `a` is at risk (with something enabled), as one condition.
+macro_rules! risk_realtime_off {
+    () => {
+        "NOT EXISTS (SELECT 1 FROM security_products sp WHERE sp.agent_id = a.id AND sp.enabled AND sp.realtime IS NOT FALSE)"
+    };
+}
+macro_rules! risk_signatures {
+    () => {
+        concat!("NOT EXISTS (SELECT 1 FROM security_products sp WHERE sp.agent_id = a.id AND sp.enabled AND ", sp_fresh!(), ")")
+    };
+}
+macro_rules! risk_database {
+    () => {
+        concat!("EXISTS (SELECT 1 FROM security_products sp WHERE sp.agent_id = a.id AND sp.enabled AND sp.kind = 'rmm' AND NOT ", sp_fresh!(), ")")
+    };
+}
+/// Our real-time protection is wanted (the sensor on, the policy at audit or block) on Linux, the
+/// one platform where it runs, and isn't on. Elsewhere `unavailable` is the platform, not a fault.
+macro_rules! risk_sensor_realtime {
+    () => {
+        "(a.os_family = 'linux' AND coalesce((a.sensor->>'enabled')::boolean, false)
+          AND a.sensor->'health'->'realtime'->>'mode' IN ('audit', 'block')
+          AND NOT (coalesce((a.sensor->>'running')::boolean, false) AND a.sensor->'health'->'realtime'->>'state' = 'on'))"
+    };
+}
+/// Why agent `a` is at risk: `realtime_off`, `signatures`, `database`, `sensor_realtime`.
+macro_rules! risks {
+    () => {
+        concat!(
+            "(CASE WHEN EXISTS (SELECT 1 FROM security_products sp WHERE sp.agent_id = a.id AND sp.enabled) THEN array_remove(ARRAY[
+                CASE WHEN ", risk_realtime_off!(), " THEN 'realtime_off' END,
+                CASE WHEN ", risk_signatures!(), " THEN 'signatures' END,
+                CASE WHEN ", risk_database!(), " THEN 'database' END,
+                CASE WHEN ", risk_sensor_realtime!(), " THEN 'sensor_realtime' END], NULL) ELSE '{}'::text[] END)"
+        )
+    };
+}
+
 /// Protection state of agent `a`, worst first: threats (an active detection), unprotected
-/// (no product enabled), at_risk (real-time protection off everywhere, or no product with
-/// signatures from the last 72 hours), unknown (never reported), protected.
+/// (no product enabled), at_risk (real-time protection off everywhere, no product with current
+/// signatures, our database older than the policy allows, or our real-time protection not on
+/// where the policy wants it and the platform has it), unknown (never reported), protected.
 macro_rules! state_rank {
     () => {
-        "(CASE
+        concat!(
+            "(CASE
             WHEN a.security_at IS NULL THEN 3
             WHEN EXISTS (SELECT 1 FROM security_detections sd WHERE sd.agent_id = a.id AND sd.resolved_at IS NULL AND sd.status = 'active') THEN 0
             WHEN NOT EXISTS (SELECT 1 FROM security_products sp WHERE sp.agent_id = a.id AND sp.enabled) THEN 1
-            WHEN NOT EXISTS (SELECT 1 FROM security_products sp WHERE sp.agent_id = a.id AND sp.enabled AND sp.realtime IS NOT FALSE)
-              OR NOT EXISTS (SELECT 1 FROM security_products sp WHERE sp.agent_id = a.id AND sp.enabled
-                              AND coalesce(sp.signatures_updated_at > now() - interval '72 hours', sp.signatures_current, true)) THEN 2
+            WHEN ",
+            risk_realtime_off!(),
+            " OR ",
+            risk_signatures!(),
+            " OR ",
+            risk_database!(),
+            " OR ",
+            risk_sensor_realtime!(),
+            " THEN 2
             ELSE 4 END)"
+        )
     };
 }
 macro_rules! state_name {
@@ -144,6 +219,15 @@ pub struct AgentRow {
     /// The sensor's last status (null: not enabled or never reported).
     sensor: Option<Value>,
     content_version: Option<String>,
+    /// Why it's at risk (see `risks!`); empty otherwise.
+    risks: Vec<String>,
+    /// Our signature database there, when it was built, and the policy's age limit (hours, 0 =
+    /// none).
+    database_version: Option<String>,
+    database_built_at: Option<DateTime<Utc>>,
+    database_max_age_hours: i32,
+    /// The policy's prevention: without it real-time `block` denies nothing.
+    prevention: bool,
     #[sqlx(default)]
     #[serde(skip)]
     sort_key: String,
@@ -204,7 +288,14 @@ pub async fn agents(
         active_threats!(),
         " AS active_threats,
          (SELECT sa.action FROM security_actions sa WHERE sa.agent_id = a.id AND sa.status IN ('sent', 'running')
-           ORDER BY sa.created_at DESC LIMIT 1) AS running_action, a.isolated, a.sensor, a.content_version"
+           ORDER BY sa.created_at DESC LIMIT 1) AS running_action, a.isolated, a.sensor, a.content_version, ",
+        risks!(),
+        " AS risks, a.database_version,
+         (SELECT sd.built_at FROM signature_databases sd WHERE sd.version = a.database_version) AS database_built_at, ",
+        db_max_age!(),
+        " AS database_max_age_hours, coalesce(",
+        policy_col!("prevention"),
+        ", false) AS prevention"
     );
     let os = q.os.as_deref().filter(|s| !s.is_empty());
     let search = q.q.as_deref().map(str::trim).filter(|s| !s.is_empty());
@@ -251,6 +342,10 @@ pub struct DetectionRow {
     action_taken: Option<String>,
     sha256: Option<String>,
     verdict: Option<String>,
+    /// `on_exec`, `on_write`, `scan`, `reputation` (file detections from our sensor).
+    found_by: Option<String>,
+    /// Refused before it ran.
+    denied: bool,
     #[sqlx(default)]
     #[serde(skip)]
     sort_key: String,
@@ -258,7 +353,7 @@ pub struct DetectionRow {
 
 const DETECTION_COLS: &str = "d.id, d.agent_id, a.hostname, c.id AS client_id, c.name AS client_name, s.name AS site_name, d.product,
        d.name, d.severity, d.status, d.resources, d.process, d.username, d.detected_at, d.first_seen_at, d.last_seen_at, d.resolved_at,
-       d.source, d.rule_id, d.mitre, d.audit, d.action_taken, d.sha256, d.verdict";
+       d.source, d.rule_id, d.mitre, d.audit, d.action_taken, d.sha256, d.verdict, d.found_by, d.denied";
 const DETECTION_FROM: &str =
     "FROM security_detections d JOIN agents a ON a.id = d.agent_id JOIN sites s ON s.id = a.site_id JOIN clients c ON c.id = s.client_id";
 const SEVERITY_RANK: &str = "coalesce(array_position(ARRAY['severe', 'high', 'moderate', 'low'], d.severity), 5)";
@@ -445,6 +540,13 @@ pub struct AgentSecurity {
     /// What the sensor runs with here.
     policy: rmm_proto::security::SensorPolicy,
     quarantine: Vec<QuarantineRow>,
+    /// Why it's at risk (`realtime_off`, `signatures`, `database`, `sensor_realtime`).
+    risks: Vec<String>,
+    /// The signature database the sensor runs: the uploaded version's details, when the server
+    /// still has its row.
+    database: Option<Value>,
+    /// The policy's limit on the database's age, hours (0: none).
+    database_max_age_hours: i32,
 }
 
 pub async fn for_agent(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uuid>) -> ApiResult<Json<AgentSecurity>> {
@@ -495,6 +597,17 @@ pub async fn for_agent(State(st): State<Arc<AppState>>, u: User, Path(id): Path<
         .bind(id)
         .fetch_all(&st.db)
         .await?;
+    let (risks, database, database_max_age_hours): (Vec<String>, Option<Value>, i32) = sqlx::query_as(AssertSqlSafe(format!(
+        "SELECT {}, (SELECT jsonb_build_object('version', sd.version, 'built_at', sd.built_at, 'stage', sd.stage, 'hashes', sd.hashes,
+                                                'yara_rules', sd.yara_rules, 'size', sd.size)
+                       FROM signature_databases sd WHERE sd.version = a.database_version), {}
+           FROM agents a WHERE a.id = $1",
+        risks!(),
+        db_max_age!()
+    )))
+    .bind(id)
+    .fetch_one(&st.db)
+    .await?;
     Ok(Json(AgentSecurity {
         supported,
         online,
@@ -511,6 +624,9 @@ pub async fn for_agent(State(st): State<Arc<AppState>>, u: User, Path(id): Path<
         isolated,
         policy,
         quarantine,
+        risks,
+        database,
+        database_max_age_hours,
     }))
 }
 
@@ -546,144 +662,6 @@ pub async fn refresh(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uu
     u.need(Perm::SecurityRead)?;
     super::access::agent(&st, &u, id).await?;
     core::refresh(&st, id).await.map_err(start_error)?;
-    Ok(Json(json!({ "ok": true })))
-}
-
-// ---------------------------------------------------------------------------
-// Sensor policies (milestone 2)
-// ---------------------------------------------------------------------------
-
-#[derive(Serialize, sqlx::FromRow)]
-pub struct PolicyRow {
-    id: Uuid,
-    client_id: Option<Uuid>,
-    client_name: Option<String>,
-    site_id: Option<Uuid>,
-    site_name: Option<String>,
-    sensor_enabled: bool,
-    quick_scan_hours: i32,
-    full_scan_days: i32,
-    auto_quarantine: bool,
-    prevention: bool,
-    canaries: bool,
-    telemetry_mb: i32,
-    updated_by_name: Option<String>,
-    updated_at: DateTime<Utc>,
-}
-
-const POLICY_SELECT: &str = "SELECT p.id, p.client_id, c.name AS client_name, p.site_id, si.name AS site_name, p.sensor_enabled, p.quick_scan_hours,
-       p.full_scan_days, p.auto_quarantine, p.prevention, p.canaries, p.telemetry_mb, us.name AS updated_by_name, p.updated_at
-  FROM security_policies p LEFT JOIN clients c ON c.id = p.client_id LEFT JOIN sites si ON si.id = p.site_id LEFT JOIN users us ON us.id = p.updated_by";
-
-pub async fn policies(State(st): State<Arc<AppState>>, u: User) -> ApiResult<Json<Vec<PolicyRow>>> {
-    u.need(Perm::SecurityRead)?;
-    Ok(Json(
-        sqlx::query_as(AssertSqlSafe(format!(
-            "{POLICY_SELECT} WHERE p.client_id IS NULL OR $1::uuid[] IS NULL OR p.client_id = ANY($1) ORDER BY p.client_id IS NOT NULL, c.name, si.name NULLS FIRST"
-        )))
-        .bind(u.scope())
-        .fetch_all(&st.db)
-        .await?,
-    ))
-}
-
-#[derive(Deserialize)]
-pub struct PolicyIn {
-    client_id: Option<Uuid>,
-    site_id: Option<Uuid>,
-    sensor_enabled: bool,
-    quick_scan_hours: i32,
-    full_scan_days: i32,
-    auto_quarantine: bool,
-    prevention: bool,
-    canaries: bool,
-    telemetry_mb: i32,
-}
-
-impl PolicyIn {
-    fn validate(&self) -> ApiResult<()> {
-        if !(0..=720).contains(&self.quick_scan_hours) || !(0..=90).contains(&self.full_scan_days) || !(16..=4096).contains(&self.telemetry_mb) {
-            return Err(ApiError::BadRequest("quick scans 0-720 hours apart, full scans 0-90 days, telemetry 16-4096 MB".into()));
-        }
-        Ok(())
-    }
-}
-
-async fn fetch_policy(st: &AppState, id: Uuid) -> ApiResult<PolicyRow> {
-    sqlx::query_as(AssertSqlSafe(format!("{POLICY_SELECT} WHERE p.id = $1"))).bind(id).fetch_optional(&st.db).await?.ok_or(ApiError::NotFound("policy"))
-}
-
-/// A client's (or site's) own policy.
-pub async fn create_policy(State(st): State<Arc<AppState>>, u: User, Json(b): Json<PolicyIn>) -> ApiResult<Json<PolicyRow>> {
-    u.need(Perm::SecurityManage)?;
-    b.validate()?;
-    let Some(client) = b.client_id else { return Err(ApiError::BadRequest("pick a client (the MSP-wide policy already exists)".into())) };
-    super::alerts::check_target(&st, &u, Some(client), b.site_id, None).await?;
-    let id = Uuid::new_v4();
-    sqlx::query(
-        "INSERT INTO security_policies (id, client_id, site_id, sensor_enabled, quick_scan_hours, full_scan_days, auto_quarantine, prevention,
-                                        canaries, telemetry_mb, updated_by)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
-    )
-    .bind(id)
-    .bind(client)
-    .bind(b.site_id)
-    .bind(b.sensor_enabled)
-    .bind(b.quick_scan_hours)
-    .bind(b.full_scan_days)
-    .bind(b.auto_quarantine)
-    .bind(b.prevention)
-    .bind(b.canaries)
-    .bind(b.telemetry_mb)
-    .bind(u.id)
-    .execute(&st.db)
-    .await
-    .map_err(|e| match &e {
-        sqlx::Error::Database(d) if d.is_unique_violation() => ApiError::Conflict("that client or site already has a policy".into()),
-        _ => e.into(),
-    })?;
-    auth::audit(&st.db, Some(u.id), "security.policy_create", None, json!({ "policy": id, "client_id": client, "site_id": b.site_id, "sensor": b.sensor_enabled })).await;
-    core::push_policies(&st).await;
-    Ok(Json(fetch_policy(&st, id).await?))
-}
-
-pub async fn update_policy(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uuid>, Json(b): Json<PolicyIn>) -> ApiResult<Json<PolicyRow>> {
-    u.need(Perm::SecurityManage)?;
-    b.validate()?;
-    let cur = fetch_policy(&st, id).await?;
-    match cur.client_id {
-        Some(c) => super::access::client(&u, c)?,
-        None if u.scope().is_some() => return Err(ApiError::Forbidden),
-        None => {}
-    }
-    sqlx::query(
-        "UPDATE security_policies SET sensor_enabled = $2, quick_scan_hours = $3, full_scan_days = $4, auto_quarantine = $5, prevention = $6,
-                canaries = $7, telemetry_mb = $8, updated_by = $9, updated_at = now() WHERE id = $1",
-    )
-    .bind(id)
-    .bind(b.sensor_enabled)
-    .bind(b.quick_scan_hours)
-    .bind(b.full_scan_days)
-    .bind(b.auto_quarantine)
-    .bind(b.prevention)
-    .bind(b.canaries)
-    .bind(b.telemetry_mb)
-    .bind(u.id)
-    .execute(&st.db)
-    .await?;
-    auth::audit(&st.db, Some(u.id), "security.policy_update", None, json!({ "policy": id, "sensor": b.sensor_enabled, "prevention": b.prevention })).await;
-    core::push_policies(&st).await;
-    Ok(Json(fetch_policy(&st, id).await?))
-}
-
-pub async fn delete_policy(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uuid>) -> ApiResult<Json<Value>> {
-    u.need(Perm::SecurityManage)?;
-    let cur = fetch_policy(&st, id).await?;
-    let Some(c) = cur.client_id else { return Err(ApiError::BadRequest("the MSP-wide policy can't be deleted".into())) };
-    super::access::client(&u, c)?;
-    sqlx::query("DELETE FROM security_policies WHERE id = $1").bind(id).execute(&st.db).await?;
-    auth::audit(&st.db, Some(u.id), "security.policy_delete", None, json!({ "policy": id })).await;
-    core::push_policies(&st).await;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -833,14 +811,20 @@ pub struct RuleRow {
 
 pub async fn rules(State(st): State<Arc<AppState>>, u: User) -> ApiResult<Json<Vec<RuleRow>>> {
     u.need(Perm::SecurityRead)?;
-    // The newest version per stage that agents run (general, plus canary).
+    // The newest version per stage that agents run (general, plus canary), of the content
+    // bundles and of the signature databases.
     let versions: Vec<(String, Value, DateTime<Utc>)> = sqlx::query_as(
-        "SELECT stage, rules, uploaded_at FROM content_versions WHERE stage IN ('general', 'canary') ORDER BY stage = 'general' DESC, uploaded_at DESC",
+        "SELECT stage, rules, uploaded_at FROM (
+             SELECT stage, rules, uploaded_at FROM content_versions WHERE stage IN ('general', 'canary')
+             UNION ALL SELECT stage, rules, uploaded_at FROM signature_databases WHERE stage IN ('general', 'canary')) v
+          ORDER BY stage = 'general' DESC, uploaded_at DESC",
     )
     .fetch_all(&st.db)
     .await?;
     let firsts: Vec<(String, DateTime<Utc>)> = sqlx::query_as(
-        "SELECT r->>'id', min(cv.uploaded_at) FROM content_versions cv, jsonb_array_elements(cv.rules) r
+        "SELECT r->>'id', min(cv.uploaded_at) FROM (
+             SELECT rules, uploaded_at, stage FROM content_versions UNION ALL SELECT rules, uploaded_at, stage FROM signature_databases) cv,
+             jsonb_array_elements(cv.rules) r
           WHERE cv.stage IN ('general', 'retired') GROUP BY 1",
     )
     .fetch_all(&st.db)
@@ -937,7 +921,8 @@ pub async fn set_rule_mode(State(st): State<Arc<AppState>>, u: User, Path(id): P
             let mode = rmm_proto::security::RuleMode::parse(m).ok_or_else(|| ApiError::BadRequest("mode must be disabled, audit, alert or block".into()))?;
             if mode == rmm_proto::security::RuleMode::Block {
                 let rule: Option<Value> = sqlx::query_scalar(
-                    "SELECT r FROM content_versions cv, jsonb_array_elements(cv.rules) r WHERE cv.stage = 'general' AND r->>'id' = $1
+                    "SELECT r FROM (SELECT rules, uploaded_at, stage FROM content_versions UNION ALL SELECT rules, uploaded_at, stage FROM signature_databases) cv,
+                            jsonb_array_elements(cv.rules) r WHERE cv.stage = 'general' AND r->>'id' = $1
                       ORDER BY cv.uploaded_at DESC LIMIT 1",
                 )
                 .bind(&id)
@@ -945,7 +930,8 @@ pub async fn set_rule_mode(State(st): State<Arc<AppState>>, u: User, Path(id): P
                 .await?;
                 let Some(rule) = rule else { return Err(ApiError::BadRequest("that rule isn't in general content".into())) };
                 let first: Option<DateTime<Utc>> = sqlx::query_scalar(
-                    "SELECT min(cv.uploaded_at) FROM content_versions cv, jsonb_array_elements(cv.rules) r WHERE cv.stage IN ('general', 'retired') AND r->>'id' = $1",
+                    "SELECT min(cv.uploaded_at) FROM (SELECT rules, uploaded_at, stage FROM content_versions UNION ALL SELECT rules, uploaded_at, stage FROM signature_databases) cv,
+                            jsonb_array_elements(cv.rules) r WHERE cv.stage IN ('general', 'retired') AND r->>'id' = $1",
                 )
                 .bind(&id)
                 .fetch_one(&st.db)
@@ -1048,7 +1034,7 @@ pub async fn promote_content(State(st): State<Arc<AppState>>, u: User, Path(id):
         return Err(ApiError::Forbidden);
     }
     let reason = body.map(|b| b.0.reason).filter(|r| !r.trim().is_empty()).unwrap_or_else(|| "promoted by hand".into());
-    if !core::set_stage(&st, id, "general", &reason, Some(u.id)).await? {
+    if !core::set_stage(&st, core::Track::Content, id, "general", &reason, Some(u.id)).await? {
         return Err(ApiError::Conflict("already general (or no such version)".into()));
     }
     Ok(Json(json!({ "ok": true })))
@@ -1060,10 +1046,110 @@ pub async fn rollback_content(State(st): State<Arc<AppState>>, u: User, Path(id)
         return Err(ApiError::Forbidden);
     }
     let reason = body.map(|b| b.0.reason).filter(|r| !r.trim().is_empty()).unwrap_or_else(|| "rolled back by hand".into());
-    if !core::set_stage(&st, id, "rolled_back", &reason, Some(u.id)).await? {
+    if !core::set_stage(&st, core::Track::Content, id, "rolled_back", &reason, Some(u.id)).await? {
         return Err(ApiError::Conflict("already rolled back (or no such version)".into()));
     }
     Ok(Json(json!({ "ok": true })))
+}
+
+// ---------------------------------------------------------------------------
+// Signature databases (antivirus milestone 2): upload, stages, the agents' download
+// ---------------------------------------------------------------------------
+
+/// Largest database upload.
+pub const DATABASE_MAX: u64 = 2 << 30;
+
+#[derive(Serialize, sqlx::FromRow)]
+pub struct DatabaseRow {
+    id: Uuid,
+    version: String,
+    sha256: String,
+    size: i64,
+    description: String,
+    hashes: i64,
+    yara_rules: i32,
+    rule_count: i64,
+    sources: Value,
+    built_at: DateTime<Utc>,
+    stage: String,
+    stage_reason: Option<String>,
+    /// False once pruned from storage (it can't be rolled out again).
+    stored: bool,
+    uploaded_by_name: Option<String>,
+    uploaded_at: DateTime<Utc>,
+    stage_changed_at: DateTime<Utc>,
+    /// Agents reporting this version.
+    agents: i64,
+}
+
+pub async fn databases(State(st): State<Arc<AppState>>, u: User) -> ApiResult<Json<Value>> {
+    u.need(Perm::SecurityRead)?;
+    let rows: Vec<DatabaseRow> = sqlx::query_as(
+        "SELECT sd.id, sd.version, sd.sha256, sd.size, sd.description, sd.hashes, sd.yara_rules, jsonb_array_length(sd.rules)::bigint AS rule_count,
+                sd.sources, sd.built_at, sd.stage, sd.stage_reason, sd.storage_key IS NOT NULL AS stored, us.name AS uploaded_by_name,
+                sd.uploaded_at, sd.stage_changed_at, (SELECT count(*) FROM agents a WHERE a.database_version = sd.version) AS agents
+           FROM signature_databases sd LEFT JOIN users us ON us.id = sd.uploaded_by
+          ORDER BY sd.uploaded_at DESC LIMIT 100",
+    )
+    .fetch_all(&st.db)
+    .await?;
+    Ok(Json(json!({ "versions": rows, "soak_minutes": st.cfg.content_soak_minutes, "verifies_signatures": st.cfg.content_pubkey.is_some() })))
+}
+
+/// `POST /security/databases`: the `.rmmdb` file `rmm-sign build-db` wrote, as the body.
+pub async fn upload_database(State(st): State<Arc<AppState>>, u: User, body: axum::body::Body) -> ApiResult<Json<Value>> {
+    u.need(Perm::SecurityManage)?;
+    if u.scope().is_some() {
+        return Err(ApiError::Forbidden);
+    }
+    let up = core::upload_database(&st, body.into_data_stream(), DATABASE_MAX, u.id).await.map_err(ApiError::BadRequest)?;
+    auth::audit(&st.db, Some(u.id), "security.database_upload", None, json!({ "version": up.version, "size": up.size })).await;
+    Ok(Json(json!({ "id": up.id, "version": up.version, "size": up.size, "stage": "canary" })))
+}
+
+pub async fn promote_database(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uuid>, body: Option<Json<StageIn>>) -> ApiResult<Json<Value>> {
+    u.need(Perm::SecurityManage)?;
+    if u.scope().is_some() {
+        return Err(ApiError::Forbidden);
+    }
+    let stored: Option<bool> = sqlx::query_scalar("SELECT storage_key IS NOT NULL FROM signature_databases WHERE id = $1").bind(id).fetch_optional(&st.db).await?;
+    if stored == Some(false) {
+        return Err(ApiError::Conflict("that version was pruned from storage; upload it again".into()));
+    }
+    let reason = body.map(|b| b.0.reason).filter(|r| !r.trim().is_empty()).unwrap_or_else(|| "promoted by hand".into());
+    if !core::set_stage(&st, core::Track::Database, id, "general", &reason, Some(u.id)).await? {
+        return Err(ApiError::Conflict("already general (or no such version)".into()));
+    }
+    Ok(Json(json!({ "ok": true })))
+}
+
+pub async fn rollback_database(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uuid>, body: Option<Json<StageIn>>) -> ApiResult<Json<Value>> {
+    u.need(Perm::SecurityManage)?;
+    if u.scope().is_some() {
+        return Err(ApiError::Forbidden);
+    }
+    let reason = body.map(|b| b.0.reason).filter(|r| !r.trim().is_empty()).unwrap_or_else(|| "rolled back by hand".into());
+    if !core::set_stage(&st, core::Track::Database, id, "rolled_back", &reason, Some(u.id)).await? {
+        return Err(ApiError::Conflict("already rolled back (or no such version)".into()));
+    }
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// `GET /agent/databases/{version}`: the file, for an agent (its id in `X-Rmm-Agent`, its
+/// secret as the bearer token), with `Range` so an interrupted download resumes.
+pub async fn agent_database(State(st): State<Arc<AppState>>, Path(version): Path<String>, headers: axum::http::HeaderMap) -> ApiResult<axum::response::Response> {
+    let agent_id = headers.get("x-rmm-agent").and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<Uuid>().ok());
+    let secret = headers.get(axum::http::header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "));
+    let (Some(agent_id), Some(secret)) = (agent_id, secret) else { return Err(ApiError::Unauthorized) };
+    if !crate::agent_ws::authenticate(&st, agent_id, secret).await? {
+        return Err(ApiError::Unauthorized);
+    }
+    let row: Option<(String, i64)> = sqlx::query_as("SELECT storage_key, size FROM signature_databases WHERE version = $1 AND storage_key IS NOT NULL AND stage <> 'rolled_back'")
+        .bind(&version)
+        .fetch_optional(&st.db)
+        .await?;
+    let (key, size) = row.ok_or(ApiError::NotFound("signature database"))?;
+    super::attachments::serve(&st, &headers, &key, size, &format!("{version}.rmmdb"), "application/octet-stream", false).await
 }
 
 // ---------------------------------------------------------------------------
@@ -1082,12 +1168,20 @@ pub struct DetectionDetail {
     /// The context is encrypted and this server has no (or another) key.
     context_unavailable: bool,
     content_version: Option<String>,
+    /// The signature database it came from, and where in the file it matched.
+    database_version: Option<String>,
+    part: Option<String>,
     notes: Option<String>,
     verdict_by_name: Option<String>,
     verdict_at: Option<DateTime<Utc>>,
     quarantine_id: Option<Uuid>,
-    /// Other machines with the same file hash (detections or quarantine), within the user's clients.
+    /// Machines with the same file hash (it ran there, was detected or quarantined), within the
+    /// user's clients, first seen first; how many, and when the first saw it.
     prevalence: Vec<Value>,
+    seen_on: i64,
+    first_seen: Option<DateTime<Utc>>,
+    /// What the server's reputation set says about the hash (`[{name, severity, source}]`).
+    reputation: Vec<Value>,
     /// Response actions started from this detection.
     actions: Vec<ActionRow>,
     alert: Option<Value>,
@@ -1130,20 +1224,12 @@ pub async fn detection(State(st): State<Arc<AppState>>, u: User, Path(id): Path<
             None => (vec![], true),
         },
     };
-    let prevalence: Vec<Value> = match &detection.sha256 {
-        Some(h) => sqlx::query_scalar(
-            "SELECT jsonb_build_object('agent_id', a.id, 'hostname', a.hostname, 'client_name', c.name, 'first_seen', min(t.at), 'how', string_agg(DISTINCT t.how, ', '))
-               FROM (SELECT agent_id, first_seen_at AS at, 'detected' AS how FROM security_detections WHERE sha256 = $1
-                     UNION ALL SELECT agent_id, quarantined_at, 'quarantined' FROM quarantine_items WHERE sha256 = $1) t
-               JOIN agents a ON a.id = t.agent_id JOIN sites s ON s.id = a.site_id JOIN clients c ON c.id = s.client_id
-              WHERE ($2::uuid[] IS NULL OR c.id = ANY($2))
-              GROUP BY a.id, a.hostname, c.name ORDER BY min(t.at) LIMIT 100",
-        )
-        .bind(h)
-        .bind(u.scope())
-        .fetch_all(&st.db)
-        .await?,
-        None => vec![],
+    let (prevalence, seen_on, first_seen, reputation) = match &detection.sha256 {
+        Some(h) => {
+            let p = hash_prevalence(&st, &u, h, 100).await?;
+            (p.agents, p.seen_on, p.first_seen, p.known)
+        }
+        None => (vec![], 0, None, vec![]),
     };
     let actions = sqlx::query_as(
         "SELECT sa.id, sa.product, sa.action, sa.status, sa.message, us.name AS created_by_name, sa.created_at, sa.started_at, sa.finished_at,
@@ -1160,9 +1246,12 @@ pub async fn detection(State(st): State<Arc<AppState>>, u: User, Path(id): Path<
     .bind(id)
     .fetch_optional(&st.db)
     .await?;
+    let (database_version, part): (Option<String>, Option<String>) =
+        sqlx::query_as("SELECT database_version, part FROM security_detections WHERE id = $1").bind(id).fetch_one(&st.db).await?;
     let rule: Option<Value> = match &detection.rule_id {
         Some(r) => sqlx::query_scalar(
-            "SELECT r FROM content_versions cv, jsonb_array_elements(cv.rules) r WHERE r->>'id' = $1 ORDER BY cv.uploaded_at DESC LIMIT 1",
+            "SELECT r FROM (SELECT rules, uploaded_at FROM content_versions UNION ALL SELECT rules, uploaded_at FROM signature_databases) cv,
+                    jsonb_array_elements(cv.rules) r WHERE r->>'id' = $1 ORDER BY cv.uploaded_at DESC LIMIT 1",
         )
         .bind(r)
         .fetch_optional(&st.db)
@@ -1177,11 +1266,16 @@ pub async fn detection(State(st): State<Arc<AppState>>, u: User, Path(id): Path<
         context,
         context_unavailable,
         content_version,
+        database_version,
+        part,
         notes,
         verdict_by_name,
         verdict_at,
         quarantine_id,
         prevalence,
+        seen_on,
+        first_seen,
+        reputation,
         actions,
         alert,
         rule,
@@ -1489,25 +1583,144 @@ pub struct PrevalenceQuery {
     sha256: String,
 }
 
-/// "Have we seen this hash elsewhere?" from what the server knows (detections, quarantine);
-/// hunting asks the agents' telemetry as well.
-pub async fn prevalence(State(st): State<Arc<AppState>>, u: User, Query(q): Query<PrevalenceQuery>) -> ApiResult<Json<Value>> {
-    u.need(Perm::SecurityRead)?;
-    let h = q.sha256.trim().to_ascii_lowercase();
+struct Prevalence {
+    agents: Vec<Value>,
+    seen_on: i64,
+    first_seen: Option<DateTime<Utc>>,
+    known: Vec<Value>,
+}
+
+/// Which machines have this hash and since when: from the sensors' reputation lookups (it ran
+/// there), detections and quarantine. Only the user's clients count, totals included, so a
+/// technician limited to some clients learns nothing of the others.
+async fn hash_prevalence(st: &AppState, u: &User, sha256: &str, limit: i64) -> ApiResult<Prevalence> {
+    let h = sha256.trim().to_ascii_lowercase();
     if h.len() != 64 || !h.bytes().all(|c| c.is_ascii_hexdigit()) {
         return Err(ApiError::BadRequest("a sha256 is 64 hex characters".into()));
     }
-    let rows: Vec<Value> = sqlx::query_scalar(
-        "SELECT jsonb_build_object('agent_id', a.id, 'hostname', a.hostname, 'client_name', c.name, 'first_seen', min(t.at), 'how', string_agg(DISTINCT t.how, ', '))
-           FROM (SELECT agent_id, first_seen_at AS at, 'detected' AS how FROM security_detections WHERE sha256 = $1
-                 UNION ALL SELECT agent_id, quarantined_at, 'quarantined' FROM quarantine_items WHERE sha256 = $1) t
-           JOIN agents a ON a.id = t.agent_id JOIN sites s ON s.id = a.site_id JOIN clients c ON c.id = s.client_id
-          WHERE ($2::uuid[] IS NULL OR c.id = ANY($2))
-          GROUP BY a.id, a.hostname, c.name ORDER BY min(t.at) LIMIT 500",
+    let rows: Vec<(Value, i64, Option<DateTime<Utc>>)> = sqlx::query_as(
+        "WITH t AS (SELECT agent_id, first_seen_at AS at, 'detected' AS how, NULL::text AS path FROM security_detections WHERE sha256 = $1
+                    UNION ALL SELECT agent_id, quarantined_at, 'quarantined', path FROM quarantine_items WHERE sha256 = $1
+                    UNION ALL SELECT agent_id, first_seen, 'ran', path FROM hash_sightings WHERE sha256 = decode($1, 'hex')),
+              v AS (SELECT a.id, a.hostname, c.name AS client_name, min(t.at) AS first_seen, string_agg(DISTINCT t.how, ', ') AS how, max(t.path) AS path
+                      FROM t JOIN agents a ON a.id = t.agent_id JOIN sites s ON s.id = a.site_id JOIN clients c ON c.id = s.client_id
+                     WHERE ($2::uuid[] IS NULL OR c.id = ANY($2)) GROUP BY a.id, a.hostname, c.name)
+         SELECT jsonb_build_object('agent_id', id, 'hostname', hostname, 'client_name', client_name, 'first_seen', first_seen, 'how', how, 'path', path),
+                count(*) OVER (), min(first_seen) OVER ()
+           FROM v ORDER BY first_seen LIMIT $3",
     )
     .bind(&h)
     .bind(u.scope())
+    .bind(limit)
     .fetch_all(&st.db)
     .await?;
-    Ok(Json(json!({ "sha256": h, "agents": rows })))
+    let known: Vec<Value> = sqlx::query_scalar(
+        "SELECT jsonb_build_object('name', name, 'severity', severity, 'source', source, 'added_at', added_at)
+           FROM reputation_hashes WHERE sha256 = decode($1, 'hex') ORDER BY source LIKE 'db:%' DESC, added_at DESC",
+    )
+    .bind(&h)
+    .fetch_all(&st.db)
+    .await?;
+    let (seen_on, first_seen) = rows.first().map_or((0, None), |r| (r.1, r.2));
+    Ok(Prevalence { agents: rows.into_iter().map(|r| r.0).collect(), seen_on, first_seen, known })
+}
+
+/// `GET /security/prevalence?sha256=`: which machines have seen this hash, first when, and
+/// whether the server's reputation set knows it.
+pub async fn prevalence(State(st): State<Arc<AppState>>, u: User, Query(q): Query<PrevalenceQuery>) -> ApiResult<Json<Value>> {
+    u.need(Perm::SecurityRead)?;
+    let p = hash_prevalence(&st, &u, &q.sha256, 500).await?;
+    Ok(Json(json!({ "sha256": q.sha256.trim().to_ascii_lowercase(), "agents": p.agents, "seen_on": p.seen_on, "first_seen": p.first_seen, "known": p.known })))
+}
+
+#[derive(Deserialize)]
+pub struct RareQuery {
+    /// Seen on at most this many machines (default 1).
+    max_agents: Option<i64>,
+    /// First seen within this many days (default 7).
+    days: Option<i32>,
+    client_id: Option<Uuid>,
+}
+
+/// `GET /security/reputation/rare`: programs that ran on few machines, recently, and that the
+/// server doesn't know: hunting leads, not detections. Counted within the user's clients.
+pub async fn rare(State(st): State<Arc<AppState>>, u: User, Query(q): Query<RareQuery>) -> ApiResult<Json<Value>> {
+    u.need(Perm::SecurityRead)?;
+    if let Some(c) = q.client_id {
+        super::access::client(&u, c)?;
+    }
+    let rows: Vec<Value> = sqlx::query_scalar(
+        "SELECT jsonb_build_object('sha256', encode(h.sha256, 'hex'), 'seen_on', count(*), 'first_seen', min(h.first_seen),
+                                   'agents', jsonb_agg(jsonb_build_object('agent_id', a.id, 'hostname', a.hostname, 'client_name', c.name, 'path', h.path)
+                                                       ORDER BY h.first_seen))
+           FROM hash_sightings h JOIN agents a ON a.id = h.agent_id JOIN sites s ON s.id = a.site_id JOIN clients c ON c.id = s.client_id
+          WHERE ($1::uuid[] IS NULL OR c.id = ANY($1)) AND ($4::uuid IS NULL OR c.id = $4)
+            AND NOT EXISTS (SELECT 1 FROM reputation_hashes r WHERE r.sha256 = h.sha256)
+          GROUP BY h.sha256
+         HAVING count(*) <= $2 AND min(h.first_seen) > now() - make_interval(days => $3)
+          ORDER BY min(h.first_seen) DESC LIMIT 500",
+    )
+    .bind(u.scope())
+    .bind(q.max_agents.unwrap_or(1).max(1))
+    .bind(q.days.unwrap_or(7).clamp(1, 365))
+    .bind(q.client_id)
+    .fetch_all(&st.db)
+    .await?;
+    Ok(Json(json!({ "items": rows })))
+}
+
+/// `GET /security/reputation`: what the server's set holds, by source.
+pub async fn reputation_sources(State(st): State<Arc<AppState>>, u: User) -> ApiResult<Json<Value>> {
+    u.need(Perm::SecurityRead)?;
+    let rows: Vec<Value> = sqlx::query_scalar(
+        "SELECT jsonb_build_object('source', source, 'hashes', count(*), 'added_at', max(added_at)) FROM reputation_hashes GROUP BY source ORDER BY source",
+    )
+    .fetch_all(&st.db)
+    .await?;
+    Ok(Json(json!({ "sources": rows })))
+}
+
+/// Largest server-only hash list, as text.
+pub const REPUTATION_LIST_MAX: usize = 256 << 20;
+
+#[derive(Deserialize)]
+pub struct ListQuery {
+    severity: Option<String>,
+}
+
+fn valid_list_name(n: &str) -> bool {
+    !n.is_empty() && n.len() <= 64 && n.bytes().all(|b| b.is_ascii_alphanumeric() || b".-_".contains(&b))
+}
+
+/// `PUT /security/reputation/lists/{name}`: a hash list for the server's reputation set only,
+/// as text (one SHA-256 per line, optionally a name after it). Agents don't download it: this
+/// is how the server's set is bigger than the database agents carry. Replaces the list.
+pub async fn put_reputation_list(State(st): State<Arc<AppState>>, u: User, Path(name): Path<String>, Query(q): Query<ListQuery>, body: String) -> ApiResult<Json<Value>> {
+    u.need(Perm::SecurityManage)?;
+    if u.scope().is_some() {
+        return Err(ApiError::Forbidden);
+    }
+    if !valid_list_name(&name) {
+        return Err(ApiError::BadRequest("list names are letters, digits, dots, dashes and underscores".into()));
+    }
+    let severity = match q.severity.as_deref().unwrap_or("high") {
+        "severe" => rmm_proto::security::ThreatSeverity::Severe,
+        "high" => rmm_proto::security::ThreatSeverity::High,
+        "moderate" => rmm_proto::security::ThreatSeverity::Moderate,
+        "low" => rmm_proto::security::ThreatSeverity::Low,
+        _ => return Err(ApiError::BadRequest("severity is severe, high, moderate or low".into())),
+    };
+    let n = core::reputation_list(&st, &name, severity, &body).await.map_err(ApiError::BadRequest)?;
+    auth::audit(&st.db, Some(u.id), "security.reputation_list", None, json!({ "name": name, "hashes": n })).await;
+    Ok(Json(json!({ "name": name, "hashes": n })))
+}
+
+pub async fn delete_reputation_list(State(st): State<Arc<AppState>>, u: User, Path(name): Path<String>) -> ApiResult<Json<Value>> {
+    u.need(Perm::SecurityManage)?;
+    if u.scope().is_some() {
+        return Err(ApiError::Forbidden);
+    }
+    let n = sqlx::query("DELETE FROM reputation_hashes WHERE source = $1").bind(format!("list:{name}")).execute(&st.db).await?.rows_affected();
+    auth::audit(&st.db, Some(u.id), "security.reputation_list_delete", None, json!({ "name": name, "hashes": n })).await;
+    Ok(Json(json!({ "ok": true, "hashes": n })))
 }

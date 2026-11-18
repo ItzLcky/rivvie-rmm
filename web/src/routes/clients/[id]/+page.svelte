@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
-	import { CircleSlash, Contact as ContactIcon, ExternalLink, KeyRound, LifeBuoy, MapPin, Monitor, Pencil, Plus, Star, Stethoscope, Trash2, UserPlus } from '@lucide/svelte';
+	import { CircleSlash, Contact as ContactIcon, ExternalLink, FolderPlus, FolderTree, KeyRound, LifeBuoy, MapPin, Monitor, Pencil, Plus, Star, Stethoscope, Trash2, UserPlus } from '@lucide/svelte';
 	import { api } from '#lib/api.js';
 	import { confirmAction } from '#lib/confirm.svelte.js';
 	import { ago, datetime, num, pct, plural } from '#lib/format.js';
@@ -34,6 +34,11 @@
 	import Switch from '#lib/ui/Switch.svelte';
 	import Tabs from '#lib/ui/Tabs.svelte';
 	import EnrollDialog from '#lib/components/EnrollDialog.svelte';
+	import AssignmentGrid from '#lib/components/policy/AssignmentGrid.svelte';
+	import SetDialog from '#lib/components/policy/SetDialog.svelte';
+	import SetTree from '#lib/components/policy/SetTree.svelte';
+	import { setHref, treeOrder } from '#lib/policy/policy.js';
+	import type { SetRow } from '#lib/policy/types.js';
 	import HealthBadge from '#lib/components/HealthBadge.svelte';
 	import OsBadge from '#lib/components/OsBadge.svelte';
 	import Status from '#lib/components/Status.svelte';
@@ -126,6 +131,9 @@
 		}
 	}
 
+	const ownSets = resource(() => (tab === 'policies' ? api.get<SetRow[]>(`/policy-sets?client_id=${id}`).then((rows) => treeOrder(rows.filter((r) => r.client_id === id))) : Promise.resolve([] as SetRow[])));
+	let newSet = $state(false);
+
 	const slaPolicies = resource(() => (tab === 'settings' && can('admin') ? api.get<SlaPolicy[]>('/sla/policies') : Promise.resolve([] as SlaPolicy[])));
 	let serviceBusy = $state(false);
 	async function setService(c: Client, body: { sla_policy_id: string | null; portal_devices?: boolean }) {
@@ -142,18 +150,6 @@
 	async function portalReset(p: Contact) {
 		const ok = await confirmAction({ title: `Reset ${p.name}'s portal sign-in?`, message: 'Removes their portal password and two-factor setup and signs them out. They can sign in again with an emailed link.', confirmLabel: 'Reset' });
 		if (ok) await attempt(() => api.del(`/contacts/${p.id}/portal-credentials`), 'Portal sign-in reset.');
-	}
-
-	let consentBusy = $state(false);
-	async function setConsent(c: Client, consent: boolean) {
-		consentBusy = true;
-		const ok = await attempt(
-			() => api.put(`/clients/${c.id}/desktop`, { consent }),
-			consent ? `${c.name}: the person at the machine is asked first.` : `${c.name}: remote desktop sessions start without asking.`
-		);
-		consentBusy = false;
-		if (ok) c.desktop_consent = consent;
-		else await client.reload();
 	}
 
 	async function deleteClient(c: Client) {
@@ -222,6 +218,7 @@
 				{ value: 'tickets', label: 'Tickets' },
 				{ value: 'contacts', label: 'Contacts' },
 				{ value: 'docs', label: 'Docs' },
+				{ value: 'policies', label: 'Policies' },
 				{ value: 'billing', label: 'Billing', hidden: !allowed('billing.read') },
 				{ value: 'settings', label: 'Settings', hidden: !can('admin') }
 			]}
@@ -373,6 +370,36 @@
 			</section>
 		{:else if tab === 'docs'}
 			<ClientDocs clientId={c.id} />
+		{:else if tab === 'policies'}
+			<div class="space-y-5">
+				<section class="card" aria-labelledby="assign-heading">
+					<header class="panel-head">
+						<div class="min-w-0">
+							<h2 id="assign-heading" class="panel-title">Assignments</h2>
+							<p class="text-muted text-xs">The policy set each device category uses at {c.name}, for the whole client or one site. A pinned device ignores these.</p>
+						</div>
+					</header>
+					<AssignmentGrid clientId={c.id} onchange={() => ownSets.reload()} />
+				</section>
+				<section class="card" aria-labelledby="own-sets-heading">
+					<header class="panel-head">
+						<div class="min-w-0">
+							<h2 id="own-sets-heading" class="panel-title">{c.name}'s own sets</h2>
+							<p class="text-muted text-xs">Sets that belong to this client: technicians with access to it can change them, and only its devices can use them.</p>
+						</div>
+						{#if can('technician')}<Button size="sm" icon={FolderPlus} onclick={() => (newSet = true)}>New set</Button>{/if}
+					</header>
+					<Async res={ownSets} compact>
+						{#snippet children(rows)}
+							{#if rows.length}
+								<SetTree rows={rows} base={Math.min(...rows.map((r) => r.depth))} label="{c.name}'s own sets" />
+							{:else}
+								<EmptyState compact icon={FolderTree} title="No sets of its own" description="Start one below an MSP-wide set (say Windows servers) to change a few fields for {c.name} only, then assign it above." />
+							{/if}
+						{/snippet}
+					</Async>
+				</section>
+			</div>
 		{:else if tab === 'billing' && allowed('billing.read')}
 			<ClientBilling clientId={c.id} />
 		{:else if tab === 'settings' && can('admin')}
@@ -404,18 +431,14 @@
 						<p class="hint ml-11.5">Contacts see a read-only list: hostname, online, last seen, missing updates.</p>
 					</div>
 				</section>
-				<section class="card space-y-4 p-5" aria-labelledby="desktop-heading">
-					<h2 id="desktop-heading" class="font-semibold">Remote desktop</h2>
-					<div>
-						<Switch checked={c.desktop_consent} disabled={consentBusy} onchange={(v) => setConsent(c, v)}>Ask the user before connecting</Switch>
-						<p class="hint ml-11.5">
-							The person at the machine gets an Allow / Deny prompt, and the session is refused if nobody answers within 30 seconds. If nobody is signed in, the session starts without asking.
-						</p>
-					</div>
+				<section class="card space-y-2 p-5" aria-labelledby="desktop-heading">
+					<h2 id="desktop-heading" class="font-semibold">Remote desktop, terminal and files</h2>
+					<p class="text-muted text-sm">Whether they're allowed, and whether the person at the machine is asked first, is part of the remote access policy. Give {c.name}'s devices a policy set that changes it on the <a class="link" href="?tab=policies">Policies</a> tab.</p>
 				</section>
 			</div>
 		{/if}
 
+		{#if newSet}<SetDialog mode="new" client={c.id} onclose={() => (newSet = false)} ondone={(r) => goto(setHref(r.id))} />{/if}
 		{#if enrolling}<EnrollDialog client={c} site={enrolling} onclose={() => (enrolling = null)} />{/if}
 		{#if ticketing}<NewTicket onclose={() => (ticketing = false)} initial={{ clientId: c.id }} />{/if}
 		{#if editingContact}

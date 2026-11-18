@@ -1,10 +1,16 @@
-//! File scanning: walks directories at low priority, hashes each file and checks it against
-//! the bundle's hashes and file rules.
+//! File scanning: walks directories at low priority and checks each file with the scan engine
+//! (`rmm-scan`: the signature database, the bundle's legacy hashes and file rules, YARA,
+//! heuristics, archives and macros). What to do about a match is the sensor's call
+//! ([`super::best`]); this module only finds.
+//!
+//! Files that scanned clean go into the verdict cache, so an unchanged file isn't read again
+//! until the engine, database or bundle changes.
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
-use rmm_content::files::FileMatcher;
-use rmm_content::{FileRule, HashIoc};
+use rmm_scan::cache::Cache;
+use rmm_scan::{Engine, Match};
 
 use super::policy::Exclusions;
 
@@ -16,15 +22,11 @@ pub enum Kind {
     Path,
 }
 
-pub enum Hit<'a> {
-    Hash(&'a HashIoc),
-    Rule(&'a FileRule),
-}
-
-pub struct Finding<'a> {
+pub struct Finding {
     pub path: PathBuf,
     pub sha256: String,
-    pub hit: Hit<'a>,
+    /// Every match, rule exclusions already applied.
+    pub matches: Vec<Match>,
 }
 
 /// Where a quick or full scan looks.
@@ -75,39 +77,63 @@ fn skip_dir(p: &Path) -> bool {
 }
 
 pub struct Scanner<'a> {
-    pub matcher: &'a FileMatcher,
+    pub engine: &'a Engine,
     pub excl: &'a Exclusions,
+    pub cache: Option<&'a Mutex<Cache>>,
+    /// Files read and checked.
     pub scanned: u64,
+    /// Files skipped because the cache knew them clean.
+    pub cached: u64,
 }
 
 impl<'a> Scanner<'a> {
-    /// Checks one file. `None` when it's clean, excluded or unreadable.
-    pub fn file(&mut self, path: &Path) -> Option<Finding<'a>> {
+    pub fn new(engine: &'a Engine, excl: &'a Exclusions, cache: Option<&'a Mutex<Cache>>) -> Self {
+        Scanner { engine, excl, cache, scanned: 0, cached: 0 }
+    }
+
+    fn cache(&self) -> Option<std::sync::MutexGuard<'a, Cache>> {
+        self.cache.map(|c| c.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// Checks one file. `None` when it's clean, excluded, unchanged since a clean scan, or
+    /// unreadable.
+    pub fn file(&mut self, path: &Path) -> Option<Finding> {
         let ps = path.to_string_lossy();
         if self.excl.path(&ps) {
             return None;
         }
         let md = std::fs::symlink_metadata(path).ok()?;
-        if !md.is_file() || md.len() == 0 || md.len() > self.matcher.max_size() {
+        if !md.is_file() || md.len() == 0 {
             return None;
         }
-        let data = std::fs::read(path).ok()?;
+        let key = rmm_scan::cache::key(path, &md);
+        if let Some(k) = &key
+            && self.cache().is_some_and(|mut c| c.clean(k))
+        {
+            self.cached += 1;
+            return None;
+        }
+        let v = self.engine.scan_path(path).ok()?;
         self.scanned += 1;
-        use sha2::{Digest, Sha256};
-        let sha256 = hex::encode(Sha256::digest(&data));
-        if self.excl.hash(&sha256) {
+        if v.clean() {
+            if let (Some(k), Some(mut c)) = (key, self.cache()) {
+                c.insert(k);
+            }
             return None;
         }
-        if let Some(h) = self.matcher.hash(&sha256) {
-            return Some(Finding { path: path.to_path_buf(), sha256, hit: Hit::Hash(h) });
+        if self.excl.hash(&v.sha256) {
+            return None;
         }
-        let rule = self.matcher.scan(&data).into_iter().find(|r| !self.excl.rule(&r.id))?;
-        Some(Finding { path: path.to_path_buf(), sha256, hit: Hit::Rule(rule) })
+        let matches: Vec<Match> = v.matches.into_iter().filter(|m| !self.excl.rule(&m.id)).collect();
+        if matches.is_empty() {
+            return None;
+        }
+        Some(Finding { path: path.to_path_buf(), sha256: v.sha256, matches })
     }
 
     /// Walks `root` (same filesystem only), calling `found` for each finding and `pace` after
     /// every file so the caller can throttle or stop (return false).
-    pub fn walk(&mut self, root: &Path, found: &mut dyn FnMut(Finding<'a>), pace: &mut dyn FnMut() -> bool) {
+    pub fn walk(&mut self, root: &Path, found: &mut dyn FnMut(Finding), pace: &mut dyn FnMut() -> bool) {
         #[cfg(unix)]
         let dev = {
             use std::os::unix::fs::MetadataExt;
@@ -131,10 +157,12 @@ impl<'a> Scanner<'a> {
                     stack.push(e.path());
                 }
             } else if md.is_file() {
+                let before = self.cached;
                 if let Some(f) = self.file(&p) {
                     found(f);
                 }
-                if !pace() {
+                // Cache hits cost a stat: only files actually read count against the pace.
+                if self.cached == before && !pace() {
                     return;
                 }
             }
@@ -143,34 +171,51 @@ impl<'a> Scanner<'a> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use rmm_content::Bundle;
+    use rmm_content::files::FileMatcher;
+
+    /// The EICAR string, assembled at runtime so this source file doesn't contain it.
+    pub fn eicar() -> String {
+        format!("X5O!P%@AP[4\\PZX54(P^)7CC)7{}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*", "}")
+    }
+
+    pub fn starter_engine() -> Engine {
+        let b = Bundle::parse(rmm_content::STARTER.as_bytes()).unwrap();
+        Engine::new(None, Some((b.version.clone(), FileMatcher::new(&b).unwrap())), rmm_scan::Limits::default()).unwrap()
+    }
 
     #[test]
-    fn finds_by_rule_and_hash_and_honours_exclusions() {
-        let b = Bundle::parse(rmm_content::STARTER.as_bytes()).unwrap();
-        let m = FileMatcher::new(&b).unwrap();
+    fn finds_by_rule_and_hash_and_honours_exclusions_and_the_cache() {
+        let e = starter_engine();
         let root = std::env::temp_dir().join(format!("rmm-scan-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(root.join("sub/deeper")).unwrap();
-        // The EICAR string, assembled at runtime so this source file doesn't contain it.
-        let eicar = format!("X5O!P%@AP[4\\PZX54(P^)7CC)7{}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*", "}");
-        std::fs::write(root.join("sub/deeper/e.com"), &eicar).unwrap();
+        std::fs::write(root.join("sub/deeper/e.com"), eicar()).unwrap();
         std::fs::write(root.join("sub/shell.php"), "<?php system($_GET['c']); ?>").unwrap();
         std::fs::write(root.join("clean.txt"), "nothing here").unwrap();
         let excl = Exclusions::default();
-        let mut s = Scanner { matcher: &m, excl: &excl, scanned: 0 };
+        let cache = Mutex::new(Cache::new(rmm_scan::cache::generation(&[&e.generation()]), 1000));
+        let mut s = Scanner::new(&e, &excl, Some(&cache));
         let mut found = vec![];
-        s.walk(&root, &mut |f| found.push((f.path.file_name().unwrap().to_string_lossy().into_owned(), match f.hit { Hit::Hash(h) => h.name.clone(), Hit::Rule(r) => r.id.clone() })), &mut || true);
+        s.walk(&root, &mut |f| found.push((f.path.file_name().unwrap().to_string_lossy().into_owned(), f.matches[0].id.clone(), f.matches[0].name.clone())), &mut || true);
         found.sort();
-        assert_eq!(found, [("e.com".to_string(), "EICAR test file".to_string()), ("shell.php".into(), "RMM-F-0003".into())], "the hash matches before the rule");
-        assert_eq!(s.scanned, 3);
+        assert_eq!(
+            found,
+            [("e.com".to_string(), "RMM-HASH".to_string(), "EICAR test file".to_string()), ("shell.php".into(), "RMM-F-0003".into(), "PHP web shell".into())],
+            "the hash matches before the rule"
+        );
+        assert_eq!((s.scanned, s.cached), (3, 0));
+        let mut s = Scanner::new(&e, &excl, Some(&cache));
+        let mut n = 0;
+        s.walk(&root, &mut |_| n += 1, &mut || true);
+        assert_eq!((n, s.scanned, s.cached), (2, 2, 1), "the clean file isn't read again; findings always are");
         let p = rmm_proto::security::SensorPolicy {
             exclusions: vec![rmm_proto::security::Exclusion { kind: rmm_proto::security::ExclusionKind::Path, value: root.join("sub/deeper").to_string_lossy().into_owned() }],
             ..Default::default()
         };
         let excl = Exclusions::from_policy(&p);
-        let mut s = Scanner { matcher: &m, excl: &excl, scanned: 0 };
+        let mut s = Scanner::new(&e, &excl, None);
         let mut n = 0;
         s.walk(&root, &mut |_| n += 1, &mut || true);
         assert_eq!(n, 1, "the excluded folder is skipped");

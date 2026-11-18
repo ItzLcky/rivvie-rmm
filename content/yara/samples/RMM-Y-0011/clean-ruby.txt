@@ -1,0 +1,1 @@
+Rubeus is also a Latin name; kerberos tickets are renewed by klist and kinit.

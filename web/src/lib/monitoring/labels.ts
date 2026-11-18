@@ -1,4 +1,4 @@
-import type { LogLevel, Policy, PolicyKind, ServiceState, Severity } from '#lib/types.js';
+import type { LogLevel, PolicyKind, ServiceState, Severity } from '#lib/types.js';
 import type { Tone } from '#lib/ui/Badge.svelte';
 
 export const kindLabels: Record<PolicyKind, string> = {
@@ -41,7 +41,7 @@ export const serviceTone: Record<ServiceState, Tone> = {
 };
 
 /** One line saying what a policy checks, e.g. "CPU ≥ 90% for 15 min". */
-export function describePolicy(p: Pick<Policy, 'kind' | 'params'>): string {
+export function describePolicy(p: { kind: PolicyKind; params: Record<string, unknown> }): string {
 	const q = p.params as Record<string, unknown>;
 	const list = (v: unknown) => (Array.isArray(v) ? (v as string[]) : []);
 	switch (p.kind) {
@@ -66,6 +66,8 @@ export function describePolicy(p: Pick<Policy, 'kind' | 'params'>): string {
 			if (q.unprotected) bits.push('no antivirus');
 			if (q.realtime_off) bits.push('real-time off');
 			if (q.sensor_down) bits.push('sensor not running');
+			if (q.sensor_realtime) bits.push('our real-time protection off');
+			if (q.database_stale) bits.push('signature database out of date');
 			if (q.signature_max_age_hours) bits.push(`signatures over ${q.signature_max_age_hours} h`);
 			if (q.stale_hours) bits.push(`no report for ${q.stale_hours} h`);
 			if (q.threats === 'any') bits.push('every detection');

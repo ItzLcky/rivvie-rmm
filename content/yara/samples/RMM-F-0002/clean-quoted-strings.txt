@@ -1,0 +1,2 @@
+Detection notes quoting the strings a Mimikatz build carries: gentilkiwi, mimikatz, sekurlsa::logonpasswords, lsadump::sam, privilege::debug.
+A rule file or an article like this is not the program.
