@@ -4,6 +4,10 @@ on:
   push:
   pull_request:
 
+# Read-only by default; a job that needs more says so.
+permissions:
+  contents: read
+
 jobs:
   rust:
     strategy:
@@ -13,10 +17,12 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Clippy (agent + proto + sign + scan engine + content)
         run: cargo clippy -p rmm-agent -p rmm-proto -p rmm-sign -p rmm-scan -p rmm-content --all-targets -- -D warnings
       - name: Clippy (scan engine and agent without YARA)
@@ -43,8 +49,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Build the test as the runner user
         id: build
         run: |
@@ -70,15 +78,19 @@ jobs:
           --health-cmd "pg_isready -U rmm" --health-interval 5s --health-timeout 5s --health-retries 20
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Package tools (to validate the generated .deb/.rpm)
         run: sudo apt-get install -y --no-install-recommends rpm
       # Prometheus's own parser and linter, for the /metrics output.
       - name: promtool
         run: |
-          curl -sSfL https://github.com/prometheus/prometheus/releases/download/v3.5.0/prometheus-3.5.0.linux-amd64.tar.gz \
-            | tar xz -C /tmp --strip-components=1 prometheus-3.5.0.linux-amd64/promtool
+          curl -sSfL -o /tmp/prometheus.tar.gz https://github.com/prometheus/prometheus/releases/download/v3.5.0/prometheus-3.5.0.linux-amd64.tar.gz
+          # From the release's sha256sums.txt.
+          echo "e811827af26d822afb09a4f28314f61b618b12cff5369835a67f674d8b46f39a  /tmp/prometheus.tar.gz" | sha256sum -c -
+          tar xzf /tmp/prometheus.tar.gz -C /tmp --strip-components=1 prometheus-3.5.0.linux-amd64/promtool
           /tmp/promtool --version
       - run: cargo build -p rmm-agent
       - name: End-to-end
@@ -139,8 +151,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Previous release
         id: prev
         run: |
@@ -154,7 +167,7 @@ jobs:
           shipped=$(git ls-tree --name-only "${{ steps.prev.outputs.tag }}" crates/rmm-server/migrations/)
           git diff --exit-code --stat "${{ steps.prev.outputs.tag }}" -- $shipped \
             || { echo "::error::a migration shipped in ${{ steps.prev.outputs.tag }} was edited; add a new one instead"; exit 1; }
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -216,8 +229,10 @@ jobs:
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Start PostgreSQL
         shell: pwsh
         run: |
@@ -265,6 +280,8 @@ jobs:
         working-directory: web
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@v4
         with:
           node-version: 24
@@ -285,6 +302,8 @@ jobs:
         working-directory: web
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - run: npm ci
       - run: npm run test:visual
         env:
