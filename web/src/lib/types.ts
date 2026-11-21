@@ -269,12 +269,14 @@ export interface Ticket {
 	csat_rating: 'good' | 'bad' | null;
 }
 export type SlaTarget = 'respond' | 'update' | 'resolve';
-export type TicketEventKind = 'created' | 'reply' | 'message' | 'note' | 'change' | 'alert' | 'job' | 'session' | 'merge' | 'agent' | 'sla' | 'split' | 'csat' | 'time';
+export type TicketEventKind = 'created' | 'reply' | 'message' | 'note' | 'change' | 'alert' | 'job' | 'session' | 'merge' | 'agent' | 'sla' | 'split' | 'csat' | 'time' | 'doc';
 export interface TicketEvent {
 	id: number; kind: TicketEventKind; public: boolean; author_id: string | null; author_contact_id: string | null;
 	author_kind: 'user' | 'contact' | 'system'; author_name: string; body: string; data: Record<string, unknown>; created_at: string;
 	email_status: 'pending' | 'sent' | 'failed' | null; email_error: string | null; email_to: string[] | null;
 }
+/** A documentation page linked to a ticket. `category` is "" when there is none. */
+export interface TicketDoc { id: string; title: string; category: string; updated_at: string; updated_by_name: string | null }
 export interface TicketAttachment { id: string; event_id: number | null; name: string; content_type: string; size: number; uploaded_by_name: string | null; created_at: string }
 export interface TicketAgent extends AgentSummary {
 	capabilities: string[]; reboot_pending: boolean; missing_patches: number;
@@ -282,6 +284,8 @@ export interface TicketAgent extends AgentSummary {
 }
 export interface TicketDetail extends Ticket {
 	events: TicketEvent[]; attachments: TicketAttachment[]; agents: TicketAgent[]; statuses: BoardStatus[];
+	/** Linked documentation pages, by title. */
+	docs: TicketDoc[];
 	/** Where a public reply is emailed, if anywhere. */
 	reply_to: string | null;
 	csat: { email: string; sent_at: string; rating: 'good' | 'bad' | null; comment: string; answered_at: string | null } | null;

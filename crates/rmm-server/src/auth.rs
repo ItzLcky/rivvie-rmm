@@ -166,11 +166,23 @@ pub enum Perm {
     BillingManage,
     /// Approve and reject other people's timesheets.
     TimeApprove,
+    /// See a client's vault: credential details, revealed passwords and notes, TOTP codes.
+    VaultRead,
+    /// Create, edit and delete vault credentials.
+    VaultManage,
 }
 
 impl Perm {
-    pub const ALL: [Perm; 6] =
-        [Perm::SecurityRead, Perm::SecurityRespond, Perm::SecurityManage, Perm::BillingRead, Perm::BillingManage, Perm::TimeApprove];
+    pub const ALL: [Perm; 8] = [
+        Perm::SecurityRead,
+        Perm::SecurityRespond,
+        Perm::SecurityManage,
+        Perm::BillingRead,
+        Perm::BillingManage,
+        Perm::TimeApprove,
+        Perm::VaultRead,
+        Perm::VaultManage,
+    ];
 
     pub fn as_str(self) -> &'static str {
         match self {
@@ -180,6 +192,8 @@ impl Perm {
             Perm::BillingRead => "billing.read",
             Perm::BillingManage => "billing.manage",
             Perm::TimeApprove => "time.approve",
+            Perm::VaultRead => "vault.read",
+            Perm::VaultManage => "vault.manage",
         }
     }
 
@@ -190,7 +204,7 @@ impl Perm {
     fn default_for(self, role: Role) -> bool {
         match self {
             Perm::SecurityRead => true,
-            Perm::SecurityRespond => role >= Role::Technician,
+            Perm::SecurityRespond | Perm::VaultRead | Perm::VaultManage => role >= Role::Technician,
             // Money stays with admins unless someone is given it explicitly.
             Perm::SecurityManage | Perm::BillingRead | Perm::BillingManage | Perm::TimeApprove => role >= Role::Admin,
         }

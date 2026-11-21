@@ -143,6 +143,11 @@ async fn seed_previous_release() {
     )
     .await;
     put(&format!("/clients/{client_id}/desktop"), json!({ "consent": true })).await;
+    // Documentation pages with free-text categories, for 0023 to turn into category rows: one
+    // new, one matching a seeded category in another case.
+    let doc = post(&format!("/clients/{client_id}/docs"), json!({ "title": "Alarm panel", "category": "Alarm codes", "body": "Code changes monthly." })).await;
+    let doc_seeded =
+        post(&format!("/clients/{client_id}/docs"), json!({ "title": "Core switch", "category": "infrastructure", "body": "Stack of two." })).await;
 
     let expect = json!({
         "admin_email": ADMIN_EMAIL,
@@ -150,6 +155,7 @@ async fn seed_previous_release() {
         "agent_id": agent_id, "hostname": hostname, "metric_samples": samples,
         "ticket_id": ticket["id"], "ticket_number": ticket["number"], "ticket_subject": "Printer jammed before the upgrade",
         "alert_policy_id": alert["id"], "schedule_id": schedule["id"], "schedule_next_run_at": schedule["next_run_at"],
+        "doc_id": doc["id"], "doc_seeded_id": doc_seeded["id"],
     });
     std::fs::write(&out, serde_json::to_vec_pretty(&expect).unwrap()).unwrap();
     let _ = std::fs::remove_dir_all(&dir);

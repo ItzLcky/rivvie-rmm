@@ -1,5 +1,6 @@
 //! RFC 6238 TOTP (SHA-1, 6 digits, 30 s) as used by every common authenticator app,
-//! plus single-use recovery codes.
+//! plus single-use recovery codes. [`code`] covers the other algorithms, digit counts and
+//! periods, for the vault's stored TOTP secrets.
 
 use data_encoding::BASE32_NOPAD;
 use hmac::{Hmac, KeyInit, Mac};
@@ -49,12 +50,132 @@ pub fn qr_svg(data: &str) -> anyhow::Result<String> {
 }
 
 fn hotp(secret: &[u8], counter: u64, digits: u32) -> u32 {
-    let mut mac = Hmac::<Sha1>::new_from_slice(secret).expect("HMAC accepts any key length");
+    hotp_with(Algorithm::Sha1, secret, counter, digits)
+}
+
+/// The HMAC behind a TOTP code. Sign-in only uses SHA-1; vault items (other people's
+/// accounts) can use any of the three RFC 6238 allows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Algorithm {
+    Sha1,
+    Sha256,
+    Sha512,
+}
+
+impl Algorithm {
+    pub fn parse(s: &str) -> Option<Algorithm> {
+        match s.to_ascii_uppercase().replace('-', "").as_str() {
+            "SHA1" => Some(Algorithm::Sha1),
+            "SHA256" => Some(Algorithm::Sha256),
+            "SHA512" => Some(Algorithm::Sha512),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Algorithm::Sha1 => "SHA1",
+            Algorithm::Sha256 => "SHA256",
+            Algorithm::Sha512 => "SHA512",
+        }
+    }
+}
+
+fn hmac<M: Mac + KeyInit>(secret: &[u8], counter: u64) -> Vec<u8> {
+    let mut mac = <M as KeyInit>::new_from_slice(secret).expect("HMAC accepts any key length");
     mac.update(&counter.to_be_bytes());
-    let h = mac.finalize().into_bytes();
+    mac.finalize().into_bytes().to_vec()
+}
+
+fn hotp_with(alg: Algorithm, secret: &[u8], counter: u64, digits: u32) -> u32 {
+    let h = match alg {
+        Algorithm::Sha1 => hmac::<Hmac<Sha1>>(secret, counter),
+        Algorithm::Sha256 => hmac::<Hmac<sha2::Sha256>>(secret, counter),
+        Algorithm::Sha512 => hmac::<Hmac<sha2::Sha512>>(secret, counter),
+    };
     let off = (h[h.len() - 1] & 0x0f) as usize;
     let bin = u32::from_be_bytes([h[off] & 0x7f, h[off + 1], h[off + 2], h[off + 3]]);
     bin % 10u32.pow(digits)
+}
+
+/// The code for `unix` (seconds), zero-padded to `digits`.
+pub fn code(secret: &[u8], alg: Algorithm, digits: u32, period: u32, unix: i64) -> String {
+    let step = unix.div_euclid(period.max(1) as i64).max(0) as u64;
+    format!("{:0width$}", hotp_with(alg, secret, step, digits), width = digits as usize)
+}
+
+/// A TOTP secret with its parameters, as an authenticator app would import it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Spec {
+    pub secret: Vec<u8>,
+    pub algorithm: Algorithm,
+    pub digits: u32,
+    pub period: u32,
+}
+
+/// Reads a base32 secret (spaces, dashes, lowercase and padding allowed) or an
+/// `otpauth://totp/...` URI, whose `algorithm`, `digits` and `period` override the defaults
+/// (SHA-1, 6, 30). The error never echoes the input: it's a secret.
+pub fn parse_spec(input: &str) -> Result<Spec, &'static str> {
+    const BAD: &str = "the TOTP secret must be base32 or an otpauth://totp/ URI";
+    let input = input.trim();
+    let mut spec = Spec { secret: Vec::new(), algorithm: Algorithm::Sha1, digits: 6, period: STEP_SECS as u32 };
+    let secret = if input.get(..10).is_some_and(|s| s.eq_ignore_ascii_case("otpauth://")) {
+        let rest = &input[10..];
+        if !rest.get(..5).is_some_and(|t| t.eq_ignore_ascii_case("totp/")) {
+            return Err("only time-based (otpauth://totp/) codes are supported");
+        }
+        let query = rest.split_once('?').map(|(_, q)| q).unwrap_or("");
+        let mut secret = None;
+        for (k, v) in query.split('&').filter_map(|kv| kv.split_once('=')) {
+            let v = percent_decode(v).ok_or(BAD)?;
+            match k.to_ascii_lowercase().as_str() {
+                "secret" => secret = Some(v),
+                "algorithm" => spec.algorithm = Algorithm::parse(&v).ok_or("the TOTP algorithm must be SHA1, SHA256 or SHA512")?,
+                "digits" => spec.digits = v.parse().map_err(|_| "TOTP digits must be 6, 7 or 8")?,
+                "period" => spec.period = v.parse().map_err(|_| "the TOTP period must be 1-300 seconds")?,
+                _ => {}
+            }
+        }
+        secret.ok_or("the otpauth URI has no secret")?
+    } else {
+        input.to_string()
+    };
+    if !(6..=8).contains(&spec.digits) {
+        return Err("TOTP digits must be 6, 7 or 8");
+    }
+    if !(1..=300).contains(&spec.period) {
+        return Err("the TOTP period must be 1-300 seconds");
+    }
+    let b32: String = secret.chars().filter(|c| !matches!(c, ' ' | '-' | '=')).map(|c| c.to_ascii_uppercase()).collect();
+    spec.secret = BASE32_NOPAD.decode(b32.as_bytes()).map_err(|_| BAD)?;
+    if spec.secret.len() < 5 || spec.secret.len() > 128 {
+        return Err(BAD);
+    }
+    Ok(spec)
+}
+
+fn percent_decode(s: &str) -> Option<String> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'%' => {
+                out.push(u8::from_str_radix(s.get(i + 1..i + 3)?, 16).ok()?);
+                i += 3;
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).ok()
 }
 
 pub fn step_at(unix_secs: i64) -> i64 {
@@ -118,6 +239,45 @@ mod tests {
             assert_eq!(hotp(KEY, step_at(t) as u64, 8), want, "t={t}");
             assert_eq!(verify(KEY, &format!("{:06}", want % 1_000_000), t), Some(step_at(t)));
         }
+    }
+
+    /// RFC 6238 appendix B: every time and algorithm, 8 digits.
+    #[test]
+    fn rfc6238_all_algorithms() {
+        let k1 = b"12345678901234567890".as_slice();
+        let k256 = b"12345678901234567890123456789012".as_slice();
+        let k512 = b"1234567890123456789012345678901234567890123456789012345678901234".as_slice();
+        for (t, sha1, sha256, sha512) in [
+            (59, "94287082", "46119246", "90693936"),
+            (1111111109, "07081804", "68084774", "25091201"),
+            (1111111111, "14050471", "67062674", "99943326"),
+            (1234567890, "89005924", "91819424", "93441116"),
+            (2000000000, "69279037", "90698825", "38618901"),
+            (20000000000, "65353130", "77737706", "47863826"),
+        ] {
+            assert_eq!(code(k1, Algorithm::Sha1, 8, 30, t), sha1, "SHA1 t={t}");
+            assert_eq!(code(k256, Algorithm::Sha256, 8, 30, t), sha256, "SHA256 t={t}");
+            assert_eq!(code(k512, Algorithm::Sha512, 8, 30, t), sha512, "SHA512 t={t}");
+        }
+        assert_eq!(code(k1, Algorithm::Sha1, 6, 30, 1111111109), "081804", "zero-padded");
+        assert_eq!(code(k1, Algorithm::Sha1, 6, 60, 119), code(k1, Algorithm::Sha1, 6, 30, 30), "both are step 1");
+    }
+
+    #[test]
+    fn specs() {
+        let plain = parse_spec("gezd gnbv-gy3t qojq gezd gnbv gy3t qojq").unwrap();
+        assert_eq!(plain, Spec { secret: KEY.to_vec(), algorithm: Algorithm::Sha1, digits: 6, period: 30 });
+        let uri = parse_spec("otpauth://totp/Acme%20VPN:dana?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&issuer=Acme&algorithm=SHA256&digits=8&period=60").unwrap();
+        assert_eq!((uri.algorithm, uri.digits, uri.period, uri.secret.as_slice()), (Algorithm::Sha256, 8, 60, KEY));
+        assert_eq!(parse_spec(&otpauth_uri(KEY, "x", "y")).unwrap().secret, KEY);
+        assert!(parse_spec("otpauth://hotp/x?secret=GEZDGNBV&counter=1").is_err());
+        assert!(parse_spec("otpauth://totp/x?issuer=a").is_err());
+        assert!(parse_spec("otpauth://totp/x?secret=GEZDGNBVGY3TQOJQ&digits=9").is_err());
+        assert!(parse_spec("otpauth://totp/x?secret=GEZDGNBVGY3TQOJQ&algorithm=MD5").is_err());
+        assert!(parse_spec("not base32!").is_err());
+        assert!(parse_spec("").is_err());
+        let e = parse_spec("hunter2 is my password").unwrap_err();
+        assert!(!e.contains("hunter2"), "errors never echo the secret");
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! Tickets: list and search, detail with the timeline and the linked agents' live state,
+//! Tickets: list and search, detail with the timeline, the linked agents' live state and pages,
 //! changes (each recorded on the timeline), replies and notes, attachments, merge, bulk edits.
 //!
 //! Visibility follows the ticket's client; tickets without one (triage) are visible only to
@@ -322,6 +322,17 @@ pub struct TicketAgent {
     alerts: Value,
 }
 
+/// A documentation page linked to the ticket.
+#[derive(Serialize, sqlx::FromRow)]
+pub struct TicketDoc {
+    id: Uuid,
+    title: String,
+    /// The category's name; empty when there is none.
+    category: String,
+    updated_at: DateTime<Utc>,
+    updated_by_name: Option<String>,
+}
+
 #[derive(Serialize, sqlx::FromRow)]
 pub struct StatusRow {
     id: Uuid,
@@ -337,6 +348,7 @@ pub struct TicketDetail {
     events: Vec<EventRow>,
     attachments: Vec<AttachmentRow>,
     agents: Vec<TicketAgent>,
+    docs: Vec<TicketDoc>,
     /// The statuses of the ticket's board, for the status picker.
     statuses: Vec<StatusRow>,
     /// Where a public reply would be emailed, if anywhere.
@@ -381,6 +393,16 @@ pub async fn get(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uuid>)
     .bind(u.scope())
     .fetch_all(&st.db)
     .await?;
+    let docs = sqlx::query_as(
+        "SELECT d.id, d.title, coalesce(dc.name, '') AS category, d.updated_at, u.name AS updated_by_name
+           FROM ticket_docs td JOIN client_docs d ON d.id = td.doc_id
+           LEFT JOIN doc_categories dc ON dc.id = d.category_id LEFT JOIN users u ON u.id = d.updated_by
+          WHERE td.ticket_id = $1 AND ($2::uuid[] IS NULL OR d.client_id = ANY($2)) ORDER BY lower(d.title), d.id",
+    )
+    .bind(id)
+    .bind(u.scope())
+    .fetch_all(&st.db)
+    .await?;
     let statuses =
         sqlx::query_as("SELECT id, name, category, position FROM board_statuses WHERE board_id = $1 ORDER BY position, name")
             .bind(ticket.board_id)
@@ -398,7 +420,7 @@ pub async fn get(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uuid>)
     .bind(id)
     .fetch_optional(&st.db)
     .await?;
-    Ok(Json(TicketDetail { ticket, events, attachments, agents, statuses, reply_to, csat }))
+    Ok(Json(TicketDetail { ticket, events, attachments, agents, docs, statuses, reply_to, csat }))
 }
 
 // ---------------------------------------------------------------------------
@@ -634,7 +656,7 @@ async fn apply(_st: &AppState, u: &User, db: &mut PgConnection, cur: &TicketRow,
             change(db, id, &author, "subject", json!(cur.subject), json!(s)).await?;
         }
     }
-    // Client first: the site, contact, assignee and agents are checked against the new one.
+    // Client first: the site, contact, assignee, agents and pages are checked against the new one.
     let mut client = cur.client_id;
     if let Some(new) = p.client_id
         && new != cur.client_id
@@ -666,6 +688,14 @@ async fn apply(_st: &AppState, u: &User, db: &mut PgConnection, cur: &TicketRow,
         sqlx::query(
             "DELETE FROM ticket_agents ta USING agents a JOIN sites s ON s.id = a.site_id
               WHERE ta.ticket_id = $1 AND a.id = ta.agent_id AND s.client_id IS DISTINCT FROM $2",
+        )
+        .bind(id)
+        .bind(client)
+        .execute(&mut *db)
+        .await?;
+        sqlx::query(
+            "DELETE FROM ticket_docs td USING client_docs d
+              WHERE td.ticket_id = $1 AND d.id = td.doc_id AND d.client_id IS DISTINCT FROM $2",
         )
         .bind(id)
         .bind(client)
@@ -1031,7 +1061,7 @@ pub async fn download(
 }
 
 // ---------------------------------------------------------------------------
-// Agents, merge
+// Agents, documentation pages, merge
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
@@ -1081,6 +1111,60 @@ pub async fn unlink_agent(State(st): State<Arc<AppState>>, u: User, Path((id, ag
     }
     let host: Option<String> = sqlx::query_scalar("SELECT hostname FROM agents WHERE id = $1").bind(agent_id).fetch_optional(&mut *tx).await?;
     tickets::add_event(&mut tx, id, "agent", false, &Author::user(u.id), "", json!({ "agent_id": agent_id, "hostname": host, "linked": false }))
+        .await?;
+    tx.commit().await?;
+    tickets::announce(&st, id).await;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+pub struct DocLink {
+    doc_id: Uuid,
+}
+
+/// Links one of the client's documentation pages (a runbook, the network overview) to the ticket.
+pub async fn link_doc(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uuid>, Json(b): Json<DocLink>) -> ApiResult<Json<Value>> {
+    u.require(Role::Technician)?;
+    let client = visible(&st, &u, id).await?;
+    let doc_client = super::access::doc(&st, &u, b.doc_id).await?;
+    if client != Some(doc_client) {
+        return Err(ApiError::BadRequest("the page must belong to the ticket's client".into()));
+    }
+    let mut tx = st.db.begin().await?;
+    let added = sqlx::query("INSERT INTO ticket_docs (ticket_id, doc_id, added_by) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING")
+        .bind(id)
+        .bind(b.doc_id)
+        .bind(u.id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+        > 0;
+    if added {
+        let title: String = sqlx::query_scalar("SELECT title FROM client_docs WHERE id = $1").bind(b.doc_id).fetch_one(&mut *tx).await?;
+        tickets::add_event(&mut tx, id, "doc", false, &Author::user(u.id), "", json!({ "doc_id": b.doc_id, "title": title, "linked": true }))
+            .await?;
+    }
+    tx.commit().await?;
+    tickets::announce(&st, id).await;
+    Ok(Json(json!({ "ok": true })))
+}
+
+pub async fn unlink_doc(State(st): State<Arc<AppState>>, u: User, Path((id, doc_id)): Path<(Uuid, Uuid)>) -> ApiResult<Json<Value>> {
+    u.require(Role::Technician)?;
+    visible(&st, &u, id).await?;
+    let mut tx = st.db.begin().await?;
+    let removed = sqlx::query("DELETE FROM ticket_docs WHERE ticket_id = $1 AND doc_id = $2")
+        .bind(id)
+        .bind(doc_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+        > 0;
+    if !removed {
+        return Err(ApiError::NotFound("linked page"));
+    }
+    let title: Option<String> = sqlx::query_scalar("SELECT title FROM client_docs WHERE id = $1").bind(doc_id).fetch_optional(&mut *tx).await?;
+    tickets::add_event(&mut tx, id, "doc", false, &Author::user(u.id), "", json!({ "doc_id": doc_id, "title": title, "linked": false }))
         .await?;
     tx.commit().await?;
     tickets::announce(&st, id).await;
@@ -1141,7 +1225,7 @@ pub struct MergeIn {
     into: Uuid,
 }
 
-/// Merges a duplicate into another ticket: its timeline, attachments, agents and email thread
+/// Merges a duplicate into another ticket: its timeline, attachments, agents, pages and email thread
 /// move over, and it's closed with a pointer to the other.
 pub async fn merge(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uuid>, Json(b): Json<MergeIn>) -> ApiResult<Json<TicketRow>> {
     u.require(Role::Technician)?;
@@ -1172,6 +1256,15 @@ pub async fn merge(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uuid
     .execute(&mut *tx)
     .await?;
     sqlx::query("DELETE FROM ticket_agents WHERE ticket_id = $1").bind(id).execute(&mut *tx).await?;
+    sqlx::query(
+        "INSERT INTO ticket_docs (ticket_id, doc_id, added_by, added_at)
+         SELECT $2, doc_id, added_by, added_at FROM ticket_docs WHERE ticket_id = $1 ON CONFLICT DO NOTHING",
+    )
+    .bind(id)
+    .bind(b.into)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("DELETE FROM ticket_docs WHERE ticket_id = $1").bind(id).execute(&mut *tx).await?;
     // A triage duplicate takes the other's client; the other takes its contact if it had none.
     sqlx::query(
         "UPDATE tickets d SET contact_id = coalesce(d.contact_id, s.contact_id),

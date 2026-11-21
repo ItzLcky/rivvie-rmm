@@ -61,6 +61,13 @@ impl Limiter {
         buckets.insert(key.to_string(), Bucket { tokens: (level - 1.0).max(0.0), at: now });
     }
 
+    /// Check and spend one token: for limits on every use rather than on failures.
+    pub fn take(&self, key: &str) -> Result<(), Duration> {
+        self.check(key)?;
+        self.fail(key);
+        Ok(())
+    }
+
     /// Forget buckets that have refilled completely; they behave like absent ones.
     pub fn prune(&self) {
         let now = Instant::now();
@@ -76,6 +83,9 @@ pub struct Limits {
     pub login_account: Limiter,
     /// Bad enrollment tokens per client IP (agent socket and token-authorized downloads).
     pub enroll_ip: Limiter,
+    /// Vault password reveals and TOTP codes per user. Unlike the others every request takes
+    /// a token (see [`Limiter::take`]): a stolen session can't page through a vault quickly.
+    pub vault_reveal: Limiter,
 }
 
 impl Default for Limits {
@@ -84,6 +94,8 @@ impl Default for Limits {
             login_ip: Limiter::new(10, Duration::from_secs(30)),
             login_account: Limiter::new(20, Duration::from_secs(90)),
             enroll_ip: Limiter::new(20, Duration::from_secs(15)),
+            // 60 per 5 minutes.
+            vault_reveal: Limiter::new(60, Duration::from_secs(5)),
         }
     }
 }
@@ -93,6 +105,7 @@ impl Limits {
         self.login_ip.prune();
         self.login_account.prune();
         self.enroll_ip.prune();
+        self.vault_reveal.prune();
     }
 }
 
@@ -211,6 +224,14 @@ mod tests {
         let wait = l.check("a").unwrap_err();
         assert!(wait > Duration::from_secs(50) && wait <= Duration::from_secs(60), "{wait:?}");
         assert!(l.check("b").is_ok(), "keys are independent");
+    }
+
+    #[test]
+    fn take_spends_on_success() {
+        let l = Limiter::new(2, Duration::from_secs(60));
+        assert!(l.take("u").is_ok() && l.take("u").is_ok());
+        assert!(l.take("u").is_err());
+        assert!(Limits::default().vault_reveal.capacity == 60.0);
     }
 
     #[test]

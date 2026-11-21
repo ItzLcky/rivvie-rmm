@@ -371,6 +371,7 @@ const tickets: T[] = [
 	ticket(5, 'Renew the SSL certificate for the intranet', 'c-initech', 'open', 4, { source: 'dashboard' }),
 	ticket(6, 'Outlook keeps asking for a password', 'c-acme', 'resolved', 3, { contact_id: 'ct-raj', contact_name: 'Raj Patel', resolved_at: ago(60 * 20) })
 ];
+const ticketDocs: Record<string, string[]> = { 't-1': ['d-printer', 'd-network'], 't-6': ['d-network'] };
 function ticketDetail(t: T) {
 	const a = agents.find((x) => x.id === (t.id === 't-2' ? 'a-2' : 'a-3'))!;
 	const ev = (id: number, kind: string, mins: number, extra: Record<string, unknown>) => ({
@@ -386,12 +387,16 @@ function ticketDetail(t: T) {
 				ev(5, 'note', 230, { author_id: 'u-1', author_kind: 'user', author_name: 'Dana Admin', body: 'Spooler restart didn’t help. Toner drum looks worn; ordering a replacement.' }),
 				ev(6, 'reply', 200, { public: true, author_id: 'u-1', author_kind: 'user', author_name: 'Dana Admin', body: 'Hi Ann, a new drum is on its way and should arrive tomorrow. Meanwhile please use the printer in reception.', email_status: 'sent', email_to: ['ann@acme.example'] }),
 				ev(7, 'change', 199, { author_id: 'u-1', author_kind: 'user', author_name: 'Dana Admin', data: { field: 'status', from: 'New', to: 'In progress' } }),
+				ev(9, 'doc', 190, { author_id: 'u-1', author_kind: 'user', author_name: 'Dana Admin', data: { doc_id: 'd-printer', title: 'Second-floor printer quirks', linked: true } }),
 				ev(8, 'message', 45, { public: true, author_contact_id: 'ct-ann', author_kind: 'contact', author_name: 'Ann Lopez', body: 'Thanks, will do!', data: { from: 'ann@acme.example' } })
 			]
 		: [ev(1, 'created', 60, { author_name: 'Alert', body: `${t.subject}\nSeverity: critical` }), ev(2, 'alert', 60, { author_name: 'Alert', data: { alert_id: 'al-1', state: 'opened' } })];
 	return {
 		...t, events, attachments: t.id === 't-1' ? [{ id: 'at-1', event_id: 1, name: 'test-page.pdf', content_type: 'application/pdf', size: 182_400, uploaded_by_name: null, created_at: ago(300) }] : [],
 		agents: [{ ...a, capabilities: ['patch', 'desktop'], reboot_pending: false, missing_patches: 3, alerts: alerts.filter((x) => x.agent_id === a.id && x.state !== 'resolved').slice(0, 3).map((x) => ({ id: x.id, title: x.title, severity: x.severity, opened_at: x.opened_at })) }],
+		// Pages linked to the ticket, by title (clientDocs is defined further down).
+		docs: (ticketDocs[t.id] ?? []).map((id) => clientDocs.find((d) => d.id === id)!).sort((x, y) => x.title.localeCompare(y.title))
+			.map((d) => ({ id: d.id, title: d.title, category: d.category, updated_at: d.updated_at, updated_by_name: d.updated_by_name })),
 		statuses: boards.find((b) => b.id === t.board_id)!.statuses, reply_to: (t.contact_email as string) || (t.requester_email as string) || null
 	};
 }
@@ -935,7 +940,142 @@ function policyRoute(path: string, q: URLSearchParams): unknown {
 	return undefined;
 }
 
-const admin = { id: 'u-1', email: 'dana@northwind.example', name: 'Dana Admin', role: 'admin', totp_enabled: true, mfa_setup_required: false, client_ids: null, preferences: {}, permissions: ['security.read', 'security.respond', 'security.manage'] };
+// --- documentation and the vault ------------------------------------------------------------
+const CAT = '00000000-0000-4000-8003-00000000000';
+const docCategories = ['Network', 'Infrastructure', 'Accounts & access', 'Applications', 'Backup & recovery', 'Vendors', 'Procedures', 'Onboarding'].map((name, i) => ({ id: `${CAT}${i + 1}`, name, position: i }));
+const V = { fw: '6f1c0c1e-9a51-4c0e-b6c9-0a4de1f3a111', m365: '1d0b9a3e-2c4f-4e8a-9b71-5e6f7a8b9c01', wifi: '2e1c8b4f-3d5a-4f9b-8c62-6f7a8b9c0d12', sw: '3f2d7c5a-4e6b-4a0c-9d53-7a8b9c0d1e23', veeam: '4a3e6d6b-5f7c-4b1d-8e44-8b9c0d1e2f34' };
+const vaultItems = [
+	{ id: V.fw, name: 'FortiGate admin', username: 'admin', url: 'https://10.0.0.1:4443', has_password: true, has_totp: true, has_notes: false, docs: 1, password_changed_at: ago(60 * 24 * 41) },
+	{ id: V.m365, name: 'Microsoft 365 global admin', username: 'admin@acmecorp.onmicrosoft.com', url: 'https://admin.microsoft.com', has_password: true, has_totp: true, has_notes: true, docs: 1, password_changed_at: ago(60 * 24 * 12) },
+	{ id: V.wifi, name: 'Staff Wi-Fi key', username: '', url: '', has_password: true, has_totp: false, has_notes: false, docs: 2, password_changed_at: ago(60 * 24 * 160) },
+	{ id: V.sw, name: 'Core switch', username: 'manager', url: '10.0.0.2', has_password: true, has_totp: false, has_notes: false, docs: 0, password_changed_at: ago(60 * 24 * 300) },
+	{ id: V.veeam, name: 'Veeam console', username: 'ACME\\svc-backup', url: 'rdp://acme-backup01', has_password: true, has_totp: false, has_notes: true, docs: 1, password_changed_at: null }
+].map((v, i) => ({ ...v, client_id: 'c-acme', updated_at: ago(60 * (30 + i * 200)), updated_by_name: i % 2 ? 'Terry Tech' : 'Dana Admin' }));
+const vaultDetail = (id: string) => {
+	const v = vaultItems.find((x) => x.id === id)!;
+	return {
+		...v,
+		linked_docs: v.docs ? clientDocs.filter((d) => d.body.includes(id)).map((d) => ({ id: d.id, title: d.title })) : [],
+		history: id === V.fw ? [{ id: 12, replaced_at: ago(60 * 24 * 41), replaced_by_name: 'Dana Admin' }, { id: 7, replaced_at: ago(60 * 24 * 220), replaced_by_name: 'Terry Tech' }] : []
+	};
+};
+const networkBody = `Head office and warehouse share one internet line; the warehouse hangs off a site-to-site tunnel.
+
+## Internet
+
+\`\`\`fields
+ISP: Northwind Fibre (business 500/500)
+Circuit / account number: NWF-204-88173
+Public IP addresses: 203.0.113.18/29
+ISP support: +1 555 0144, option 2
+\`\`\`
+
+## Addressing
+
+\`\`\`fields
+LAN subnet: 10.0.0.0/22
+Gateway: 10.0.0.1
+DNS servers: 10.0.0.10 (acme-dc01), 1.1.1.1
+DHCP range: 10.0.1.100 - 10.0.1.250
+Static range:
+\`\`\`
+
+## VLANs
+
+| VLAN | Name | Subnet | Purpose |
+|---|---|---|---|
+| 1 | Default | 10.0.0.0/24 | Servers and printers |
+| 20 | Staff | 10.0.1.0/24 | Workstations, staff Wi-Fi |
+| 30 | Guest | 192.168.30.0/24 | Guest Wi-Fi, internet only |
+| 40 | Tills | 10.0.3.0/24 | Warehouse point of sale |
+
+## Firewall
+
+The FortiGate sits in the comms cupboard on the first floor. Firmware updates go in the Sunday window, see [Change procedure](doc:d-change).
+
+\`\`\`credential
+item: vault:${V.fw}
+label: Firewall admin
+\`\`\`
+
+\`\`\`callout warning
+Rebooting the firewall drops the **warehouse tunnel** and every till with it. Call Ann Lopez first, and never between 07:00 and 19:00.
+\`\`\`
+
+## Switches
+
+| Name | Model | Management IP | Location |
+|---|---|---|---|
+| core-sw01 | Aruba 2930F-48G | 10.0.0.2 | Comms cupboard |
+| wh-sw01 | Aruba 2530-24G | 10.0.2.2 | Warehouse office |
+
+\`\`\`credential
+label: Switch admin
+\`\`\`
+
+## Servers
+
+\`\`\`device
+agent: a-1
+\`\`\`
+
+\`\`\`device
+agent: a-2
+\`\`\`
+
+## Checks after a change
+
+- [x] Both sites reach the file server
+- [x] Tills can take a card payment
+- [ ] Guest Wi-Fi can't reach 10.0.0.0/22
+
+Staff Wi-Fi uses the [Staff Wi-Fi key](vault:${V.wifi}); the guest key is on the sign at reception.
+
+\`\`\`
+diagnose vpn tunnel list name warehouse
+execute ping-options source 10.0.0.1
+\`\`\`
+`;
+const clientDocs = [
+	{ id: 'd-network', title: 'Network overview', cat: 0, body: networkBody, mins: 95, by: 'Dana Admin', revisions: 6 },
+	{ id: 'd-wifi', title: 'Wi-Fi', cat: 0, body: `\`\`\`credential\nitem: vault:${V.wifi}\n\`\`\`\n`, mins: 60 * 24 * 9, by: 'Terry Tech', revisions: 1 },
+	{ id: 'd-dc', title: 'acme-dc01', cat: 1, body: '```device\nagent: a-1\n```\n', mins: 60 * 24 * 30, by: 'Dana Admin', revisions: 3 },
+	{ id: 'd-m365', title: 'Microsoft 365 tenant', cat: 2, body: `\`\`\`credential\nitem: vault:${V.m365}\n\`\`\`\n`, mins: 60 * 5, by: 'Terry Tech', revisions: 2 },
+	{ id: 'd-backup', title: 'Backup and recovery', cat: 4, body: `\`\`\`credential\nitem: vault:${V.veeam}\n\`\`\`\n`, mins: 60 * 24 * 60, by: 'Dana Admin', revisions: 0 },
+	{ id: 'd-change', title: 'Change procedure', cat: 6, body: 'Sunday 22:00 to 02:00.', mins: 60 * 24 * 90, by: 'Dana Admin', revisions: 0 },
+	{ id: 'd-printer', title: 'Second-floor printer quirks', cat: -1, body: 'Turn it off and on again.', mins: 60 * 24 * 3, by: 'Terry Tech', revisions: 0 }
+].map((d) => ({
+	id: d.id, client_id: 'c-acme', title: d.title, category_id: d.cat >= 0 ? docCategories[d.cat].id : null, category: d.cat >= 0 ? docCategories[d.cat].name : '',
+	body: d.body, updated_by_name: d.by, updated_at: ago(d.mins), revisions: d.revisions
+}));
+const docRow = (d: (typeof clientDocs)[number]) => ({ ...d, body: null });
+const docDetail = (d: (typeof clientDocs)[number]) => ({
+	...d,
+	history: Array.from({ length: d.revisions }, (_, i) => ({ id: 40 - i, title: d.title, edited_by: i % 2 ? 'Terry Tech' : 'Dana Admin', edited_at: ago(60 * 24 * (i * 9 + 2)) })),
+	credentials: vaultItems.filter((v) => d.body.includes(v.id)),
+	credentials_hidden: false,
+	// Newest first.
+	tickets: tickets.filter((t) => ticketDocs[t.id]?.includes(d.id)).sort((x, y) => Date.parse(y.created_at as string) - Date.parse(x.created_at as string))
+		.map((t) => ({ id: t.id, number: t.number, subject: t.subject, status: t.status_name, status_category: t.status_category, updated_at: t.updated_at }))
+});
+const TPL = '00000000-0000-4000-8004-00000000000';
+const docTemplates = [
+	['Network overview', 0, 'Internet, addressing, VLANs, firewall and switches.'],
+	['Wi-Fi', 0, 'SSIDs, the controller and the keys for staff and guests.'],
+	['Server', 1, 'One server: role, hardware, services, access and maintenance.'],
+	['Microsoft 365 tenant', 2, 'Tenant details, admin accounts, security baseline and domains.'],
+	['Line-of-business application', 3, 'An application the client runs on: vendor, licences, access, installs and updates.'],
+	['Backup and recovery', 4, 'What is backed up, where, how to restore, and the restore tests.'],
+	['Vendor', 5, 'A supplier: account, support contacts, portal and escalation.'],
+	['New user procedure', 6, 'The steps for a new starter at this client.'],
+	['Client onboarding checklist', 7, 'Everything to collect and set up when a new client signs.']
+].map(([name, cat, description], i) => ({
+	id: `${TPL}${i + 1}`, name, category_id: docCategories[cat as number].id, category: docCategories[cat as number].name, description,
+	body: null as string | null, updated_by_name: i === 2 ? 'Dana Admin' : null, updated_at: ago(60 * 24 * (i === 2 ? 4 : 40))
+}));
+const categoryOut = (c: (typeof docCategories)[number]) => ({ ...c, docs: clientDocs.filter((d) => d.category_id === c.id).length, templates: docTemplates.filter((t) => t.category_id === c.id).length });
+
+const admin = { id: 'u-1', email: 'dana@northwind.example', name: 'Dana Admin', role: 'admin', totp_enabled: true, mfa_setup_required: false, client_ids: null, preferences: {}, permissions: ['security.read', 'security.respond', 'security.manage', 'vault.read', 'vault.manage'] };
 
 export async function mockApi(p: Page, opts: { signedIn?: boolean } = {}) {
 	const signedIn = opts.signedIn ?? true;
@@ -951,6 +1091,8 @@ export async function mockApi(p: Page, opts: { signedIn?: boolean } = {}) {
 			const r = hunt(route.request().postDataJSON() ?? {});
 			return json(r.body, r.status);
 		}
+		if (route.request().method() === 'POST' && /^\/vault\/[^/]+\/reveal$/.test(path)) return json({ value: 'Tr0ub4dor&3-hx9Q' });
+		if (route.request().method() === 'POST' && /^\/vault\/[^/]+\/totp$/.test(path)) return json({ code: '492039', digits: 6, period: 30, remaining: 17 });
 		if (route.request().method() !== 'GET') return json({ ok: true });
 		let m: RegExpMatchArray | null;
 		if (path === '/settings/public') return json({ company_name: 'Northwind IT' });
@@ -958,6 +1100,16 @@ export async function mockApi(p: Page, opts: { signedIn?: boolean } = {}) {
 		if (path === '/dashboard') return json(dashboard(q.get('client_id')));
 		if (path === '/clients') return json(clients.map(clientOut));
 		if ((m = path.match(/^\/clients\/([^/]+)$/))) return json(clientOut(clients.find((c) => c.id === m![1])!));
+		if ((m = path.match(/^\/clients\/([^/]+)\/docs$/))) return json(clientDocs.filter((d) => d.client_id === m![1]).map(docRow));
+		if ((m = path.match(/^\/docs\/([^/]+)$/))) {
+			const d = clientDocs.find((x) => x.id === m![1]);
+			return d ? json(docDetail(d)) : json({ error: 'document not found' }, 404);
+		}
+		if (path === '/doc-categories') return json(docCategories.map(categoryOut));
+		if (path === '/doc-templates') return json(docTemplates);
+		if ((m = path.match(/^\/doc-templates\/([^/]+)$/))) return json({ ...docTemplates.find((t) => t.id === m![1])!, body: '# {{client.name}}\n\n```fields\nLabel:\n```\n' });
+		if ((m = path.match(/^\/clients\/([^/]+)\/vault$/))) return json(vaultItems.filter((v) => v.client_id === m![1]));
+		if ((m = path.match(/^\/vault\/([^/]+)$/))) return json(vaultDetail(m![1]));
 		if (path === '/agents') {
 			let list = agents.filter((a) => (!q.get('client_id') || a.client_id === q.get('client_id')) && (!q.get('online') || String(a.online) === q.get('online')));
 			if (q.get('health')) list = list.filter((a) => q.get('health')!.split(',').includes(a.health));

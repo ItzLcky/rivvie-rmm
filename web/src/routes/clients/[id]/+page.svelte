@@ -10,7 +10,8 @@
 	import { resource } from '#lib/resource.svelte.js';
 	import { loadClients } from '#lib/scope.svelte.js';
 	import { allowed, can } from '#lib/session.svelte.js';
-	import ClientDocs from '#lib/components/work/ClientDocs.svelte';
+	import ClientDocs from '#lib/components/docs/ClientDocs.svelte';
+	import ClientVault from '#lib/components/vault/ClientVault.svelte';
 	import ClientBilling from '#lib/components/billing/ClientBilling.svelte';
 	import { attempt, toast } from '#lib/toast.svelte.js';
 	import type { AgentSummary, Client, Contact, Dashboard, Site, SlaPolicy, Ticket } from '#lib/types.js';
@@ -218,6 +219,7 @@
 				{ value: 'tickets', label: 'Tickets' },
 				{ value: 'contacts', label: 'Contacts' },
 				{ value: 'docs', label: 'Docs' },
+				{ value: 'passwords', label: 'Passwords', hidden: !allowed('vault.read') },
 				{ value: 'policies', label: 'Policies' },
 				{ value: 'billing', label: 'Billing', hidden: !allowed('billing.read') },
 				{ value: 'settings', label: 'Settings', hidden: !can('admin') }
@@ -369,7 +371,9 @@
 				</Async>
 			</section>
 		{:else if tab === 'docs'}
-			<ClientDocs clientId={c.id} />
+			<ClientDocs clientId={c.id} clientName={c.name} />
+		{:else if tab === 'passwords' && allowed('vault.read')}
+			<ClientVault clientId={c.id} clientName={c.name} />
 		{:else if tab === 'policies'}
 			<div class="space-y-5">
 				<section class="card" aria-labelledby="assign-heading">

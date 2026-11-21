@@ -1115,6 +1115,8 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
     }
     portal_and_sla(&url, &admin, db, a_id, b_id).await;
     billing(&url, &admin, &tech, db, a_id, b_id).await;
+    docs_and_vault(&url, &admin, db, a_id, b_id).await;
+    ticket_docs(&url, &admin, a_id, b_id).await;
 
     // --- rate limits ------------------------------------------------------------------------------
     // Failed sign-ins from one client IP (via the trusted proxy's X-Forwarded-For).
@@ -1555,6 +1557,16 @@ async fn previous_release_rows(admin: &Api, path: &str) {
         let sched = admin.get(&format!("/schedules/{}", s("schedule_id"))).await;
         assert_eq!((sched["next_run_at"].as_str(), sched["agents"].as_i64()), (e["schedule_next_run_at"].as_str(), Some(1)), "{sched}");
         println!("previous release's policies: ok");
+    }
+    // Its documentation pages: free-text categories became category rows (see tests/upgrade.rs).
+    if let (Some(doc), Some(seeded)) = (e["doc_id"].as_str(), e["doc_seeded_id"].as_str()) {
+        let d = admin.get(&format!("/docs/{doc}")).await;
+        assert_eq!((d["title"].as_str(), d["category"].as_str(), d["body"].as_str()), (Some("Alarm panel"), Some("Alarm codes"), Some("Code changes monthly.")), "{d}");
+        let cats = admin.get("/doc-categories").await;
+        assert!(cats.as_array().unwrap().iter().any(|c| c["id"] == d["category_id"] && c["name"] == "Alarm codes"), "{cats}");
+        let d = admin.get(&format!("/docs/{seeded}")).await;
+        assert_eq!(d["category_id"], "00000000-0000-4000-8003-000000000002", "matched the seeded Infrastructure: {d}");
+        println!("previous release's documentation: ok");
     }
     // The suite counts what it creates (agents, tickets, alerts), so the old client goes once
     // it has been read back: deleting it is a check of its own on the migrated rows' keys.
@@ -3752,6 +3764,26 @@ async fn portal_and_sla(url: &str, admin: &Api, db: &sqlx::PgPool, a_id: &str, b
     let bodies: Vec<&str> = view["events"].as_array().unwrap().iter().map(|e| e["body"].as_str().unwrap()).collect();
     assert!(bodies.contains(&"Which model is it?") && !bodies.iter().any(|b| b.contains("Internal")), "{bodies:?}");
     assert_eq!(view["events"].as_array().unwrap().iter().find(|e| e["body"] == "Which model is it?").unwrap()["author_kind"], "staff");
+    // A linked documentation page is internal: no `doc` event in the portal, none emailed.
+    let runbook = admin.post(&format!("/clients/{a_id}/docs"), json!({ "title": "Charger runbook", "body": "Internal steps." })).await;
+    let runbook_id = runbook["id"].as_str().unwrap().to_string();
+    admin.post(&format!("/tickets/{ptid}/docs"), json!({ "doc_id": runbook_id })).await;
+    let (s, _) = admin.call(reqwest::Method::DELETE, &format!("/tickets/{ptid}/docs/{runbook_id}"), None).await;
+    assert!(s.is_success());
+    admin.post(&format!("/tickets/{ptid}/docs"), json!({ "doc_id": runbook_id })).await;
+    let doc_events: Vec<i64> = events_of(&admin.get(&format!("/tickets/{ptid}")).await, "doc").iter().map(|e| e["id"].as_i64().unwrap()).collect();
+    assert_eq!(doc_events.len(), 3);
+    let view = portal.get(&format!("/portal/tickets/{ptid}")).await;
+    assert!(view["events"].as_array().unwrap().iter().all(|e| e["kind"] != "doc"), "{view}");
+    assert!(!view.to_string().contains("Charger runbook"), "{view}");
+    assert!(!portal.get("/portal/tickets?state=all").await.to_string().contains("Charger runbook"));
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let (mailed,): (i64,) = sqlx::query_as("SELECT count(*) FROM email_messages WHERE event_id = ANY($1) OR body LIKE '%Charger runbook%'")
+        .bind(&doc_events)
+        .fetch_one(db)
+        .await
+        .unwrap();
+    assert_eq!(mailed, 0, "nothing emailed for a linked page");
     let aid = view["attachments"][0]["id"].as_str().unwrap();
     let res = portal.http.get(format!("{}/portal/tickets/{ptid}/attachments/{aid}", portal.base)).send().await.unwrap();
     assert_eq!(res.headers()["content-type"], "application/octet-stream");
@@ -4328,7 +4360,7 @@ async fn billing(url: &str, admin: &Api, tech: &Api, db: &sqlx::PgPool, a_id: &s
     let void = admin.call(reqwest::Method::POST, &format!("/invoices/{inv_a}/void"), None).await.0;
     assert_eq!(void, StatusCode::CONFLICT, "a paid invoice can't be voided");
 
-    // --- projects, scheduling, client documentation -----------------------------------------------
+    // --- projects and scheduling -----------------------------------------------------------------
     let p = admin.post("/projects", json!({ "client_id": a_id, "name": "Office move", "budget_minutes": 600, "status": "active" })).await;
     let pid = p["id"].as_str().unwrap().to_string();
     let task = admin.post(&format!("/projects/{pid}/tasks"), json!({ "phase": "Prep", "title": "Label the cables", "estimate_minutes": 120 })).await;
@@ -4351,13 +4383,6 @@ async fn billing(url: &str, admin: &Api, tech: &Api, db: &sqlx::PgPool, a_id: &s
     assert_eq!(sch["overlaps"], 0);
     let cal = admin.get(&format!("/schedule?from={}&to={}", url_escape(&chrono::Utc::now().to_rfc3339()), url_escape(&(tomorrow + chrono::Duration::days(1)).to_rfc3339()))).await;
     assert!(cal.as_array().unwrap().iter().any(|e| e["ticket_id"] == tt_id.as_str() && e["project_name"].is_null()));
-    let doc = admin.post(&format!("/clients/{a_id}/docs"), json!({ "title": "Network", "category": "Infrastructure", "body": "VLAN 10: staff" })).await;
-    let doc_id = doc["id"].as_str().unwrap().to_string();
-    admin.call(reqwest::Method::PUT, &format!("/docs/{doc_id}"), Some(json!({ "title": "Network", "category": "Infrastructure", "body": "VLAN 10: staff\nVLAN 20: guests" }))).await;
-    let d = admin.get(&format!("/docs/{doc_id}")).await;
-    assert_eq!((d["revisions"].as_i64(), d["body"].as_str()), (Some(1), Some("VLAN 10: staff\nVLAN 20: guests")));
-    let old = admin.get(&format!("/docs/{doc_id}/revisions/{}", d["history"][0]["id"])).await;
-    assert_eq!(old["body"], "VLAN 10: staff");
 
     // --- reports ----------------------------------------------------------------------------------
     let desk = admin.get(&format!("/reports/service-desk?from={month_start}&to={month_end}")).await;
@@ -4381,7 +4406,376 @@ async fn billing(url: &str, admin: &Api, tech: &Api, db: &sqlx::PgPool, a_id: &s
     assert!(String::from_utf8_lossy(&qbr).contains("(Quarterly business review)"));
     let ov = admin.get("/billing/overview").await;
     assert!(ov["currencies"].as_array().unwrap().iter().any(|c| c["currency"] == "USD"), "{ov}");
-    println!("time, contracts, invoices, accounting, projects, schedule, docs, reports: ok");
+    println!("time, contracts, invoices, accounting, projects, schedule, reports: ok");
+}
+
+/// A user signed in through their own session, with two-factor authentication turned on when
+/// `mfa` is set. `client` limits them to one client.
+async fn signed_in(url: &str, admin: &Api, email: &str, role: &str, client: Option<&str>, mfa: bool) -> Api {
+    let access = match client {
+        Some(c) => json!({ "all_clients": false, "client_ids": [c] }),
+        None => json!({ "all_clients": true }),
+    };
+    let mut body = json!({ "email": email, "name": email, "password": "user-password-123", "role": role });
+    body.as_object_mut().unwrap().extend(access.as_object().unwrap().clone());
+    admin.post("/users", body).await;
+    let api = Api::new(url);
+    api.post("/auth/login", json!({ "email": email, "password": "user-password-123" })).await;
+    if mfa {
+        let setup = api.post("/auth/totp/setup", json!({ "password": "user-password-123" })).await;
+        api.post("/auth/totp/enable", json!({ "code": totp(setup["secret"].as_str().unwrap()) })).await;
+    }
+    api
+}
+
+/// Client documentation (categories, templates, pages, links, export) and the password vault
+/// (encryption at rest, reveal, history, TOTP, who is refused, and that no secret ever shows
+/// up outside a reveal).
+async fn docs_and_vault(url: &str, admin: &Api, db: &sqlx::PgPool, a_id: &str, b_id: &str) {
+    use reqwest::Method;
+    let tech = signed_in(url, admin, "docs-tech@e2e.test", "technician", None, true).await;
+
+    // --- categories and templates -----------------------------------------------------------------
+    let cats = admin.get("/doc-categories").await;
+    let names: Vec<&str> = cats.as_array().unwrap().iter().map(|c| c["name"].as_str().unwrap()).collect();
+    assert_eq!(&names[..3], ["Network", "Infrastructure", "Accounts & access"], "seeded, in order: {cats}");
+    let cat_id = |cats: &Value, name: &str| cats.as_array().unwrap().iter().find(|c| c["name"] == name).unwrap()["id"].as_str().unwrap().to_string();
+    let infra = cat_id(&cats, "Infrastructure");
+    let (s, _) = tech.call(Method::POST, "/doc-categories", Some(json!({ "name": "Printers" }))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "categories are for admins");
+    let printers = admin.post("/doc-categories", json!({ "name": "Printers" })).await;
+    let printers_id = printers["id"].as_str().unwrap().to_string();
+    assert_eq!(printers["position"].as_i64(), Some(names.len() as i64), "new categories go last: {printers}");
+    let (s, v) = admin.call(Method::POST, "/doc-categories", Some(json!({ "name": "printers" }))).await;
+    assert_eq!((s, v["error"].as_str()), (StatusCode::CONFLICT, Some("there is already a category with that name")));
+    let renamed = admin.put(&format!("/doc-categories/{printers_id}"), json!({ "name": "Printers & copiers" })).await;
+    assert_eq!(renamed["name"], "Printers & copiers");
+    let ordered = admin.put("/doc-categories/order", json!({ "ids": [printers_id] })).await;
+    assert_eq!((ordered[0]["id"].as_str(), ordered[0]["position"].as_i64()), (Some(printers_id.as_str()), Some(0)), "{ordered}");
+    assert_eq!((ordered[1]["name"].as_str(), ordered[1]["position"].as_i64()), (Some("Network"), Some(1)), "the rest keep their order");
+
+    let templates = tech.get("/doc-templates").await;
+    let net = templates.as_array().unwrap().iter().find(|t| t["name"] == "Network overview").cloned().unwrap();
+    assert_eq!((net["category"].as_str(), net["body"].is_null()), (Some("Network"), true), "lists carry no bodies: {net}");
+    assert_eq!(templates.as_array().unwrap().len(), 9, "the starter set");
+    let net = tech.get(&format!("/doc-templates/{}", net["id"].as_str().unwrap())).await;
+    let body = net["body"].as_str().unwrap();
+    assert!(body.contains("```credential\nlabel: Firewall admin\n```") && body.contains("{{client.name}}") && body.contains("```fields"), "{body}");
+    let (s, _) = tech.call(Method::POST, "/doc-templates", Some(json!({ "name": "Printer" }))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "templates are for admins");
+    let t = admin.post("/doc-templates", json!({ "name": "Printer", "category_id": printers_id, "description": "One printer", "body": "# Printer at {{client.name}}" })).await;
+    let t_id = t["id"].as_str().unwrap().to_string();
+    assert_eq!((t["category"].as_str(), t["body"].as_str()), (Some("Printers & copiers"), Some("# Printer at {{client.name}}")), "{t}");
+    let (s, v) = admin.call(Method::POST, "/doc-templates", Some(json!({ "name": "printer" }))).await;
+    assert_eq!((s, v["error"].as_str()), (StatusCode::CONFLICT, Some("there is already a template with that name")));
+    let (s, v) = admin.call(Method::POST, "/doc-templates", Some(json!({ "name": "Ghost", "category_id": uuid::Uuid::new_v4() }))).await;
+    assert_eq!((s, v["error"].as_str()), (StatusCode::BAD_REQUEST, Some("unknown category")));
+    let t = admin.put(&format!("/doc-templates/{t_id}"), json!({ "name": "Printer or copier", "category_id": printers_id, "body": "# {{client.name}}" })).await;
+    assert_eq!((t["name"].as_str(), t["description"].as_str()), (Some("Printer or copier"), Some("")));
+    admin.call(Method::DELETE, &format!("/doc-categories/{printers_id}"), None).await;
+    let t = admin.get(&format!("/doc-templates/{t_id}")).await;
+    assert_eq!((t["category_id"].is_null(), t["category"].as_str()), (true, Some("")), "deleting a category uncategorises its templates");
+    let (s, _) = admin.call(Method::DELETE, &format!("/doc-templates/{t_id}"), None).await;
+    assert!(s.is_success());
+    assert_eq!(admin.call(Method::GET, &format!("/doc-templates/{t_id}"), None).await.0, StatusCode::NOT_FOUND);
+
+    // --- pages: versions, stale saves, export ------------------------------------------------------
+    let doc = admin.post(&format!("/clients/{a_id}/docs"), json!({ "title": "Network", "category_id": infra, "body": "VLAN 10: staff" })).await;
+    let doc_id = doc["id"].as_str().unwrap().to_string();
+    let opened = doc["updated_at"].clone();
+    let saved = admin.put(&format!("/docs/{doc_id}"), json!({ "title": "Network", "category_id": infra, "body": "VLAN 10: staff\nVLAN 20: guests", "expected_updated_at": opened })).await;
+    assert_ne!(saved["updated_at"], opened);
+    let d = admin.get(&format!("/docs/{doc_id}")).await;
+    assert_eq!((d["revisions"].as_i64(), d["body"].as_str()), (Some(1), Some("VLAN 10: staff\nVLAN 20: guests")));
+    assert_eq!((d["category"].as_str(), d["category_id"].as_str(), d["updated_at"].clone()), (Some("Infrastructure"), Some(infra.as_str()), saved["updated_at"].clone()));
+    let old = admin.get(&format!("/docs/{doc_id}/revisions/{}", d["history"][0]["id"])).await;
+    assert_eq!(old["body"], "VLAN 10: staff");
+    let (s, v) = tech
+        .call(Method::PUT, &format!("/docs/{doc_id}"), Some(json!({ "title": "Network", "body": "overwrite", "expected_updated_at": opened })))
+        .await;
+    assert_eq!((s, v["error"].as_str()), (StatusCode::CONFLICT, Some("someone else saved this page since you opened it")));
+    assert_eq!(admin.get(&format!("/docs/{doc_id}")).await["revisions"], 1, "a refused save keeps nothing");
+    let (s, v) = admin.call(Method::POST, &format!("/clients/{a_id}/docs"), Some(json!({ "title": "X", "category_id": uuid::Uuid::new_v4() }))).await;
+    assert_eq!((s, v["error"].as_str()), (StatusCode::BAD_REQUEST, Some("unknown category")));
+    let res = admin.http.get(format!("{}/docs/{doc_id}/export", admin.base)).send().await.unwrap();
+    assert_eq!(res.headers()["content-type"], "text/markdown; charset=utf-8");
+    assert!(res.headers()["content-disposition"].to_str().unwrap().starts_with("attachment; filename=\"Network.md\""), "{:?}", res.headers());
+    let md = res.text().await.unwrap();
+    let updated = chrono::DateTime::parse_from_rfc3339(saved["updated_at"].as_str().unwrap()).unwrap().with_timezone(&chrono::Utc);
+    assert_eq!(
+        md,
+        format!(
+            "---\ntitle: \"Network\"\ncategory: \"Infrastructure\"\nclient: \"Client A\"\nupdated: {}\n---\n\nVLAN 10: staff\nVLAN 20: guests",
+            updated.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        )
+    );
+
+    // --- the vault ---------------------------------------------------------------------------------
+    const PW1: &str = "Fw-first-p4ss!";
+    const PW2: &str = "Fw-second-p4ss!";
+    const NOTE: &str = "Console cable is in the comms cabinet";
+    const SECRET: &str = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+    let mut seen = String::new();
+    let item = admin
+        .post(
+            &format!("/clients/{a_id}/vault"),
+            json!({ "name": "Firewall admin", "username": "admin", "url": "https://fw.client-a.example", "password": PW1, "notes": NOTE,
+                    "totp": format!("otpauth://totp/Client%20A:admin?secret={SECRET}&issuer=Client%20A&algorithm=SHA1&digits=6&period=30") }),
+        )
+        .await;
+    seen += &item.to_string();
+    let item_id = item["id"].as_str().unwrap().to_string();
+    assert_eq!((item["has_password"].as_bool(), item["has_notes"].as_bool(), item["has_totp"].as_bool()), (Some(true), Some(true), Some(true)), "{item}");
+    assert!(item["password_changed_at"].is_string());
+    let (s, v) = admin.call(Method::POST, &format!("/clients/{a_id}/vault"), Some(json!({ "name": "Bad", "totp": "not a secret!" }))).await;
+    assert_eq!((s, v["error"].as_str()), (StatusCode::BAD_REQUEST, Some("the TOTP secret must be base32 or an otpauth://totp/ URI")));
+    let (s, _) = admin.call(Method::POST, &format!("/clients/{a_id}/vault"), Some(json!({ "name": "Bad", "url": "javascript:alert(1)" }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let b_item = admin.post(&format!("/clients/{b_id}/vault"), json!({ "name": "Client B router", "password": "b-router-pass" })).await;
+    let b_item_id = b_item["id"].as_str().unwrap().to_string();
+    // At rest: sealed, bound to the row and column, under a wrapped per-client key.
+    let (pw, notes, secret): (Vec<u8>, Vec<u8>, Vec<u8>) =
+        sqlx::query_as("SELECT password, notes, totp_secret FROM vault_items WHERE id = $1::uuid").bind(&item_id).fetch_one(db).await.unwrap();
+    for (sealed, plain) in [(&pw, PW1.as_bytes()), (&notes, NOTE.as_bytes())] {
+        assert!(!sealed.windows(plain.len()).any(|w| w == plain), "sealed at rest");
+    }
+    assert_ne!(secret, data_encoding::BASE32_NOPAD.decode(SECRET.as_bytes()).unwrap());
+    let (keys,): (i64,) = sqlx::query_as("SELECT count(*) FROM vault_keys WHERE client_id IN ($1::uuid, $2::uuid)").bind(a_id).bind(b_id).fetch_one(db).await.unwrap();
+    assert_eq!(keys, 2, "one key per client");
+    // A ciphertext moved to another column doesn't open.
+    sqlx::query("UPDATE vault_items SET notes = password WHERE id = $1::uuid").bind(&b_item_id).execute(db).await.unwrap();
+    let (s, _) = admin.call(Method::POST, &format!("/vault/{b_item_id}/reveal"), Some(json!({ "field": "notes" }))).await;
+    assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR);
+    sqlx::query("UPDATE vault_items SET notes = NULL WHERE id = $1::uuid").bind(&b_item_id).execute(db).await.unwrap();
+
+    let list = admin.get(&format!("/clients/{a_id}/vault")).await;
+    seen += &list.to_string();
+    assert_eq!(list.as_array().unwrap().len(), 1, "only client A's items: {list}");
+    assert_eq!((list[0]["username"].as_str(), list[0]["url"].as_str()), (Some("admin"), Some("https://fw.client-a.example")));
+
+    let res = admin.http.post(format!("{}/vault/{item_id}/reveal", admin.base)).json(&json!({ "field": "password" })).send().await.unwrap();
+    assert_eq!(res.headers()["cache-control"], "no-store");
+    assert_eq!(res.json::<Value>().await.unwrap()["value"], PW1);
+    assert_eq!(admin.post(&format!("/vault/{item_id}/reveal"), json!({ "field": "notes" })).await["value"], NOTE);
+    let (n, details): (i64, Option<Value>) = sqlx::query_as(
+        "SELECT count(*) OVER (), details FROM audit_log WHERE action = 'vault.reveal' AND target_id = $1::uuid ORDER BY id DESC LIMIT 1",
+    )
+    .bind(&item_id)
+    .fetch_one(db)
+    .await
+    .unwrap();
+    let details = details.unwrap();
+    assert_eq!((n, details["field"].as_str(), details["name"].as_str()), (2, Some("notes"), Some("Firewall admin")), "{details}");
+    let before = totp(SECRET);
+    let code = admin.post(&format!("/vault/{item_id}/totp"), json!({})).await;
+    let after = totp(SECRET);
+    assert!(code["code"] == before.as_str() || code["code"] == after.as_str(), "{code} vs {before}/{after}");
+    assert_eq!((code["digits"].as_i64(), code["period"].as_i64()), (Some(6), Some(30)));
+    assert!((1..=30).contains(&code["remaining"].as_i64().unwrap()));
+    let (n,): (i64,) = sqlx::query_as("SELECT count(*) FROM audit_log WHERE action = 'vault.totp' AND target_id = $1::uuid").bind(&item_id).fetch_one(db).await.unwrap();
+    assert_eq!(n, 1);
+
+    // Update: absent fields stay, null clears, a new password keeps the old one.
+    let upd = admin.put(&format!("/vault/{item_id}"), json!({ "password": PW2, "notes": null })).await;
+    seen += &upd.to_string();
+    assert_eq!((upd["has_password"].as_bool(), upd["has_notes"].as_bool(), upd["has_totp"].as_bool()), (Some(true), Some(false), Some(true)), "{upd}");
+    assert_eq!((upd["name"].as_str(), upd["history"].as_array().unwrap().len()), (Some("Firewall admin"), 1));
+    let same = admin.put(&format!("/vault/{item_id}"), json!({ "password": PW2, "username": "root" })).await;
+    assert_eq!((same["username"].as_str(), same["history"].as_array().unwrap().len()), (Some("root"), 1), "the same password isn't a change");
+    assert_eq!(admin.post(&format!("/vault/{item_id}/reveal"), json!({ "field": "password" })).await["value"], PW2);
+    let h = upd["history"][0]["id"].clone();
+    assert_eq!(admin.post(&format!("/vault/{item_id}/reveal"), json!({ "history": h })).await["value"], PW1);
+    let (s, _) = admin.call(Method::POST, &format!("/vault/{item_id}/reveal"), Some(json!({ "field": "notes" }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "notes were cleared");
+    let (s, _) = admin.call(Method::POST, &format!("/vault/{item_id}/reveal"), Some(json!({ "field": "totp_secret" }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "TOTP secrets are never revealed");
+    let (details,): (Value,) =
+        sqlx::query_as("SELECT details FROM audit_log WHERE action = 'vault.update' AND target_id = $1::uuid ORDER BY id LIMIT 1").bind(&item_id).fetch_one(db).await.unwrap();
+    assert_eq!(details["fields"], json!(["password", "notes"]), "{details}");
+    let (audit,): (String,) = sqlx::query_as("SELECT coalesce(string_agg(details::text, ' '), '') FROM audit_log WHERE action LIKE 'vault.%'").fetch_one(db).await.unwrap();
+    assert!(![PW1, PW2, NOTE, SECRET].iter().any(|x| audit.contains(x)), "no secret in the audit log: {audit}");
+
+    // --- links from pages ---------------------------------------------------------------------------
+    let ghost = uuid::Uuid::new_v4();
+    let linked = admin
+        .post(
+            &format!("/clients/{a_id}/docs"),
+            json!({ "title": "Firewall", "category_id": cat_id(&cats, "Network"),
+                    "body": format!("```credential\nitem: vault:{item_id}\n```\n\nAlso [B's router](vault:{b_item_id}) and [gone](vault:{ghost}).\n\n```credential\nlabel: Switch admin\n```") }),
+        )
+        .await;
+    let linked_id = linked["id"].as_str().unwrap().to_string();
+    let d = admin.get(&format!("/docs/{linked_id}")).await;
+    seen += &d.to_string();
+    let creds: Vec<&str> = d["credentials"].as_array().unwrap().iter().map(|c| c["id"].as_str().unwrap()).collect();
+    assert_eq!((creds, d["credentials_hidden"].as_bool()), (vec![item_id.as_str()], Some(false)), "only the same client's item resolves: {d}");
+    assert_eq!(d["credentials"][0]["username"], "root");
+    let detail = admin.get(&format!("/vault/{item_id}")).await;
+    seen += &detail.to_string();
+    assert_eq!((detail["docs"].as_i64(), detail["linked_docs"][0]["title"].as_str()), (Some(1), Some("Firewall")), "{detail}");
+    assert_eq!(admin.get(&format!("/vault/{b_item_id}")).await["docs"], 0, "another client's item isn't linked");
+    seen += &admin.get(&format!("/clients/{a_id}/docs")).await.to_string();
+    seen += &tech.get(&format!("/clients/{a_id}/vault")).await.to_string();
+    // Saving without the reference drops the link.
+    admin.put(&format!("/docs/{linked_id}"), json!({ "title": "Firewall", "body": "No credentials here." })).await;
+    assert_eq!(admin.get(&format!("/vault/{item_id}")).await["docs"], 0);
+    admin.put(&format!("/docs/{linked_id}"), json!({ "title": "Firewall", "body": format!("[admin](vault:{item_id})") })).await;
+
+    // --- who is refused ------------------------------------------------------------------------------
+    let no_mfa = signed_in(url, admin, "vault-nomfa@e2e.test", "technician", None, false).await;
+    let readonly = signed_in(url, admin, "vault-readonly@e2e.test", "readonly", None, true).await;
+    let scoped = signed_in(url, admin, "vault-scoped@e2e.test", "technician", Some(b_id), true).await;
+    for (who, api, status, error) in [
+        ("without 2FA", &no_mfa, StatusCode::FORBIDDEN, Some("turn on two-factor authentication to use the vault")),
+        ("read-only", &readonly, StatusCode::FORBIDDEN, Some("insufficient permissions")),
+        ("scoped to client B", &scoped, StatusCode::NOT_FOUND, None),
+    ] {
+        for (method, path, body) in [
+            (Method::GET, format!("/clients/{a_id}/vault"), None),
+            (Method::GET, format!("/vault/{item_id}"), None),
+            (Method::POST, format!("/vault/{item_id}/reveal"), Some(json!({ "field": "password" }))),
+            (Method::POST, format!("/vault/{item_id}/totp"), Some(json!({}))),
+            (Method::PUT, format!("/vault/{item_id}"), Some(json!({ "password": "stolen" }))),
+            (Method::DELETE, format!("/vault/{item_id}"), None),
+            (Method::POST, format!("/clients/{a_id}/vault"), Some(json!({ "name": "Planted" }))),
+        ] {
+            let (s, v) = api.call(method.clone(), &path, body).await;
+            assert_eq!(s, status, "{who}: {method} {path}: {v}");
+            if let Some(e) = error {
+                assert_eq!(v["error"], e, "{who}: {method} {path}");
+            }
+        }
+    }
+    assert_eq!(scoped.get(&format!("/clients/{b_id}/vault")).await.as_array().unwrap().len(), 1, "their own client's vault works");
+    let (s, _) = readonly.call(Method::POST, &format!("/clients/{b_id}/vault"), Some(json!({ "name": "x" }))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    for api in [&no_mfa, &readonly] {
+        let d = api.get(&format!("/docs/{linked_id}")).await;
+        seen += &d.to_string();
+        assert_eq!((d["credentials"].clone(), d["credentials_hidden"].as_bool()), (json!([]), Some(true)), "{d}");
+    }
+    let still = admin.post(&format!("/vault/{item_id}/reveal"), json!({ "field": "password" })).await;
+    assert_eq!(still["value"], PW2, "nothing the refused users sent changed it");
+
+    for s in [PW1, PW2, NOTE, SECRET, "b-router-pass"] {
+        assert!(!seen.contains(s), "a secret appeared outside a reveal");
+    }
+
+    // Deleting an item leaves the page; the reference no longer resolves.
+    admin.call(Method::DELETE, &format!("/vault/{item_id}"), None).await;
+    assert_eq!(admin.call(Method::GET, &format!("/vault/{item_id}"), None).await.0, StatusCode::NOT_FOUND);
+    let d = admin.get(&format!("/docs/{linked_id}")).await;
+    assert_eq!((d["credentials"].clone(), d["body"].as_str()), (json!([]), Some(format!("[admin](vault:{item_id})").as_str())));
+    println!("documentation and the vault: ok");
+}
+
+/// Documentation pages linked to tickets: link, duplicate, the client rule, unlink, the timeline,
+/// both sides' responses, client changes and merges, and who is refused. (That the portal never
+/// shows the `doc` events is checked in `portal_and_sla`, which has a portal session.)
+async fn ticket_docs(url: &str, admin: &Api, a_id: &str, b_id: &str) {
+    use reqwest::Method;
+    let tech = signed_in(url, admin, "tdocs-tech@e2e.test", "technician", None, true).await;
+    let readonly = signed_in(url, admin, "tdocs-readonly@e2e.test", "readonly", None, true).await;
+    let scoped = signed_in(url, admin, "tdocs-scoped@e2e.test", "technician", Some(b_id), true).await;
+    let network = admin.get("/doc-categories").await.as_array().unwrap().iter().find(|c| c["name"] == "Network").unwrap()["id"].clone();
+    let page = |client: &str, title: &str, category: Value| {
+        let (client, title) = (client.to_string(), title.to_string());
+        async move { admin.post(&format!("/clients/{client}/docs"), json!({ "title": title, "category_id": category, "body": "Steps." })).await["id"].as_str().unwrap().to_string() }
+    };
+    let admin_name = admin.get("/auth/me").await["name"].clone();
+    let net = page(a_id, "Network overview", network.clone()).await;
+    let backup = page(a_id, "Backup runbook", Value::Null).await;
+    let b_page = page(b_id, "Client B wiki", Value::Null).await;
+    let ticket = |client: &str, subject: &str| {
+        let (client, subject) = (client.to_string(), subject.to_string());
+        async move { admin.post("/tickets", json!({ "subject": subject, "client_id": client })).await }
+    };
+    let t1 = ticket(a_id, "VPN down").await;
+    let t1_id = t1["id"].as_str().unwrap().to_string();
+    let tb_id = ticket(b_id, "Client B printer").await["id"].as_str().unwrap().to_string();
+
+    // Link, twice, and the rules.
+    for doc in [&backup, &net, &net] {
+        tech.post(&format!("/tickets/{t1_id}/docs"), json!({ "doc_id": doc })).await;
+    }
+    let (s, v) = tech.call(Method::POST, &format!("/tickets/{t1_id}/docs"), Some(json!({ "doc_id": b_page }))).await;
+    assert_eq!((s, v["error"].as_str()), (StatusCode::BAD_REQUEST, Some("the page must belong to the ticket's client")));
+    let (s, _) = tech.call(Method::POST, &format!("/tickets/{t1_id}/docs"), Some(json!({ "doc_id": uuid::Uuid::new_v4() }))).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "no such page");
+    let (s, v) = scoped.call(Method::POST, &format!("/tickets/{tb_id}/docs"), Some(json!({ "doc_id": net }))).await;
+    assert_eq!((s, v["error"].as_str()), (StatusCode::NOT_FOUND, Some("document not found")), "a page of a client they can't see");
+    let (s, _) = scoped.call(Method::POST, &format!("/tickets/{t1_id}/docs"), Some(json!({ "doc_id": net }))).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "a ticket they can't see");
+    for (method, path, body) in [
+        (Method::POST, format!("/tickets/{t1_id}/docs"), Some(json!({ "doc_id": backup }))),
+        (Method::DELETE, format!("/tickets/{t1_id}/docs/{net}"), None),
+    ] {
+        let (s, v) = readonly.call(method.clone(), &path, body).await;
+        assert_eq!((s, v["error"].as_str()), (StatusCode::FORBIDDEN, Some("insufficient permissions")), "read-only: {method} {path}");
+    }
+
+    // The ticket: pages by title, with category and who saved them; one event per change.
+    let d = readonly.get(&format!("/tickets/{t1_id}")).await;
+    let titles: Vec<&str> = d["docs"].as_array().unwrap().iter().map(|x| x["title"].as_str().unwrap()).collect();
+    assert_eq!(titles, ["Backup runbook", "Network overview"], "{d}");
+    let n = &d["docs"][1];
+    assert_eq!((n["id"].as_str(), n["category"].as_str(), n["updated_by_name"].as_str()), (Some(net.as_str()), Some("Network"), admin_name.as_str()), "{n}");
+    assert!(n["updated_at"].is_string());
+    assert_eq!(d["docs"][0]["category"], "", "uncategorised");
+    let ev = events_of(&d, "doc");
+    assert_eq!(ev.len(), 2, "linking twice is a no-op: {ev:?}");
+    assert_eq!(ev[0]["data"], json!({ "doc_id": backup, "title": "Backup runbook", "linked": true }));
+    assert_eq!((ev[1]["data"]["title"].as_str(), ev[1]["public"].as_bool(), ev[1]["author_name"].as_str()), (Some("Network overview"), Some(false), Some("tdocs-tech@e2e.test")));
+
+    // The page: the tickets that link it.
+    let p = readonly.get(&format!("/docs/{net}")).await;
+    assert_eq!(p["tickets"].as_array().unwrap().len(), 1, "{p}");
+    let t = &p["tickets"][0];
+    assert_eq!((t["id"].as_str(), t["number"].as_i64(), t["subject"].as_str()), (Some(t1_id.as_str()), t1["number"].as_i64(), Some("VPN down")));
+    assert_eq!((t["status"].as_str(), t["status_category"].as_str()), (Some("New"), Some("new")), "{t}");
+    assert!(t["updated_at"].is_string());
+    assert_eq!(admin.get(&format!("/docs/{b_page}")).await["tickets"], json!([]));
+
+    // Unlink.
+    let (s, _) = tech.call(Method::DELETE, &format!("/tickets/{t1_id}/docs/{backup}"), None).await;
+    assert!(s.is_success());
+    let (s, v) = tech.call(Method::DELETE, &format!("/tickets/{t1_id}/docs/{backup}"), None).await;
+    assert_eq!((s, v["error"].as_str()), (StatusCode::NOT_FOUND, Some("linked page not found")));
+    let d = admin.get(&format!("/tickets/{t1_id}")).await;
+    assert_eq!(d["docs"].as_array().unwrap().len(), 1);
+    let ev = events_of(&d, "doc");
+    assert_eq!(ev.len(), 3);
+    assert_eq!(ev[2]["data"], json!({ "doc_id": backup, "title": "Backup runbook", "linked": false }));
+    assert_eq!(admin.get(&format!("/docs/{backup}")).await["tickets"], json!([]));
+
+    // Merging moves the links to the surviving ticket.
+    let t2_id = ticket(a_id, "VPN down again").await["id"].as_str().unwrap().to_string();
+    for doc in [&backup, &net] {
+        tech.post(&format!("/tickets/{t2_id}/docs"), json!({ "doc_id": doc })).await;
+    }
+    let p = admin.get(&format!("/docs/{net}")).await;
+    let ids: Vec<&str> = p["tickets"].as_array().unwrap().iter().map(|x| x["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, [t2_id.as_str(), t1_id.as_str()], "newest first");
+    tech.post(&format!("/tickets/{t2_id}/merge"), json!({ "into": t1_id })).await;
+    let d = admin.get(&format!("/tickets/{t1_id}")).await;
+    let titles: Vec<&str> = d["docs"].as_array().unwrap().iter().map(|x| x["title"].as_str().unwrap()).collect();
+    assert_eq!(titles, ["Backup runbook", "Network overview"], "{d}");
+    assert_eq!(admin.get(&format!("/tickets/{t2_id}")).await["docs"], json!([]));
+    let p = admin.get(&format!("/docs/{backup}")).await;
+    assert_eq!((p["tickets"].as_array().unwrap().len(), p["tickets"][0]["id"].as_str()), (1, Some(t1_id.as_str())), "{p}");
+
+    // Changing the client drops the old client's pages.
+    let (s, v) = tech.call(Method::PATCH, &format!("/tickets/{t1_id}"), Some(json!({ "client_id": b_id }))).await;
+    assert!(s.is_success(), "{v}");
+    assert_eq!(admin.get(&format!("/tickets/{t1_id}")).await["docs"], json!([]));
+    assert_eq!(admin.get(&format!("/docs/{net}")).await["tickets"], json!([]));
+    tech.post(&format!("/tickets/{t1_id}/docs"), json!({ "doc_id": b_page })).await;
+    assert_eq!(scoped.get(&format!("/docs/{b_page}")).await["tickets"][0]["id"], t1_id.as_str(), "client B's page now");
+
+    // Deleting a page drops its links.
+    admin.call(Method::DELETE, &format!("/docs/{b_page}"), None).await;
+    assert_eq!(admin.get(&format!("/tickets/{t1_id}")).await["docs"], json!([]));
+    println!("documentation on tickets: ok");
 }
 
 /// The policy migration (0022) on a database with old-model rows in every shape: MSP-wide,

@@ -134,7 +134,7 @@ fn file_name(path: &str) -> String {
     path.rsplit(['/', '\\']).find(|s| !s.is_empty()).unwrap_or("download").to_string()
 }
 
-fn disposition(name: &str) -> String {
+pub(super) fn disposition(name: &str) -> String {
     let ascii: String = name.chars().map(|c| if c.is_ascii_alphanumeric() || " ._-()".contains(c) { c } else { '_' }).collect();
     let encoded: String = name
         .bytes()

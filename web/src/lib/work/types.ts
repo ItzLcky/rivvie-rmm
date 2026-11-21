@@ -158,35 +158,6 @@ export interface ProjectDetail extends Project {
 	burn: { week: string; minutes: number }[];
 }
 
-export interface ClientDoc {
-	id: string;
-	client_id: string;
-	title: string;
-	category: string;
-	body: string | null;
-	updated_by_name: string | null;
-	updated_at: string;
-	revisions: number;
-}
-
-export interface DocRevisionRef {
-	id: number;
-	title: string;
-	edited_by: string | null;
-	edited_at: string;
-}
-
-export interface ClientDocDetail extends ClientDoc {
-	body: string;
-	history: DocRevisionRef[];
-}
-
-export interface DocRevision {
-	title: string;
-	body: string;
-	edited_at: string;
-}
-
 export interface Breakdown {
 	name: string;
 	opened: number;

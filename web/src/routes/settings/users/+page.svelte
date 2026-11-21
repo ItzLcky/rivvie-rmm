@@ -98,11 +98,13 @@
 		{ value: 'security.manage', label: 'Manage', hint: 'Security policies, exclusions, rule modes and content rollout' },
 		{ value: 'billing.read', label: 'See billing', hint: 'Rates, contracts, invoices and money in reports' },
 		{ value: 'billing.manage', label: 'Manage billing', hint: 'Contracts, products, rates, invoice runs and accounting' },
-		{ value: 'time.approve', label: 'Approve time', hint: 'Approve and reject timesheets' }
+		{ value: 'time.approve', label: 'Approve time', hint: 'Approve and reject timesheets' },
+		{ value: 'vault.read', label: 'See passwords', hint: 'Reveal vault passwords and notes, show TOTP codes. Needs two-factor authentication.' },
+		{ value: 'vault.manage', label: 'Manage passwords', hint: 'Add, change and delete vault credentials. Needs two-factor authentication.' }
 	];
 	const roleDefaults: Record<string, string[]> = {
-		admin: ['security.read', 'security.respond', 'security.manage', 'billing.read', 'billing.manage', 'time.approve'],
-		technician: ['security.read', 'security.respond'],
+		admin: ['security.read', 'security.respond', 'security.manage', 'billing.read', 'billing.manage', 'time.approve', 'vault.read', 'vault.manage'],
+		technician: ['security.read', 'security.respond', 'vault.read', 'vault.manage'],
 		readonly: ['security.read']
 	};
 	const permLabel = (list: string[]) => (list.length ? perms.filter((p) => list.includes(p.value)).map((p) => p.label).join(', ') : 'No access');
@@ -117,7 +119,7 @@
 	async function savePerms(e: SubmitEvent) {
 		e.preventDefault();
 		const body = { permissions: permMode === 'role' ? null : perms.map((p) => p.value).filter((v) => permSet.includes(v)) };
-		if (await attempt(() => api.put(`/users/${editingPerms!.id}/permissions`, body), 'Endpoint security permissions saved.')) {
+		if (await attempt(() => api.put(`/users/${editingPerms!.id}/permissions`, body), 'Permissions saved.')) {
 			editingPerms = null;
 			res.reload();
 		}
@@ -158,7 +160,7 @@
 				...(u.role !== 'admin'
 					? [{ label: 'Client access', icon: Building2, onSelect: () => ((editingAccess = u), (accessForm = { all_clients: u.all_clients, client_ids: [...u.client_ids] })) }]
 					: []),
-				...(u.role !== 'admin' ? [{ label: 'Endpoint security', icon: ShieldCheck, onSelect: () => openPerms(u) }] : []),
+				...(u.role !== 'admin' ? [{ label: 'Permissions', icon: ShieldCheck, onSelect: () => openPerms(u) }] : []),
 				{ label: 'Sessions', icon: MonitorSmartphone, onSelect: () => (viewing = u) },
 				{ label: 'Reset password', icon: KeyRound, onSelect: () => ((resetting = u), (resetPw = '')) },
 				...(u.totp_enabled ? [{ label: 'Reset 2FA', icon: ShieldOff, onSelect: () => reset2fa(u) }] : []),
@@ -180,7 +182,7 @@
 		{ id: 'name', label: 'User', cell: nameCell, hideable: false },
 		{ id: 'role', label: 'Role', cell: roleCell },
 		{ id: 'access', label: 'Clients', cell: accessCell, from: 'md' },
-		{ id: 'security', label: 'Endpoint security', cell: securityCell, from: 'lg' },
+		{ id: 'security', label: 'Permissions', cell: securityCell, from: 'lg' },
 		{ id: 'mfa', label: '2FA', cell: mfaCell, from: 'sm' },
 		{ id: 'status', label: 'Last sign-in', cell: statusCell, from: 'lg' },
 		{ id: 'actions', label: '', cell: actionsCell, hideable: false, align: 'right', class: 'w-16' }
@@ -232,7 +234,7 @@
 
 {#if editingPerms}
 	{@const u = editingPerms}
-	<Modal title="Endpoint security" description={u.email} onclose={() => (editingPerms = null)}>
+	<Modal title="Permissions" description={u.email} onclose={() => (editingPerms = null)}>
 		<form id="perms" class="space-y-4" onsubmit={savePerms}>
 			<fieldset class="space-y-2">
 				<legend class="sr-only">Permissions from</legend>
@@ -258,7 +260,7 @@
 					</div>
 				{/each}
 			</fieldset>
-			<p class="text-muted text-xs">Client access still applies: they only see and act on agents of their clients. Takes effect on their next request.</p>
+			<p class="text-muted text-xs">Client access still applies: they only see and act on agents (and credentials) of their clients. Takes effect on their next request.</p>
 		</form>
 		{#snippet footer()}
 			<Button onclick={() => (editingPerms = null)}>Cancel</Button>

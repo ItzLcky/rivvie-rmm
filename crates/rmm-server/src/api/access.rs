@@ -20,6 +20,13 @@ pub async fn agent(st: &AppState, u: &User, agent_id: Uuid) -> ApiResult<Uuid> {
     client.filter(|c| u.can_see_client(*c)).ok_or(ApiError::NotFound("agent"))
 }
 
+/// The documentation page's client, if the page exists and `u` may see it.
+pub async fn doc(st: &AppState, u: &User, doc_id: Uuid) -> ApiResult<Uuid> {
+    let client: Option<Uuid> =
+        sqlx::query_scalar("SELECT client_id FROM client_docs WHERE id = $1").bind(doc_id).fetch_optional(&st.db).await?;
+    client.filter(|c| u.can_see_client(*c)).ok_or(ApiError::NotFound("document"))
+}
+
 /// The site's client, if the site exists and `u` may see it.
 pub async fn site(st: &AppState, u: &User, site_id: Uuid) -> ApiResult<Uuid> {
     let client: Option<Uuid> =

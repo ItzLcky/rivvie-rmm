@@ -125,14 +125,14 @@ Portal access is scoped to one client in the session and checked on every query.
 
 ## Documentation and credentials
 
-Per-client documentation pages are straightforward. A **password vault** is a separate, larger decision: it would hold the most sensitive data in the product. If we build one:
+Per-client documentation pages are straightforward. A **password vault** is a separate, larger decision: it holds the most sensitive data in the product. Built 2026-11-20 to [documentation.md](documentation.md#password-vault):
 
-- envelope encryption: a per-client data key wrapped by a key that isn't in Postgres (KMS, or a key file mounted only on the server);
-- reveal on request with a mandatory audit entry;
-- a permission of its own;
-- 2FA required to view.
+- envelope encryption: a random 32-byte key per client, wrapped with `RMM_DATA_KEY` (which lives in the server's environment, not in Postgres), seals each password, note and TOTP secret with ChaCha20-Poly1305 and associated data binding it to its item and field. No `RMM_DATA_KEY`, no vault: it never falls back to plaintext;
+- reveal on request, one field at a time, rate-limited, with a mandatory audit entry; TOTP codes are computed on the server so the secret never leaves it;
+- permissions of their own, `vault.read` and `vault.manage`;
+- 2FA required for every vault request.
 
-Do this before the vault: encrypt the TOTP secrets at rest. Phase 8 added `RMM_DATA_KEY` and ChaCha20-Poly1305 sealing (`crates/rmm-server/src/crypto.rs`), but TOTP secrets are still plaintext in Postgres.
+Still open: an outside security review, and a command to rotate `RMM_DATA_KEY` (rewrap the client keys). TOTP secrets of user accounts have been sealed at rest since migration 0014.
 
 ## Reporting
 

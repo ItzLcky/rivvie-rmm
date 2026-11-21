@@ -30,7 +30,15 @@ export function can(min: 'readonly' | 'technician' | 'admin'): boolean {
 	return !!session.user && order[session.user.role] >= order[min];
 }
 
-export type Permission = 'security.read' | 'security.respond' | 'security.manage' | 'billing.read' | 'billing.manage' | 'time.approve';
+export type Permission =
+	| 'security.read'
+	| 'security.respond'
+	| 'security.manage'
+	| 'billing.read'
+	| 'billing.manage'
+	| 'time.approve'
+	| 'vault.read'
+	| 'vault.manage';
 
 /** Holds a named permission (the server sends the effective set; older servers: role defaults). */
 export function allowed(perm: Permission): boolean {
@@ -38,5 +46,5 @@ export function allowed(perm: Permission): boolean {
 	if (!u) return false;
 	if (u.permissions) return u.permissions.includes(perm);
 	if (perm === 'security.read') return true;
-	return perm === 'security.respond' ? can('technician') : can('admin');
+	return perm === 'security.respond' || perm === 'vault.read' || perm === 'vault.manage' ? can('technician') : can('admin');
 }

@@ -29,6 +29,9 @@ pub enum ApiError {
     TooLarge(String),
     #[error("too many failed attempts; try again in {} seconds", .0.as_secs())]
     TooManyRequests(std::time::Duration),
+    /// A limit on every use, not on failures (vault reveals).
+    #[error("too many requests; try again in {} seconds", .0.as_secs())]
+    Throttled(std::time::Duration),
     #[error(transparent)]
     Db(#[from] sqlx::Error),
     #[error(transparent)]
@@ -47,7 +50,7 @@ impl IntoResponse for ApiError {
             ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
             ApiError::Conflict(_) => StatusCode::CONFLICT,
             ApiError::TooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
-            ApiError::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
+            ApiError::TooManyRequests(_) | ApiError::Throttled(_) => StatusCode::TOO_MANY_REQUESTS,
             ApiError::Db(sqlx::Error::RowNotFound) => StatusCode::NOT_FOUND,
             ApiError::Db(sqlx::Error::Database(e)) if e.is_unique_violation() => StatusCode::CONFLICT,
             ApiError::Db(_) | ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -67,7 +70,7 @@ impl IntoResponse for ApiError {
         match self {
             ApiError::MfaRequired(_) => body["mfa_required"] = true.into(),
             ApiError::MfaSetupRequired => body["mfa_setup_required"] = true.into(),
-            ApiError::TooManyRequests(wait) => {
+            ApiError::TooManyRequests(wait) | ApiError::Throttled(wait) => {
                 return (status, [(axum::http::header::RETRY_AFTER, wait.as_secs().to_string())], Json(body)).into_response();
             }
             _ => {}

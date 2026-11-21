@@ -50,7 +50,7 @@
 <PageHeader title="Account" description={session.user ? `${session.user.name} · ${session.user.email}` : undefined} />
 
 <div class="grid max-w-5xl gap-5 lg:grid-cols-2">
-	<section class={cx('card p-5', setup && 'lg:col-span-2 lg:max-w-xl')}>
+	<section id="two-factor" class={cx('card scroll-mt-4 p-5', setup && 'lg:col-span-2 lg:max-w-xl')}>
 		<h2 class="font-semibold">Two-factor authentication</h2>
 		<p class="text-muted mt-0.5 mb-4 text-sm">A code from an authenticator app on your phone, asked for at every sign-in.</p>
 		<TwoFactor onchange={() => gen++} />

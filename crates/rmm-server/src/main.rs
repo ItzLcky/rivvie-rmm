@@ -260,6 +260,12 @@ async fn serve(db: sqlx::PgPool, args: ServeArgs) -> Result<()> {
         }
     };
     api::seal_totp_secrets(&db, data_key.as_ref()).await.context("encrypting two-factor secrets")?;
+    if data_key.is_none() {
+        let (n,): (i64,) = sqlx::query_as("SELECT count(*) FROM vault_keys").fetch_one(&db).await.context("checking vault keys")?;
+        if n > 0 {
+            warn!("{n} client vault(s) are encrypted with RMM_DATA_KEY, which isn't set: the vault is unavailable until it is");
+        }
+    }
     let state = Arc::new(AppState {
         storage,
         company: company.into(),

@@ -14,6 +14,7 @@ mod channels;
 mod auth;
 mod clients;
 mod desk;
+mod docs;
 mod downloads;
 mod kb;
 mod jobs;
@@ -38,6 +39,7 @@ mod time;
 mod tools;
 mod totp;
 pub(crate) mod users;
+mod vault;
 
 pub use jobs::{FAILED as JOB_FAILED, deliver as deliver_job};
 pub use portal::PORTAL_LINK_MINUTES;
@@ -200,6 +202,8 @@ pub fn router(attachment_max: u64) -> Router<Arc<AppState>> {
         .route("/tickets/{id}/attachments/{aid}", get(tickets::download))
         .route("/tickets/{id}/agents", post(tickets::link_agent))
         .route("/tickets/{id}/agents/{agent_id}", delete(tickets::unlink_agent))
+        .route("/tickets/{id}/docs", post(tickets::link_doc))
+        .route("/tickets/{id}/docs/{doc_id}", delete(tickets::unlink_doc))
         .route("/tickets/{id}/merge", post(tickets::merge))
         .route("/contacts", get(servicedesk::list_contacts).post(servicedesk::create_contact))
         .route("/contacts/{id}", get(servicedesk::get_contact).put(servicedesk::update_contact).delete(servicedesk::remove_contact))
@@ -298,9 +302,19 @@ pub fn router(attachment_max: u64) -> Router<Arc<AppState>> {
         .route("/projects/{id}/tasks", post(pm::create_task))
         .route("/projects/{id}/tasks/{tid}", axum::routing::put(pm::update_task).delete(pm::remove_task))
         .route("/projects/{id}/tasks/{tid}/ticket", post(pm::task_ticket))
-        .route("/clients/{id}/docs", get(pm::docs).post(pm::create_doc))
-        .route("/docs/{id}", get(pm::doc).put(pm::update_doc).delete(pm::remove_doc))
-        .route("/docs/{id}/revisions/{rev}", get(pm::revision))
+        .route("/clients/{id}/docs", get(docs::list).post(docs::create))
+        .route("/docs/{id}", get(docs::get).put(docs::update).delete(docs::remove))
+        .route("/docs/{id}/revisions/{rev}", get(docs::revision))
+        .route("/docs/{id}/export", get(docs::export))
+        .route("/doc-categories", get(docs::categories).post(docs::create_category))
+        .route("/doc-categories/order", axum::routing::put(docs::reorder_categories))
+        .route("/doc-categories/{id}", axum::routing::put(docs::update_category).delete(docs::delete_category))
+        .route("/doc-templates", get(docs::templates).post(docs::create_template))
+        .route("/doc-templates/{id}", get(docs::template).put(docs::update_template).delete(docs::delete_template))
+        .route("/clients/{id}/vault", get(vault::list).post(vault::create))
+        .route("/vault/{id}", get(vault::get).put(vault::update).delete(vault::remove))
+        .route("/vault/{id}/reveal", post(vault::reveal))
+        .route("/vault/{id}/totp", post(vault::totp))
         .route("/reports/service-desk", get(reports::service_desk))
         .route("/reports/utilisation", get(reports::utilisation))
         .route("/reports/profitability", get(reports::profitability))

@@ -5,6 +5,8 @@
 		ArrowRightLeft,
 		BellRing,
 		Copy,
+		ExternalLink,
+		FileText,
 		GitMerge,
 		Link2,
 		Mail,
@@ -31,7 +33,9 @@
 	import { categoryOf, levels, priorities, priorityOf, sourceLabels, ticketMeta, ticketNumber } from '#lib/servicedesk/tickets.svelte.js';
 	import { can, company, session } from '#lib/session.svelte.js';
 	import { attempt, toast } from '#lib/toast.svelte.js';
-	import type { AgentSummary, CannedResponse, Contact, Page, Priority, StatusCategory, Ticket, TicketAgent, TicketAttachment, TicketDetail, TicketEvent, TicketMeta } from '#lib/types.js';
+	import type { AgentSummary, CannedResponse, Contact, Page, Priority, StatusCategory, Ticket, TicketAgent, TicketAttachment, TicketDetail, TicketDoc, TicketEvent, TicketMeta } from '#lib/types.js';
+	import { agentLoader, docContext, docPageHref } from '#lib/docs/context.js';
+	import type { DocDetail, DocRow } from '#lib/docs/types.js';
 	import { targetLabels, until } from '#lib/servicedesk/sla.js';
 	import SlaBadge from '#lib/components/ticket/SlaBadge.svelte';
 	import TicketTime from '#lib/components/work/TicketTime.svelte';
@@ -39,6 +43,7 @@
 	import Badge from '#lib/ui/Badge.svelte';
 	import Button from '#lib/ui/Button.svelte';
 	import Combobox from '#lib/ui/Combobox.svelte';
+	import Drawer from '#lib/ui/Drawer.svelte';
 	import EmptyState from '#lib/ui/EmptyState.svelte';
 	import Field from '#lib/ui/Field.svelte';
 	import IconButton from '#lib/ui/IconButton.svelte';
@@ -50,6 +55,8 @@
 	import Skeleton from '#lib/ui/Skeleton.svelte';
 	import Textarea from '#lib/ui/Textarea.svelte';
 	import HealthBadge from '#lib/components/HealthBadge.svelte';
+	import DocCredentials from '#lib/components/docs/DocCredentials.svelte';
+	import DocView from '#lib/components/docs/DocView.svelte';
 	import JobBadge from '#lib/components/JobBadge.svelte';
 	import RunScript from '#lib/components/RunScript.svelte';
 	import SeverityBadge from '#lib/components/SeverityBadge.svelte';
@@ -76,13 +83,16 @@
 	// --- properties ---------------------------------------------------------------------------
 	let contacts = $state<Contact[]>([]);
 	let clientAgents = $state<AgentSummary[]>([]);
+	let clientDocs = $state<DocRow[]>([]);
 	$effect(() => {
 		const c = res.data?.client_id;
 		contacts = [];
 		clientAgents = [];
+		clientDocs = [];
 		if (!c || !tech) return;
 		api.get<Contact[]>(`/contacts?client_id=${c}`).then((l) => res.data?.client_id === c && (contacts = l));
 		api.get<Page<AgentSummary>>(`/agents?client_id=${c}&limit=500&sort=hostname`).then((p) => res.data?.client_id === c && (clientAgents = p.items));
+		api.get<DocRow[]>(`/clients/${c}/docs`).then((l) => res.data?.client_id === c && (clientDocs = l));
 	});
 
 	const canned = resource(() => (can('technician') ? api.get<CannedResponse[]>('/canned-responses') : Promise.resolve([])));
@@ -183,6 +193,28 @@
 		if (await attempt(() => api.del(`/tickets/${id}/agents/${a.id}`), `${a.hostname} unlinked.`)) res.reload();
 	}
 
+	// --- documentation -----------------------------------------------------------------------
+	async function linkDoc(docId: string) {
+		if (docId && (await attempt(() => api.post(`/tickets/${id}/docs`, { doc_id: docId })))) res.reload();
+	}
+	async function unlinkDoc(d: TicketDoc) {
+		if (await attempt(() => api.del(`/tickets/${id}/docs/${d.id}`), `${d.title} unlinked.`)) res.reload();
+	}
+	/** The page open in the drawer, read without leaving the ticket. */
+	let peek = $state<string | null>(null);
+	const peekDoc = resource(() => (peek ? api.get<DocDetail>(`/docs/${peek}`) : Promise.resolve(null)), { keep: false });
+	const docAgents = new Map<string, ReturnType<typeof agentLoader>>();
+	function agentsOf(clientId: string) {
+		let l = docAgents.get(clientId);
+		if (!l) docAgents.set(clientId, (l = agentLoader(clientId)));
+		return l;
+	}
+	function openPeek(e: MouseEvent, docId: string) {
+		if (e.ctrlKey || e.metaKey || e.shiftKey || e.altKey || e.button) return;
+		e.preventDefault();
+		peek = docId;
+	}
+
 	// --- merge --------------------------------------------------------------------------------
 	let merging = $state(false);
 	let mergeQuery = $state('');
@@ -202,7 +234,7 @@
 		const cur = res.data!;
 		const ok = await confirmAction({
 			title: `Merge ${ticketNumber(cur.number)} into ${ticketNumber(t.number)}?`,
-			message: `Its timeline, attachments, agents and email thread move to ${ticketNumber(t.number)} (“${t.subject}”), and this ticket is closed. This can't be undone.`,
+			message: `Its timeline, attachments, agents, linked pages and email thread move to ${ticketNumber(t.number)} (“${t.subject}”), and this ticket is closed. This can't be undone.`,
 			confirmLabel: 'Merge'
 		});
 		if (ok && (await attempt(() => api.post(`/tickets/${id}/merge`, { into: t.id }), `Merged into ${ticketNumber(t.number)}.`))) {
@@ -386,6 +418,9 @@
 									{:else if e.kind === 'agent'}
 										<Link2 class="size-3.5 shrink-0" aria-hidden="true" />
 										<span><span class="text-fg">{e.author_name}</span> {e.data.linked ? 'linked' : 'unlinked'} {e.data.hostname ?? 'an agent'}</span>
+									{:else if e.kind === 'doc'}
+										<FileText class="size-3.5 shrink-0" aria-hidden="true" />
+										<span><span class="text-fg">{e.author_name}</span> {e.data.linked ? 'linked' : 'unlinked'} {e.data.title ?? 'a page'}</span>
 									{:else if e.kind === 'sla'}
 										<Timer class={cx('size-3.5 shrink-0', e.data.event === 'sla_breach' ? 'text-danger' : 'text-warning')} aria-hidden="true" />
 										<span class={e.data.event === 'sla_breach' ? 'text-danger' : ''}>{e.body}</span>
@@ -652,6 +687,41 @@
 					{/if}
 				</section>
 
+				<section class="card" aria-labelledby="docs-h">
+					<header class="border-border flex items-center justify-between min-h-12 border-b px-4 py-3">
+						<h2 id="docs-h" class="panel-title">Documentation</h2>
+					</header>
+					{#if t.docs.length}
+						<ul class="divide-border divide-y">
+							{#each t.docs as d (d.id)}
+								<li class="flex items-center gap-2 px-4 py-2.5">
+									<FileText class="text-muted size-4 shrink-0" aria-hidden="true" />
+									<div class="min-w-0 flex-1">
+										<a class="hover:text-accent block truncate font-medium" href={docPageHref(t.client_id ?? '', d.id)} onclick={(e) => openPeek(e, d.id)} aria-haspopup="dialog">{d.title}</a>
+										<p class="text-muted truncate text-xs">{d.category || 'Uncategorised'} · saved <time datetime={d.updated_at} title={datetime(d.updated_at)}>{ago(d.updated_at)}</time></p>
+									</div>
+									{#if tech && !t.merged_into}<IconButton size="sm" icon={Unlink} label="Unlink {d.title}" onclick={() => unlinkDoc(d)} />{/if}
+								</li>
+							{/each}
+						</ul>
+					{:else}
+						<EmptyState compact title="No pages linked" description={t.client_id ? 'Link the runbooks and network notes this ticket needs, to read them here.' : 'Choose a client first.'} />
+					{/if}
+					{#if tech && t.client_id && !t.merged_into}
+						<div class="border-border border-t px-4 py-3">
+							{#key t.docs.length}
+								<Combobox
+									label="Link a page"
+									value=""
+									placeholder="Link a page…"
+									items={clientDocs.filter((d) => !t.docs.some((x) => x.id === d.id)).map((d) => ({ value: d.id, label: d.title, hint: d.category || undefined }))}
+									onchange={linkDoc}
+								/>
+							{/key}
+						</div>
+					{/if}
+				</section>
+
 				{#if t.attachments.length}
 					<section class="card" aria-labelledby="files-h">
 						<header class="border-border min-h-12 border-b px-4 py-3"><h2 id="files-h" class="panel-title">Attachments</h2></header>
@@ -669,6 +739,35 @@
 			</aside>
 		</div>
 
+		<Drawer open={!!peek} title="Documentation" side="right" width="w-[44rem]" onclose={() => (peek = null)}>
+			<Async res={peekDoc}>
+				{#snippet skeleton()}
+					<div class="space-y-4 px-5 pb-6" aria-busy="true">
+						<span class="sr-only">Loading page</span>
+						<Skeleton class="h-3 w-24" /><Skeleton class="h-6 w-64" /><Skeleton class="h-4 w-full" lines={6} />
+					</div>
+				{/snippet}
+				{#snippet children(d)}
+					{#if d}
+						{@const ctx = docContext(d, agentsOf(d.client_id), { docHref: (x) => docPageHref(d.client_id, x), openDoc: (x) => (peek = x) })}
+						<article aria-labelledby="peek-title">
+							<header class="border-border flex flex-wrap items-start justify-between gap-x-4 gap-y-3 border-b px-5 pb-4">
+								<div class="min-w-0">
+									<p class="eyebrow">{d.category || 'Uncategorised'}</p>
+									<h2 id="peek-title" class="mt-1 text-xl font-bold break-words">{d.title}</h2>
+									<p class="text-muted mt-1 text-xs">
+										Saved <time datetime={d.updated_at} title={datetime(d.updated_at)}>{ago(d.updated_at)}</time>{d.updated_by_name ? ` by ${d.updated_by_name}` : ''}
+									</p>
+								</div>
+								<Button size="sm" icon={ExternalLink} href={docPageHref(d.client_id, d.id)}>Open page</Button>
+							</header>
+							<DocCredentials doc={d} {ctx} class="px-5" />
+							<div class="px-5 py-5"><DocView source={d.body} {ctx} /></div>
+						</article>
+					{/if}
+				{/snippet}
+			</Async>
+		</Drawer>
 		{#if running}<RunScript agents={[running]} ticketId={t.id} onclose={() => (running = null)} />{/if}
 		{#if merging}
 			<Modal title="Merge {ticketNumber(t.number)} into…" description="Pick the ticket to keep. Everything on this one moves there." onclose={() => (merging = false)}>

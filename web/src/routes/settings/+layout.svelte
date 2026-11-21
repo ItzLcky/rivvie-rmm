@@ -28,6 +28,7 @@
 		{ value: '/settings/notifications', label: 'Notifications' },
 		{ value: '/settings/service-desk', label: 'Service desk' },
 		{ value: '/settings/sla', label: 'SLAs' },
+		{ value: '/settings/documentation', label: 'Documentation' },
 		{ value: '/settings/billing', label: 'Billing' }
 	]}
 />

@@ -253,7 +253,7 @@ to SYSTEM and Administrators. Windows service logs go to `C:\ProgramData\RMM\log
 | `RMM_TICKET_CLOSE_DAYS` | `7` | Resolved tickets move to Closed after this |
 | `RMM_PUBLIC_URL` callbacks | | QuickBooks and Xero redirect to `<RMM_PUBLIC_URL>/api/billing/accounting/qbo/callback` (or `/xero/callback`): register that in the provider's developer portal. For the QuickBooks sandbox set `RMM_QBO_API_URL=https://sandbox-quickbooks.api.intuit.com` |
 | `RMM_EMAIL_RAW_DAYS` | `90` | Raw MIME of inbound mail is deleted after this (the ticket keeps the text and attachments) |
-| `RMM_DATA_KEY` | empty (required by the compose files) | 32 bytes, hex or base64 (`openssl rand -hex 32`). Encrypts two-factor secrets and detection context at rest. Secrets stored before it was set are encrypted at the next start. Keep a copy off the server: if it's lost, users with 2FA can't sign in until `rmm-server reset2fa` clears it, and the server refuses to start without it once anything has been encrypted |
+| `RMM_DATA_KEY` | empty (required by the compose files) | 32 bytes, hex or base64 (`openssl rand -hex 32`). Encrypts two-factor secrets and detection context at rest, and the password vault's per-client keys (the vault is unavailable without it). Secrets stored before it was set are encrypted at the next start. Keep a copy off the server: if it's lost, users with 2FA can't sign in until `rmm-server reset2fa` clears it, and the server refuses to start without it once anything has been encrypted |
 | `RMM_TRUSTED_PROXIES` | empty | Reverse proxies whose `X-Forwarded-For` gives the client IP (for rate limiting and the audit log): comma-separated addresses/CIDRs, or `private` for loopback + RFC 1918 + IPv6 ULA. The bundled compose stack sets `private` for Caddy |
 | `RMM_ATTACHMENT_MAX_MB` | `100` | Largest ticket or portal attachment, per file. Uploads and downloads stream to and from storage (S3 multipart over 8 MB), so this bounds disk use, not server memory. Replies email attachments up to 15 MB in total; larger files go as links (the portal for contacts who can sign in, otherwise a download link valid for 30 days) |
 | `RMM_METRICS_TOKEN` | empty | Turns on `GET /metrics` (see [Monitoring the server](#monitoring-the-server)); without it the route answers 404 |
@@ -597,7 +597,45 @@ give them to others under Users → Permissions). Technicians log time without s
   volume, backlog age, response and resolution times, SLA attainment and satisfaction; utilisation;
   client profitability; and a quarterly business review PDF per client.
 
-Not built: a password vault (it would need its own security review first).
+## Documentation and passwords
+
+Design: [docs/design/documentation.md](docs/design/documentation.md).
+
+- **Documents** (Clients → a client → Docs) are Markdown, with blocks written as fenced code
+  (` ```fields `, ` ```credential `, ` ```callout warning `, ` ```device `) and links to credentials
+  (`[Firewall admin](vault:<id>)`) and other pages (`doc:<id>`). Raw HTML is never rendered. Every save
+  keeps the previous version; a save over someone else's newer one is refused. A page exports as a
+  `.md` file with front matter (title, category, client, updated) and imports the same way (New
+  page → Import .md). Pages are edited in place: Markdown beside a live preview (a Write / Preview
+  switch on small screens), a formatting toolbar and **Insert block** (a credential is picked from
+  the vault or created there; a device is picked from the client's agents). Leaving with unsaved
+  changes asks first.
+- **Pages on tickets:** a ticket's **Documentation** card links pages of the ticket's client (the
+  runbook, the network overview) the way agents are linked. Clicking one opens it in a drawer beside
+  the ticket, blocks and credentials included; the page's Docs tab lists the tickets that link it.
+  Linking and unlinking are internal timeline entries, never shown in the portal or emailed.
+  Changing the ticket's client drops the old client's pages; merging moves them.
+- **Categories and templates** are MSP-wide, managed by admins under Company settings →
+  Documentation. Nine starter templates are seeded (network, Wi-Fi, server, Microsoft 365, line-of-business
+  application, backup, vendor, new user, client onboarding); `{{client.name}}`, `{{date}}` and
+  `{{user.name}}` are filled in when a page is started from one. Credential blocks with only a
+  `label:` are empty slots to fill from the vault.
+- **The password vault** (Clients → a client → Passwords) holds credentials per client: name,
+  username, URL, password, notes and a TOTP secret (base32 or an `otpauth://` URI; SHA-1, SHA-256 or
+  SHA-512, 6-8 digits). Password, notes and TOTP secret are encrypted with a random key per client,
+  itself encrypted with `RMM_DATA_KEY`, and each ciphertext is bound to its item and field. **The
+  vault needs `RMM_DATA_KEY`**: without it the vault is unavailable (it never falls back to storing
+  secrets in the clear). Deleting a client deletes its key.
+- Secrets never appear in lists, documents or the audit log. A password or note is fetched one at a
+  time by a reveal (rate-limited to 60 per 5 minutes per user, written to the audit log, never
+  cached); TOTP secrets never leave the server, which computes the code. Changing a password keeps
+  the last 10 in the item's history. In the dashboard a revealed password hides itself after 30
+  seconds, and a TOTP code is fetched only when someone presses *Show code* (each one is an audit
+  entry), never polled. The Passwords tab also has a password generator.
+- Permissions `vault.read` (see credentials, reveal, codes) and `vault.manage` (create, edit,
+  delete): technicians and admins by default; read-only users and portal contacts have no vault
+  access. Both also need **two-factor authentication turned on** for the user, and access to the
+  client.
 
 ## Remote desktop
 

@@ -85,6 +85,11 @@ const pages: [string, string][] = [
 	['ticket-alert', '/tickets/t-2'],
 	['client-tickets', '/clients/c-acme?tab=tickets'],
 	['client-contacts', '/clients/c-acme?tab=contacts'],
+	['client-docs', '/clients/c-acme?tab=docs&doc=d-network'],
+	['client-docs-edit', '/clients/c-acme?tab=docs&doc=d-network&edit=1'],
+	['client-passwords', '/clients/c-acme?tab=passwords'],
+	['client-password', '/clients/c-acme?tab=passwords&item=6f1c0c1e-9a51-4c0e-b6c9-0a4de1f3a111'],
+	['settings-documentation', '/settings/documentation'],
 	['agent-tickets', '/agents/a-3?tab=tickets'],
 	['service-desk', '/settings/service-desk']
 ];
@@ -110,7 +115,10 @@ const phone: [string, string][] = [
 	['policy-set-patching', '/policies/sets/ps-acme-tills?section=patching'],
 	['policy-set-alert', '/policies/sets/ps-acme-win?section=alerts&item=p-disk'],
 	['agent-policy', '/agents/a-3?tab=policy'],
-	['client-policies', '/clients/c-acme?tab=policies']
+	['client-policies', '/clients/c-acme?tab=policies'],
+	['client-docs', '/clients/c-acme?tab=docs&doc=d-network'],
+	['client-docs-edit', '/clients/c-acme?tab=docs&doc=d-network&edit=1'],
+	['client-passwords', '/clients/c-acme?tab=passwords']
 ];
 
 const jpeg = readFileSync(new URL('./fixtures/desktop.jpg', import.meta.url));
@@ -141,7 +149,7 @@ async function settle(page: Page) {
 	// The gallery shows loading states on purpose.
 	if (!page.url().includes('/dev/ui')) await expect(page.locator('[aria-busy="true"]')).toHaveCount(0, { timeout: 20_000 });
 	await page.evaluate(() => document.fonts.ready);
-	if (await page.locator('#s-body, #rs-body').count()) await page.locator('.cm-editor').first().waitFor();
+	if (await page.locator('#s-body, #rs-body, #doc-body').count()) await page.locator('.cm-editor').first().waitFor();
 	await page.waitForTimeout(250);
 }
 
@@ -312,6 +320,59 @@ for (const theme of ['light', 'dark'] as const) {
 			await page.getByLabel('Type Acme Corp to confirm').fill('Acme Corp');
 			await expect(page.getByRole('button', { name: 'Delete client' })).toBeEnabled();
 			await expect(page).toHaveScreenshot(`${theme}-confirm.png`);
+		});
+
+		test('fill a credential slot', async ({ page }) => {
+			await mockApi(page);
+			await page.goto('/clients/c-acme?tab=docs&doc=d-network&edit=1');
+			await settle(page);
+			const preview = page.getByRole('region', { name: 'Preview' });
+			await preview.getByRole('button', { name: 'Choose credential' }).click();
+			const dialog = page.getByRole('dialog', { name: 'Choose a credential' });
+			await expect(dialog).toBeVisible();
+			await dialog.getByText('Core switch').click();
+			await expect(dialog.getByRole('radio', { name: /Core switch/ })).toBeChecked();
+			await page.waitForTimeout(400);
+			await expect(page).toHaveScreenshot(`${theme}-client-docs-pick.png`);
+			await dialog.getByRole('button', { name: 'Link credential' }).click();
+			await expect(dialog).toHaveCount(0);
+			// The slot's block now names the item, so the preview shows its card.
+			await expect(preview.getByRole('heading', { name: 'Core switch' })).toBeVisible();
+			await expect(preview.getByRole('button', { name: 'Choose credential' })).toHaveCount(0);
+			await expect(page.getByText('Unsaved changes')).toBeVisible();
+			// Leaving asks first.
+			await page.getByRole('button', { name: 'Cancel' }).first().click();
+			await expect(page.getByRole('alertdialog')).toContainText('Discard changes?');
+		});
+
+		test('ticket documentation drawer', async ({ page }) => {
+			await mockApi(page);
+			await page.goto('/tickets/t-1');
+			await settle(page);
+			const card = page.getByRole('region', { name: 'Documentation' });
+			await expect(card.getByRole('link')).toHaveText(['Network overview', 'Second-floor printer quirks']);
+			await card.getByRole('link', { name: 'Network overview' }).click();
+			const drawer = page.getByRole('dialog', { name: 'Documentation' });
+			await expect(drawer.getByRole('heading', { name: 'Network overview', level: 2 })).toBeVisible();
+			await expect(drawer.getByRole('link', { name: 'Open page' })).toHaveAttribute('href', '/clients/c-acme?tab=docs&doc=d-network');
+			await expect(page).toHaveURL(/\/tickets\/t-1$/);
+			await page.waitForTimeout(400);
+			await expect(page).toHaveScreenshot(`${theme}-ticket-doc.png`);
+		});
+
+		test('credential card', async ({ page }) => {
+			await mockApi(page);
+			await page.goto('/clients/c-acme?tab=docs&doc=d-network');
+			await settle(page);
+			const card = page.locator('article').getByRole('region', { name: 'FortiGate admin' });
+			await card.getByRole('button', { name: 'Reveal password' }).click();
+			await expect(card.getByText('Tr0ub4dor&3-hx9Q')).toBeVisible();
+			await card.getByRole('button', { name: 'Show code' }).click();
+			await expect(card.getByText('492 039')).toBeVisible();
+			await expect(card).toHaveScreenshot(`${theme}-credential-revealed.png`);
+			// The chip of an inline link opens the same card in a popover.
+			await page.getByRole('button', { name: 'Staff Wi-Fi key' }).last().click();
+			await expect(page.getByRole('dialog', { name: 'Staff Wi-Fi key' })).toBeVisible();
 		});
 
 		test.describe('phone', () => {
