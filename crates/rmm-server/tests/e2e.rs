@@ -2182,8 +2182,10 @@ async fn realtime_and_reputation(url: &str, admin: &Api, dir: &Path, id1: &str, 
     // --- reputation: a server-only hash list, an agent that ran the program ------------------------
     let d = dir.join("a1-scan/rep");
     std::fs::create_dir_all(&d).unwrap();
+    // Copies of bash, which runs under any name (a multi-call coreutils `sleep` doesn't: it
+    // looks at its own name and refuses one it doesn't know).
     let make = |name: &str, marker: &str| {
-        let mut b = std::fs::read("/bin/sleep").unwrap();
+        let mut b = std::fs::read("/bin/bash").unwrap();
         b.extend_from_slice(marker.as_bytes());
         let p = d.join(name);
         std::fs::write(&p, &b).unwrap();
@@ -2205,7 +2207,10 @@ async fn realtime_and_reputation(url: &str, admin: &Api, dir: &Path, id1: &str, 
     assert_eq!(res.json::<Value>().await.unwrap()["hashes"], 60_000);
     let (s, v) = admin.call(reqwest::Method::DELETE, "/security/reputation/lists/e2e-big", None).await;
     assert!(s.is_success() && v["hashes"] == 60_000, "{v}");
-    admin.run_script(id1, &format!("{} 6; {} 6", known.display(), rare.display()), 60).await;
+    // `; :` keeps each copy running its own `sleep` as a child rather than exec'ing into it.
+    let job = admin.run_script(id1, &format!("{0} -c 'sleep 6; :'; {1} -c 'sleep 6; :'", known.display(), rare.display()), 60).await;
+    let job = admin.wait_job(&job, 60).await;
+    assert_eq!((job["status"].as_str(), job["exit_code"].as_i64()), (Some("succeeded"), Some(0)), "{job}");
     let det = eventually(90, "the reputation detection", || async { detections_for(admin, id1, "RMM-REPUTATION").await.into_iter().next() }).await;
     assert_eq!((det["found_by"].as_str(), det["sha256"].as_str(), det["status"].as_str()), (Some("reputation"), Some(known_h.as_str()), Some("active")), "{det}");
     assert!(det["action_taken"].as_str().unwrap().contains("reported only"), "{det}");

@@ -38,7 +38,7 @@ use rmm_proto::security::{Action, Product, ProductKind, SensorDetection, SensorH
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Notify, mpsc, oneshot};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::sensor::{DbFile, DbSet, FromSensor, ToSensor, scan};
@@ -760,9 +760,11 @@ impl Supervisor {
         let batch: Vec<_> = i.rep.queue.drain(..n).collect();
         if tx.try_send(AgentMsg::ReputationQuery { hashes: batch.clone() }).is_err() {
             // Busy socket: try again next time.
+            debug!(n, "reputation lookup deferred: the connection is busy");
             i.rep.queue.splice(0..0, batch);
             return;
         }
+        debug!(n, "reputation lookup sent");
         if i.rep.paths.len() > 10_000 {
             i.rep.paths.clear();
         }
@@ -781,6 +783,7 @@ impl Supervisor {
 
     /// The server's answer: an alert for each hash it knows. Never acted on.
     pub fn reputation(&self, known: Vec<rmm_proto::security::HashKnown>) {
+        debug!(known = known.len(), "reputation answer");
         for k in known {
             let path = lock(&self.inner).rep.paths.remove(&k.sha256).flatten();
             let d = SensorDetection {
