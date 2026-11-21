@@ -1,7 +1,7 @@
 import AxeBuilder from '@axe-core/playwright';
 import { readFileSync } from 'node:fs';
 import { expect, test, type Page, type WebSocketRoute } from '@playwright/test';
-import { mockApi } from './mock';
+import { NOW, mockApi } from './mock';
 
 const pages: [string, string][] = [
 	['dashboard', '/'],
@@ -427,6 +427,274 @@ test('keyboard: g a, j/k and Enter', async ({ page }) => {
 	await expect(page).toHaveURL(/\/agents\/a-/);
 	await page.keyboard.press('?');
 	await expect(page.getByRole('dialog', { name: 'Keyboard shortcuts' })).toBeVisible();
+});
+
+// --- documentation and the vault: what the buttons do -------------------------------------------
+
+type Call = { method: string; path: string; body: unknown };
+/**
+ * Answers some API calls differently from the shared mock (`fn` returns undefined to pass a call
+ * on) and records every call that writes.
+ */
+async function routeApi(page: Page, fn: (method: string, path: string, body: unknown) => { status?: number; json: unknown } | undefined) {
+	const calls: Call[] = [];
+	await page.route('**/api/**', async (route) => {
+		const req = route.request();
+		const path = new URL(req.url()).pathname.replace(/^\/api/, '');
+		const body = req.postData() ? req.postDataJSON() : null;
+		if (req.method() !== 'GET') calls.push({ method: req.method(), path, body });
+		const r = fn(req.method(), path, body);
+		if (!r) return route.fallback();
+		return route.fulfill({ status: r.status ?? 200, contentType: 'application/json', body: JSON.stringify(r.json) });
+	});
+	return calls;
+}
+const newDoc = (over: Record<string, unknown>) => ({
+	id: 'd-new', client_id: 'c-acme', title: 'Untitled', category_id: null, category: '', body: '', updated_by_name: 'Dana Admin',
+	updated_at: NOW.toISOString(), revisions: 0, history: [], credentials: [], credentials_hidden: false, tickets: [], ...over
+});
+/** The Markdown source: CodeMirror's content element, or the textarea before it loads. */
+const editorText = (page: Page) => page.locator('#doc-body');
+
+test.describe('documentation', () => {
+	test('new page from a template', async ({ page }) => {
+		await mockApi(page);
+		let created: Record<string, unknown> | null = null;
+		const calls = await routeApi(page, (method, path, body) => {
+			if (method === 'GET' && path === '/doc-templates/00000000-0000-4000-8004-000000000002')
+				return { json: { id: '00000000-0000-4000-8004-000000000002', name: 'Wi-Fi', category_id: '00000000-0000-4000-8003-000000000001', category: 'Network', description: '', body: '# Wi-Fi at {{client.name}}\n\nReviewed {{date}} by {{user.name}}.\n', updated_at: NOW.toISOString(), updated_by_name: null } };
+			if (method === 'POST' && path === '/clients/c-acme/docs') {
+				created = newDoc({ ...(body as object), category: 'Network' });
+				return { json: { id: 'd-new' } };
+			}
+			if (method === 'GET' && path === '/docs/d-new' && created) return { json: created };
+		});
+		await page.goto('/clients/c-acme?tab=docs');
+		await settle(page);
+		await page.getByRole('button', { name: 'New page' }).first().click();
+		const dialog = page.getByRole('dialog', { name: 'New page' });
+		await dialog.getByText('SSIDs, the controller').click();
+		await expect(dialog.getByLabel('Title')).toHaveValue('Wi-Fi');
+		await dialog.getByLabel('Title').fill('Guest and staff Wi-Fi');
+		await dialog.getByRole('button', { name: 'Open in the editor' }).click();
+		await expect(dialog).toHaveCount(0);
+
+		const editor = page.locator('section[aria-labelledby="doc-editor-h"]');
+		await expect(page.getByRole('heading', { name: 'New page', level: 2 })).toBeVisible();
+		await expect(page).toHaveURL(/edit=new/);
+		await expect(editor.getByLabel('Title')).toHaveValue('Guest and staff Wi-Fi');
+		await expect(editorText(page)).toContainText('# Wi-Fi at Acme Corp');
+		await expect(editorText(page)).toContainText('Reviewed 2026-06-15 by Dana Admin.');
+		await expect(page.getByRole('region', { name: 'Preview' }).getByRole('heading', { name: 'Wi-Fi at Acme Corp' })).toBeVisible();
+
+		await editor.getByRole('button', { name: 'Save', exact: true }).click();
+		await expect.poll(() => calls.filter((c) => c.method === 'POST')).toEqual([
+			{ method: 'POST', path: '/clients/c-acme/docs', body: { title: 'Guest and staff Wi-Fi', category_id: '00000000-0000-4000-8003-000000000001', body: '# Wi-Fi at Acme Corp\n\nReviewed 2026-06-15 by Dana Admin.\n' } }
+		]);
+		await expect(page).toHaveURL(/doc=d-new/);
+		await expect(page).not.toHaveURL(/edit=/);
+		await expect(page.getByRole('heading', { name: 'Guest and staff Wi-Fi', level: 2 })).toBeVisible();
+	});
+
+	test('new page from an imported .md file', async ({ page }) => {
+		await mockApi(page);
+		const calls = await routeApi(page, (method, path) => (method === 'POST' && path === '/clients/c-acme/docs' ? { json: { id: 'd-new' } } : undefined));
+		await page.goto('/clients/c-acme?tab=docs');
+		await settle(page);
+		await page.getByRole('button', { name: 'New page' }).first().click();
+		const dialog = page.getByRole('dialog', { name: 'New page' });
+		await dialog.getByLabel('Import a Markdown file').setInputFiles({ name: 'vpn.md', mimeType: 'text/markdown', buffer: Buffer.from('---\ntitle: "Remote access VPN"\ncategory: Network\n---\n\n## Clients\n\nFortiClient 7.4.\n') });
+		await expect(dialog).toHaveCount(0);
+		await expect(page.getByRole('heading', { name: 'New page', level: 2 })).toBeVisible();
+		await expect(page.locator('#doc-title-input')).toHaveValue('Remote access VPN');
+		await expect(page.locator('#doc-category')).toHaveValue('00000000-0000-4000-8003-000000000001');
+		await expect(editorText(page)).toContainText('FortiClient 7.4.');
+		await page.getByRole('button', { name: 'Save', exact: true }).click();
+		await expect.poll(() => calls.find((c) => c.method === 'POST')?.body).toEqual({ title: 'Remote access VPN', category_id: '00000000-0000-4000-8003-000000000001', body: '## Clients\n\nFortiClient 7.4.\n' });
+	});
+
+	test('reload on a new draft goes back to the list', async ({ page }) => {
+		await mockApi(page);
+		await page.goto('/clients/c-acme?tab=docs&edit=new');
+		await settle(page);
+		await expect(page).not.toHaveURL(/edit=/);
+		await expect(page.getByRole('heading', { name: 'Pages' })).toBeVisible();
+	});
+
+	test('leaving a new draft', async ({ page }) => {
+		await mockApi(page);
+		await page.goto('/clients/c-acme?tab=docs');
+		await settle(page);
+		const open = async (title: string) => {
+			await page.getByRole('button', { name: 'New page' }).first().click();
+			await page.getByRole('dialog', { name: 'New page' }).getByLabel('Title').fill(title);
+			await page.getByRole('button', { name: 'Open in the editor' }).click();
+			await expect(page.getByRole('heading', { name: 'New page', level: 2 })).toBeVisible();
+		};
+		// Back discards an untouched draft; Forward onto it finds none and drops the param.
+		await open('Scratch');
+		await page.goBack();
+		await expect(page.getByRole('heading', { name: 'Pages' })).toBeVisible();
+		await expect(page).not.toHaveURL(/edit=/);
+		await page.goForward();
+		await expect(page).not.toHaveURL(/edit=/);
+		await expect(page.getByRole('heading', { name: 'Pages' })).toBeVisible();
+		// With changes, leaving asks first, then goes where it was going.
+		await open('Printers');
+		await editorText(page).click();
+		await page.keyboard.type('Two floors.');
+		await expect(page.getByText('Unsaved changes')).toBeVisible();
+		await page.getByRole('link', { name: /^Tickets/ }).first().click();
+		await expect(page.getByRole('alertdialog')).toContainText('Discard changes?');
+		await expect(page).toHaveURL(/edit=new/);
+		await page.getByRole('alertdialog').getByRole('button', { name: 'Discard' }).click();
+		await expect(page).toHaveURL(/\/tickets$/);
+		await expect(page.getByRole('heading', { name: 'Tickets', level: 1 })).toBeVisible();
+	});
+
+	test('a stale save offers to overwrite', async ({ page }) => {
+		await mockApi(page);
+		let puts = 0;
+		const calls = await routeApi(page, (method, path) => {
+			if (method === 'PUT' && path === '/docs/d-change') return ++puts === 1 ? { status: 409, json: { error: 'someone else saved this page since you opened it' } } : { json: { ok: true, updated_at: NOW.toISOString() } };
+		});
+		await page.goto('/clients/c-acme?tab=docs&doc=d-change&edit=1');
+		await settle(page);
+		await page.locator('#doc-title-input').fill('Change window');
+		await page.getByRole('button', { name: 'Save', exact: true }).click();
+		const banner = page.getByRole('alert').filter({ hasText: 'Someone else saved this page since you opened it.' });
+		await expect(banner).toBeVisible();
+		expect(calls[0].body).toMatchObject({ title: 'Change window', expected_updated_at: expect.any(String) });
+		await expect(page).toHaveURL(/edit=1/);
+		await banner.getByRole('button', { name: 'Save anyway' }).click();
+		await expect(page).not.toHaveURL(/edit=/);
+		expect(calls.length).toBe(2);
+		expect(calls[1].body).toEqual({ title: 'Change window', category_id: '00000000-0000-4000-8003-000000000007', body: 'Sunday 22:00 to 02:00.' });
+	});
+
+	test('a stale save can be dropped', async ({ page }) => {
+		await mockApi(page);
+		await routeApi(page, (method, path) => (method === 'PUT' && path === '/docs/d-change' ? { status: 409, json: { error: 'conflict' } } : undefined));
+		await page.goto('/clients/c-acme?tab=docs&doc=d-change&edit=1');
+		await settle(page);
+		await page.locator('#doc-title-input').fill('Change window');
+		await page.getByRole('button', { name: 'Save', exact: true }).click();
+		await page.getByRole('button', { name: 'Discard mine' }).click();
+		await expect(page).not.toHaveURL(/edit=/);
+		await expect(page.getByRole('alertdialog')).toHaveCount(0);
+		await expect(page.getByRole('heading', { name: 'Change procedure', level: 2 })).toBeVisible();
+	});
+
+	test('save a page as a template', async ({ page }) => {
+		await mockApi(page);
+		const calls = await routeApi(page, () => undefined);
+		await page.goto('/clients/c-acme?tab=docs&doc=d-change');
+		await settle(page);
+		await page.getByRole('button', { name: 'More page actions' }).click();
+		await page.getByRole('menuitem', { name: 'Save as template…' }).click();
+		const dialog = page.getByRole('dialog', { name: 'Save as template' });
+		await expect(dialog.getByRole('textbox', { name: 'Name', exact: true })).toHaveValue('Change procedure');
+		await dialog.getByLabel('Description').fill('When changes may happen.');
+		await dialog.getByRole('button', { name: 'Save template' }).click();
+		await expect(dialog).toHaveCount(0);
+		expect(calls).toEqual([{ method: 'POST', path: '/doc-templates', body: { name: 'Change procedure', description: 'When changes may happen.', category_id: '00000000-0000-4000-8003-000000000007', body: 'Sunday 22:00 to 02:00.' } }]);
+		await expect(page.getByText('Template Change procedure saved.')).toBeVisible();
+	});
+
+	test('settings: templates and categories', async ({ page }) => {
+		await mockApi(page);
+		const calls = await routeApi(page, (method, path, body) => {
+			if (method === 'GET' && path === '/doc-templates/00000000-0000-4000-8004-000000000003')
+				return { json: { id: '00000000-0000-4000-8004-000000000003', name: 'Server', category_id: '00000000-0000-4000-8003-000000000002', category: 'Infrastructure', description: 'One server.', body: '# {{client.name}} server\n', updated_at: NOW.toISOString(), updated_by_name: null } };
+			if (method === 'POST' && path === '/doc-templates') return { json: { id: '00000000-0000-4000-8004-000000000099', ...(body as object), category: '', updated_at: NOW.toISOString(), updated_by_name: 'Dana Admin' } };
+			if (method === 'PUT' && path.startsWith('/doc-templates/')) return { json: { id: path.split('/')[2], ...(body as object), category: '', updated_at: NOW.toISOString(), updated_by_name: 'Dana Admin' } };
+			if (method === 'POST' && path === '/doc-categories') return { json: { id: '00000000-0000-4000-8003-000000000099', ...(body as object), position: 8, docs: 0, templates: 0 } };
+		});
+		await page.goto('/settings/documentation');
+		await settle(page);
+
+		// New template.
+		await page.getByRole('link', { name: 'New template' }).click();
+		await expect(page.getByRole('heading', { name: 'New template', level: 2 })).toBeVisible();
+		await page.locator('#doc-title-input').fill('Printer');
+		await page.locator('#doc-category').selectOption({ label: 'Infrastructure' });
+		await page.locator('#doc-description').fill('A printer or copier.');
+		await page.getByRole('button', { name: 'Save', exact: true }).click();
+		await expect(page).not.toHaveURL(/template=/);
+		await expect(page.getByRole('heading', { name: 'Templates' })).toBeVisible();
+		expect(calls.at(-1)).toMatchObject({ method: 'POST', path: '/doc-templates', body: { name: 'Printer', category_id: '00000000-0000-4000-8003-000000000002', description: 'A printer or copier.', body: expect.stringContaining('fields') } });
+
+		// Edit one.
+		await page.getByRole('link', { name: 'Edit Server' }).click();
+		await expect(page.getByRole('heading', { name: 'Editing Server', level: 2 })).toBeVisible();
+		await expect(page.locator('#doc-title-input')).toHaveValue('Server');
+		await expect(editorText(page)).toContainText('{{client.name}} server');
+		await page.locator('#doc-description').fill('One server, physical or virtual.');
+		await page.getByRole('button', { name: 'Save', exact: true }).click();
+		await expect(page).not.toHaveURL(/template=/);
+		expect(calls.at(-1)).toEqual({ method: 'PUT', path: '/doc-templates/00000000-0000-4000-8004-000000000003', body: { name: 'Server', category_id: '00000000-0000-4000-8003-000000000002', description: 'One server, physical or virtual.', body: '# {{client.name}} server\n' } });
+
+		// Duplicate one.
+		await page.getByRole('button', { name: 'Duplicate Server' }).click();
+		await expect(page.getByText('Server (copy) added.')).toBeVisible();
+		expect(calls.at(-1)).toEqual({ method: 'POST', path: '/doc-templates', body: { name: 'Server (copy)', category_id: '00000000-0000-4000-8003-000000000002', description: 'One server.', body: '# {{client.name}} server\n' } });
+
+		// New category.
+		await page.getByLabel('New category name').fill('Security');
+		await page.getByRole('button', { name: 'Add', exact: true }).click();
+		await expect(page.getByText('Security added.')).toBeVisible();
+		await expect(page.getByLabel('New category name')).toHaveValue('');
+		expect(calls.at(-1)).toEqual({ method: 'POST', path: '/doc-categories', body: { name: 'Security' } });
+	});
+});
+
+test.describe('vault', () => {
+	const fresh = {
+		id: '5b4f7e7c-6a8d-4c2e-9f35-9c0d1e2f3a45', client_id: 'c-acme', name: 'NAS admin', username: 'root', url: 'https://10.0.0.20:5001', has_password: true, has_totp: false, has_notes: false,
+		docs: 0, password_changed_at: NOW.toISOString(), updated_at: NOW.toISOString(), updated_by_name: 'Dana Admin', linked_docs: [], history: []
+	};
+
+	test('create a credential', async ({ page }) => {
+		await mockApi(page);
+		const calls = await routeApi(page, (method, path) => {
+			if (method === 'POST' && path === '/clients/c-acme/vault') return { json: fresh };
+			if (method === 'GET' && path === `/vault/${fresh.id}`) return { json: fresh };
+		});
+		await page.goto('/clients/c-acme?tab=passwords');
+		await settle(page);
+		await page.getByRole('button', { name: 'New password' }).click();
+		const dialog = page.getByRole('dialog', { name: 'New password' });
+		await dialog.getByRole('textbox', { name: 'Name', exact: true }).fill('NAS admin');
+		await dialog.getByLabel('Username').fill('root');
+		await dialog.getByLabel('URL or host').fill('https://10.0.0.20:5001');
+		await dialog.getByRole('textbox', { name: 'Password', exact: true }).fill('correct horse');
+		await dialog.getByRole('button', { name: 'Save' }).click();
+		await expect(dialog).toHaveCount(0);
+		expect(calls).toEqual([{ method: 'POST', path: '/clients/c-acme/vault', body: { name: 'NAS admin', username: 'root', url: 'https://10.0.0.20:5001', password: 'correct horse' } }]);
+		await expect(page).toHaveURL(new RegExp(`item=${fresh.id}`));
+		await expect(page.getByRole('dialog', { name: 'Credential' }).getByRole('heading', { name: 'NAS admin' })).toBeVisible();
+	});
+
+	test('edit a credential', async ({ page }) => {
+		await mockApi(page);
+		const fw = '6f1c0c1e-9a51-4c0e-b6c9-0a4de1f3a111';
+		const calls = await routeApi(page, (method, path, body) => {
+			if (method === 'PUT' && path === `/vault/${fw}`) return { json: { ...fresh, id: fw, name: 'FortiGate admin', has_totp: true, ...(body as object) } };
+		});
+		await page.goto(`/clients/c-acme?tab=passwords&item=${fw}`);
+		await settle(page);
+		const drawer = page.getByRole('dialog', { name: 'Credential' });
+		await drawer.getByRole('button', { name: 'Edit' }).click();
+		const dialog = page.getByRole('dialog', { name: 'Edit FortiGate admin' });
+		await expect(dialog.getByRole('textbox', { name: 'Name', exact: true })).toHaveValue('FortiGate admin');
+		await expect(dialog.getByRole('textbox', { name: 'Password', exact: true })).toHaveAttribute('placeholder', 'Unchanged');
+		await dialog.getByLabel('Username').fill('fgadmin');
+		await dialog.getByRole('button', { name: 'Save' }).click();
+		await expect(dialog).toHaveCount(0);
+		expect(calls).toEqual([{ method: 'PUT', path: `/vault/${fw}`, body: { name: 'FortiGate admin', username: 'fgadmin', url: 'https://10.0.0.1:4443' } }]);
+		await expect(drawer).toBeVisible();
+		await expect(drawer.getByText('fgadmin')).toBeVisible();
+	});
 });
 
 test('filters live in the URL', async ({ page }) => {

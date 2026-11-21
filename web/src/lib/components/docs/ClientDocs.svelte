@@ -1,4 +1,7 @@
 <script lang="ts">
+	import { onMount } from 'svelte';
+	import { afterNavigate } from '$app/navigation';
+	import { page } from '$app/state';
 	import { ArrowLeft, BookmarkPlus, FileDown, FileQuestion, FileText, History, Pencil, Plus, RotateCcw, Search, Trash2 } from '@lucide/svelte';
 	import { ApiError, api } from '#lib/api.js';
 	import { confirmAction } from '#lib/confirm.svelte.js';
@@ -65,17 +68,25 @@
 		creating = true;
 		if (!templates) api.get<DocTemplate[]>('/doc-templates').then((t) => (templates = t), () => (templates = []));
 	}
+	/**
+	 * The unsaved new page. It belongs to the `edit=new` history entry it was opened with, and is
+	 * settled when a navigation lands (not by watching the URL, which changes only after the
+	 * navigation finishes): landing anywhere else discards it, and landing on `edit=new` without
+	 * one (a reload, or Back/Forward onto it) drops the param.
+	 */
 	let draft = $state<DocDraft | null>(null);
 	function started(d: DocDraft) {
 		creating = false;
 		draft = d;
 		setParams({ doc: null, edit: 'new' }, { push: true });
 	}
-	// A reload (or Back) to `edit=new` has no draft any more.
-	$effect(() => {
-		if (editParam === 'new' && !draft) setParams({ edit: null });
-		if (editParam !== 'new' && draft) draft = null;
-	});
+	function landed(edit: string | null) {
+		if (edit !== 'new') draft = null;
+		else if (!draft) setParams({ edit: null });
+	}
+	// This tab mounts after the client loads, so after the navigation that opened it.
+	onMount(() => landed(page.url.searchParams.get('edit')));
+	afterNavigate(({ to }) => to && landed(to.url.searchParams.get('edit')));
 
 	let createdId: string | null = null;
 	async function saveNew(d: DocDraft): Promise<SaveResult> {
@@ -108,7 +119,7 @@
 		if (editParam === 'new') {
 			const id = saved ? createdId : null;
 			createdId = null;
-			draft = null;
+			// The navigation discards the draft when it lands.
 			setParams({ doc: id, edit: null }, { push: false });
 		} else {
 			if (!saved) doc.reload();
