@@ -697,3 +697,12 @@ Response actions (technicians with `security.respond`): kill a process tree, qua
 Limits: the Windows and macOS sensors are compile-checked only and poll for processes (fast short-lived processes can be missed; ETW and Endpoint Security are planned); on Linux the real-time process source and on-access protection need root. ClamAV's own on-access detections aren't collected yet. See the roadmap for the rest.
 
 See [docs/ROADMAP.md](docs/ROADMAP.md) for what's next: the rest of the PSA and more.
+
+## License
+
+Copyright (C) 2026 Sean Dobens
+
+GNU Affero General Public License v3.0 or later ([LICENSE](LICENSE)). You can use, modify and
+self-host it, including commercially. If you distribute it, or run a modified version as a
+service for others, you must make your source available under the same license. Third-party
+detection rules in `content/yara` keep their own licenses, noted in each file.
