@@ -752,13 +752,20 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
         )
         .await;
     assert_eq!(s, StatusCode::NOT_FOUND, "can't create scripts for clients you can't see");
+    // Scripts already there (an upgraded database brings its own) stay visible as they were.
+    let script_names = || async {
+        tech.get("/scripts").await.as_array().unwrap().iter().map(|s| s["name"].as_str().unwrap().to_string()).collect::<Vec<String>>()
+    };
+    let mut expected = script_names().await;
     let b_script = tech
         .post("/scripts", json!({ "name": "b-only", "interpreter": "bash", "body": "echo b", "client_id": b_id }))
         .await;
     let global = admin.post("/scripts", json!({ "name": "global", "interpreter": "bash", "body": "echo global" })).await;
-    let names: Vec<String> =
-        tech.get("/scripts").await.as_array().unwrap().iter().map(|s| s["name"].as_str().unwrap().to_string()).collect();
-    assert_eq!(names, ["b-only", "global"]);
+    expected.extend(["b-only".to_string(), "global".to_string()]);
+    expected.sort();
+    let mut names = script_names().await;
+    names.sort();
+    assert_eq!(names, expected);
     let (s, _) = admin
         .call(reqwest::Method::POST, "/jobs", Some(json!({ "agent_ids": [id1], "script_id": b_script["id"] })))
         .await;
