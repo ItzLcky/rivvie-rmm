@@ -21,7 +21,7 @@
 
 <fieldset class="card max-w-3xl space-y-5 p-4" {disabled}>
 	<legend class="sr-only">Agent policy</legend>
-	<PField path="auto_update" name="Automatic updates" hint="When a device connects and a newer signed release is uploaded for its platform, it's offered the update. Each agent waits for running jobs, restarts, and rolls back by itself if the new version can't reconnect.">
+	<PField path="auto_update" name="Automatic updates" hint="When a newer signed release is on the server for a device's platform, the device is offered it when it connects, or within a few minutes if it's already online. Each agent waits for running jobs, restarts, and rolls back by itself if the new version can't reconnect.">
 		<Switch bind:checked={autoUpdate} {disabled}>Update agents automatically</Switch>
 	</PField>
 </fieldset>

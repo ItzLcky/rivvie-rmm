@@ -118,6 +118,26 @@ pub async fn offer(st: &AppState, agent_id: Uuid) -> Result<String, String> {
     Ok(version)
 }
 
+/// What [`due`] needs to know about an agent.
+#[derive(sqlx::FromRow)]
+struct UpdateRow {
+    id: Uuid,
+    os_family: String,
+    arch: String,
+    agent_version: String,
+    update_version: Option<String>,
+    update_state: Option<String>,
+}
+
+/// Whether the release for this agent's platform is newer than what it runs and hasn't
+/// already failed on it.
+fn due(st: &AppState, r: &UpdateRow) -> bool {
+    let Some(release) = st.releases.get(st, &platform_of(&r.os_family, &r.arch)) else { return false };
+    let failed_before = r.update_version.as_deref() == Some(release.manifest.version.as_str())
+        && matches!(r.update_state.as_deref(), Some("failed" | "rolled_back"));
+    is_newer(&release.manifest.version, &r.agent_version) && !failed_before
+}
+
 /// On connect, when the agent's policy (`agent.auto_update`) has automatic updates on: offer
 /// unless this exact version already failed here.
 pub async fn auto_offer(st: &AppState, agent_id: Uuid) {
@@ -126,30 +146,60 @@ pub async fn auto_offer(st: &AppState, agent_id: Uuid) {
         Ok(false) => return,
         Err(e) => return tracing::warn!(%agent_id, "reading the agent policy: {e}"),
     }
-    #[derive(sqlx::FromRow)]
-    struct Row {
-        os_family: String,
-        arch: String,
-        agent_version: String,
-        update_version: Option<String>,
-        update_state: Option<String>,
-    }
-    let row: Option<Row> =
-        sqlx::query_as("SELECT os_family, arch, agent_version, update_version, update_state FROM agents WHERE id = $1")
-            .bind(agent_id)
-            .fetch_optional(&st.db)
-            .await
-            .ok()
-            .flatten();
-    let Some(Row { os_family: os, arch, agent_version: current, update_version: tried, update_state: state }) = row else {
-        return;
-    };
-    let Some(release) = st.releases.get(st, &platform_of(&os, &arch)) else { return };
-    let failed_before = tried.as_deref() == Some(release.manifest.version.as_str())
-        && matches!(state.as_deref(), Some("failed" | "rolled_back"));
-    if is_newer(&release.manifest.version, &current) && !failed_before {
+    let row: Option<UpdateRow> = sqlx::query_as(
+        "SELECT id, os_family, arch, agent_version, update_version, update_state FROM agents WHERE id = $1",
+    )
+    .bind(agent_id)
+    .fetch_optional(&st.db)
+    .await
+    .ok()
+    .flatten();
+    if let Some(r) = row
+        && due(st, &r)
+    {
         let _ = offer(st, agent_id).await;
     }
+}
+
+/// How often connected agents are checked for a newer release.
+const SWEEP_EVERY: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// An update in progress that hasn't reported for this long is presumed dead and offered
+/// again. Longer than the agent's 30 minute wait for running jobs.
+const STALE_MINUTES: i32 = 45;
+
+/// Offers new releases to agents that stay connected: a release uploaded (or a policy turned
+/// on) after an agent connected would otherwise wait for its next reconnect.
+pub async fn run(st: Arc<AppState>) {
+    let mut tick = tokio::time::interval(SWEEP_EVERY);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        if let Err(e) = sweep(&st).await {
+            warn!("agent update sweep: {e}");
+        }
+    }
+}
+
+async fn sweep(st: &AppState) -> sqlx::Result<()> {
+    let rows: Vec<UpdateRow> = sqlx::query_as(
+        "SELECT a.id, a.os_family, a.arch, a.agent_version, a.update_version, a.update_state FROM agents a
+           JOIN policy_effective e ON e.set_id = a.policy_set_id AND e.item_id = $1
+          WHERE a.online AND coalesce((e.config ->> 'auto_update')::boolean, false)
+            AND NOT (coalesce(a.update_state, '') IN ('offered', 'downloading', 'waiting', 'applying')
+                     AND a.update_at > now() - make_interval(mins => $2))",
+    )
+    .bind(crate::policy::AGENT_ITEM)
+    .bind(STALE_MINUTES)
+    .fetch_all(&st.db)
+    .await?;
+    for r in rows.iter().filter(|r| due(st, r)) {
+        match offer(st, r.id).await {
+            Ok(v) => tracing::info!(agent_id = %r.id, version = %v, "offered agent update"),
+            Err(e) => tracing::debug!(agent_id = %r.id, "not offering an update: {e}"),
+        }
+    }
+    Ok(())
 }
 
 /// The piece of the release an agent asked for. Empty if the version moved on meanwhile,

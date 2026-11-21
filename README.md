@@ -442,7 +442,12 @@ private key stays on a build machine or in CI.
 4. Put the binary and its `.update.json` in `RMM_AGENT_DIR` (the image already has them there).
    Agents → **Update N outdated** (or the agent page's **Update** button) offers it. Turn on
    **Update agents automatically** in the agent policy (Policies → All devices → Agent, or any set
-   below it, say to leave servers to be updated by hand) to offer it whenever an agent connects.
+   below it, say to leave servers to be updated by hand) to offer it when an agent connects, and to
+   agents already online within a couple of minutes of a new release appearing.
+
+Image builds from `main` (not a tag) number their agents after the newest tag as a pre-release,
+e.g. `0.1.2-dev.57` after `v0.1.1`, so each build is newer than the one before and agents move to it.
+A `v0.1.2` tag later sorts above all of those.
 
 The agent checks that the version is newer than its own, downloads it over its socket, and
 verifies the checksum and signature. It then waits for running jobs to finish (at most 30 minutes)

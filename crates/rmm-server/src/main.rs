@@ -303,6 +303,7 @@ async fn serve(db: sqlx::PgPool, args: ServeArgs) -> Result<()> {
     tokio::spawn(sla::run(state.clone()));
     tokio::spawn(accounting::run(state.clone()));
     tokio::spawn(metrics::probe_pool(state.clone()));
+    tokio::spawn(updates::run(state.clone()));
     if state.cfg.metrics_token.is_some() {
         info!("metrics: GET /metrics (bearer token required)");
     }

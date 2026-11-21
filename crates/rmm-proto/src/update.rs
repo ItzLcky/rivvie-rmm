@@ -34,7 +34,7 @@ pub fn current_platform() -> String {
 type Parsed<'a> = ((u64, u64, u64), Option<&'a str>);
 
 /// `major.minor.patch[-pre][+build]`. Build metadata is ignored; a pre-release sorts before
-/// its release, and pre-release tags compare as strings.
+/// its release, and pre-release tags compare as semver does (see [`pre_cmp`]).
 fn parse(v: &str) -> Option<Parsed<'_>> {
     let v = v.trim().trim_start_matches('v');
     let v = v.split('+').next()?;
@@ -55,9 +55,32 @@ pub fn is_newer(candidate: &str, current: &str) -> bool {
         std::cmp::Ordering::Less => false,
         std::cmp::Ordering::Equal => match (apre, bpre) {
             (None, Some(_)) => true,
-            (Some(x), Some(y)) => x > y,
+            (Some(x), Some(y)) => pre_cmp(x, y).is_gt(),
             _ => false,
         },
+    }
+}
+
+/// Semver pre-release order: dot-separated identifiers left to right, numeric ones by value
+/// (so `dev.10` > `dev.9`) and below alphanumeric ones, and a longer tag wins a tie.
+fn pre_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let (mut x, mut y) = (a.split('.'), b.split('.'));
+    loop {
+        let o = match (x.next(), y.next()) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(p), Some(q)) => match (p.parse::<u64>(), q.parse::<u64>()) {
+                (Ok(m), Ok(n)) => m.cmp(&n),
+                (Ok(_), Err(_)) => Ordering::Less,
+                (Err(_), Ok(_)) => Ordering::Greater,
+                (Err(_), Err(_)) => p.cmp(q),
+            },
+        };
+        if o.is_ne() {
+            return o;
+        }
     }
 }
 
@@ -72,6 +95,15 @@ mod tests {
         assert!(is_newer("0.1.10", "0.1.9"));
         assert!(is_newer("0.2.0", "0.2.0-rc.1"));
         assert!(is_newer("0.2.0-rc.2", "0.2.0-rc.1"));
+        assert!(is_newer("0.1.2-dev.10", "0.1.2-dev.9"));
+        assert!(is_newer("0.1.2-dev.100", "0.1.2-dev.99"));
+        assert!(is_newer("0.1.2-dev.1", "0.1.1"));
+        assert!(is_newer("0.1.2", "0.1.2-dev.500"));
+        assert!(is_newer("0.1.2-rc", "0.1.2-dev.5"));
+        assert!(is_newer("0.1.2-dev.5.1", "0.1.2-dev.5"));
+        assert!(is_newer("0.1.2-dev.x", "0.1.2-dev.5"));
+        assert!(!is_newer("0.1.2-dev.9", "0.1.2-dev.10"));
+        assert!(!is_newer("0.1.2-dev.5", "0.1.2-dev.5"));
         assert!(is_newer("v0.2.0", "0.1.0+abc"));
         assert!(!is_newer("0.1.0", "0.1.0"));
         assert!(!is_newer("0.1.0+build2", "0.1.0+build1"));
