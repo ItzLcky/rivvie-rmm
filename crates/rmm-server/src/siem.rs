@@ -193,7 +193,7 @@ pub fn syslog_message(facility: i16, host: &str, ev: &Value) -> String {
     let sd = format!(
         "[{SD_ID} kind=\"{}\" id=\"{}\" event=\"{}\"]",
         sd_escape(ev["kind"].as_str().unwrap_or("")),
-        sd_escape(&ev["id"].to_string().trim_matches('"').to_string()),
+        sd_escape(ev["id"].to_string().trim_matches('"')),
         sd_escape(ev["event"].as_str().unwrap_or(""))
     );
     let build = |body: &str| format!("<{pri}>1 {} {host} rmm-server - {} {sd} {body}", event_time(ev).to_rfc3339_opts(SecondsFormat::Millis, true), msg_id(ev));
