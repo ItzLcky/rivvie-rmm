@@ -86,6 +86,10 @@ pub struct Limits {
     /// Vault password reveals and TOTP codes per user. Unlike the others every request takes
     /// a token (see [`Limiter::take`]): a stolen session can't page through a vault quickly.
     pub vault_reveal: Limiter,
+    /// Single sign-on redirects per client IP (each stores a row until it is used or expires).
+    pub sso_start: Limiter,
+    /// Failed single sign-on callbacks (a valid state, then something wrong) per client IP.
+    pub sso_callback: Limiter,
 }
 
 impl Default for Limits {
@@ -96,6 +100,8 @@ impl Default for Limits {
             enroll_ip: Limiter::new(20, Duration::from_secs(15)),
             // 60 per 5 minutes.
             vault_reveal: Limiter::new(60, Duration::from_secs(5)),
+            sso_start: Limiter::new(30, Duration::from_secs(10)),
+            sso_callback: Limiter::new(30, Duration::from_secs(20)),
         }
     }
 }
@@ -106,6 +112,8 @@ impl Limits {
         self.login_account.prune();
         self.enroll_ip.prune();
         self.vault_reveal.prune();
+        self.sso_start.prune();
+        self.sso_callback.prune();
     }
 }
 

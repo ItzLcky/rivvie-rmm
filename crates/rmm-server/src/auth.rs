@@ -96,9 +96,15 @@ pub struct User {
     pub name: String,
     pub role: String,
     pub totp_enabled: bool,
+    /// A second factor is set up: an authenticator app or a passkey.
+    pub mfa_enabled: bool,
     /// 2FA is required for this account but not set up yet: until it is, the session can
     /// only reach the 2FA setup endpoints.
     pub mfa_setup_required: bool,
+    /// This session was opened through single sign-on (the identity provider did the second factor).
+    pub sso_session: bool,
+    /// The account was created by SSO and has no password anyone knows.
+    pub sso_only: bool,
     /// The clients this user may see, or `None` for all of them (admins, and accounts with
     /// `all_clients` set).
     pub client_ids: Option<Vec<Uuid>>,
@@ -114,6 +120,12 @@ impl User {
     pub fn role(&self) -> Role {
         // The CHECK constraint guarantees a valid value; fall back to least privilege anyway.
         Role::parse(&self.role).unwrap_or(Role::Readonly)
+    }
+
+    /// Whether this session has had a second factor: set up on the account, or done by the
+    /// identity provider for an SSO session. The vault asks for it.
+    pub fn second_factor(&self) -> bool {
+        self.mfa_enabled || self.sso_session
     }
 
     pub fn require(&self, min: Role) -> Result<(), ApiError> {
@@ -201,6 +213,11 @@ impl Perm {
         Perm::ALL.into_iter().find(|p| p.as_str() == s)
     }
 
+    /// What a role holds without an explicit permission set.
+    pub fn role_defaults(role: Role) -> Vec<Perm> {
+        Perm::ALL.into_iter().filter(|p| p.default_for(role)).collect()
+    }
+
     fn default_for(self, role: Role) -> bool {
         match self {
             Perm::SecurityRead => true,
@@ -212,12 +229,18 @@ impl Perm {
 }
 
 /// SQL select list for [`User`] from a `users u` row, given the placeholder bound to
-/// `require_2fa_all` and the session id expression. Expands to a `&'static str`.
+/// `require_2fa_all`, the session id expression and a boolean expression for "this session
+/// was opened by SSO". Expands to a `&'static str`.
 macro_rules! user_columns {
-    ($require_all:literal, $session_id:literal) => {
+    ($require_all:literal, $session_id:literal, $sso:literal) => {
         concat!(
             "u.id, u.email, u.name, u.role, u.totp_secret IS NOT NULL AS totp_enabled, ",
-            "(u.totp_secret IS NULL AND (u.role = 'admin' OR ", $require_all, ")) AS mfa_setup_required, ",
+            "(u.totp_secret IS NOT NULL OR EXISTS (SELECT 1 FROM user_passkeys m WHERE m.user_id = u.id)) AS mfa_enabled, ",
+            // A second factor is a TOTP secret or a passkey. A session the identity provider
+            // vouched for (with its own MFA) doesn't have to set one up here.
+            "(u.totp_secret IS NULL AND NOT EXISTS (SELECT 1 FROM user_passkeys k WHERE k.user_id = u.id) ",
+            "AND NOT (", $sso, ") AND (u.role = 'admin' OR ", $require_all, ")) AS mfa_setup_required, ",
+            "(", $sso, ") AS sso_session, u.sso_only, ",
             "CASE WHEN u.role = 'admin' OR u.all_clients THEN NULL ",
             "ELSE ARRAY(SELECT uc.client_id FROM user_clients uc WHERE uc.user_id = u.id) END AS client_ids, u.permissions, ",
             $session_id, " AS session_id"
@@ -227,10 +250,12 @@ macro_rules! user_columns {
 pub(crate) use user_columns;
 
 /// Whether a session whose account still has to set up 2FA may call this path:
-/// only `me`, `logout` and the `/auth/totp` endpoints.
+/// only `me`, `logout` and the `/auth/totp` and `/auth/passkeys` endpoints.
 fn allowed_before_mfa_setup(path: &str) -> bool {
     let path = path.strip_prefix("/api").unwrap_or(path);
-    matches!(path, "/auth/me" | "/auth/logout" | "/auth/totp") || path.starts_with("/auth/totp/")
+    matches!(path, "/auth/me" | "/auth/logout" | "/auth/totp" | "/auth/passkeys")
+        || path.starts_with("/auth/totp/")
+        || path.starts_with("/auth/passkeys/")
 }
 
 pub fn extract_token(headers: &header::HeaderMap) -> Option<String> {
@@ -254,7 +279,7 @@ pub async fn session_user(state: &AppState, token: &str) -> sqlx::Result<Option<
     // per request.
     sqlx::query_as::<_, User>(concat!(
             "WITH s AS (
-                 SELECT ", user_columns!("$3", "s.id"), "
+                 SELECT ", user_columns!("$3", "s.id", "s.sso_provider_id IS NOT NULL"), "
                    FROM user_sessions s JOIN users u ON u.id = s.user_id
                   WHERE s.token_hash = $1 AND s.expires_at > now() AND NOT u.disabled
                     AND s.last_seen_at > now() - make_interval(hours => $2)
@@ -350,10 +375,10 @@ mod tests {
 
     #[test]
     fn mfa_setup_paths() {
-        for p in ["/api/auth/me", "/api/auth/totp", "/api/auth/totp/setup", "/auth/logout"] {
+        for p in ["/api/auth/me", "/api/auth/totp", "/api/auth/totp/setup", "/auth/logout", "/api/auth/passkeys", "/api/auth/passkeys/register/start"] {
             assert!(allowed_before_mfa_setup(p), "{p}");
         }
-        for p in ["/api/agents", "/api/auth/totpx", "/api/auth/password", "/api/users/x/totp", "/api/auth/me/x"] {
+        for p in ["/api/agents", "/api/auth/totpx", "/api/auth/passkeysx", "/api/auth/password", "/api/users/x/totp", "/api/auth/me/x"] {
             assert!(!allowed_before_mfa_setup(p), "{p}");
         }
     }

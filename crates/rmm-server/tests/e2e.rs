@@ -22,8 +22,14 @@
 //! must read back through the API before the suite runs. That database's admin must be the
 //! e2e admin with two-factor auth cleared (`rmm-server reset2fa`).
 //!
+//! The single sign-on and passkey section starts a second server on the same database, because
+//! WebAuthn needs a host name (`http://localhost:<port>`) where the main one is reached by
+//! 127.0.0.1, and a stand-in OIDC provider (an axum issuer with a generated ES256 key).
+//!
 //! `RMM_E2E_PROMTOOL=<path to promtool>` also parses and lints the `/metrics` output with
 //! Prometheus's own tool (CI sets it; without it that check is skipped).
+//!
+//! `RMM_E2E_ONLY=sso` runs only the sign-in and the single sign-on and passkey section.
 //!
 //! `RMM_E2E_ONLY=desk` runs only the core and service desk sections (faster while working on
 //! tickets, the portal and billing).
@@ -516,6 +522,14 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
     assert!(sealed && stored != plain_secret && stored.len() > plain_secret.len(), "TOTP secrets are encrypted at rest");
     if let Ok(path) = std::env::var("RMM_E2E_EXPECT") {
         previous_release_rows(&admin, &path).await;
+    }
+
+    // RMM_E2E_ONLY=sso runs just the single sign-on and passkey section (and the sign-in above).
+    if std::env::var("RMM_E2E_ONLY").as_deref() == Ok("sso") {
+        // The setup above used this step's code.
+        LAST_TOTP_STEP.store(totp_step(), std::sync::atomic::Ordering::SeqCst);
+        sso_and_passkeys(server, db, dir, &secret).await;
+        return Ok(());
     }
 
     // --- tenancy -------------------------------------------------------------------------
@@ -1117,6 +1131,7 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
     billing(&url, &admin, &tech, db, a_id, b_id).await;
     docs_and_vault(&url, &admin, db, a_id, b_id).await;
     ticket_docs(&url, &admin, a_id, b_id).await;
+    sso_and_passkeys(server, db, dir, &secret).await;
 
     // --- rate limits ------------------------------------------------------------------------------
     // Failed sign-ins from one client IP (via the trusted proxy's X-Forwarded-For).
@@ -4997,4 +5012,623 @@ async fn policy_migration() {
     db.close().await;
     sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE IF EXISTS {db_name} WITH (FORCE)"))).execute(&mut admin_conn).await.unwrap();
     println!("policy migration: ok");
+}
+
+
+// ---------------------------------------------------------------------------------------------
+// Single sign-on (OIDC) and passkeys
+// ---------------------------------------------------------------------------------------------
+
+/// What the stand-in identity provider puts in the next ID token it issues.
+#[derive(Clone)]
+struct Scenario {
+    sub: String,
+    email: Option<String>,
+    email_verified: bool,
+    name: String,
+    groups: Vec<String>,
+    aud: Option<String>,
+    nonce: Option<String>,
+    iss: Option<String>,
+    /// Sign with a key that isn't in the JWKS.
+    wrong_key: bool,
+    expired: bool,
+}
+
+impl Scenario {
+    fn user(sub: &str, email: &str, groups: &[&str]) -> Scenario {
+        Scenario {
+            sub: sub.into(),
+            email: Some(email.into()),
+            email_verified: true,
+            name: "Sso Person".into(),
+            groups: groups.iter().map(|g| g.to_string()).collect(),
+            aud: None,
+            nonce: None,
+            iss: None,
+            wrong_key: false,
+            expired: false,
+        }
+    }
+}
+
+struct Issued {
+    scenario: Scenario,
+    nonce: String,
+    challenge: String,
+}
+
+struct IdpInner {
+    base: String,
+    key: ring::signature::EcdsaKeyPair,
+    other: ring::signature::EcdsaKeyPair,
+    jwks: Value,
+    scenario: std::sync::Mutex<Scenario>,
+    codes: std::sync::Mutex<std::collections::HashMap<String, Issued>>,
+}
+
+type Idp = std::sync::Arc<IdpInner>;
+
+const IDP_CLIENT: &str = "rmm-e2e";
+const IDP_SECRET: &str = "s3cret-e2e-client-secret";
+
+fn b64url(b: &[u8]) -> String {
+    data_encoding::BASE64URL_NOPAD.encode(b)
+}
+
+fn ec_key() -> ring::signature::EcdsaKeyPair {
+    use ring::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair};
+    let rng = ring::rand::SystemRandom::new();
+    let pk8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).unwrap();
+    EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pk8.as_ref(), &rng).unwrap()
+}
+
+impl IdpInner {
+    fn sign(&self, claims: &Value, wrong_key: bool) -> String {
+        use ring::signature::KeyPair;
+        let _ = KeyPair::public_key(&self.key);
+        let input = format!("{}.{}", b64url(json!({ "alg": "ES256", "kid": "e2e-1", "typ": "JWT" }).to_string().as_bytes()), b64url(claims.to_string().as_bytes()));
+        let key = if wrong_key { &self.other } else { &self.key };
+        let sig = key.sign(&ring::rand::SystemRandom::new(), input.as_bytes()).unwrap();
+        format!("{input}.{}", b64url(sig.as_ref()))
+    }
+}
+
+/// An OIDC provider on a free port: discovery, JWKS, authorize (which approves at once) and token.
+async fn idp_mock() -> Idp {
+    use axum::extract::{Query as Q, State as S};
+    use axum::http::{HeaderMap, StatusCode as Code};
+    use axum::routing::{get, post};
+    use ring::signature::KeyPair;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let key = ec_key();
+    let point = key.public_key().as_ref().to_vec();
+    let jwks = json!({ "keys": [{ "kty": "EC", "crv": "P-256", "kid": "e2e-1", "use": "sig", "alg": "ES256", "x": b64url(&point[1..33]), "y": b64url(&point[33..]) }] });
+    let idp: Idp = std::sync::Arc::new(IdpInner {
+        base: base.clone(),
+        key,
+        other: ec_key(),
+        jwks,
+        scenario: std::sync::Mutex::new(Scenario::user("sub-0", "nobody@e2e.test", &[])),
+        codes: Default::default(),
+    });
+    let app = axum::Router::new()
+        .route(
+            "/.well-known/openid-configuration",
+            get(|S(i): S<Idp>| async move {
+                axum::Json(json!({
+                    "issuer": i.base, "authorization_endpoint": format!("{}/authorize", i.base), "token_endpoint": format!("{}/token", i.base),
+                    "jwks_uri": format!("{}/jwks", i.base), "token_endpoint_auth_methods_supported": ["client_secret_basic"],
+                    "id_token_signing_alg_values_supported": ["ES256"], "response_types_supported": ["code"], "subject_types_supported": ["public"],
+                }))
+            }),
+        )
+        .route("/jwks", get(|S(i): S<Idp>| async move { axum::Json(i.jwks.clone()) }))
+        .route(
+            "/authorize",
+            get(|S(i): S<Idp>, Q(q): Q<std::collections::HashMap<String, String>>| async move {
+                assert_eq!(q["response_type"], "code");
+                assert_eq!(q["client_id"], IDP_CLIENT);
+                assert_eq!(q["code_challenge_method"], "S256", "PKCE is mandatory");
+                assert!(q["scope"].split(' ').any(|s| s == "openid"));
+                assert!(!q["nonce"].is_empty() && !q["state"].is_empty());
+                let code = hex::encode(rand_bytes());
+                i.codes.lock().unwrap().insert(
+                    code.clone(),
+                    Issued { scenario: i.scenario.lock().unwrap().clone(), nonce: q["nonce"].clone(), challenge: q["code_challenge"].clone() },
+                );
+                axum::response::Redirect::to(&format!("{}?code={code}&state={}", q["redirect_uri"], q["state"]))
+            }),
+        )
+        .route(
+            "/token",
+            post(|S(i): S<Idp>, h: HeaderMap, axum::Form(f): axum::Form<std::collections::HashMap<String, String>>| async move {
+                let basic = h.get("authorization").and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Basic ")).and_then(|v| data_encoding::BASE64.decode(v.as_bytes()).ok());
+                if basic.as_deref() != Some(format!("{IDP_CLIENT}:{IDP_SECRET}").as_bytes()) {
+                    return (Code::UNAUTHORIZED, axum::Json(json!({ "error": "invalid_client" })));
+                }
+                let Some(issued) = i.codes.lock().unwrap().remove(f.get("code").map(String::as_str).unwrap_or("")) else {
+                    return (Code::BAD_REQUEST, axum::Json(json!({ "error": "invalid_grant" })));
+                };
+                if b64url(&sha256_raw(f.get("code_verifier").map(String::as_str).unwrap_or("").as_bytes())) != issued.challenge {
+                    return (Code::BAD_REQUEST, axum::Json(json!({ "error": "invalid_grant", "error_description": "PKCE verification failed" })));
+                }
+                let sc = issued.scenario;
+                let now = chrono::Utc::now().timestamp();
+                let mut claims = json!({
+                    "iss": sc.iss.clone().unwrap_or_else(|| i.base.clone()),
+                    "aud": sc.aud.clone().unwrap_or_else(|| IDP_CLIENT.to_string()),
+                    "sub": sc.sub, "iat": now, "exp": if sc.expired { now - 3600 } else { now + 300 },
+                    "nonce": sc.nonce.clone().unwrap_or(issued.nonce), "name": sc.name, "groups": sc.groups,
+                });
+                if let Some(e) = &sc.email {
+                    claims["email"] = json!(e);
+                    claims["email_verified"] = json!(sc.email_verified);
+                }
+                (Code::OK, axum::Json(json!({ "access_token": "unused", "token_type": "Bearer", "id_token": i.sign(&claims, sc.wrong_key) })))
+            }),
+        )
+        .with_state(idp.clone());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    idp
+}
+
+fn rand_bytes() -> [u8; 16] {
+    let mut b = [0u8; 16];
+    getrandom::fill(&mut b).unwrap();
+    b
+}
+
+fn sha256_raw(b: &[u8]) -> Vec<u8> {
+    use sha2::Digest;
+    sha2::Sha256::digest(b).to_vec()
+}
+
+/// A browser: keeps cookies, follows no redirects by itself.
+fn browser() -> reqwest::Client {
+    reqwest::Client::builder().cookie_store(true).redirect(reqwest::redirect::Policy::none()).build().unwrap()
+}
+
+fn location(r: &reqwest::Response) -> String {
+    assert!(r.status().is_redirection(), "expected a redirect, got {} from {}", r.status(), r.url());
+    r.headers()["location"].to_str().unwrap().to_string()
+}
+
+/// The redirects of one SSO sign-in. Returns (the callback URL the provider sent the browser back
+/// to, where the server then sent it).
+async fn sso_walk(b: &reqwest::Client, public: &str, provider: &str) -> (String, String) {
+    let to_idp = location(&b.get(format!("{public}/api/auth/sso/{provider}/start?next=/agents")).send().await.unwrap());
+    let back = location(&b.get(&to_idp).send().await.unwrap());
+    let end = location(&b.get(&back).send().await.unwrap());
+    (back, end)
+}
+
+/// The server, started a second time on the e2e database with a public URL of `localhost`.
+struct SsoServer(Child);
+
+impl Drop for SsoServer {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+async fn audit_detail(db: &sqlx::PgPool, action: &str) -> Value {
+    sqlx::query_scalar("SELECT details FROM audit_log WHERE action = $1 ORDER BY id DESC LIMIT 1").bind(action).fetch_one(db).await.unwrap_or(Value::Null)
+}
+
+async fn audit_count(db: &sqlx::PgPool, action: &str) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM audit_log WHERE action = $1").bind(action).fetch_one(db).await.unwrap()
+}
+
+async fn sso_and_passkeys(server: &Server, db: &sqlx::PgPool, dir: &Path, admin_totp_secret: &str) {
+    use reqwest::Method;
+    use webauthn_authenticator_rs::WebauthnAuthenticator;
+    use webauthn_authenticator_rs::softpasskey::SoftPasskey;
+    use webauthn_rs::prelude::{CreationChallengeResponse, RequestChallengeResponse, Url};
+
+    let port = free_port();
+    let public = format!("http://localhost:{port}");
+    let log = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("server-sso.log")).unwrap();
+    let _guard = SsoServer(
+        Command::new(env!("CARGO_BIN_EXE_rmm-server"))
+            .env("DATABASE_URL", &server.db_url)
+            .env("RMM_BIND", format!("127.0.0.1:{port}"))
+            .env("RMM_PUBLIC_URL", &public)
+            .env("RMM_WEB_DIR", dir.join("web"))
+            .env("RMM_AGENT_DIR", dir.join("agents"))
+            .env("RMM_STORAGE_DIR", dir.join("storage"))
+            .env("RMM_DATA_KEY", "ab".repeat(32))
+            .env("RMM_UPDATE_PUBKEY", content_pubkey())
+            .env("RUST_LOG", "info,rmm_server=debug")
+            .stdout(log.try_clone().unwrap())
+            .stderr(log)
+            .spawn()
+            .expect("starting the second rmm-server"),
+    );
+    wait_healthy(&format!("http://127.0.0.1:{port}")).await;
+    let api = |b: reqwest::Client| Api { http: b, base: format!("{public}/api") };
+
+    // The built-in admin signs in here with its authenticator app.
+    let admin = api(browser());
+    sign_in_with_totp(&admin, admin_totp_secret).await;
+    let client_x = admin.post("/clients", json!({ "name": "SSO Client X" })).await["id"].as_str().unwrap().to_string();
+    let client_y = admin.post("/clients", json!({ "name": "SSO Client Y" })).await["id"].as_str().unwrap().to_string();
+
+    // --- a provider: validated against the stand-in, secret sealed, never read back -------------------
+    let idp = idp_mock().await;
+    let provider = |name: &str| {
+        json!({ "name": name, "preset": "custom", "issuer": idp.base, "client_id": IDP_CLIENT, "client_secret": IDP_SECRET,
+                "jit": true, "group_sync": true, "groups_claim": "groups", "allowed_domains": ["e2e.test"] })
+    };
+    let (s, v) = admin.call(Method::POST, "/settings/sso/providers", Some(json!({ "name": "Dead", "issuer": "http://127.0.0.1:9", "client_id": "c", "client_secret": "s" }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "an issuer that doesn't answer is refused: {v}");
+    let (s, _) = admin.call(Method::POST, "/settings/sso/providers", Some(json!({ "name": "Plain", "issuer": "http://idp.example.com", "client_id": "c", "client_secret": "s" }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "plain http only for localhost");
+    let created = admin.post("/settings/sso/providers", provider("Mock IdP")).await;
+    let pid = created["id"].as_str().unwrap().to_string();
+    let (blob, sealed): (Vec<u8>, bool) = sqlx::query_as("SELECT client_secret, secret_sealed FROM sso_providers WHERE id = $1::uuid").bind(&pid).fetch_one(db).await.unwrap();
+    assert!(sealed && !blob.windows(IDP_SECRET.len()).any(|w| w == IDP_SECRET.as_bytes()), "client secrets are encrypted at rest");
+    let listing = admin.get("/settings/sso").await;
+    assert!(!listing.to_string().contains(IDP_SECRET), "the secret is never returned");
+    assert_eq!(listing["providers"][0]["has_secret"], true);
+    assert_eq!(listing["redirect_uri"], format!("{public}/api/auth/sso/callback"));
+    let test = admin.post(&format!("/settings/sso/providers/{pid}/test"), json!({})).await;
+    assert_eq!((test["ok"].clone(), test["keys"].clone()), (json!(true), json!(1)), "{test}");
+    admin
+        .put(
+            &format!("/settings/sso/providers/{pid}/maps"),
+            json!([
+                { "group_value": "RMM-Admins", "role": "admin" },
+                { "group_value": "rmm-techs", "role": "technician", "client_ids": [client_x] },
+                { "group_value": "rmm-lead", "role": "technician", "extra_permissions": ["billing.read"], "client_ids": [client_y] },
+            ]),
+        )
+        .await;
+    let (s, _) = admin.call(Method::PUT, &format!("/settings/sso/providers/{pid}/maps"), Some(json!([{ "group_value": "x", "role": "technician", "extra_permissions": ["nope"] }]))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let buttons = reqwest::get(format!("{public}/api/auth/sso/providers")).await.unwrap().json::<Value>().await.unwrap();
+    assert_eq!(buttons["providers"][0]["name"], "Mock IdP", "the sign-in page lists providers without a session: {buttons}");
+    assert!(!buttons.to_string().contains("issuer"), "and only what a button needs");
+
+    // --- JIT sign-in: the account, role and clients come from the groups ---------------------------------
+    *idp.scenario.lock().unwrap() = Scenario::user("sub-new", "Newhire@e2e.test", &["rmm-techs", "unrelated"]);
+    let b = browser();
+    let (_, end) = sso_walk(&b, &public, &pid).await;
+    assert_eq!(end, "/agents", "back to where the sign-in began");
+    let tech = api(b);
+    let me = tech.get("/auth/me").await;
+    assert_eq!((me["email"].as_str(), me["role"].as_str(), me["sso_session"].clone(), me["mfa_setup_required"].clone()), (Some("newhire@e2e.test"), Some("technician"), json!(true), json!(false)), "{me}");
+    assert_eq!(me["client_ids"], json!([client_x]));
+    assert!(tech.get("/agents").await.is_array() || tech.get("/agents").await.is_object());
+    let (s, v) = tech.call(Method::GET, &format!("/clients/{client_x}/vault"), None).await;
+    assert!(s.is_success(), "the vault wants a second factor, which the identity provider did: {s} {v}");
+    let user_id = me["id"].as_str().unwrap().to_string();
+    let (only, hash): (bool, String) = sqlx::query_as("SELECT sso_only, password_hash FROM users WHERE id = $1::uuid").bind(&user_id).fetch_one(db).await.unwrap();
+    assert!(only && hash.starts_with("$argon2"), "an unusable random password");
+    let pw = api(browser());
+    let (s, _) = pw.call(Method::POST, "/auth/login", Some(json!({ "email": "newhire@e2e.test", "password": "" }))).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    assert_eq!(audit_detail(db, "auth.login").await["via"], "sso");
+    assert_eq!(audit_count(db, "auth.sso_access_sync").await, 1);
+
+    // --- the next sign-in follows the groups: more clients, a permission, then none at all ------------------
+    *idp.scenario.lock().unwrap() = Scenario::user("sub-new", "newhire@e2e.test", &["rmm-techs", "RMM-LEAD"]);
+    let b = browser();
+    sso_walk(&b, &public, &pid).await;
+    let tech = api(b);
+    let me = tech.get("/auth/me").await;
+    let mut clients: Vec<String> = me["client_ids"].as_array().unwrap().iter().map(|c| c.as_str().unwrap().to_string()).collect();
+    clients.sort();
+    let mut want = vec![client_x.clone(), client_y.clone()];
+    want.sort();
+    assert_eq!(clients, want);
+    assert!(me["permissions"].as_array().unwrap().iter().any(|p| p == "billing.read"), "{me}");
+    assert!(!me["permissions"].as_array().unwrap().iter().any(|p| p == "billing.manage"));
+    *idp.scenario.lock().unwrap() = Scenario::user("sub-new", "newhire@e2e.test", &["rmm-admins"]);
+    let b = browser();
+    sso_walk(&b, &public, &pid).await;
+    let me = api(b).get("/auth/me").await;
+    assert_eq!((me["role"].as_str(), me["mfa_setup_required"].clone()), (Some("admin"), json!(false)), "an admin from an SSO session doesn't have to set up TOTP here: {me}");
+    *idp.scenario.lock().unwrap() = Scenario::user("sub-new", "newhire@e2e.test", &["somebody-else"]);
+    let b = browser();
+    let (_, end) = sso_walk(&b, &public, &pid).await;
+    assert_eq!(end, "/login?sso_error=not_allowed", "no mapping, no default role");
+    let (s, _) = api(b).call(Method::GET, "/auth/me", None).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "and no session");
+    assert_eq!(audit_detail(db, "auth.sso_failed").await["reason"], "no group mapping matches");
+    // Someone who used SSO before and is in none of the groups now loses their access.
+    let (role, all, n): (String, bool, i64) =
+        sqlx::query_as("SELECT role, all_clients, (SELECT count(*) FROM user_clients WHERE user_id = $1::uuid) FROM users WHERE id = $1::uuid").bind(&user_id).fetch_one(db).await.unwrap();
+    assert_eq!((role.as_str(), all, n), ("readonly", false, 0), "removed from every group");
+    // A first sign-in that matches nothing changes nothing: trying SSO once doesn't demote an account.
+    let keep = admin.post("/users", json!({ "email": "keepme@e2e.test", "name": "Keep", "password": "user-password-123", "role": "admin" })).await;
+    *idp.scenario.lock().unwrap() = Scenario::user("sub-keep", "keepme@e2e.test", &[]);
+    assert_eq!(sso_walk(&browser(), &public, &pid).await.1, "/login?sso_error=not_allowed");
+    let (role, links): (String, i64) =
+        sqlx::query_as("SELECT role, (SELECT count(*) FROM user_identities WHERE user_id = $1::uuid) FROM users WHERE id = $1::uuid").bind(keep["id"].as_str().unwrap()).fetch_one(db).await.unwrap();
+    assert_eq!((role.as_str(), links), ("admin", 0), "still an admin, and not linked");
+
+    // --- linking: only by a verified address, and never over another identity ---------------------------------
+    let linked = admin.post("/users", json!({ "email": "linked@e2e.test", "name": "Linked", "password": "user-password-123", "role": "readonly", "all_clients": false, "client_ids": [] })).await;
+    let linked_id = linked["id"].as_str().unwrap().to_string();
+    let mut sc = Scenario::user("sub-linked", "linked@e2e.test", &["rmm-techs"]);
+    sc.email_verified = false;
+    *idp.scenario.lock().unwrap() = sc.clone();
+    let (_, end) = sso_walk(&browser(), &public, &pid).await;
+    assert_eq!(end, "/login?sso_error=not_allowed", "an unverified address links nothing");
+    sc.email = None;
+    *idp.scenario.lock().unwrap() = sc.clone();
+    assert_eq!(sso_walk(&browser(), &public, &pid).await.1, "/login?sso_error=not_allowed", "no address at all");
+    sc.email = Some("linked@e2e.test".into());
+    sc.email_verified = true;
+    *idp.scenario.lock().unwrap() = sc.clone();
+    let b = browser();
+    assert_eq!(sso_walk(&b, &public, &pid).await.1, "/agents");
+    let me = api(b).get("/auth/me").await;
+    assert_eq!(me["id"], linked_id.as_str(), "the existing account, not a new one");
+    assert_eq!(me["role"], "technician", "group sync applies to linked accounts");
+    assert_eq!(audit_count(db, "auth.sso_link").await, 1);
+    // The same person again, now by subject alone: a changed address doesn't matter.
+    sc.email = Some("renamed@e2e.test".into());
+    *idp.scenario.lock().unwrap() = sc.clone();
+    let b = browser();
+    assert_eq!(sso_walk(&b, &public, &pid).await.1, "/agents");
+    assert_eq!(api(b).get("/auth/me").await["id"], linked_id.as_str());
+    // A different identity claiming that address can't take the account over.
+    let other = Scenario::user("sub-impostor", "linked@e2e.test", &["rmm-admins"]);
+    *idp.scenario.lock().unwrap() = other;
+    assert_eq!(sso_walk(&browser(), &public, &pid).await.1, "/login?sso_error=not_allowed");
+    assert_eq!(audit_detail(db, "auth.sso_failed").await["reason"], "the account is linked to a different identity at this provider");
+    // Domains are restricted per provider.
+    *idp.scenario.lock().unwrap() = Scenario::user("sub-outsider", "visitor@other.example", &["rmm-admins"]);
+    assert_eq!(sso_walk(&browser(), &public, &pid).await.1, "/login?sso_error=not_allowed");
+    assert_eq!(audit_detail(db, "auth.sso_failed").await["reason"], "email domain not allowed");
+    // A disabled account stays out.
+    admin.call(Method::DELETE, &format!("/users/{linked_id}"), None).await;
+    *idp.scenario.lock().unwrap() = Scenario::user("sub-linked", "linked@e2e.test", &["rmm-techs"]);
+    assert_eq!(sso_walk(&browser(), &public, &pid).await.1, "/login?sso_error=not_allowed");
+    assert_eq!(audit_detail(db, "auth.sso_failed").await["reason"], "the account is disabled");
+
+    // --- tokens that must not be accepted ------------------------------------------------------------------
+    let base_sc = Scenario::user("sub-new", "newhire@e2e.test", &["rmm-techs"]);
+    type Tweak = Box<dyn Fn(&mut Scenario)>;
+    let attempts: Vec<(&str, Tweak, &str)> = vec![
+        ("bad_nonce", Box::new(|s| s.nonce = Some("replayed-nonce".into())), "bad_nonce"),
+        ("bad_audience", Box::new(|s| s.aud = Some("someone-elses-client".into())), "bad_audience"),
+        ("bad_issuer", Box::new(|s| s.iss = Some("https://evil.example.com".into())), "bad_issuer"),
+        ("expired", Box::new(|s| s.expired = true), "expired"),
+        ("bad_signature", Box::new(|s| s.wrong_key = true), "bad_signature"),
+    ];
+    for (name, tweak, code) in attempts {
+        let mut sc = base_sc.clone();
+        tweak(&mut sc);
+        *idp.scenario.lock().unwrap() = sc;
+        let b = browser();
+        let (_, end) = sso_walk(&b, &public, &pid).await;
+        assert_eq!(end, "/login?sso_error=failed", "{name}");
+        let (s, _) = api(b).call(Method::GET, "/auth/me", None).await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED, "{name}: no session");
+        let reason = audit_detail(db, "auth.sso_failed").await["reason"].as_str().unwrap().to_string();
+        assert!(reason.starts_with(code), "{name}: {reason}");
+    }
+    // A callback is single use, and only for the browser that began it.
+    *idp.scenario.lock().unwrap() = base_sc.clone();
+    let b = browser();
+    let (back, end) = sso_walk(&b, &public, &pid).await;
+    assert_eq!(end, "/agents");
+    assert_eq!(location(&b.get(&back).send().await.unwrap()), "/login?sso_error=expired", "replayed callback");
+    let to_idp = location(&browser().get(format!("{public}/api/auth/sso/{pid}/start")).send().await.unwrap());
+    let back = location(&browser().get(&to_idp).send().await.unwrap());
+    assert_eq!(location(&browser().get(&back).send().await.unwrap()), "/login?sso_error=failed", "another browser has no binding cookie");
+    assert_eq!(audit_detail(db, "auth.sso_failed").await["reason"], "the state cookie doesn't match");
+    assert_eq!(location(&browser().get(format!("{public}/api/auth/sso/callback?code=x&state=forged")).send().await.unwrap()), "/login?sso_error=expired");
+    // Redirect targets stay on the site.
+    let to_idp = location(&b.get(format!("{public}/api/auth/sso/{pid}/start?next=//evil.example.com")).send().await.unwrap());
+    let back = location(&b.get(&to_idp).send().await.unwrap());
+    assert_eq!(location(&b.get(&back).send().await.unwrap()), "/");
+
+    // --- requiring SSO, with a break-glass admin ------------------------------------------------------------------
+    let (s, v) = admin.call(Method::PUT, "/settings/sso", Some(json!({ "required": true }))).await;
+    assert_eq!(s, StatusCode::CONFLICT, "nobody could sign in with a password afterwards: {v}");
+    let me = admin.get("/auth/me").await;
+    admin.post("/users", json!({ "email": "plain@e2e.test", "name": "Plain", "password": "user-password-123", "role": "technician" })).await;
+    let bg2 = admin.post("/users", json!({ "email": "bg2@e2e.test", "name": "Second break-glass", "password": "user-password-123", "role": "admin" })).await["id"].as_str().unwrap().to_string();
+    admin.put(&format!("/users/{}/sso-exempt", me["id"].as_str().unwrap()), json!({ "exempt": true })).await;
+    // A claim from the provider never reaches a break-glass account.
+    *idp.scenario.lock().unwrap() = Scenario::user("sub-bg", ADMIN_EMAIL, &["rmm-admins"]);
+    assert_eq!(sso_walk(&browser(), &public, &pid).await.1, "/login?sso_error=not_allowed");
+    assert_eq!(audit_detail(db, "auth.sso_failed").await["reason"], "break-glass accounts aren't linked by email");
+    admin.put("/settings/sso", json!({ "required": true })).await;
+    let plain = api(browser());
+    let (s, v) = plain.call(Method::POST, "/auth/login", Some(json!({ "email": "plain@e2e.test", "password": "user-password-123" }))).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "refused, and in the same words as a wrong password: {v}");
+    assert_eq!(v["error"], "not authenticated");
+    assert_eq!(audit_detail(db, "auth.login_denied_sso_required").await["ip"], "127.0.0.1");
+    let breakglass = api(browser());
+    let (s, v) = breakglass.call(Method::POST, "/auth/login", Some(json!({ "email": ADMIN_EMAIL, "password": ADMIN_PASSWORD }))).await;
+    assert_eq!((s, v["mfa_required"].clone()), (StatusCode::UNAUTHORIZED, json!(true)), "the password is accepted for a break-glass account, which then asks for its second factor: {v}");
+    let me2 = sign_in_with_totp(&breakglass, admin_totp_secret).await;
+    assert_eq!(me2["user"]["email"], ADMIN_EMAIL, "the break-glass admin still signs in with a password");
+    let (s, _) = admin.call(Method::PUT, &format!("/users/{}/sso-exempt", me["id"].as_str().unwrap()), Some(json!({ "exempt": false }))).await;
+    assert_eq!(s, StatusCode::CONFLICT, "the last break-glass admin stays");
+    let (s, _) = admin.call(Method::DELETE, &format!("/settings/sso/providers/{pid}"), None).await;
+    assert_eq!(s, StatusCode::CONFLICT, "and the last provider");
+    // Disabling the last break-glass admin is refused too (the first one may stand down while a second holds).
+    admin.put(&format!("/users/{bg2}/sso-exempt"), json!({ "exempt": true })).await;
+    admin.put(&format!("/users/{}/sso-exempt", me["id"].as_str().unwrap()), json!({ "exempt": false })).await;
+    let (s, v) = admin.call(Method::DELETE, &format!("/users/{bg2}"), None).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    admin.put(&format!("/users/{}/sso-exempt", me["id"].as_str().unwrap()), json!({ "exempt": true })).await;
+    admin.put("/settings/sso", json!({ "required": false })).await;
+    // Switching the provider off ends the sessions it vouched for.
+    *idp.scenario.lock().unwrap() = base_sc.clone();
+    let b = browser();
+    sso_walk(&b, &public, &pid).await;
+    let held = api(b);
+    held.get("/auth/me").await;
+    let mut off = provider("Mock IdP");
+    off["enabled"] = json!(false);
+    admin.put(&format!("/settings/sso/providers/{pid}"), off).await;
+    let (s, _) = held.call(Method::GET, "/auth/me", None).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    assert_eq!(sso_walk_start_only(&public, &pid).await, "/login?sso_error=provider_error");
+    admin.put(&format!("/settings/sso/providers/{pid}"), provider("Mock IdP")).await;
+    // A new client id means the subjects it issued mean nothing: links and sessions go.
+    let (links,): (i64,) = sqlx::query_as("SELECT count(*) FROM user_identities WHERE provider_id = $1::uuid").bind(&pid).fetch_one(db).await.unwrap();
+    assert!(links > 0);
+    let mut moved = provider("Mock IdP");
+    moved["client_id"] = json!("another-client");
+    admin.put(&format!("/settings/sso/providers/{pid}"), moved).await;
+    let (links,): (i64,) = sqlx::query_as("SELECT count(*) FROM user_identities WHERE provider_id = $1::uuid").bind(&pid).fetch_one(db).await.unwrap();
+    assert_eq!(links, 0);
+    let mut moved = provider("Mock IdP");
+    moved["issuer"] = json!(format!("{}/another", idp.base));
+    moved.as_object_mut().unwrap().remove("client_secret");
+    let (s, v) = admin.call(Method::PUT, &format!("/settings/sso/providers/{pid}"), Some(moved)).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "a new issuer needs the secret entered again: {v}");
+    assert!(v["error"].as_str().unwrap().contains("secret"), "{v}");
+    admin.put(&format!("/settings/sso/providers/{pid}"), provider("Mock IdP")).await;
+
+    // --- passkeys ----------------------------------------------------------------------------------------------------
+    let origin = Url::parse(&public).unwrap();
+    let pk_pw = "user-password-123";
+    let mut device = SoftPasskey::new(true);
+    let pk = signed_in_at(&public, &admin, "pk@e2e.test", "technician").await;
+    // 2FA isn't required for a technician, so nothing changes at sign-in yet.
+    let start = pk.post("/auth/passkeys/register/start", json!({ "password": pk_pw })).await;
+    let (s, _) = pk.call(Method::POST, "/auth/passkeys/register/start", Some(json!({ "password": "wrong-password-1" }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "registering asks for the password");
+    let ccr: CreationChallengeResponse = serde_json::from_value(start["options"].clone()).unwrap();
+    let cred = device.do_registration(origin.clone(), ccr).unwrap();
+    let vault = format!("/clients/{client_x}/vault");
+    assert_eq!(pk.call(Method::GET, &vault, None).await.0, StatusCode::FORBIDDEN, "no second factor yet, no vault");
+    let fin = pk.post("/auth/passkeys/register/finish", json!({ "ceremony_id": start["ceremony_id"], "name": "Laptop key", "credential": cred })).await;
+    let recovery: Vec<String> = fin["recovery_codes"].as_array().expect("a first factor with no TOTP creates recovery codes").iter().map(|c| c.as_str().unwrap().to_string()).collect();
+    assert_eq!(recovery.len(), 10);
+    let (s, _) = pk.call(Method::POST, "/auth/passkeys/register/finish", Some(json!({ "ceremony_id": start["ceremony_id"], "name": "again", "credential": cred }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "a ceremony finishes once");
+    assert!(pk.call(Method::GET, &vault, None).await.0.is_success(), "a passkey is a second factor for the vault");
+    let list = pk.get("/auth/passkeys").await;
+    assert_eq!(list["passkeys"][0]["name"], "Laptop key");
+    assert_eq!(list["recovery_codes_left"], 10);
+    let (stored, ): (Value,) = sqlx::query_as("SELECT passkey FROM user_passkeys WHERE user_id = (SELECT id FROM users WHERE email = 'pk@e2e.test')").fetch_one(db).await.unwrap();
+    assert!(!stored.to_string().to_lowercase().contains("private"), "only the public credential is stored");
+    let passkey_id = list["passkeys"][0]["id"].as_str().unwrap().to_string();
+    pk.call(Method::PATCH, &format!("/auth/passkeys/{passkey_id}"), Some(json!({ "name": "Work laptop" }))).await;
+    assert_eq!(pk.get("/auth/passkeys").await["passkeys"][0]["name"], "Work laptop");
+
+    // Signing in now asks for a second factor, and offers the passkey.
+    let login = |body: Value| async {
+        let b = api(browser());
+        let (s, v) = b.call(Method::POST, "/auth/login", Some(body)).await;
+        (b, s, v)
+    };
+    let creds = json!({ "email": "pk@e2e.test", "password": pk_pw });
+    let (_, s, v) = login(creds.clone()).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    assert_eq!((v["mfa_required"].clone(), v["methods"].clone()), (json!(true), json!({ "totp": false, "passkey": true })), "{v}");
+    let challenge = |email: &str, password: &str| {
+        let api = api(browser());
+        let (email, password) = (email.to_string(), password.to_string());
+        async move { api.call(Method::POST, "/auth/login/passkey", Some(json!({ "email": email, "password": password }))).await }
+    };
+    assert_eq!(challenge("pk@e2e.test", "wrong").await.0, StatusCode::UNAUTHORIZED, "the challenge is for someone who knows the password");
+    let (s, ch) = challenge("pk@e2e.test", pk_pw).await;
+    assert!(s.is_success(), "{ch}");
+    let rcr: RequestChallengeResponse = serde_json::from_value(ch["options"].clone()).unwrap();
+    let assertion = device.do_authentication(origin.clone(), rcr).unwrap();
+    let body = json!({ "email": "pk@e2e.test", "password": pk_pw, "passkey": { "ceremony_id": ch["ceremony_id"], "credential": assertion } });
+    let (b, s, v) = login(body.clone()).await;
+    assert!(s.is_success(), "{v}");
+    assert_eq!(b.get("/auth/me").await["email"], "pk@e2e.test");
+    let (_, s, _) = login(body).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "an answer can't be replayed");
+    let used: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar("SELECT last_used_at FROM user_passkeys WHERE id = $1::uuid").bind(&passkey_id).fetch_one(db).await.unwrap();
+    assert!(used.is_some());
+    // A challenge answered for another account's ceremony, a wrong password at the last step and a TOTP-shaped code all fail.
+    let (_, ch2) = challenge("pk@e2e.test", pk_pw).await;
+    let rcr: RequestChallengeResponse = serde_json::from_value(ch2["options"].clone()).unwrap();
+    let assertion = device.do_authentication(origin.clone(), rcr).unwrap();
+    let (_, s, _) = login(json!({ "email": "pk@e2e.test", "password": "wrong-password", "passkey": { "ceremony_id": ch2["ceremony_id"], "credential": assertion } })).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    let (_, s, _) = login(json!({ "email": "pk@e2e.test", "password": pk_pw, "code": "123456" })).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "there is no authenticator app to check a code against");
+    // Recovery codes still work, once.
+    let (b, s, v) = login(json!({ "email": "pk@e2e.test", "password": pk_pw, "code": recovery[0] })).await;
+    assert!(s.is_success(), "{v}");
+    assert_eq!(b.get("/auth/me").await["email"], "pk@e2e.test");
+    let (_, s, _) = login(json!({ "email": "pk@e2e.test", "password": pk_pw, "code": recovery[0] })).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "recovery codes are single use");
+    // TOTP beside the passkey; removing TOTP keeps the passkey (and the codes).
+    let setup = pk.post("/auth/totp/setup", json!({ "password": pk_pw })).await;
+    let secret = setup["secret"].as_str().unwrap().to_string();
+    pk.post("/auth/totp/enable", json!({ "code": totp(&secret) })).await;
+    let (_, s, v) = login(json!({ "email": "pk@e2e.test", "password": pk_pw })).await;
+    assert_eq!((s, v["methods"].clone()), (StatusCode::UNAUTHORIZED, json!({ "totp": true, "passkey": true })));
+    // Remove the passkey (password needed): TOTP remains.
+    let (s, _) = pk.call(Method::POST, &format!("/auth/passkeys/{passkey_id}/remove"), Some(json!({ "password": "wrong-password-1" }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    pk.post(&format!("/auth/passkeys/{passkey_id}/remove"), json!({ "password": pk_pw })).await;
+    assert_eq!(pk.get("/auth/passkeys").await["passkeys"], json!([]));
+    let (_, s, v) = login(json!({ "email": "pk@e2e.test", "password": pk_pw })).await;
+    assert_eq!((s, v["methods"].clone()), (StatusCode::UNAUTHORIZED, json!({ "totp": true, "passkey": false })));
+    let (b, s, _) = login(json!({ "email": "pk@e2e.test", "password": pk_pw, "code": "000000" })).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    drop(b);
+
+    // A required second factor can be a passkey: an admin has nothing but the setup endpoints until one is registered.
+    let boss = signed_in_at(&public, &admin, "pk-admin@e2e.test", "admin").await;
+    assert_eq!(boss.get("/auth/me").await["mfa_setup_required"], true);
+    let (s, _) = boss.call(Method::GET, "/agents", None).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    let mut boss_device = SoftPasskey::new(true);
+    let start = boss.post("/auth/passkeys/register/start", json!({ "password": pk_pw })).await;
+    let ccr: CreationChallengeResponse = serde_json::from_value(start["options"].clone()).unwrap();
+    let cred = boss_device.do_registration(origin.clone(), ccr).unwrap();
+    boss.post("/auth/passkeys/register/finish", json!({ "ceremony_id": start["ceremony_id"], "name": "Key", "credential": cred })).await;
+    assert_eq!(boss.get("/auth/me").await["mfa_setup_required"], false, "a passkey satisfies the requirement");
+    boss.get("/agents").await;
+    // The admin's reset (lost key) removes passkeys and codes.
+    let boss_id = boss.get("/auth/me").await["id"].as_str().unwrap().to_string();
+    let (s, _) = admin.call(Method::DELETE, &format!("/users/{boss_id}/totp"), None).await;
+    assert!(s.is_success());
+    let (n,): (i64,) = sqlx::query_as("SELECT count(*) FROM user_passkeys WHERE user_id = $1::uuid").bind(&boss_id).fetch_one(db).await.unwrap();
+    assert_eq!(n, 0);
+    // SSO-only accounts have no password to confirm with, so no passkeys.
+    let (s, v) = tech.call(Method::POST, "/auth/passkeys/register/start", Some(json!({ "password": "anything-at-all-1" }))).await;
+    assert!(s == StatusCode::UNAUTHORIZED || s == StatusCode::BAD_REQUEST, "{s} {v}");
+}
+
+/// The 30-second step of the current time, which a TOTP code is good for once.
+fn totp_step() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() / 30
+}
+
+static LAST_TOTP_STEP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The built-in admin's password and authenticator code. A code is accepted once per step, so
+/// this waits for a step it hasn't used (a wrong code would also count against the sign-in limit).
+async fn sign_in_with_totp(api: &Api, secret: &str) -> Value {
+    while totp_step() <= LAST_TOTP_STEP.load(std::sync::atomic::Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    LAST_TOTP_STEP.store(totp_step(), std::sync::atomic::Ordering::SeqCst);
+    let (s, v) = api.call(reqwest::Method::POST, "/auth/login", Some(json!({ "email": ADMIN_EMAIL, "password": ADMIN_PASSWORD, "code": totp(secret) }))).await;
+    assert!(s.is_success(), "the admin's sign-in with a TOTP code: {s} {v}");
+    v
+}
+
+/// A user the admin creates, signed in on the second server.
+async fn signed_in_at(public: &str, admin: &Api, email: &str, role: &str) -> Api {
+    admin.post("/users", json!({ "email": email, "name": email, "password": "user-password-123", "role": role, "all_clients": true })).await;
+    let api = Api { http: browser(), base: format!("{public}/api") };
+    api.post("/auth/login", json!({ "email": email, "password": "user-password-123" })).await;
+    api
+}
+
+/// `/start` for a provider that is switched off.
+async fn sso_walk_start_only(public: &str, provider: &str) -> String {
+    location(&browser().get(format!("{public}/api/auth/sso/{provider}/start")).send().await.unwrap())
 }

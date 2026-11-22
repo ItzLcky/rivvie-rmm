@@ -18,15 +18,90 @@ use crate::state::AppState;
 pub struct Login {
     email: String,
     password: String,
-    /// TOTP or recovery code; required once the password checks out for an account with 2FA.
+    /// TOTP or recovery code; required once the password checks out for an account with 2FA
+    /// (unless a passkey answers instead).
     #[serde(default)]
     code: Option<String>,
+    /// The browser's answer to a challenge from `/auth/login/passkey`.
+    #[serde(default)]
+    passkey: Option<PasskeyAnswer>,
+}
+
+#[derive(Deserialize)]
+pub struct PasskeyAnswer {
+    ceremony_id: String,
+    credential: webauthn_rs::prelude::PublicKeyCredential,
 }
 
 /// Verified against when the email is unknown so response timing doesn't reveal which accounts exist.
 fn dummy_hash() -> String {
     static H: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     H.get_or_init(|| auth::hash_password("not-a-real-password").unwrap_or_default()).clone()
+}
+
+#[derive(sqlx::FromRow)]
+pub struct PasswordRow {
+    pub id: Uuid,
+    password_hash: String,
+    disabled: bool,
+    totp_secret: Option<Vec<u8>>,
+    totp_sealed: bool,
+    sso_exempt: bool,
+    passkeys: i64,
+}
+
+/// The first step of a password sign-in: rate limits, then the email and password. Failures
+/// count against the limits and are audited; success leaves the second factor to the caller.
+pub async fn check_password(st: &AppState, ip_key: &str, email: &str, password: &str) -> ApiResult<PasswordRow> {
+    let account_key = email.trim().to_lowercase();
+    st.limits.login_ip.check(ip_key).map_err(ApiError::TooManyRequests)?;
+    st.limits.login_account.check(&account_key).map_err(ApiError::TooManyRequests)?;
+
+    let row: Option<PasswordRow> = sqlx::query_as(
+        "SELECT id, password_hash, disabled, totp_secret, totp_sealed, sso_exempt,
+                (SELECT count(*) FROM user_passkeys k WHERE k.user_id = users.id) AS passkeys
+           FROM users WHERE lower(email) = lower($1)",
+    )
+    .bind(email.trim())
+    .fetch_optional(&st.db)
+    .await?;
+
+    let hash = row.as_ref().map(|r| r.password_hash.clone()).unwrap_or_else(dummy_hash);
+    let ok = auth::verify_password_async(password, hash).await;
+    let Some(row) = row.filter(|_| ok) else {
+        st.limits.login_ip.fail(ip_key);
+        st.limits.login_account.fail(&account_key);
+        auth::audit(&st.db, None, "auth.login_failed", None, json!({ "email": email, "ip": ip_key })).await;
+        return Err(ApiError::Unauthorized);
+    };
+    if row.disabled {
+        return Err(ApiError::Unauthorized);
+    }
+    if st.company().sso_required && !row.sso_exempt {
+        // The same answer as a wrong password, so this doesn't confirm that the password was right.
+        auth::audit(&st.db, Some(row.id), "auth.login_denied_sso_required", Some(("user", row.id)), json!({ "ip": ip_key })).await;
+        return Err(ApiError::Unauthorized);
+    }
+    Ok(row)
+}
+
+/// Opens a session exactly as a password sign-in does: a fresh token, its row (with the
+/// browser, and the identity provider for SSO), and the user's last sign-in time.
+pub async fn open_session(st: &AppState, headers: &HeaderMap, user_id: Uuid, sso_provider: Option<Uuid>) -> ApiResult<(String, Uuid)> {
+    let token = auth::random_token();
+    let ua = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).map(|s| s.chars().take(200).collect::<String>());
+    let (session_id,): (Uuid,) = sqlx::query_as(
+        "INSERT INTO user_sessions (token_hash, user_id, expires_at, user_agent, sso_provider_id) VALUES ($1,$2,$3,$4,$5) RETURNING id",
+    )
+    .bind(auth::token_hash(&token))
+    .bind(user_id)
+    .bind(Utc::now() + Duration::days(auth::SESSION_DAYS))
+    .bind(ua)
+    .bind(sso_provider)
+    .fetch_one(&st.db)
+    .await?;
+    sqlx::query("UPDATE users SET last_login_at = now() WHERE id = $1").bind(user_id).execute(&st.db).await?;
+    Ok((token, session_id))
 }
 
 pub async fn login(
@@ -37,76 +112,58 @@ pub async fn login(
 ) -> ApiResult<impl IntoResponse> {
     let ip_key = ip.to_string();
     let account_key = body.email.trim().to_lowercase();
-    st.limits.login_ip.check(&ip_key).map_err(ApiError::TooManyRequests)?;
-    st.limits.login_account.check(&account_key).map_err(ApiError::TooManyRequests)?;
+    let row = check_password(&st, &ip_key, &body.email, &body.password).await?;
+    let user_id = row.id;
     let failed = || {
         st.limits.login_ip.fail(&ip_key);
         st.limits.login_account.fail(&account_key);
     };
-
-    #[derive(sqlx::FromRow)]
-    struct Login {
-        id: uuid::Uuid,
-        password_hash: String,
-        disabled: bool,
-        totp_secret: Option<Vec<u8>>,
-        totp_sealed: bool,
-    }
-    let row: Option<Login> =
-        sqlx::query_as("SELECT id, password_hash, disabled, totp_secret, totp_sealed FROM users WHERE lower(email) = lower($1)")
-            .bind(body.email.trim())
-            .fetch_optional(&st.db)
-            .await?;
-
-    let hash = row.as_ref().map(|r| r.password_hash.clone()).unwrap_or_else(dummy_hash);
-    let ok = auth::verify_password_async(&body.password, hash).await;
-    let Some(Login { id: user_id, disabled, totp_secret, totp_sealed, .. }) = row.filter(|_| ok) else {
-        failed();
-        auth::audit(&st.db, None, "auth.login_failed", None, json!({ "email": body.email, "ip": ip_key })).await;
-        return Err(ApiError::Unauthorized);
-    };
-    if disabled {
-        return Err(ApiError::Unauthorized);
-    }
-    if let Some(secret) = totp_secret {
-        let secret = super::totp::open(&st, &secret, totp_sealed)?;
-        let Some(code) = body.code.as_deref().map(str::trim).filter(|c| !c.is_empty()) else {
-            return Err(ApiError::MfaRequired("two-factor code required"));
-        };
-        match super::totp::check_code(&st.db, user_id, &secret, code).await? {
-            Some(super::totp::Factor::Totp) => {}
-            Some(super::totp::Factor::Recovery { remaining }) => {
-                auth::audit(&st.db, Some(user_id), "auth.recovery_code_used", Some(("user", user_id)), json!({ "remaining": remaining }))
-                    .await;
-            }
-            None => {
+    let (has_totp, has_passkey) = (row.totp_secret.is_some(), row.passkeys > 0);
+    let methods = |msg: &'static str| ApiError::MfaMethods { msg, totp: has_totp, passkey: has_passkey };
+    if has_totp || has_passkey {
+        if let Some(answer) = &body.passkey {
+            if !super::passkeys::verify_login(&st, user_id, &answer.ceremony_id, &answer.credential).await? {
                 failed();
-                auth::audit(&st.db, Some(user_id), "auth.mfa_failed", Some(("user", user_id)), json!({ "ip": ip_key })).await;
-                return Err(ApiError::MfaRequired("invalid two-factor code"));
+                auth::audit(&st.db, Some(user_id), "auth.mfa_failed", Some(("user", user_id)), json!({ "ip": ip_key, "factor": "passkey" })).await;
+                return Err(methods("passkey verification failed"));
+            }
+            auth::audit(&st.db, Some(user_id), "auth.passkey_used", Some(("user", user_id)), json!({})).await;
+        } else {
+            let Some(code) = body.code.as_deref().map(str::trim).filter(|c| !c.is_empty()) else {
+                return Err(methods("two-factor code required"));
+            };
+            let secret = match &row.totp_secret {
+                Some(stored) => Some(super::totp::open(&st, stored, row.totp_sealed)?),
+                None => None,
+            };
+            match super::totp::check_code(&st.db, user_id, secret.as_deref(), code).await? {
+                Some(super::totp::Factor::Totp) => {}
+                Some(super::totp::Factor::Recovery { remaining }) => {
+                    auth::audit(&st.db, Some(user_id), "auth.recovery_code_used", Some(("user", user_id)), json!({ "remaining": remaining }))
+                        .await;
+                }
+                None => {
+                    failed();
+                    auth::audit(&st.db, Some(user_id), "auth.mfa_failed", Some(("user", user_id)), json!({ "ip": ip_key })).await;
+                    return Err(methods("invalid two-factor code"));
+                }
             }
         }
     }
 
-    let token = auth::random_token();
-    let ua = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).map(|s| s.chars().take(200).collect::<String>());
-    let (session_id,): (Uuid,) = sqlx::query_as(
-        "INSERT INTO user_sessions (token_hash, user_id, expires_at, user_agent) VALUES ($1,$2,$3,$4) RETURNING id",
-    )
-    .bind(auth::token_hash(&token))
-    .bind(user_id)
-    .bind(Utc::now() + Duration::days(auth::SESSION_DAYS))
-    .bind(ua)
-    .fetch_one(&st.db)
-    .await?;
-    sqlx::query("UPDATE users SET last_login_at = now() WHERE id = $1").bind(user_id).execute(&st.db).await?;
+    let (token, session_id) = open_session(&st, &headers, user_id, None).await?;
     auth::audit(&st.db, Some(user_id), "auth.login", None, json!({ "ip": ip_key })).await;
 
-    let user: User = sqlx::query_as(concat!("SELECT ", auth::user_columns!("$3", "$2::uuid"), " FROM users u WHERE u.id = $1"))
-        .bind(user_id)
-        .bind(session_id)
-        .bind(st.company().require_2fa_all)
-        .fetch_one(&st.db)
-        .await?;
+    let user: User = sqlx::query_as(concat!(
+        "SELECT ",
+        auth::user_columns!("$3", "$2::uuid", "false"),
+        " FROM users u WHERE u.id = $1"
+    ))
+    .bind(user_id)
+    .bind(session_id)
+    .bind(st.company().require_2fa_all)
+    .fetch_one(&st.db)
+    .await?;
     Ok((
         AppendHeaders([(header::SET_COOKIE, auth::session_cookie(&token, st.cfg.secure_cookies()))]),
         // Token is also returned for non-browser API clients.

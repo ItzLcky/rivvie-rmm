@@ -22,6 +22,10 @@ pub struct AppState {
     pub storage: crate::storage::Storage,
     /// Triage packages being received, by action id.
     pub triage: std::sync::Mutex<std::collections::HashMap<uuid::Uuid, Vec<u8>>>,
+    /// OIDC discovery documents and signing keys of the single sign-on providers.
+    pub oidc: crate::oidc::Cache,
+    /// WebAuthn relying party and pending passkey ceremonies.
+    pub passkeys: crate::webauthn::Passkeys,
 }
 
 #[derive(Debug, Clone, Default, sqlx::FromRow)]
@@ -40,11 +44,13 @@ pub struct Company {
     pub smtp_from: String,
     /// Satisfaction surveys on resolve.
     pub csat_enabled: bool,
+    /// Password sign-in is refused for everyone but break-glass accounts.
+    pub sso_required: bool,
 }
 
 impl Company {
     pub const COLUMNS: &str = "company_name, session_idle_hours, require_2fa_all,
-        smtp_host, smtp_port, smtp_security, smtp_username, smtp_password, smtp_from, csat_enabled";
+        smtp_host, smtp_port, smtp_security, smtp_username, smtp_password, smtp_from, csat_enabled, sso_required";
 
     pub async fn load(db: &PgPool) -> sqlx::Result<Self> {
         sqlx::query_as(sqlx::AssertSqlSafe(format!("SELECT {} FROM company_settings", Self::COLUMNS))).fetch_one(db).await
