@@ -116,6 +116,11 @@ npm run test:visual:docker -- --update-snapshots    # after an intended UI chang
 
 ## Deploying
 
+For a production install, follow the [operator guide](docs/OPERATOR.md): the install path,
+TLS and proxy settings, sizing, the secrets to keep safe, backups, monitoring and upgrades. Releases
+are listed in the [changelog](CHANGELOG.md) and cut as in [docs/RELEASING.md](docs/RELEASING.md).
+The quick version:
+
 ```sh
 cp deploy/.env.example deploy/.env      # set RMM_DOMAIN, POSTGRES_PASSWORD and RMM_DATA_KEY
 docker compose -f deploy/docker-compose.yml up -d --build
@@ -231,6 +236,8 @@ Config lives in `/etc/rmm-agent/agent.toml` (mode 0600) on Linux and in
 to SYSTEM and Administrators. Windows service logs go to `C:\ProgramData\RMM\logs\agent.log`.
 
 ## Server configuration
+
+The settings most installs touch; [docs/OPERATOR.md](docs/OPERATOR.md#environment-variable-reference) has every variable.
 
 | Env var | Default | |
 |---|---|---|

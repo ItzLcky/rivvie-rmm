@@ -1559,7 +1559,9 @@ async fn previous_release_rows(admin: &Api, path: &str) {
         println!("previous release's policies: ok");
     }
     // Its documentation pages: free-text categories became category rows (see tests/upgrade.rs).
-    if let (Some(doc), Some(seeded)) = (e["doc_id"].as_str(), e["doc_seeded_id"].as_str()) {
+    // Only when the previous release had documentation to seed (`docs_seeded`, see tests/upgrade.rs).
+    if e["docs_seeded"] == true {
+        let (doc, seeded) = (e["doc_id"].as_str().expect("doc_id"), e["doc_seeded_id"].as_str().expect("doc_seeded_id"));
         let d = admin.get(&format!("/docs/{doc}")).await;
         assert_eq!((d["title"].as_str(), d["category"].as_str(), d["body"].as_str()), (Some("Alarm panel"), Some("Alarm codes"), Some("Code changes monthly.")), "{d}");
         let cats = admin.get("/doc-categories").await;
