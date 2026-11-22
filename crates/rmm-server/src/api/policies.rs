@@ -781,6 +781,19 @@ async fn check_refs(st: &AppState, u: &User, module: Module, config: &Value, own
                 script_ok(s).await?;
             }
         }
+        Module::Software => {
+            // A client's own package can only be required of that client's devices.
+            if let Some(p) = uuid(config.get("package_id")) {
+                let pkg_client: Option<Option<Uuid>> =
+                    sqlx::query_scalar("SELECT client_id FROM software_packages WHERE id = $1").bind(p).fetch_optional(&st.db).await?;
+                match pkg_client {
+                    None => return Err(ApiError::NotFound("software package")),
+                    Some(Some(c)) if !u.can_see_client(c) => return Err(ApiError::NotFound("software package")),
+                    Some(Some(c)) if owner != Some(c) => return Err(bad("that package belongs to another client".into())),
+                    _ => {}
+                }
+            }
+        }
         _ => {}
     }
     Ok(())
@@ -827,7 +840,7 @@ async fn schedule_state(db: &mut sqlx::PgConnection, item: Uuid, config: &Value)
 
 #[derive(Deserialize)]
 pub struct NewItem {
-    /// `alert` or `schedule` (the others live once, in All devices).
+    /// `alert`, `schedule` or `software` (the others live once, in All devices).
     module: String,
     name: String,
     #[serde(default = "yes")]

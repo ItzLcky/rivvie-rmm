@@ -34,6 +34,7 @@ mod search;
 mod scripts;
 mod security;
 mod servicedesk;
+mod software;
 mod services;
 mod settings;
 mod sso;
@@ -139,6 +140,20 @@ pub fn router(attachment_max: u64) -> Router<Arc<AppState>> {
         .route("/patch-runs/{id}", get(patches::run))
         .route("/patch-runs/{id}/cancel", post(patches::cancel_run))
         .route("/patch-windows", get(patches::windows))
+        .route("/software/packages", get(software::list).post(software::create))
+        .route("/software/packages/{id}", get(software::get).put(software::update).delete(software::delete))
+        .route("/software/packages/{id}/devices", get(software::package_devices))
+        .route("/software/packages/{id}/installer", axum::routing::delete(software::delete_installer))
+        .route("/software/deploy", post(software::deploy))
+        .route("/software/scan", post(software::scan))
+        .route("/software/runs", get(software::runs))
+        .route("/software/runs/{id}", get(software::run))
+        .route("/software/runs/{id}/cancel", post(software::cancel_run))
+        .route("/software/updates", get(software::updates))
+        .route("/software/updates/install", post(software::install_updates))
+        .route("/software/updates/ignore", post(software::ignore_updates))
+        .route("/agents/{id}/software", get(software::for_agent))
+        .route("/agent/software/{id}/installer", get(software::agent_installer))
         .route("/sites/{id}/maintenance-window", axum::routing::put(patches::set_window))
         .route("/agents/{id}/security", get(security::for_agent))
         .route("/agents/{id}/security/actions", post(security::start))
@@ -372,6 +387,7 @@ pub fn router(attachment_max: u64) -> Router<Arc<AppState>> {
                 .delete(security::delete_reputation_list)
                 .layer(axum::extract::DefaultBodyLimit::max(security::REPUTATION_LIST_MAX)),
         )
+        .route("/software/packages/{id}/installer", post(software::upload_installer).layer(upload_limit(1)))
         .route("/tickets/{id}/attachments", post(tickets::upload).layer(upload_limit(tickets::MAX_UPLOAD_FILES)))
         .route("/portal/tickets", post(portal::create_ticket).layer(upload_limit(portal::MAX_FILES)))
         .route("/portal/tickets/{id}/messages", post(portal::add_message).layer(upload_limit(portal::MAX_FILES)))

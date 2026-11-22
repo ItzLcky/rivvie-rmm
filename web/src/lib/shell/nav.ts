@@ -1,5 +1,5 @@
 import type { Component } from 'svelte';
-import { BarChart3, BellRing, BookOpen, CalendarDays, Clock, FileSignature, FolderKanban, Receipt, Building2, LifeBuoy, CalendarClock, FileCode2, History, LayoutDashboard, ListChecks, Monitor, PackageCheck, Settings, Shield, ShieldCheck } from '@lucide/svelte';
+import { Boxes, BarChart3, BellRing, BookOpen, CalendarDays, Clock, FileSignature, FolderKanban, Receipt, Building2, LifeBuoy, CalendarClock, FileCode2, History, LayoutDashboard, ListChecks, Monitor, PackageCheck, Settings, Shield, ShieldCheck } from '@lucide/svelte';
 import type { Role } from '#lib/types.js';
 import type { Permission } from '#lib/session.svelte.js';
 
@@ -65,7 +65,8 @@ export const nav: NavGroup[] = [
 			{ href: '/scripts', label: 'Scripts', icon: FileCode2, key: 's', scoped: true },
 			{ href: '/schedules', label: 'Schedules', icon: CalendarClock, key: 'h', scoped: true },
 			{ href: '/jobs', label: 'Jobs', icon: ListChecks, key: 'j', scoped: true },
-			{ href: '/patches', label: 'Patches', icon: PackageCheck, key: 'u', scoped: true }
+			{ href: '/patches', label: 'Patches', icon: PackageCheck, key: 'u', scoped: true },
+			{ href: '/software', label: 'Software', icon: Boxes, key: 'f', scoped: true }
 		]
 	},
 	{

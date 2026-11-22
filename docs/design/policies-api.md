@@ -66,7 +66,7 @@ from All devices down.
 
 ```json
 {
-  "id": "uuid", "module": "alert | schedule | patch | security | remote_access | agent", "name": "CPU",
+  "id": "uuid", "module": "alert | schedule | software | patch | security | remote_access | agent", "name": "CPU",
   "origin_set_id": "uuid", "origin_set_name": "Linux",
   "status": "defined | inherited | overridden",   // relative to the set being viewed
   "enabled": true, "config": { ... },             // merged, as it applies in this set
@@ -95,6 +95,7 @@ merge key by key, recursively; scalars, arrays and `null` replace.
 |---|---|---|
 | `alert` | `{kind, params, severity, channel_ids: [], notify_resolved: true, renotify_minutes: null, ticket_board_id: null, ticket_priority: 3, ticket_auto_resolve: false, run_script_id: null}` — `kind`/`params` as the old alert policies (`offline`, `cpu`, `memory`, `disk`, `service`, `job_failed`, `log`, `security`, `patch`) | everything but `kind` |
 | `schedule` | `{script_id, cron, timezone: "UTC", args: [], timeout_secs: null, retain_days: 30}` | `args`, `timeout_secs` (and `enabled`) |
+| `software` | `{package_id, state: "present" \| "latest" \| "absent", bootstrap_choco: false, window: null}` (see [software.md](software.md)) | `state`, `bootstrap_choco`, `window` (and `enabled`) |
 | `patch` | `{auto_approve_severities: [], auto_approve_categories: [], deferral_days, auto_install, reboot_policy, window: null \| {days: [0-6], start: "HH:MM", minutes: 15-1440, tz: "Europe/Berlin" \| "site"}}` | all fields |
 | `security` | `{sensor_enabled, quick_scan_hours, full_scan_days, auto_quarantine, prevention, canaries, telemetry_mb, realtime: "off\|audit\|block", scan_on_write, archive_depth, database_max_age_hours}` | all fields |
 | `remote_access` | `{desktop_enabled, desktop_consent, shell_enabled, files_enabled}` | all fields |
@@ -151,7 +152,7 @@ Paged like `/agents` (`limit`, `after`, `before`, `sort=hostname|client`, `dir`)
 ## Items
 
 ### `POST /policy-sets/{set_id}/items`
-`{module: "alert" | "schedule", name, enabled?: true, config, client_id?, site_id?}` → `ItemView`
+`{module: "alert" | "schedule" | "software", name, enabled?: true, config, client_id?, site_id?}` → `ItemView`
 (at its set). In a client's set the limit is that client (another → 400). `site_id` must belong
 to `client_id` (400). Referenced channels, boards and scripts must exist (404 / 400 "unknown
 notification channel"); a client's own script (`run_script_id`, `params.script_id` of

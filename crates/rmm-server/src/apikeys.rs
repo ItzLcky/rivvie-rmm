@@ -34,6 +34,7 @@ pub const GROUPS: &[(&str, &str)] = &[
     ("scripts", "Script library"),
     ("alerts", "Alerts"),
     ("tickets", "Tickets"),
+    ("software", "Software catalog and deployment"),
     ("security", "Endpoint protection (needs the security.read permission)"),
 ];
 

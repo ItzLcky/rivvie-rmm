@@ -18,6 +18,7 @@ mod notify;
 mod oidc;
 mod paging;
 mod patches;
+mod software;
 mod ratelimit;
 mod rotate;
 mod scheduler;
@@ -331,6 +332,7 @@ async fn serve(db: sqlx::PgPool, args: ServeArgs) -> Result<()> {
     tokio::spawn(notify::worker(state.clone()));
     tokio::spawn(scheduler::run(state.clone()));
     tokio::spawn(patches::scheduler(state.clone()));
+    tokio::spawn(software::scheduler(state.clone()));
     tokio::spawn(security::rollout_loop(state.clone()));
     tokio::spawn(email::poll_loop(state.clone(), args.mail_poll_secs));
     tokio::spawn(sla::run(state.clone()));
@@ -490,6 +492,9 @@ async fn housekeeping(state: Arc<AppState>) {
             );
             if let Err(e) = patches::prune(db).await {
                 warn!("housekeeping: pruning patches: {e}");
+            }
+            if let Err(e) = software::prune(db).await {
+                warn!("housekeeping: pruning software runs: {e}");
             }
             results.push(
                 sqlx::query("DELETE FROM agent_metrics WHERE ts < now() - make_interval(days => $1)")

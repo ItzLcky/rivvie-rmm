@@ -75,7 +75,7 @@ async fn handle(mut ws: WebSocket, state: Arc<AppState>, ip: IpAddr) -> anyhow::
             let _ = ws.close().await;
             Ok(())
         }
-        AgentMsg::Auth { protocol, agent_id, secret, agent_version, jobs, capabilities, patch_runs, security_actions } => {
+        AgentMsg::Auth { protocol, agent_id, secret, agent_version, jobs, capabilities, patch_runs, security_actions, software_runs } => {
             if protocol != PROTOCOL_VERSION {
                 send(&mut ws, &ServerMsg::AuthFailed { reason: format!("unsupported protocol {protocol}") }).await?;
                 return Ok(());
@@ -92,7 +92,7 @@ async fn handle(mut ws: WebSocket, state: Arc<AppState>, ip: IpAddr) -> anyhow::
             )
             .await?;
             crate::metrics::inc(&crate::metrics::M.agent_connects);
-            let held = Held { jobs, patch_runs, security_actions };
+            let held = Held { jobs, patch_runs, security_actions, software_runs };
             run_session(ws, state, agent_id, agent_version, held, capabilities).await
         }
         _ => Ok(()),
@@ -206,6 +206,7 @@ struct Held {
     jobs: Vec<Uuid>,
     patch_runs: Vec<Uuid>,
     security_actions: Vec<Uuid>,
+    software_runs: Vec<Uuid>,
 }
 
 async fn run_session(
@@ -274,6 +275,9 @@ async fn run_session(
     }
     if let Err(e) = crate::patches::on_connect(&state, agent_id, client_id, &capabilities, &held.patch_runs, &tx).await {
         warn!(%agent_id, "patch state on connect: {e:#}");
+    }
+    if let Err(e) = crate::software::on_connect(&state, agent_id, client_id, &capabilities, &held.software_runs).await {
+        warn!(%agent_id, "software state on connect: {e:#}");
     }
     if let Err(e) = crate::security::on_connect(&state, agent_id, client_id, &capabilities, &held.security_actions).await {
         warn!(%agent_id, "security state on connect: {e:#}");
@@ -536,6 +540,18 @@ async fn on_message(
                 let _ = tx.send(ServerMsg::PatchAck { run_id: outcome.run_id }).await;
             }
         }
+        AgentMsg::SoftwareScanResult { request_id: _, providers, error, items } => {
+            crate::software::ingest_scan(state, agent_id, client_id, providers, error, &items).await?
+        }
+        AgentMsg::SoftwareProgress { run_id, stage, message } => {
+            crate::software::ingest_progress(state, agent_id, client_id, run_id, stage, message).await?
+        }
+        AgentMsg::SoftwareResult(outcome) => {
+            crate::software::ingest_result(state, agent_id, client_id, &outcome).await?;
+            if let Some(tx) = reply.upgrade() {
+                let _ = tx.send(ServerMsg::SoftwareAck { run_id: outcome.run_id }).await;
+            }
+        }
         AgentMsg::SecurityStatus(report) => crate::security::ingest_report(state, agent_id, client_id, report).await?,
         AgentMsg::SecurityActionResult { request_id, state: phase, message, data } => {
             crate::security::ingest_action(state, agent_id, client_id, request_id, phase, message, data).await?
@@ -601,6 +617,9 @@ fn message_type(m: &AgentMsg) -> usize {
         AgentMsg::TriageChunk { .. } => 28,
         AgentMsg::ToolReply { .. } => 29,
         AgentMsg::ReputationQuery { .. } => 30,
+        AgentMsg::SoftwareScanResult { .. } => 31,
+        AgentMsg::SoftwareProgress { .. } => 32,
+        AgentMsg::SoftwareResult(_) => 33,
     }
 }
 

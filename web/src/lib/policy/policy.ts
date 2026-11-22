@@ -17,7 +17,8 @@ export const moduleLabels: Record<Module, string> = {
 	patch: 'Patching',
 	security: 'Security',
 	remote_access: 'Remote access',
-	agent: 'Agent'
+	agent: 'Agent',
+	software: 'Software'
 };
 /** Singular, for one item: "the Patching policy". */
 export const moduleNoun: Record<Module, string> = {
@@ -26,13 +27,15 @@ export const moduleNoun: Record<Module, string> = {
 	patch: 'patch policy',
 	security: 'security policy',
 	remote_access: 'remote access policy',
-	agent: 'agent policy'
+	agent: 'agent policy',
+	software: 'software requirement'
 };
 
 /** Sections of the policy set page, in order; `?section=`. */
 export const sections = [
 	{ value: 'alerts', module: 'alert' },
 	{ value: 'schedules', module: 'schedule' },
+	{ value: 'software', module: 'software' },
 	{ value: 'patching', module: 'patch' },
 	{ value: 'security', module: 'security' },
 	{ value: 'remote', module: 'remote_access' },
@@ -179,6 +182,9 @@ export const fieldLabels: Record<string, string> = {
 	'params.reboot_hours': 'Pending restart',
 	'params.failed': 'Failed installs',
 	args: 'Arguments',
+	state: 'Requirement',
+	bootstrap_choco: 'Chocolatey install',
+	package_id: 'Package',
 	timeout_secs: 'Timeout',
 	auto_approve_severities: 'Severities',
 	auto_approve_categories: 'Categories',

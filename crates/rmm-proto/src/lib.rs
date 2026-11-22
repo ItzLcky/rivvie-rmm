@@ -11,6 +11,7 @@
 pub mod desktop;
 pub mod patch;
 pub mod security;
+pub mod software;
 pub mod telemetry;
 pub mod tools;
 pub mod update;
@@ -82,6 +83,9 @@ pub enum AgentMsg {
         /// Security actions still running, or finished and not yet reported to this server.
         #[serde(default)]
         security_actions: Vec<Uuid>,
+        /// Software runs still running or awaiting [`ServerMsg::SoftwareAck`], like `patch_runs`.
+        #[serde(default)]
+        software_runs: Vec<Uuid>,
     },
     Heartbeat(Metrics),
     Inventory(Inventory),
@@ -181,6 +185,26 @@ pub enum AgentMsg {
         percent: Option<u8>,
     },
     PatchResult(patch::PatchOutcome),
+    /// Answer to [`ServerMsg::SoftwareScan`], and sent unasked after every software run.
+    SoftwareScanResult {
+        /// The request this answers; `None` for the rescan after a run.
+        #[serde(default)]
+        request_id: Option<Uuid>,
+        /// Providers this machine has: `winget`, `choco`, `apt`, `dnf`.
+        #[serde(default)]
+        providers: Vec<String>,
+        /// The scan failed; `items` is then empty and means nothing.
+        #[serde(default)]
+        error: Option<String>,
+        items: Vec<software::Status>,
+    },
+    SoftwareProgress {
+        run_id: Uuid,
+        stage: patch::PatchStage,
+        #[serde(default)]
+        message: Option<String>,
+    },
+    SoftwareResult(software::Outcome),
     /// The session's monitors and which one is shown. Sent first, and again when either changes.
     DesktopInfo {
         session_id: Uuid,
@@ -367,6 +391,26 @@ pub enum ServerMsg {
     },
     /// The server has stored this install's result; the agent can forget it.
     PatchAck {
+        run_id: Uuid,
+    },
+    /// Report what is installed of these catalog packages (only to agents listing
+    /// [`software::CAPABILITY`]); answered with [`AgentMsg::SoftwareScanResult`].
+    SoftwareScan {
+        request_id: Uuid,
+        packages: Vec<software::Package>,
+    },
+    /// Install, upgrade or remove one package. Answered with progress, then
+    /// [`AgentMsg::SoftwareResult`].
+    SoftwareRun {
+        run_id: Uuid,
+        op: software::Op,
+        package: software::Package,
+        /// Install Chocolatey first if it's the provider and the machine doesn't have it.
+        #[serde(default)]
+        bootstrap_choco: bool,
+    },
+    /// The server has stored this run's result; the agent can forget it.
+    SoftwareAck {
         run_id: Uuid,
     },
     /// Start a remote desktop session (only sent to agents listing [`desktop::CAPABILITY`]).

@@ -11,12 +11,12 @@
 //! alive. After every install the agent rescans and sends the fresh list unasked.
 
 #[cfg(any(target_os = "linux", test))]
-mod apt;
+pub(crate) mod apt;
 pub(crate) mod cmd;
 #[cfg(debug_assertions)]
 mod fake;
 #[cfg(any(target_os = "linux", test))]
-mod dnf;
+pub(crate) mod dnf;
 #[cfg(any(target_os = "linux", test))]
 mod pacman;
 #[cfg(any(target_os = "macos", test))]
@@ -114,8 +114,9 @@ struct Pending {
 
 pub struct Manager {
     provider: Option<Arc<dyn PatchProvider>>,
-    /// One scan or install at a time.
-    op: tokio::sync::Mutex<()>,
+    /// One scan or install at a time. Shared with software deployment (`crate::deploy`):
+    /// package managers lock anyway.
+    op: Arc<tokio::sync::Mutex<()>>,
     /// Scans waiting for `op`; further requests while one waits are folded into it.
     scan_waiting: std::sync::atomic::AtomicBool,
     runs: tokio::sync::Mutex<HashMap<Uuid, Pending>>,
@@ -159,9 +160,15 @@ impl Manager {
         runs.keys().copied().collect()
     }
 
-    /// Whether an install is running (the self-updater waits for it).
+    /// The lock package-manager operations (scans, installs, software runs) take.
+    pub fn op_lock(&self) -> Arc<tokio::sync::Mutex<()>> {
+        self.op.clone()
+    }
+
+    /// Whether an install is running (the self-updater waits for it), here or in software
+    /// deployment, which holds the same lock.
     pub async fn busy(&self) -> bool {
-        self.runs.lock().await.values().any(|p| p.finished.is_none())
+        self.runs.lock().await.values().any(|p| p.finished.is_none()) || self.op.try_lock().is_err()
     }
 
     /// New connection: resend finished results the server hasn't stored.

@@ -82,7 +82,7 @@ impl PatchProvider for Apt {
 
 /// `Inst libssl3 [3.0.2-0ubuntu1.10] (3.0.2-0ubuntu1.12 Ubuntu:22.04/jammy-updates, Ubuntu:22.04/jammy-security [amd64])`
 /// Only upgrades count: `Inst` lines without a `[current version]` are new dependencies.
-fn parse_simulation(out: &str) -> Vec<PatchUpdate> {
+pub(crate) fn parse_simulation(out: &str) -> Vec<PatchUpdate> {
     let mut updates = Vec::new();
     for line in out.lines() {
         let Some(rest) = line.strip_prefix("Inst ") else { continue };
