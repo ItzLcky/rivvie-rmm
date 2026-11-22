@@ -9,10 +9,44 @@
 //! cargo test -p rmm-server --test e2e_windows -- --ignored --nocapture
 //! ```
 //!
-//! It covers what the Linux suite can't: the MSI (install, upgrade over itself, uninstall),
-//! the service and its recovery settings, the `C:\ProgramData\RMM` ACL, PowerShell and cmd
-//! jobs, Job Objects killing a timed-out script's whole tree, job results surviving a
-//! service restart, and the service list.
+//! It covers what the Linux suite can't, in sections that can be run alone:
+//!
+//! - `base`: the MSI (install, upgrade over itself, uninstall), the service and its recovery
+//!   settings, the `C:\ProgramData\RMM` ACL, PowerShell and cmd jobs, Job Objects killing a
+//!   timed-out script's whole tree, job results surviving a service restart, the service list.
+//! - `shell`: a ConPTY terminal through the server's shell relay: a command and its output,
+//!   closing the terminal kills what was started from it, `exit` ends the session.
+//! - `eventlog`: Event Log watchers (`wevtutil`): an error written with `eventcreate` and
+//!   with `Write-EventLog` opens an alert; an information event doesn't.
+//! - `patches`: a Windows Update Agent scan returns a result without an error. Nothing is
+//!   installed.
+//! - `defender`: Defender's status through `Get-MpComputerStatus`, a signature update, and a
+//!   detection of the EICAR test file (built at run time: the string never sits in a file
+//!   Defender would scan).
+//! - `sensor`: the sensor starts, reports process telemetry and a behaviour detection, and
+//!   quarantines (and restores) a test file that signed content flags.
+//! - `update`: self-update with a signed build: the detached watchdog stops and starts the
+//!   service; a build that never confirms is rolled back; then the update that does confirm.
+//!   Needs two agent builds, see below.
+//!
+//! `RMM_E2E_ONLY=shell,eventlog` runs just those sections (`base` is a section too), and
+//! `RMM_E2E_SKIP=sensor` runs all but those. The install and uninstall always run.
+//!
+//! The `update` section needs the agent built with the release key and a newer build of it:
+//!
+//! ```powershell
+//! cargo run -q -p rmm-sign -- pubkey --key key.txt       # key.txt: 64 hex digits, "09" * 32
+//! $env:RMM_UPDATE_PUBKEY = "<that key>"
+//! $env:RMM_AGENT_VERSION = "99.0.0"; cargo build -p rmm-agent
+//! copy target\debug\rmm-agent.exe target\e2e-agent-new.exe
+//! Remove-Item Env:RMM_AGENT_VERSION; cargo build -p rmm-agent
+//! $env:RMM_E2E_NEW_AGENT_BIN = "target\e2e-agent-new.exe"
+//! ```
+//!
+//! Without `RMM_E2E_NEW_AGENT_BIN` (or `RMM_UPDATE_PUBKEY` in the agent) the section is
+//! skipped, and the sensor section can't load its content either (its test file is then not
+//! flagged). The e2e signs with the fixed test seed `[9; 32]`; the `e2e-windows` job in
+//! `.github/workflows/ci.yml` does all of the above.
 #![cfg(windows)]
 
 use std::net::TcpListener;
@@ -28,6 +62,15 @@ use sqlx::Connection;
 
 const ADMIN_EMAIL: &str = "admin@e2e.test";
 const ADMIN_PASSWORD: &str = "e2e-admin-password";
+/// Seed of the key that signs the e2e's agent updates and detection content (the agent is
+/// built with its public half as RMM_UPDATE_PUBKEY, and so is the server).
+const SIGNING_SEED: [u8; 32] = [9u8; 32];
+const ROOT_SET: &str = "00000000-0000-4000-8001-000000000000";
+const SECURITY_ITEM: &str = "00000000-0000-4000-8000-000000000002";
+
+fn content_pubkey() -> String {
+    hex::encode(ed25519_dalek::SigningKey::from_bytes(&SIGNING_SEED).verifying_key().as_bytes())
+}
 
 fn agent_bin() -> PathBuf {
     if let Some(p) = std::env::var_os("RMM_E2E_AGENT_BIN") {
@@ -99,6 +142,31 @@ impl Api {
         let (s, v) = self.call(reqwest::Method::POST, path, Some(body)).await;
         assert!(s.is_success(), "POST {path}: {s} {v}");
         v
+    }
+
+    /// An alert policy in All devices: `kind` and `params` as the alert policy form has them.
+    async fn alert_policy(&self, name: &str, kind: &str, severity: &str, params: Value) -> Value {
+        let body = json!({ "module": "alert", "name": name, "config": { "kind": kind, "severity": severity, "params": params } });
+        let (s, v) = self.call(reqwest::Method::POST, &format!("/policy-sets/{ROOT_SET}/items"), Some(body.clone())).await;
+        assert!(s.is_success(), "creating alert policy {body}: {s} {v}");
+        v
+    }
+
+    async fn delete_policy(&self, id: &str) {
+        let (s, v) = self.call(reqwest::Method::DELETE, &format!("/policy-items/{id}"), None).await;
+        assert!(s.is_success(), "deleting policy {id}: {s} {v}");
+    }
+
+    /// Changes some fields of a single-instance item (security, ...) in All devices.
+    async fn set_root_item(&self, item: &str, fields: Value) -> (StatusCode, Value) {
+        let set = self.get(&format!("/policy-sets/{ROOT_SET}")).await;
+        let mut config = set["policies"].as_array().unwrap().iter().find(|p| p["id"] == item).unwrap()["item_config"].clone();
+        config.as_object_mut().unwrap().extend(fields.as_object().unwrap().clone());
+        self.call(reqwest::Method::PUT, &format!("/policy-items/{item}"), Some(json!({ "config": config }))).await
+    }
+
+    async fn alerts(&self, query: &str) -> Vec<Value> {
+        self.get(&format!("/alerts?{query}")).await["items"].as_array().cloned().unwrap_or_default()
     }
 
     async fn run(&self, interpreter: &str, agent: &str, body: &str, timeout: i32) -> String {
@@ -200,6 +268,9 @@ async fn windows_end_to_end() {
         .env("RMM_AGENT_DIR", dir.join("agents"))
         .env("RMM_STORAGE_DIR", dir.join("storage"))
         .env("RMM_HEARTBEAT_SECS", "5")
+        .env("RMM_ALERT_EVAL_SECS", "2")
+        .env("RMM_UPDATE_PUBKEY", content_pubkey())
+        .env("RMM_CONTENT_SOAK_MINUTES", "0")
         .env("RMM_ADMIN_EMAIL", ADMIN_EMAIL)
         .env("RMM_ADMIN_PASSWORD", ADMIN_PASSWORD)
         .env("RMM_DATA_KEY", "ab".repeat(32))
@@ -275,6 +346,35 @@ async fn run(url: String, dir: PathBuf) {
     let install_log = std::fs::read_to_string(data.join("logs").join("install.log")).unwrap_or_default();
     assert!(install_log.contains("ok: enrolled as"), "{install_log}");
 
+    let sections = Sections::from_env();
+    if sections.on("base") {
+        base_checks(&admin, &http, &dir, &id, site, &token, msi_url, &msi).await;
+    }
+    sections.run_extra(&admin, &url, &dir, &id).await;
+
+    // --- uninstall --------------------------------------------------------------------------------
+    // What a self-update leaves beside the binary goes with it.
+    let leftovers: Vec<PathBuf> =
+        ["rmm-agent.old.exe", "rmm-agent.new.exe"].iter().map(|n| program_files.with_file_name(n)).filter(|p| p.exists()).collect();
+    msiexec(&dir, &["/x", msi.to_str().unwrap()], "uninstall.log");
+    assert_eq!(service_state(), None, "the service is removed");
+    assert!(!program_files.exists(), "the binary is removed");
+    for p in &leftovers {
+        assert!(!p.exists(), "uninstall removes {} too", p.display());
+    }
+    assert!(data.join("agent.toml").exists(), "the enrollment is kept for a reinstall");
+    eventually(60, "the agent to go offline", || async {
+        (admin.get(&format!("/agents/{id}")).await["online"] == false).then_some(())
+    })
+    .await;
+    let _ = std::fs::remove_dir_all(&data);
+    println!("windows e2e: ok");
+}
+
+/// Jobs, a restart, services and an MSI upgrade over the running service.
+#[allow(clippy::too_many_arguments)]
+async fn base_checks(admin: &Api, http: &reqwest::Client, dir: &Path, id: &str, site: &str, token: &Value, msi_url: &str, msi: &Path) {
+    let id = id.to_string();
     // --- jobs ------------------------------------------------------------------------------------
     let j = admin.run("powershell", &id, "Write-Output 'hello from powershell'; [Console]::Error.WriteLine('oops'); exit 3", 60).await;
     let j = admin.wait_job(&j, 90).await;
@@ -326,8 +426,8 @@ async fn run(url: String, dir: PathBuf) {
     };
     let uses_before = token_uses().await;
     let res = http.get(msi_url).send().await.unwrap();
-    std::fs::write(&msi, res.bytes().await.unwrap()).unwrap();
-    msiexec(&dir, &["/i", msi.to_str().unwrap()], "upgrade.log");
+    std::fs::write(msi, res.bytes().await.unwrap()).unwrap();
+    msiexec(dir, &["/i", msi.to_str().unwrap()], "upgrade.log");
     assert_eq!(service_state().as_deref(), Some("RUNNING"), "running again after the upgrade");
     let (_, products) = powershell(
         "@(Get-ItemProperty HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\* | Where-Object DisplayName -eq 'RMM Agent').Count",
@@ -340,15 +440,544 @@ async fn run(url: String, dir: PathBuf) {
     .await;
     assert_eq!(token_uses().await, uses_before, "keeping the enrollment doesn't spend a token use");
 
-    // --- uninstall --------------------------------------------------------------------------------
-    msiexec(&dir, &["/x", msi.to_str().unwrap()], "uninstall.log");
-    assert_eq!(service_state(), None, "the service is removed");
-    assert!(!program_files.exists(), "the binary is removed");
-    assert!(data.join("agent.toml").exists(), "the enrollment is kept for a reinstall");
-    eventually(60, "the agent to go offline", || async {
-        (admin.get(&format!("/agents/{id}")).await["online"] == false).then_some(())
+}
+
+// =====================================================================================================
+// Sections
+// =====================================================================================================
+
+/// Which sections to run: `RMM_E2E_ONLY=a,b` only those, `RMM_E2E_SKIP=a,b` all but those.
+struct Sections {
+    only: Option<Vec<String>>,
+    skip: Vec<String>,
+}
+
+impl Sections {
+    const ALL: [&str; 7] = ["base", "shell", "eventlog", "patches", "defender", "sensor", "update"];
+
+    fn from_env() -> Self {
+        let list = |k: &str| {
+            std::env::var(k).ok().map(|v| v.split(',').map(|s| s.trim().to_ascii_lowercase()).filter(|s| !s.is_empty()).collect::<Vec<_>>())
+        };
+        let s = Self { only: list("RMM_E2E_ONLY"), skip: list("RMM_E2E_SKIP").unwrap_or_default() };
+        for n in s.only.iter().flatten().chain(&s.skip) {
+            assert!(Self::ALL.contains(&n.as_str()), "unknown section {n:?} in RMM_E2E_ONLY/RMM_E2E_SKIP; the sections are {:?}", Self::ALL);
+        }
+        s
+    }
+
+    fn on(&self, name: &str) -> bool {
+        self.only.as_ref().is_none_or(|o| o.iter().any(|n| n == name)) && !self.skip.iter().any(|n| n == name)
+    }
+
+    /// Everything after the base checks and before the uninstall. The self-update goes last: it
+    /// replaces the agent's binary.
+    async fn run_extra(&self, admin: &Api, url: &str, dir: &Path, id: &str) {
+        for name in &Self::ALL[1..] {
+            if !self.on(name) {
+                println!("section {name}: not selected");
+                continue;
+            }
+            println!("section {name}: start");
+            let started = Instant::now();
+            match *name {
+                "shell" => shell(admin, url, id).await,
+                "eventlog" => eventlog(admin, id).await,
+                "patches" => patches(admin, id).await,
+                "defender" => defender(admin, dir, id).await,
+                "sensor" => sensor(admin, dir, id).await,
+                "update" => update(admin, dir, id).await,
+                _ => unreachable!(),
+            }
+            println!("section {name}: ok in {} s", started.elapsed().as_secs());
+        }
+    }
+}
+
+// --- ConPTY shells --------------------------------------------------------------------------------------
+
+type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// A browser terminal: the shell relay's WebSocket, with what it has said so far.
+struct Term {
+    ws: Ws,
+    out: String,
+    opened: bool,
+    closed: Option<Value>,
+}
+
+impl Term {
+    async fn connect(url: &str, cookie: &str, id: &str) -> Term {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let mut req = format!("{}/api/agents/{id}/shell?cols=120&rows=30", url.replacen("http", "ws", 1)).into_client_request().unwrap();
+        req.headers_mut().insert("cookie", cookie.parse().unwrap());
+        let (ws, _) = tokio_tungstenite::connect_async(req).await.expect("the shell socket");
+        Term { ws, out: String::new(), opened: false, closed: None }
+    }
+
+    /// Reads until `done` holds (or the session closes, if `done` is about that), at most `secs`.
+    async fn until(&mut self, secs: u64, what: &str, done: impl Fn(&Term) -> bool) {
+        use futures_util::StreamExt;
+        use tokio_tungstenite::tungstenite::Message;
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        while !done(self) {
+            let left = deadline.checked_duration_since(Instant::now()).unwrap_or_default();
+            assert!(!left.is_zero(), "timed out waiting for: {what}\nterminal output so far: {:?}\nclosed: {:?}", self.out, self.closed);
+            match tokio::time::timeout(left, self.ws.next()).await {
+                Ok(Some(Ok(Message::Binary(b)))) => self.out.push_str(&String::from_utf8_lossy(&b)),
+                Ok(Some(Ok(Message::Text(t)))) => {
+                    let v: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
+                    match v["type"].as_str() {
+                        Some("opened") => self.opened = true,
+                        Some("closed") => self.closed = Some(v),
+                        _ => {}
+                    }
+                }
+                Ok(Some(Ok(_))) => {}
+                Ok(Some(Err(_)) | None) => {
+                    assert!(self.closed.is_some() || done(self), "the socket ended while waiting for: {what}\noutput: {:?}", self.out);
+                    return;
+                }
+                Err(_) => {} // the deadline check above reports it
+            }
+        }
+    }
+
+    async fn send(&mut self, text: &str) {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::Message;
+        self.ws.send(Message::Binary(text.as_bytes().to_vec().into())).await.unwrap();
+    }
+
+    async fn send_json(&mut self, v: Value) {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::Message;
+        self.ws.send(Message::Text(v.to_string().into())).await.unwrap();
+    }
+}
+
+/// A technician's session cookie (the admin's has two-factor sign-in on it, which is more than
+/// a WebSocket test needs).
+async fn technician_cookie(url: &str, admin: &Api, email: &str) -> String {
+    admin
+        .post("/users", json!({ "email": email, "name": "Shell Tech", "password": "shell-password-123", "role": "technician", "all_clients": true }))
+        .await;
+    let res = reqwest::Client::new()
+        .post(format!("{url}/api/auth/login"))
+        .json(&json!({ "email": email, "password": "shell-password-123" }))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success(), "technician sign-in: {}", res.status());
+    res.headers()["set-cookie"].to_str().unwrap().split(';').next().unwrap().to_string()
+}
+
+async fn shell(admin: &Api, url: &str, id: &str) {
+    let cookie = technician_cookie(url, admin, "shell@e2e.test").await;
+
+    // A command, and what it prints (the arithmetic keeps the answer out of the typed echo).
+    let mut t = Term::connect(url, &cookie, id).await;
+    t.until(30, "the terminal to open", |t| t.opened).await;
+    t.send("$n = 6 * 7; \"shell-$n-ok\"\r").await;
+    t.until(60, "the command's output", |t| t.out.contains("shell-42-ok")).await;
+    assert!(t.out.contains("PS ") || t.out.contains("shell-42-ok"), "a PowerShell prompt came with it: {:?}", t.out);
+
+    // Resizing reaches the console PowerShell sees.
+    t.send_json(json!({ "type": "resize", "cols": 90, "rows": 25 })).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    t.send("\"w=\" + ($Host.UI.RawUI.WindowSize.Width + 1000)\r").await;
+    t.until(30, "the console to have the new width", |t| t.out.contains("w=1090")).await;
+
+    // Closing the terminal kills what was started from it, grandchildren included.
+    let marker = format!("rmm-e2e-shell-{}", uuid::Uuid::new_v4().simple());
+    t.send(&format!("Start-Process cmd.exe -WindowStyle Hidden -ArgumentList '/c','ping -n 600 127.0.0.1 >nul & rem {marker}'\r")).await;
+    eventually(60, "the process started from the terminal", || async { (processes_with(&marker) > 0).then_some(()) }).await;
+    let _ = t.ws.close(None).await;
+    drop(t);
+    eventually(30, "closing the terminal to kill what it started", || async { (processes_with(&marker) == 0).then_some(()) }).await;
+
+    // `exit` ends the session: the console is told (a ConPTY's pipe doesn't close by itself).
+    let mut t = Term::connect(url, &cookie, id).await;
+    t.until(30, "the second terminal to open", |t| t.opened).await;
+    t.send("exit\r").await;
+    t.until(30, "the session to report that the shell exited", |t| t.closed.is_some()).await;
+    assert_eq!(t.closed.as_ref().unwrap()["reason"], "shell exited");
+
+    // The server recorded both sessions.
+    let log = admin.get(&format!("/agents/{id}/activity")).await;
+    let actions: Vec<&str> = log.as_array().into_iter().flatten().filter_map(|e| e["action"].as_str()).collect();
+    assert!(actions.contains(&"shell.open"), "{actions:?}");
+}
+
+// --- Event Log watchers ---------------------------------------------------------------------------------
+
+async fn eventlog(admin: &Api, id: &str) {
+    let marker = format!("rmm-e2e-evt-{}", uuid::Uuid::new_v4().simple());
+    let pol = admin
+        .alert_policy("Event log marker", "log", "warning", json!({ "channels": ["Application"], "min_level": "error", "pattern": marker }))
+        .await;
+    let pol_id = pol["id"].as_str().unwrap().to_string();
+    // The watcher set reaches the agent, which notes where each log ends; only later events count.
+    tokio::time::sleep(Duration::from_secs(8)).await;
+
+    let (ok, out) = sh(
+        "eventcreate.exe",
+        &["/T", "ERROR", "/ID", "777", "/L", "APPLICATION", "/SO", "RmmE2E", "/D", &format!("written by eventcreate {marker}")],
+    );
+    assert!(ok, "eventcreate: {out}");
+    // Below the watcher's level: no alert, no entry.
+    let (ok, out) = sh(
+        "eventcreate.exe",
+        &["/T", "INFORMATION", "/ID", "778", "/L", "APPLICATION", "/SO", "RmmE2E", "/D", &format!("information only {marker}")],
+    );
+    assert!(ok, "eventcreate: {out}");
+    // The other way to write one; a new source can take a moment to register, so this one is
+    // checked only if it was written.
+    let (wrote, out) = powershell(&format!(
+        "$ErrorActionPreference = 'Stop'; New-EventLog -LogName Application -Source RmmE2EPs -ErrorAction SilentlyContinue; \
+         Write-EventLog -LogName Application -Source RmmE2EPs -EntryType Error -EventId 4242 -Message 'written by Write-EventLog {marker}'"
+    ));
+    if !wrote {
+        println!("Write-EventLog failed; checking eventcreate only: {out}");
+    }
+
+    // Polled every 30 s, then the alert evaluation.
+    let alert = eventually(150, "an alert for the event", || async { admin.alerts(&format!("policy_id={pol_id}")).await.into_iter().next() }).await;
+    assert!(alert["details"]["message"].as_str().unwrap_or_default().contains(&marker), "{alert}");
+    let entries = eventually(60, "the log entries", || async {
+        let e = admin.get(&format!("/agents/{id}/log-events?q={marker}")).await;
+        let n = e.as_array().map_or(0, |a| a.len());
+        (n >= if wrote { 2 } else { 1 }).then_some(e)
     })
     .await;
-    let _ = std::fs::remove_dir_all(&data);
-    println!("windows e2e: ok");
+    let entries = entries.as_array().unwrap();
+    let by_id = |event_id: i64| entries.iter().find(|e| e["event_id"] == event_id);
+    let e = by_id(777).unwrap_or_else(|| panic!("the eventcreate event (id 777): {entries:?}"));
+    assert_eq!((e["source"].as_str(), e["level"].as_str()), (Some("RmmE2E"), Some("error")), "{e}");
+    assert!(e["message"].as_str().unwrap().contains(&marker), "the rendered message: {e}");
+    if wrote {
+        assert!(by_id(4242).is_some(), "the Write-EventLog event (id 4242): {entries:?}");
+    }
+    assert!(by_id(778).is_none(), "an information event is below the watcher's level: {entries:?}");
+    admin.delete_policy(&pol_id).await;
+}
+
+// --- Windows Update ---------------------------------------------------------------------------------------
+
+/// Failures that mean this machine can't reach Windows Update, not that the agent can't use it.
+const WU_UNREACHABLE: [&str; 6] = ["0x80072EE7", "0x80072EFD", "0x80072EE2", "0x8024402C", "0x80244010", "0x80070422"];
+
+async fn patches(admin: &Api, id: &str) {
+    // Hosted runners ship with the Windows Update service switched off.
+    let (_, out) = powershell("Set-Service wuauserv -StartupType Manual -ErrorAction SilentlyContinue; Start-Service wuauserv -ErrorAction SilentlyContinue; (Get-Service wuauserv).Status");
+    println!("Windows Update service: {}", out.trim());
+
+    admin.post("/patches/scan", json!({ "agent_ids": [id] })).await;
+    // A first search can take minutes: it contacts Windows Update.
+    let p = eventually(600, "the patch scan to finish", || async {
+        let p = admin.get(&format!("/agents/{id}/patches")).await;
+        (!p["status"]["scanned_at"].is_null() || !p["status"]["scan_error"].is_null()).then_some(p)
+    })
+    .await;
+    let status = &p["status"];
+    assert_eq!(status["supported"], true, "the agent offers patching on Windows: {status}");
+    let provider = status["provider"].as_str().unwrap_or_default();
+    assert!(provider == "wua" || provider == "pswindowsupdate", "provider: {status}");
+    match status["scan_error"].as_str() {
+        None => println!("patch scan with {provider}: {} updates missing, reboot pending: {}", p["patches"].as_array().map_or(0, |a| a.len()), status["reboot_pending"]),
+        Some(err) if WU_UNREACHABLE.iter().any(|c| err.contains(c)) => {
+            println!("this machine can't reach Windows Update ({err}); the scan failed the way it should, not asserting more");
+        }
+        Some(err) => panic!("the Windows Update scan failed with {provider}: {err}"),
+    }
+    assert!(status["reboot_pending"].is_boolean(), "reboot state is reported: {status}");
+}
+
+// --- Defender ---------------------------------------------------------------------------------------------
+
+/// The EICAR test file, cut in pieces so it exists whole only in the script that writes it
+/// (and never in this source, the binary or a file Defender would scan before then).
+const EICAR_PS: &str = r"$e = 'X5O!P%@AP[4\PZX54(P^)7CC)7}$' + 'EICAR-STANDARD-ANTIVIRUS-TEST-FILE!' + '$H+H*';";
+
+async fn security_state(admin: &Api, id: &str) -> Value {
+    admin.get(&format!("/agents/{id}/security")).await
+}
+
+fn product<'a>(s: &'a Value, kind: &str) -> Option<&'a Value> {
+    s["products"].as_array()?.iter().find(|p| p["kind"] == kind)
+}
+
+async fn wait_security_action(admin: &Api, id: &str, action: &str, secs: u64) -> Value {
+    let started = admin.post(&format!("/agents/{id}/security/actions"), json!({ "action": action })).await;
+    let action_id = started["id"].as_str().unwrap().to_string();
+    eventually(secs, &format!("security action {action}"), || async {
+        let s = security_state(admin, id).await;
+        let a = s["actions"].as_array()?.iter().find(|a| a["id"] == action_id.as_str())?.clone();
+        (!matches!(a["status"].as_str(), Some("sent" | "running"))).then_some(a)
+    })
+    .await
+}
+
+async fn defender(admin: &Api, dir: &Path, id: &str) {
+    admin.post(&format!("/agents/{id}/security/refresh"), json!({})).await;
+    let s = eventually(120, "Defender's status", || async {
+        let s = security_state(admin, id).await;
+        product(&s, "defender").is_some().then_some(s)
+    })
+    .await;
+    assert_eq!(s["supported"], true, "{s}");
+    let d = product(&s, "defender").unwrap().clone();
+    println!("Defender: {d}");
+    if d["enabled"] != true {
+        println!("Defender isn't running on this machine ({}); status reporting works, skipping the rest", d["detail"]);
+        return;
+    }
+    assert!(d["version"].is_string() && d["signature_version"].is_string() && !d["signatures_updated_at"].is_null(), "versions come from Get-MpComputerStatus: {d}");
+    assert!(d["actions"].as_array().is_some_and(|a| a.len() == 3), "scans and signature updates are offered: {d}");
+
+    // A signature update may fail without a connection; it must finish either way.
+    let a = wait_security_action(admin, id, "update_signatures", 360).await;
+    println!("update_signatures: {} ({})", a["status"], a["message"]);
+    assert!(matches!(a["status"].as_str(), Some("succeeded" | "failed")), "{a}");
+
+    // The EICAR test file: found by a scan of its folder (or by real-time protection when the
+    // file is written), reported as a detection.
+    let folder = dir.join("eicar");
+    std::fs::create_dir_all(&folder).unwrap();
+    let file = folder.join("eicar-test.com");
+    let (wrote, out) = powershell(&format!("{EICAR_PS} Set-Content -NoNewline -Encoding ascii -Path '{}' -Value $e", file.display()));
+    println!("wrote the test file: {wrote} {}", out.trim());
+    let (_, out) = powershell(&format!("Start-MpScan -ScanType CustomScan -ScanPath '{}'", folder.display()));
+    println!("custom scan: {}", out.trim());
+    let found = eventually(240, "Defender's detection of the test file", || async {
+        admin.post(&format!("/agents/{id}/security/refresh"), json!({})).await;
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let s = security_state(admin, id).await;
+        s["detections"].as_array()?.iter().find(|d| d["name"].as_str().is_some_and(|n| n.to_ascii_uppercase().contains("EICAR"))).cloned()
+    })
+    .await;
+    println!("detection: {found}");
+    assert_eq!(found["product"], "defender", "{found}");
+    assert!(found["detected_at"].is_string(), "{found}");
+}
+
+// --- the sensor ---------------------------------------------------------------------------------------------
+
+fn signed(bundle: &Value) -> Value {
+    use ed25519_dalek::Signer;
+    use sha2::Digest;
+    let text = serde_json::to_string_pretty(bundle).unwrap();
+    let sha = hex::encode(sha2::Sha256::digest(text.as_bytes()));
+    let version = bundle["version"].as_str().unwrap();
+    let sig = ed25519_dalek::SigningKey::from_bytes(&SIGNING_SEED).sign(&rmm_proto::security::content_signed_message(version, &sha));
+    json!({ "bundle": text, "signature": { "version": version, "sha256": sha, "signature": hex::encode(sig.to_bytes()) } })
+}
+
+/// Detection content for Windows: a file with a marker string, and a process with a marker on
+/// its command line.
+fn sensor_bundle(version: &str) -> Value {
+    let proc_ev = |cmd: &str| {
+        json!({ "ts": "2026-11-10T00:00:00Z", "kind": "process", "action": "start", "process": { "pid": 9, "name": "cmd.exe", "command_line": cmd } })
+    };
+    json!({
+        "version": version, "created_at": chrono::Utc::now(), "description": "Windows e2e content", "hashes": [],
+        "file_rules": [{
+            "id": "E2E-F-1", "name": "E2E test malware", "severity": "high", "confidence": "high", "mode": "alert", "mitre": ["T1204"],
+            "strings": [{ "text": "RMM-E2E-MALWARE" }],
+            "tests": [{ "text": "x RMM-E2E-MALWARE x", "expect": true }, { "text": "clean", "expect": false }]
+        }],
+        "behaviour_rules": [{
+            "id": "E2E-B-1", "name": "E2E marker process", "severity": "high", "confidence": "high", "mode": "alert", "mitre": ["T1059"],
+            "event": "process", "actions": ["start"], "when": { "field": "process.command_line", "op": "contains", "value": "rmm-e2e-marker" },
+            "tests": [{ "event": proc_ev("cmd.exe /c ping rmm-e2e-marker"), "expect": true }, { "event": proc_ev("cmd.exe /c ping"), "expect": false }]
+        }]
+    })
+}
+
+async fn detections_for(admin: &Api, id: &str, rule: &str) -> Vec<Value> {
+    admin.get(&format!("/security/detections?view=all&audit=true&agent_id={id}&rule_id={rule}")).await["items"].as_array().cloned().unwrap_or_default()
+}
+
+/// A process with the marker on its command line, alive for `secs` (polling sees it).
+async fn marker_process(admin: &Api, id: &str, secs: u32) {
+    let j = admin
+        .run(
+            "powershell",
+            id,
+            &format!("Start-Process cmd.exe -Wait -WindowStyle Hidden -ArgumentList '/c','ping -n {secs} 127.0.0.1 >nul & rem rmm-e2e-marker'"),
+            120,
+        )
+        .await;
+    let j = admin.wait_job(&j, 120).await;
+    assert_eq!(j["status"], "succeeded", "{j}");
+}
+
+async fn sensor(admin: &Api, dir: &Path, id: &str) {
+    let respond = |action: Value| async move {
+        let v = admin.post(&format!("/agents/{id}/security/respond"), json!({ "action": action })).await;
+        v["id"].as_str().unwrap().to_string()
+    };
+    let wait_action = |action_id: String| async move {
+        eventually(120, &format!("response action {action_id}"), || async {
+            let s = security_state(admin, id).await;
+            let a = s["actions"].as_array()?.iter().find(|a| a["id"] == action_id.as_str())?.clone();
+            (!matches!(a["status"].as_str(), Some("sent" | "running"))).then_some(a)
+        })
+        .await
+    };
+
+    let s = security_state(admin, id).await;
+    assert_eq!(s["sensor_supported"], true, "the sensor is available on Windows: {s}");
+    let policy = |on: bool| {
+        json!({ "sensor_enabled": on, "quick_scan_hours": 0, "full_scan_days": 0, "auto_quarantine": true, "prevention": false, "canaries": false, "telemetry_mb": 16 })
+    };
+    let (st, v) = admin.set_root_item(SECURITY_ITEM, policy(true)).await;
+    assert!(st.is_success(), "{v}");
+    eventually(60, "the sensor to start", || async { (security_state(admin, id).await["sensor"]["running"] == true).then_some(()) }).await;
+
+    // Process telemetry: polling sees a process that lives a few seconds.
+    marker_process(admin, id, 10).await;
+    eventually(60, "the marker process in the telemetry", || async {
+        let t = admin.get(&format!("/agents/{id}/telemetry?text=rmm-e2e-marker&kinds=process")).await;
+        t["events"].as_array().filter(|e| !e.is_empty()).map(|_| ())
+    })
+    .await;
+
+    // Detection content: needs the agent built with the release key.
+    let up = admin.post("/security/content", signed(&sensor_bundle("e2e.1"))).await;
+    println!("content uploaded: {}", up["stage"]);
+    let loaded = {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            if security_state(admin, id).await["content_version"] == "e2e.1" {
+                break true;
+            }
+            if Instant::now() > deadline {
+                break false;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    };
+    if !loaded {
+        println!("the agent didn't load the signed content (built without RMM_UPDATE_PUBKEY?); skipping the detection checks");
+    } else {
+        // A behaviour rule on the process command line.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        marker_process(admin, id, 10).await;
+        let hit = eventually(60, "the behaviour detection", || async { detections_for(admin, id, "E2E-B-1").await.into_iter().next() }).await;
+        assert_eq!(hit["source"], "behaviour", "{hit}");
+
+        // A file the content flags: scan, quarantine (the original is gone), restore.
+        let bad = dir.join("scan").join("sub").join("payload.bin");
+        std::fs::create_dir_all(bad.parent().unwrap()).unwrap();
+        std::fs::write(&bad, b"header RMM-E2E-MALWARE trailer").unwrap();
+        let scan = respond(json!({ "type": "scan_path", "path": dir.join("scan").to_string_lossy() })).await;
+        let a = wait_action(scan).await;
+        assert_eq!(a["status"], "succeeded", "{a}");
+        assert!(a["message"].as_str().unwrap().starts_with("Found 1 threat"), "{a}");
+        let d = eventually(30, "the file detection", || async { detections_for(admin, id, "E2E-F-1").await.into_iter().next() }).await;
+        assert_eq!((d["status"].as_str(), d["action_taken"].as_str()), (Some("quarantined"), Some("quarantined")), "{d}");
+        eventually(30, "the file to leave its place", || async { (!bad.exists()).then_some(()) }).await;
+        let q = eventually(30, "the quarantine list", || async {
+            admin.get(&format!("/security/quarantine?agent_id={id}")).await.as_array().unwrap().first().cloned()
+        })
+        .await;
+        assert_eq!(q["sha256"], d["sha256"], "{q}");
+        let restore = admin.post(&format!("/agents/{id}/security/respond"), json!({ "action": { "type": "restore_file", "id": q["id"] }, "exclude_hash": true })).await;
+        let a = wait_action(restore["id"].as_str().unwrap().to_string()).await;
+        assert_eq!(a["status"], "succeeded", "{a}");
+        assert_eq!(std::fs::read(&bad).unwrap(), b"header RMM-E2E-MALWARE trailer", "restored byte for byte");
+    }
+
+    // Off again: the sensor stops.
+    let (st, v) = admin.set_root_item(SECURITY_ITEM, policy(false)).await;
+    assert!(st.is_success(), "{v}");
+    eventually(60, "the sensor to stop", || async { (security_state(admin, id).await["sensor"]["running"] != true).then_some(()) }).await;
+}
+
+// --- self-update ----------------------------------------------------------------------------------------------
+
+fn file_sha256(p: &Path) -> String {
+    use sha2::Digest;
+    hex::encode(sha2::Sha256::digest(std::fs::read(p).unwrap_or_else(|e| panic!("reading {}: {e}", p.display()))))
+}
+
+/// Offers `bin` as release `version` of the Windows agent: the binary in the server's agent
+/// directory, and the manifest next to it, signed.
+fn publish_release(dir: &Path, bin: &Path, version: &str) {
+    use ed25519_dalek::Signer;
+    let target = dir.join("agents").join("rmm-agent-windows-x86_64.exe");
+    std::fs::copy(bin, &target).unwrap();
+    let sha = file_sha256(&target);
+    let sig = ed25519_dalek::SigningKey::from_bytes(&SIGNING_SEED).sign(&rmm_proto::update::signed_message("windows-x86_64", version, &sha));
+    std::fs::write(
+        dir.join("agents").join("rmm-agent-windows-x86_64.exe.update.json"),
+        json!({ "platform": "windows-x86_64", "version": version, "sha256": sha, "signature": hex::encode(sig.to_bytes()) }).to_string(),
+    )
+    .unwrap();
+}
+
+async fn wait_update(admin: &Api, id: &str, secs: u64, finished: &[&str]) -> Value {
+    eventually(secs, &format!("the update to reach one of {finished:?}"), || async {
+        let a = admin.get(&format!("/agents/{id}")).await;
+        match a["update_state"].as_str() {
+            Some(s) if finished.contains(&s) => Some(a),
+            Some("failed") => panic!("the update failed: {}", a["update_detail"]),
+            _ => None,
+        }
+    })
+    .await
+}
+
+async fn update(admin: &Api, dir: &Path, id: &str) {
+    let Some(new_bin) = std::env::var_os("RMM_E2E_NEW_AGENT_BIN").map(PathBuf::from) else {
+        println!("RMM_E2E_NEW_AGENT_BIN isn't set (see the module docs); skipping the self-update");
+        return;
+    };
+    let installed = PathBuf::from(std::env::var("ProgramFiles").unwrap()).join("RMM").join("rmm-agent.exe");
+    let update_log = PathBuf::from(std::env::var("ProgramData").unwrap()).join("RMM").join("logs").join("update.log");
+    let old_version = admin.get(&format!("/agents/{id}")).await["agent_version"].as_str().unwrap().to_string();
+    let hash_before = file_sha256(&installed);
+    let hash_new = file_sha256(&new_bin);
+    assert_ne!(hash_before, hash_new, "the new build differs from the installed one");
+    assert!(admin.get("/agent-updates").await["auto_update"] != true, "nothing offers updates by itself here");
+
+    // A build that never confirms: it runs as 99.0.0 but was offered as 99.0.1, so the version
+    // the watchdog waits for never checks in. After 120 s the watchdog puts the old one back.
+    publish_release(dir, &new_bin, "99.0.1");
+    let offered = admin.post(&format!("/agents/{id}/update"), json!({})).await;
+    assert_eq!(offered["version"], "99.0.1", "{offered}");
+    let a = wait_update(admin, id, 480, &["rolled_back"]).await;
+    assert!(a["update_detail"].as_str().unwrap_or_default().contains("didn't connect"), "{a}");
+    eventually(120, "the old agent back online", || async {
+        let a = admin.get(&format!("/agents/{id}")).await;
+        (a["online"] == true && a["agent_version"] == old_version.as_str()).then_some(())
+    })
+    .await;
+    assert_eq!(service_state().as_deref(), Some("RUNNING"), "the service runs after the rollback");
+    assert_eq!(file_sha256(&installed), hash_before, "the old binary is back, byte for byte");
+    let log = std::fs::read_to_string(&update_log).unwrap_or_default();
+    assert!(log.contains("rolling back"), "the watchdog logs to update.log: {log}");
+
+    // The update that does confirm: the watchdog stops the service, swaps the binary, starts it.
+    publish_release(dir, &new_bin, "99.0.0");
+    admin.post(&format!("/agents/{id}/update"), json!({})).await;
+    wait_update(admin, id, 300, &["completed"]).await;
+    eventually(120, "the new agent online", || async {
+        let a = admin.get(&format!("/agents/{id}")).await;
+        (a["online"] == true && a["agent_version"] == "99.0.0").then_some(())
+    })
+    .await;
+    assert_eq!(service_state().as_deref(), Some("RUNNING"));
+    assert_eq!(file_sha256(&installed), hash_new, "the new binary is in place");
+    eventually(60, "the watchdog to log the confirmation", || async {
+        std::fs::read_to_string(&update_log).unwrap_or_default().contains("new version confirmed").then_some(())
+    })
+    .await;
+    // Still the same machine, and it still works.
+    let j = admin.run("powershell", id, "Write-Output updated-ok", 60).await;
+    let j = admin.wait_job(&j, 90).await;
+    assert_eq!(j["status"], "succeeded", "{j}");
+    assert!(j["stdout"].as_str().unwrap().contains("updated-ok"), "{j}");
+    assert_eq!(admin.agents().await.len(), 1, "no second agent appeared");
 }
