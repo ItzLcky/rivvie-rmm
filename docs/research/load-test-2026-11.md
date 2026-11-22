@@ -46,6 +46,11 @@ job creation one query per agent (500 jobs 10.6 s → 0.05 s), the dashboard com
 three times per agent (0.61 → 0.27 s uncontended), and heartbeats waiting for an fsync each
 (pool acquire wait 849 → 22 ms, Postgres 7.1 → 2.5 cores, page-read p95 4.8 s → 0.35 s).
 
+**Update 2026-11-22:** the search and dashboard-health scans described above are fixed by
+stored columns (migration 0026); see [Stored columns for search and
+health](#stored-columns-for-search-and-health) for the re-measurement. The figures in the rest of
+this document are from before that change.
+
 ## Hardware and versions
 
 | | |
@@ -251,16 +256,121 @@ anyway.
    acquire wait 849 → 22 ms, Postgres CPU 7.1 → 2.5 cores, page-read p95 4.8 s → 0.35 s,
    dashboard p50 1.5 s → 0.28 s (runs b → c).
 
+## Stored columns for search and health
+
+Added 2026-11-22 (migration 0026). The two things the first test found gave out first, the
+global search and the dashboard's per-request health, now read stored columns:
+
+- **Search.** An agent's addresses and logged-in users are copied out of its inventory JSON into
+  `agent_search_terms` when the inventory arrives (a trigger on `agents.inventory`). Hostname,
+  OS name and those terms have `pg_trgm` GIN indexes, and `agent_search()` is a union of index
+  lookups. Results are the same as before (a test compares the two on a mixed fleet,
+  including `%`/`_` in the search text); the old expression also failed outright on a malformed
+  inventory, the new one doesn't.
+- **Health.** Each agent row stores its health rank and the inputs to it (open alerts, whether a
+  critical or warning alert is open and not held back, failed jobs in 24 hours, overdue and
+  failed patches, the fullest disk). Triggers on `alerts`, `jobs`, `patches` and the agent row
+  itself keep them current; the rank rules are the SQL function `agent_health_rank`. The
+  server's housekeeping runs `refresh_agent_health()` every five minutes for what only time
+  changes (a job ageing past 24 hours, an update missing for a week) and as a safety net: 0.46 s
+  of Postgres at 10,000 agents when nothing differs, and it writes only rows that differ. The
+  dashboard, the agent list, its health filter and its health sort now read columns.
+
+Cost: the migration took 4.5–5.3 s on the 10,000-agent database. The new table and four indexes
+are about 22 MB at 10,000 agents (2.2 KB per agent). Per write: the inventory update went from
+1.2–1.9 ms to 2.4–2.6 ms (the search terms are rewritten only if the inventory changed); a
+heartbeat is unchanged (0.1–0.2 ms) and a scan's 12 new patch rows cost nothing extra. A
+micro-benchmark of 3,000 scans (36,000 `patches` rows, one statement per scan) took 689 ms with
+the triggers and 673 ms without them. A first version of the patches trigger recounted on every
+insert and cost 3.6 ms per scan; a test that compares the stored values to the old expressions
+after every kind of change caught a duplicate-id counting bug in the second version.
+
+### Method
+
+Same generator, server build profile and hardware as above, 10,000 agents, 240 s hold
+(`--duration 240`; otherwise the command in [Reproducing](#reproducing)). The machine was shared
+with other builds and test runs during this work (load average 8–37, and `/proc/pressure/io`
+at 50–70% from other processes' disk writes), which wrecked the first loaded runs on the
+btrfs volume (fsync stalls dropped sessions and timed out requests in both the before and the
+after run). So:
+
+- **Uncontended** figures (no agents connected, the 10,000-agent database, median of 5) are from
+  the btrfs database, before binary and after binary on the same data, back to back.
+- **Loaded** figures use Postgres on a tmpfs (`docker run --tmpfs /var/lib/postgresql/data`), so
+  disk contention from other processes can't reach it; the server and generator still shared
+  the CPU. "Burst" is a database where all 10,000 agents enrolled in that run (first inventories,
+  first patch scans); "steady" is the next run on the same agents. Before = the binary at
+  `28df9a1`; after = this change.
+
+### Uncontended, 10,000 agents (ms, median of 5)
+
+| | Before | After |
+|---|---|---|
+| `GET /api/search?q=<hostname prefix>` | 844 | 16 |
+| `GET /api/search?q=<full hostname>` | 800 | 17 |
+| `GET /api/search?q=10.0.0.` (IP prefix, matches every agent) | 424 | 43 |
+| `GET /api/search?q=alice` (logged-in user, matches every agent) | 825 | 44 |
+| `GET /api/search?q=lg` (two characters, no trigram to use) | 48 | 31 |
+| `GET /api/agents?limit=50&q=<hostname prefix>` | 1,936 | 38 |
+| `GET /api/agents?limit=50&q=10.0.0.` | 959 | 58 |
+| `GET /api/dashboard` | 257 | 53 |
+| `GET /api/agents?limit=50&sort=health` | 1,587 | 27 |
+| `GET /api/agents?limit=50&health=unhealthy,attention` | 736 | 13 |
+| `GET /api/agents?limit=50` | 27 | 27 |
+| `GET /api/alerts?limit=50` | 6 | 6 |
+
+The search and agent-list filters that match every agent still have to return and sort all
+10,000 rows, which is what the 40–60 ms is. A two-character search can't use a trigram index and
+reads all three of them; it is about as fast as before. (A second pair of measurements on the
+tmpfs database, taken while the machine was busier, gave before/after: search by hostname prefix
+1,591 → 8 ms, agent list sorted by health 3,530 → 36 ms, dashboard 909 → 93 ms.)
+
+### Loaded, 10,000 agents, Postgres on tmpfs (ms)
+
+| | Before, burst | After, burst | Before, steady | After, steady |
+|---|---|---|---|---|
+| Online after ramp / dropped | 10,000 / 0 | 10,000 / 0 | 10,000 / 0 | 10,000 / 0 |
+| Agent page p50 / p95 | 5 / 16 | 4 / 36 | 17 / 70 | 4 / 7 |
+| Agents list p50 / p95 | 38 / 93 | 32 / 151 | 126 / 234 | 32 / 42 |
+| Alert list p50 / p95 | 4 / 16 | 4 / 35 | 21 / 66 | 6 / 10 |
+| **Dashboard p50 / p95** | 240 / 2,754 | 40 / 279 | 784 / 1,123 | **47 / 63** |
+| **Search p50 / p95** | 856 / 1,460 | 9 / 42 | 2,019 / 2,618 | **4 / 8** |
+| Job dispatch p50 / p95 | 125 / 166 | 103 / 120 | 163 / 189 | 30 / 33 |
+| Result ack p50 / p95 | 2.5 / 58 | 3 / 22 | 18 / 105 | 1 / 2 |
+| Postgres CPU, hold mean (cores) | 3.45 | 0.50 | 3.80 | 0.28 |
+| Pool idle, mean (of 32) | 25.3 | 29.5 | 22.8 | 30.3 |
+| Alert evaluation, mean per pass (ms) | 117–394 | 111–1,881 | 595–2,060 | 285–411 |
+| API errors | 0 | 0 | 0 | 0 |
+
+The burst and steady columns of one binary were taken minutes apart under different outside
+load (the second "before" run overlapped with other builds; the second "after" run did not), so
+read the pairs as order-of-magnitude, not as exact ratios. The query-level numbers from
+`pg_stat_statements` are less sensitive to that: in the before-steady run the search query
+averaged 1,739 ms per call (427 calls) and the dashboard's health query 423 ms (406 calls); in
+the after-steady run neither is in the top ten, the dashboard's health query averages 10.5 ms
+and the largest remaining read is the dashboard's offline/high-disk lists (22 ms).
+
+### What is left
+
+- The dashboard is still ~50 ms: five queries that each read all agents (the offline list,
+  OS counts, per-client health counts, the totals). A per-client rollup table would take that
+  to a few ms, but it is already off the list of things that give out first.
+- Searches of one or two characters, and searches that match most of the fleet, still read and
+  sort every match.
+- The 20,000-agent mass reconnect was not re-run: its limit (Postgres CPU and the pool during
+  inventory, service and patch-scan writes) is in writes this change barely touches.
+
 ## What to do next
 
 In order of what the test says matters:
 
-1. **Search** (~0.8 s per call at 10,000 agents, linear in fleet size). The agent part matches
+1. **Search** (done, [see above](#stored-columns-for-search-and-health): 0.84 s → 16 ms). The agent part matched
    IP addresses and logged-in users by expanding every agent's inventory JSON. Store those in
    their own columns (or a small table) when inventory arrives, and index hostnames for
    substring search (`pg_trgm`). Needs a migration; bigger than this block.
-2. **Dashboard health** (~0.27 s per call at 10,000, refetched on every alert, job and
-   online/offline event by every open dashboard). Compute health when its inputs change (a
+2. **Dashboard health** (done: 0.26 s → 53 ms uncontended, and Postgres under a loaded
+   dashboard 3.5–3.8 → 0.3–0.5 cores). It was ~0.27 s per call at 10,000, refetched on every
+   alert, job and online/offline event by every open dashboard. Compute health when its inputs change (a
    heartbeat, an alert, a job result, a patch scan) and store it on the agent, so the
    dashboard and agent list just count. Also worth debouncing the dashboard's refetch more on
    big fleets.

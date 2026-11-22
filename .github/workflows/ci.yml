@@ -86,6 +86,10 @@ jobs:
         env:
           RMM_E2E_DATABASE_URL: postgres://rmm:rmm@localhost:5432/postgres
           RMM_E2E_PROMTOOL: /tmp/promtool
+      - name: Stored search and health against the old expressions
+        run: cargo test -p rmm-server --bin rmm-server stored_columns -- --ignored --nocapture
+        env:
+          RMM_E2E_DATABASE_URL: postgres://rmm:rmm@localhost:5432/postgres
       # Keeps the load generator working: 200 simulated agents for a minute, with dashboards,
       # page requests and bulk jobs; --check fails on any refused connection, dropped session or
       # API error. The full runs (docs/research/load-test-2026-11.md) are manual.

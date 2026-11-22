@@ -46,6 +46,7 @@ pub(crate) mod users;
 mod vault;
 mod webhooks;
 
+pub use agents::refresh_health as refresh_agent_health;
 pub use jobs::{FAILED as JOB_FAILED, deliver as deliver_job};
 pub use portal::PORTAL_LINK_MINUTES;
 pub use sso::seal_existing as seal_sso_secrets;

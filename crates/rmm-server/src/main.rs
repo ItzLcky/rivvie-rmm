@@ -450,6 +450,12 @@ async fn housekeeping(state: Arc<AppState>) {
         if let Err(e) = security::sweep(&state).await {
             warn!("housekeeping: security actions: {e}");
         }
+        // Stored agent health follows alerts, jobs and patches through triggers; this catches
+        // what only the clock changes (a job failed 24 hours ago, an update missing for a week)
+        // and anything the triggers missed.
+        if let Err(e) = api::refresh_agent_health(db).await {
+            warn!("housekeeping: refreshing agent health: {e}");
+        }
         // Roll the last few complete hours of samples up (idempotent; late samples are folded in).
         results.push(
             sqlx::query(
