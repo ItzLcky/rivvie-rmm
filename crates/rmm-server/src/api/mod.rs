@@ -23,6 +23,7 @@ mod msi;
 mod mutes;
 mod packages;
 mod passkeys;
+mod automations;
 mod schedules;
 mod patches;
 mod pm;
@@ -217,6 +218,9 @@ pub fn router(attachment_max: u64) -> Router<Arc<AppState>> {
         .route("/policy-sets/{id}/items", post(policies::create_item))
         .route("/policy-items/{id}", get(policies::get_item).put(policies::update_item).delete(policies::delete_item))
         .route("/policy-items/{id}/overrides/{set_id}", axum::routing::put(policies::put_override).delete(policies::delete_override))
+        .route("/policy-items/{id}/runs", get(automations::for_item))
+        .route("/policy-items/{id}/runs/reset", post(automations::reset))
+        .route("/agents/{id}/automations", get(automations::for_agent))
         .route("/policy-items/{id}/exclusions/{agent_id}", axum::routing::put(policies::exclude).delete(policies::include))
         .route("/device-categories", get(policies::list_categories).post(policies::create_category))
         .route("/device-categories/{id}", axum::routing::put(policies::update_category).delete(policies::delete_category))

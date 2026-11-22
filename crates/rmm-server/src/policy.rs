@@ -40,6 +40,7 @@ pub enum Module {
     Security,
     RemoteAccess,
     Agent,
+    Automation,
 }
 
 impl Module {
@@ -51,6 +52,7 @@ impl Module {
             "security" => Module::Security,
             "remote_access" => Module::RemoteAccess,
             "agent" => Module::Agent,
+            "automation" => Module::Automation,
             _ => return None,
         })
     }
@@ -63,12 +65,13 @@ impl Module {
             Module::Security => "security",
             Module::RemoteAccess => "remote_access",
             Module::Agent => "agent",
+            Module::Automation => "automation",
         }
     }
 
     /// Lives once, in All devices; everything else can only override it.
     pub fn single(self) -> bool {
-        !matches!(self, Module::Alert | Module::Schedule)
+        !matches!(self, Module::Alert | Module::Schedule | Module::Automation)
     }
 
     /// Top-level config fields a descendant set may override.
@@ -82,9 +85,14 @@ impl Module {
             Module::Security => SECURITY_FIELDS.contains(&field),
             Module::RemoteAccess => REMOTE_FIELDS.contains(&field),
             Module::Agent => field == "auto_update",
+            // One trigger and one script per item; the rest tunes how it runs.
+            Module::Automation => AUTOMATION_OVERRIDABLE.contains(&field),
         }
     }
 }
+
+const AUTOMATION_OVERRIDABLE: &[&str] =
+    &["args", "timeout_secs", "retry_failed", "max_attempts", "retry_minutes", "cooldown_minutes", "max_runs_per_hour", "respect_window"];
 
 const ALERT_FIELDS: &[&str] = &[
     "kind",
@@ -210,6 +218,136 @@ impl ScheduleConfig {
             return Err("at most 50 arguments of at most 4096 characters".into());
         }
         crate::scheduler::next_run(&self.cron, &self.timezone, chrono::Utc::now()).map(|_| ())
+    }
+}
+
+/// What starts an automation (docs/design/automations.md). `run_once` has no event: it runs on
+/// every device the item reaches, once. A trigger on custom field or tag changes belongs here
+/// too once those exist; [`crate::automation::fire`] is the one entry point events use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Trigger {
+    /// The agent's first connection.
+    Enrollment,
+    /// The agent connects after being offline for `offline_minutes` or more.
+    AgentOnline,
+    /// An alert of `alert_kind` opens on the agent.
+    AlertOpened,
+    /// A patch install finished and the machine still needs a restart.
+    PatchRebootPending,
+    RunOnce,
+}
+
+impl Trigger {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Trigger::Enrollment => "enrollment",
+            Trigger::AgentOnline => "agent_online",
+            Trigger::AlertOpened => "alert_opened",
+            Trigger::PatchRebootPending => "patch_reboot_pending",
+            Trigger::RunOnce => "run_once",
+        }
+    }
+
+    /// One row per device and item, ever: the row is the record that it ran.
+    pub fn once_per_device(self) -> bool {
+        matches!(self, Trigger::Enrollment | Trigger::RunOnce)
+    }
+}
+
+fn three() -> i32 {
+    3
+}
+fn sixty() -> i32 {
+    60
+}
+fn hundred() -> i32 {
+    100
+}
+
+/// The alert kinds `alert_opened` can name (the `kind` of an alert item).
+pub const ALERT_KINDS: &[&str] = &["offline", "cpu", "memory", "disk", "service", "job_failed", "log", "security", "patch"];
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutomationConfig {
+    pub trigger: Trigger,
+    pub script_id: Uuid,
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// None: the script's own timeout.
+    #[serde(default)]
+    pub timeout_secs: Option<i32>,
+    /// `agent_online`: how long the agent must have been offline.
+    #[serde(default)]
+    pub offline_minutes: Option<i32>,
+    /// `alert_opened`: the kind of alert (cpu, disk, offline, ...).
+    #[serde(default)]
+    pub alert_kind: Option<String>,
+    /// `enrollment` and `run_once`: run again when the script fails, up to `max_attempts`
+    /// times in all, `retry_minutes` apart.
+    #[serde(default)]
+    pub retry_failed: bool,
+    #[serde(default = "three")]
+    pub max_attempts: i32,
+    #[serde(default = "thirty")]
+    pub retry_minutes: i32,
+    /// Event triggers: the same device doesn't run this automation again within this many
+    /// minutes (0: no limit).
+    #[serde(default = "sixty")]
+    pub cooldown_minutes: i32,
+    /// At most this many runs of this automation start in any hour, across all devices.
+    /// Event runs over it are skipped; `enrollment` and `run_once` runs wait their turn.
+    #[serde(default = "hundred")]
+    pub max_runs_per_hour: i32,
+    /// Hold runs until the site's maintenance window is open (sites without one run at once).
+    #[serde(default)]
+    pub respect_window: bool,
+    /// Event runs are forgotten after this many days (`enrollment` and `run_once` rows are the
+    /// record that the script ran, and stay).
+    #[serde(default = "thirty")]
+    pub retain_days: i32,
+}
+
+impl AutomationConfig {
+    fn validate(&self) -> Result<(), String> {
+        match (self.trigger, self.offline_minutes) {
+            (Trigger::AgentOnline, Some(m)) if (5..=43200).contains(&m) => {}
+            (Trigger::AgentOnline, _) => return Err("offline_minutes (5 minutes to 30 days) says how long the agent must have been offline".into()),
+            (_, Some(_)) => return Err("offline_minutes belongs to the agent_online trigger".into()),
+            _ => {}
+        }
+        match (self.trigger, self.alert_kind.as_deref()) {
+            (Trigger::AlertOpened, Some(k)) if ALERT_KINDS.contains(&k) => {}
+            (Trigger::AlertOpened, _) => return Err(format!("alert_kind is one of {}", ALERT_KINDS.join(", "))),
+            (_, Some(_)) => return Err("alert_kind belongs to the alert_opened trigger".into()),
+            _ => {}
+        }
+        if self.retry_failed && !self.trigger.once_per_device() {
+            return Err("retrying belongs to enrollment and run_once automations; event runs are not repeated".into());
+        }
+        if !(1..=10).contains(&self.max_attempts) {
+            return Err("attempts must be 1-10".into());
+        }
+        if !(5..=1440).contains(&self.retry_minutes) {
+            return Err("retry after 5 minutes to 24 hours".into());
+        }
+        if !(0..=10080).contains(&self.cooldown_minutes) {
+            return Err("cooldown must be 0 minutes to 7 days".into());
+        }
+        if !(1..=10000).contains(&self.max_runs_per_hour) {
+            return Err("at most 1-10000 runs per hour".into());
+        }
+        if !(1..=3650).contains(&self.retain_days) {
+            return Err("keep runs for 1-3650 days".into());
+        }
+        if self.timeout_secs.is_some_and(|t| !(1..=86400).contains(&t)) {
+            return Err("timeout must be 1-86400 seconds".into());
+        }
+        if self.args.len() > 50 || self.args.iter().any(|a| a.len() > 4096) {
+            return Err("at most 50 arguments of at most 4096 characters".into());
+        }
+        Ok(())
     }
 }
 
@@ -351,6 +489,11 @@ pub fn validate(module: Module, config: &Value) -> Result<Value, String> {
         }
         Module::RemoteAccess => serde_json::to_value(parse::<RemoteAccessConfig>(config)?),
         Module::Agent => serde_json::to_value(parse::<AgentConfig>(config)?),
+        Module::Automation => {
+            let c: AutomationConfig = parse(config)?;
+            c.validate()?;
+            serde_json::to_value(c)
+        }
     };
     out.map_err(|e| e.to_string())
 }
@@ -363,6 +506,7 @@ pub fn clean_override(module: Module, config: &Value) -> Result<Value, String> {
         return Err(match (module, bad.as_str()) {
             (Module::Alert, "kind") => "an alert's type can't be overridden".into(),
             (Module::Schedule, _) => format!("{bad} can't be overridden: a scheduled script's overrides are limited to enabled, args and timeout_secs"),
+            (Module::Automation, _) => format!("{bad} can't be overridden: an automation's trigger and script are fixed; its args, timeout, retries and limits can change"),
             _ => format!("{bad} isn't a {} setting", module.as_str()),
         });
     }
@@ -687,6 +831,39 @@ mod tests {
         assert!(validate(Module::Patch, &merge(&patch, &json!({ "window": { "tz": "Mars/Olympus" } }))).is_err());
         assert!(validate(Module::Patch, &merge(&patch, &json!({ "reboot_policy": "sometimes" }))).is_err());
         assert!(validate(Module::RemoteAccess, &json!({ "desktop_enabled": true, "desktop_consent": false, "shell_enabled": true })).is_err(), "missing field");
+    }
+
+    #[test]
+    fn automations_are_checked_per_trigger() {
+        let id = Uuid::nil();
+        let ok = |v: Value| validate(Module::Automation, &v);
+        let base = |trigger: &str, extra: Value| {
+            let mut v = json!({ "trigger": trigger, "script_id": id });
+            v.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            v
+        };
+        let c = ok(base("enrollment", json!({}))).unwrap();
+        assert_eq!((c["cooldown_minutes"].as_i64(), c["max_runs_per_hour"].as_i64(), c["max_attempts"].as_i64()), (Some(60), Some(100), Some(3)), "defaults filled in: {c}");
+        assert!(ok(base("run_once", json!({ "retry_failed": true, "max_attempts": 5, "retry_minutes": 10 }))).is_ok());
+        // Each trigger takes its own parameter and refuses the others'.
+        assert!(ok(base("agent_online", json!({}))).is_err(), "needs offline_minutes");
+        assert!(ok(base("agent_online", json!({ "offline_minutes": 4 }))).is_err(), "at least 5 minutes");
+        assert!(ok(base("agent_online", json!({ "offline_minutes": 30 }))).is_ok());
+        assert!(ok(base("enrollment", json!({ "offline_minutes": 30 }))).is_err());
+        assert!(ok(base("alert_opened", json!({}))).is_err(), "needs alert_kind");
+        assert!(ok(base("alert_opened", json!({ "alert_kind": "weather" }))).is_err());
+        assert!(ok(base("alert_opened", json!({ "alert_kind": "disk" }))).is_ok());
+        assert!(ok(base("patch_reboot_pending", json!({ "alert_kind": "disk" }))).is_err());
+        assert!(ok(base("alert_opened", json!({ "alert_kind": "disk", "retry_failed": true }))).is_err(), "events aren't retried");
+        assert!(ok(base("volcano", json!({}))).is_err(), "unknown trigger");
+        for bad in [json!({ "max_attempts": 0 }), json!({ "retry_minutes": 1 }), json!({ "cooldown_minutes": -1 }), json!({ "max_runs_per_hour": 0 }), json!({ "timeout_secs": 0 }), json!({ "color": "red" })] {
+            assert!(ok(base("enrollment", bad.clone())).is_err(), "{bad}");
+        }
+        // Overrides tune how it runs, never what starts it or which script.
+        assert!(clean_override(Module::Automation, &json!({ "args": ["-q"], "max_runs_per_hour": 5, "respect_window": true })).is_ok());
+        assert!(clean_override(Module::Automation, &json!({ "trigger": "run_once" })).is_err());
+        assert!(clean_override(Module::Automation, &json!({ "script_id": id })).is_err());
+        assert!(!Module::Automation.single(), "defined in any set, like alerts and schedules");
     }
 
     #[test]

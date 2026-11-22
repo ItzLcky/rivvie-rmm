@@ -352,6 +352,7 @@ async fn announce(st: &AppState, ids: &[Uuid], event: &'static str, channels: &[
             if let Err(e) = run_alert_script(st, id).await {
                 warn!(alert = %id, "running the alert's script: {e:#}");
             }
+            crate::automation::alert_opened(st, id).await;
         } else {
             crate::tickets::alert_resolved(st, id).await;
         }

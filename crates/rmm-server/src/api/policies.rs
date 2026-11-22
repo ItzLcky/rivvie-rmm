@@ -575,6 +575,9 @@ pub struct ItemView {
     /// Unresolved alerts it raised (alerts; in the agent view, on that agent).
     open_alerts: i64,
     schedule: Option<ScheduleState>,
+    /// Automations: how many runs are in each state (`waiting`, `pending`, `succeeded`, `failed`,
+    /// `skipped`), on the agents the user can see (in the agent view, on that agent).
+    runs: Option<Value>,
     /// Agent view only: the limit includes the agent.
     #[serde(skip_serializing_if = "Option::is_none")]
     applies: Option<bool>,
@@ -601,6 +604,7 @@ struct ItemRow {
     open_alerts: i64,
     next_run_at: Option<DateTime<Utc>>,
     last_run_at: Option<DateTime<Utc>>,
+    runs: Option<Value>,
 }
 
 /// (item, set, enabled, config, updated_at)
@@ -619,12 +623,18 @@ async fn item_views(st: &AppState, u: &User, chain: &[ChainEntry], agent: Option
                 (SELECT count(*) FROM alerts al JOIN agents aa ON aa.id = al.agent_id JOIN sites sa ON sa.id = aa.site_id
                   WHERE al.policy_id = i.id AND al.resolved_at IS NULL AND ($2::uuid[] IS NULL OR sa.client_id = ANY($2))
                     AND ($3::uuid IS NULL OR al.agent_id = $3)) AS open_alerts,
-                ss.next_run_at, ss.last_run_at
+                ss.next_run_at, ss.last_run_at,
+                CASE WHEN i.module = 'automation' THEN (
+                    SELECT jsonb_build_object('waiting', count(*) FILTER (WHERE r.status = 'waiting'), 'pending', count(*) FILTER (WHERE r.status = 'pending'),
+                                              'succeeded', count(*) FILTER (WHERE r.status = 'succeeded'), 'failed', count(*) FILTER (WHERE r.status = 'failed'),
+                                              'skipped', count(*) FILTER (WHERE r.status = 'skipped'))
+                      FROM automation_runs r JOIN agents ra ON ra.id = r.agent_id JOIN sites rs ON rs.id = ra.site_id
+                     WHERE r.item_id = i.id AND ($2::uuid[] IS NULL OR rs.client_id = ANY($2)) AND ($3::uuid IS NULL OR r.agent_id = $3)) END AS runs
            FROM policy_effective e JOIN policy_items i ON i.id = e.item_id
            LEFT JOIN clients c ON c.id = i.client_id LEFT JOIN sites si ON si.id = i.site_id
            LEFT JOIN policy_schedule_state ss ON ss.item_id = i.id
           WHERE e.set_id = $1 AND ($2::uuid[] IS NULL OR i.client_id IS NULL OR i.client_id = ANY($2))
-          ORDER BY array_position(ARRAY['alert', 'schedule', 'patch', 'security', 'remote_access', 'agent'], i.module), lower(i.name)",
+          ORDER BY array_position(ARRAY['alert', 'schedule', 'patch', 'security', 'remote_access', 'agent', 'automation'], i.module), lower(i.name)",
     )
     .bind(here.id)
     .bind(u.scope())
@@ -681,6 +691,7 @@ async fn item_views(st: &AppState, u: &User, chain: &[ChainEntry], agent: Option
             overridable: r.set_id != here.id && may_edit_module(u, here.client_id, module).is_ok(),
             open_alerts: r.open_alerts,
             schedule: (module == Module::Schedule).then_some(ScheduleState { next_run_at: r.next_run_at, last_run_at: r.last_run_at }),
+            runs: r.runs,
             applies,
             excluded,
         });
@@ -700,14 +711,14 @@ async fn item_view(st: &AppState, u: &User, item: Uuid, set: Uuid) -> ApiResult<
 
 /// An item's identity, if the user may see it.
 #[derive(sqlx::FromRow)]
-struct ItemMeta {
-    id: Uuid,
+pub(crate) struct ItemMeta {
+    pub(crate) id: Uuid,
     set_id: Uuid,
     set_client_id: Option<Uuid>,
-    module: String,
-    name: String,
+    pub(crate) module: String,
+    pub(crate) name: String,
     enabled: bool,
-    config: Value,
+    pub(crate) config: Value,
     client_id: Option<Uuid>,
     site_id: Option<Uuid>,
 }
@@ -718,7 +729,8 @@ impl ItemMeta {
     }
 }
 
-async fn fetch_item(st: &AppState, u: &User, id: Uuid) -> ApiResult<ItemMeta> {
+/// The item, if the user may see it.
+pub(crate) async fn fetch_item(st: &AppState, u: &User, id: Uuid) -> ApiResult<ItemMeta> {
     let m: ItemMeta = sqlx::query_as(
         "SELECT i.id, i.set_id, ps.client_id AS set_client_id, i.module, i.name, i.enabled, i.config, i.client_id, i.site_id
            FROM policy_items i JOIN policy_sets ps ON ps.id = i.set_id WHERE i.id = $1",
@@ -776,7 +788,7 @@ async fn check_refs(st: &AppState, u: &User, module: Module, config: &Value, own
                 script_ok(s).await?;
             }
         }
-        Module::Schedule => {
+        Module::Schedule | Module::Automation => {
             if let Some(s) = uuid(config.get("script_id")) {
                 script_ok(s).await?;
             }
@@ -827,7 +839,7 @@ async fn schedule_state(db: &mut sqlx::PgConnection, item: Uuid, config: &Value)
 
 #[derive(Deserialize)]
 pub struct NewItem {
-    /// `alert` or `schedule` (the others live once, in All devices).
+    /// `alert`, `schedule` or `automation` (the others live once, in All devices).
     module: String,
     name: String,
     #[serde(default = "yes")]
