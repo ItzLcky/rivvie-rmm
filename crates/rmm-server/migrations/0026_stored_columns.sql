@@ -108,24 +108,24 @@ CREATE TRIGGER agents_health BEFORE INSERT OR UPDATE OF last_metrics, update_sta
         alert_critical, alert_warning, failed_jobs_24h, patches_overdue, patches_failed
     ON agents FOR EACH ROW EXECUTE FUNCTION agents_health_row();
 
--- Recounts from the tables. `ids` NULL = every agent. Writes only what changed, so a refresh
--- that finds nothing new doesn't rewrite the agent rows.
+-- Recounts from the tables, for the agents in `ids`. Writes only what changed, so a refresh that
+-- finds nothing new doesn't rewrite the agent rows. (Joined through unnest() rather than
+-- `ids IS NULL OR id = ANY(ids)`: that form makes the planner scan every agent for one.)
 CREATE FUNCTION refresh_agent_alerts(ids uuid[]) RETURNS void LANGUAGE sql AS $$
     UPDATE agents a SET open_alerts = x.n, alert_critical = x.c, alert_warning = x.w
       FROM (SELECT g.id, count(al.id)::int AS n,
                    coalesce(bool_or(al.severity = 'critical' AND NOT al.suppressed), false) AS c,
                    coalesce(bool_or(al.severity = 'warning' AND NOT al.suppressed), false) AS w
-              FROM agents g LEFT JOIN alerts al ON al.agent_id = g.id AND al.resolved_at IS NULL
-             WHERE ids IS NULL OR g.id = ANY(ids)
+              FROM (SELECT DISTINCT unnest(ids) AS id) u JOIN agents g ON g.id = u.id LEFT JOIN alerts al ON al.agent_id = g.id AND al.resolved_at IS NULL
              GROUP BY g.id) x
      WHERE a.id = x.id AND (a.open_alerts, a.alert_critical, a.alert_warning) IS DISTINCT FROM (x.n, x.c, x.w)
 $$;
 CREATE FUNCTION refresh_agent_jobs(ids uuid[]) RETURNS void LANGUAGE sql AS $$
     UPDATE agents a SET failed_jobs_24h = x.n
       FROM (SELECT g.id, count(j.id)::int AS n
-              FROM agents g LEFT JOIN jobs j ON j.agent_id = g.id AND j.created_at > now() - interval '24 hours'
-                                             AND j.status IN ('failed', 'error', 'timed_out', 'lost')
-             WHERE ids IS NULL OR g.id = ANY(ids)
+              FROM (SELECT DISTINCT unnest(ids) AS id) u JOIN agents g ON g.id = u.id
+                   LEFT JOIN jobs j ON j.agent_id = g.id AND j.created_at > now() - interval '24 hours'
+                                   AND j.status IN ('failed', 'error', 'timed_out', 'lost')
              GROUP BY g.id) x
      WHERE a.id = x.id AND a.failed_jobs_24h <> x.n
 $$;
@@ -135,20 +135,22 @@ CREATE FUNCTION refresh_agent_patches(ids uuid[]) RETURNS void LANGUAGE sql AS $
                    count(p.agent_id) FILTER (WHERE (p.category IN ('security', 'critical') OR p.severity = 'critical')
                                                    AND p.first_seen_at < now() - interval '7 days')::int AS o,
                    count(p.agent_id) FILTER (WHERE p.state = 'failed')::int AS f
-              FROM agents g LEFT JOIN patches p ON p.agent_id = g.id AND p.state <> 'installed' AND p.approval <> 'declined'
-             WHERE ids IS NULL OR g.id = ANY(ids)
+              FROM (SELECT DISTINCT unnest(ids) AS id) u JOIN agents g ON g.id = u.id
+                   LEFT JOIN patches p ON p.agent_id = g.id AND p.state <> 'installed' AND p.approval <> 'declined'
              GROUP BY g.id) x
      WHERE a.id = x.id AND (a.patches_overdue, a.patches_failed) IS DISTINCT FROM (x.o, x.f)
 $$;
--- Everything, then the rank again for what only time changed (a reboot pending for a day, an
--- update failure older than a week), which no counter shows.
+-- Everything, for `ids` (NULL = every agent), then the rank again for what only time changed
+-- (a reboot pending for a day, an update failure older than a week), which no counter shows.
 CREATE FUNCTION refresh_agent_health(ids uuid[] DEFAULT NULL) RETURNS void LANGUAGE plpgsql AS $$
 BEGIN
+    ids := coalesce(ids, ARRAY(SELECT id FROM agents));
     PERFORM refresh_agent_alerts(ids);
     PERFORM refresh_agent_jobs(ids);
     PERFORM refresh_agent_patches(ids);
     UPDATE agents a SET health_rank = agent_health_rank(a)
-     WHERE (ids IS NULL OR a.id = ANY(ids)) AND a.health_rank <> agent_health_rank(a);
+      FROM (SELECT DISTINCT unnest(ids) AS id) u
+     WHERE a.id = u.id AND a.health_rank <> agent_health_rank(a);
 END $$;
 
 -- Alerts: opened, resolved, held back or released, re-rated.
@@ -194,7 +196,9 @@ CREATE FUNCTION patches_health_sync() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE ids uuid[];
 BEGIN
     IF TG_OP = 'INSERT' THEN
-        ids := ARRAY(SELECT DISTINCT agent_id FROM new_rows WHERE state <> 'installed');
+        -- A first sighting counts only if it is already a failure or old (a scan of new updates is the common case).
+        ids := ARRAY(SELECT DISTINCT agent_id FROM new_rows
+                      WHERE state <> 'installed' AND approval <> 'declined' AND (state = 'failed' OR first_seen_at < now() - interval '7 days'));
     ELSIF TG_OP = 'DELETE' THEN
         ids := ARRAY(SELECT DISTINCT agent_id FROM old_rows WHERE state <> 'installed');
     ELSE
