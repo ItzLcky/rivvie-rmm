@@ -92,6 +92,10 @@ const pages: [string, string][] = [
 	['client-password', '/clients/c-acme?tab=passwords&item=6f1c0c1e-9a51-4c0e-b6c9-0a4de1f3a111'],
 	['settings-documentation', '/settings/documentation'],
 	['agent-tickets', '/agents/a-3?tab=tickets'],
+	['agent-notes', '/agents/a-3?tab=notes'],
+	['agents-tagged', '/agents?tag=tg-vip'],
+	['client-fields', '/clients/c-acme?tab=fields'],
+	['settings-fields', '/settings/fields'],
 	['service-desk', '/settings/service-desk'],
 	['settings-api', '/settings/api-keys'],
 	['settings-webhooks', '/settings/webhooks'],
@@ -101,6 +105,8 @@ const phone: [string, string][] = [
 	['dashboard', '/'],
 	['agents', '/agents'],
 	['agent', '/agents/a-3'],
+	['agent-notes', '/agents/a-3?tab=notes'],
+	['settings-fields', '/settings/fields'],
 	['job', '/jobs/j-1'],
 	['alerts', '/alerts'],
 	['patches', '/patches'],
@@ -830,4 +836,92 @@ test('filters live in the URL', async ({ page }) => {
 	await expect(page).toHaveURL(/sort=hostname&dir=desc|dir=desc/);
 	await page.reload();
 	await expect(page.getByRole('tab', { name: /^Offline/ })).toHaveAttribute('aria-selected', 'true');
+});
+
+test.describe('tags, fields, notes and saved views', () => {
+	test('choosing a saved view goes to its URL and sets its columns', async ({ page }) => {
+		await mockApi(page);
+		await page.goto('/agents');
+		await settle(page);
+		await page.getByRole('button', { name: /Views/ }).click();
+		await page.getByRole('menuitem', { name: /VIP machines/ }).click();
+		await expect(page).toHaveURL(/tag=tg-vip/);
+		await expect(page.getByRole('row', { name: /acme-dc01/ })).toBeVisible();
+		await expect(page.getByRole('row', { name: /globex/ })).toHaveCount(0);
+		// The view that matches the URL is named on the button.
+		await expect(page.getByRole('button', { name: /VIP machines/ })).toBeVisible();
+	});
+
+	test('save the current view', async ({ page }) => {
+		await mockApi(page);
+		const calls = await routeApi(page, () => undefined);
+		await page.goto('/agents?os=windows&sort=hostname&dir=desc&after=abc');
+		await settle(page);
+		await page.getByRole('button', { name: /Views/ }).click();
+		await page.getByRole('menuitem', { name: /Save this view/ }).click();
+		const dialog = page.getByRole('dialog', { name: 'Save this view' });
+		await dialog.getByLabel('Name').fill('Windows, Z to A');
+		await dialog.getByRole('switch', { name: /Share with everyone/ }).click();
+		await dialog.getByRole('button', { name: 'Save view' }).click();
+		// Paging cursors never become part of a view.
+		expect(calls[0]).toMatchObject({ method: 'POST', path: '/saved-views', body: { page: 'agents', name: 'Windows, Z to A', query: 'os=windows&sort=hostname&dir=desc', shared: true } });
+	});
+
+	test('tag several agents at once', async ({ page }) => {
+		await mockApi(page);
+		const calls = await routeApi(page, () => undefined);
+		await page.goto('/agents');
+		await settle(page);
+		await page.getByRole('checkbox', { name: /Select all/ }).click();
+		await page.getByRole('button', { name: 'Tags', exact: true }).click();
+		const dialog = page.getByRole('dialog', { name: 'Change tags' });
+		await dialog.getByLabel('What to do with Pilot ring').selectOption('add');
+		await dialog.getByLabel('What to do with Legacy').selectOption('remove');
+		await dialog.getByRole('button', { name: 'Apply' }).click();
+		expect(calls.at(-1)).toMatchObject({ method: 'POST', path: '/agents/tags', body: { add: ['tg-pilot'], remove: ['tg-legacy'] } });
+	});
+
+	test('add and pin a note', async ({ page }) => {
+		await mockApi(page);
+		const calls = await routeApi(page, () => undefined);
+		await page.goto('/agents/a-3?tab=notes');
+		await settle(page);
+		await expect(page.getByRole('complementary', { name: 'Pinned note' })).toContainText('Reboots itself every Sunday night');
+		await page.getByLabel('Add a note').fill('Swapped the PSU <b>today</b>');
+		await page.getByRole('button', { name: 'Add note' }).click();
+		expect(calls).toEqual([{ method: 'POST', path: '/agents/a-3/notes', body: { body: 'Swapped the PSU <b>today</b>', pinned: false } }]);
+		// Someone else's note can be pinned but not edited.
+		await expect(page.getByRole('button', { name: 'Edit note' })).toHaveCount(1);
+	});
+
+	test('edit custom fields on an agent', async ({ page }) => {
+		await mockApi(page);
+		const calls = await routeApi(page, () => undefined);
+		await page.goto('/agents/a-3');
+		await settle(page);
+		await page.getByRole('region', { name: 'Custom fields' }).getByRole('button', { name: 'Edit' }).click();
+		await page.getByLabel('Support tier').selectOption('Silver');
+		await page.getByLabel('Owner').fill('');
+		await page.getByRole('button', { name: 'Save' }).click();
+		// Only what changed is sent; clearing is null.
+		expect(calls).toEqual([{ method: 'PUT', path: '/agents/a-3/fields', body: { values: { support_tier: 'Silver', owner: null } } }]);
+	});
+
+	test('define a field that scripts may set', async ({ page }) => {
+		await mockApi(page);
+		const calls = await routeApi(page, () => undefined);
+		await page.goto('/settings/fields');
+		await settle(page);
+		await page.getByRole('button', { name: 'Add field' }).click();
+		const dialog = page.getByRole('dialog', { name: 'New custom field' });
+		await dialog.getByLabel('Label').fill('Last backup');
+		await expect(dialog.getByLabel('Name')).toHaveValue('last_backup');
+		await dialog.getByLabel('Type').selectOption('date');
+		await dialog.getByRole('switch', { name: 'Scripts can set it' }).click();
+		await expect(dialog.getByText('RMM-FIELD last_backup=value')).toBeVisible();
+		await dialog.getByRole('button', { name: 'Save' }).click();
+		expect(calls).toEqual([
+			{ method: 'POST', path: '/custom-fields', body: { entity: 'agent', name: 'last_backup', label: 'Last backup', description: '', kind: 'date', options: [], client_id: null, script_writable: true } }
+		]);
+	});
 });

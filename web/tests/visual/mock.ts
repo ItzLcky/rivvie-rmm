@@ -49,7 +49,8 @@ function agent(i: number, host: string, siteId: string, os: 'linux' | 'windows',
 		last_metrics: health === 'unknown' ? null : metrics(online ? ago(0) : ago(37 + i * 90), cpu, mem, [['/', disk], ['/var', Math.max(5, disk - 30)]]),
 		update_state: null, update_version: null, update_detail: null, update_at: null,
 		health, disk_max_pct: health === 'unknown' ? 0 : disk, failed_jobs_24h: failed, open_alerts: 0,
-		patches_overdue: 0, patches_failed: 0, reboot_pending: false, reboot_pending_since: null as string | null, alerts_muted: false
+		patches_overdue: 0, patches_failed: 0, reboot_pending: false, reboot_pending_since: null as string | null, alerts_muted: false,
+		tags: [] as { id: string; name: string; color: string }[]
 	};
 }
 const agents: Agent[] = [
@@ -66,6 +67,46 @@ agents[6].enrolled_at = ago(60 * 24 * 2);
 // Patch state that counts against health, and a snoozed machine.
 Object.assign(agents[2], { patches_overdue: 2, patches_failed: 1, reboot_pending: true, reboot_pending_since: ago(60 * 30) });
 agents[3].alerts_muted = true;
+
+// --- tags, custom fields, notes, saved views -----------------------------------------------------
+const tagList = [
+	{ id: 'tg-vip', name: 'VIP', color: 'violet', created_at: ago(60 * 24 * 30) },
+	{ id: 'tg-dc', name: 'Domain controller', color: 'red', created_at: ago(60 * 24 * 30) },
+	{ id: 'tg-pilot', name: 'Pilot ring', color: 'teal', created_at: ago(60 * 24 * 12) },
+	{ id: 'tg-legacy', name: 'Legacy', color: 'amber', created_at: ago(60 * 24 * 9) }
+];
+const tagOf = (...ids: string[]) => ids.map((id) => tagList.find((t) => t.id === id)!).map(({ id, name, color }) => ({ id, name, color }));
+agents[0].tags = tagOf('tg-dc', 'tg-vip');
+agents[1].tags = tagOf('tg-vip');
+agents[2].tags = tagOf('tg-pilot');
+agents[3].tags = tagOf('tg-legacy');
+const tagsOut = () => tagList.map((t) => ({ ...t, agents: agents.filter((a) => a.tags.some((x) => x.id === t.id)).length }));
+const fieldDefs = [
+	{ id: 'cf-warranty', entity: 'agent', name: 'warranty_end', label: 'Warranty ends', description: 'From the vendor portal', kind: 'date', options: [], client_id: null, client_name: null, script_writable: true, position: 0, in_use: 3 },
+	{ id: 'cf-tier', entity: 'agent', name: 'support_tier', label: 'Support tier', description: '', kind: 'select', options: ['Gold', 'Silver', 'Bronze'], client_id: null, client_name: null, script_writable: false, position: 1, in_use: 2 },
+	{ id: 'cf-owner', entity: 'agent', name: 'owner', label: 'Owner', description: 'Who uses the machine', kind: 'text', options: [], client_id: 'c-acme', client_name: 'Acme Corp', script_writable: false, position: 2, in_use: 1 },
+	{ id: 'cf-am', entity: 'client', name: 'account_manager', label: 'Account manager', description: '', kind: 'text', options: [], client_id: null, client_name: null, script_writable: false, position: 0, in_use: 2 },
+	{ id: 'cf-rack', entity: 'site', name: 'rack', label: 'Rack', description: 'Where the server sits', kind: 'text', options: [], client_id: null, client_name: null, script_writable: false, position: 0, in_use: 1 }
+];
+const fieldValues = (entity: string) =>
+	fieldDefs
+		.filter((f) => f.entity === entity)
+		.map((f) => {
+			const v: Record<string, [string, string, number]> = { cf_warranty: ['2027-03-01', 'script', 90], cf_tier: ['Gold', 'user', 600], cf_owner: ['Jo Smith', 'user', 1200], cf_am: ['Priya Nair', 'user', 3000], cf_rack: ['R12, U8', 'user', 3000] };
+			const [value, source, mins] = v[f.id.replace('-', '_')] ?? [null, null, 0];
+			return {
+				field_id: f.id, name: f.name, label: f.label, description: f.description, kind: f.kind, options: f.options, script_writable: f.script_writable, client_id: f.client_id,
+				value, source, updated_at: value ? ago(mins) : null, updated_by_name: source === 'user' ? 'Dana Admin' : null
+			};
+		});
+const notes = [
+	{ id: 'n-1', agent_id: 'a-3', body: 'Reboots itself every Sunday night: that is the patch window, not a fault.\nCall Jo at the front desk before touching it in office hours.', author_id: 'u-admin', author_name: 'Dana Admin', pinned: true, created_at: ago(60 * 24 * 6), updated_at: ago(60 * 24 * 6), can_edit: true },
+	{ id: 'n-2', agent_id: 'a-3', body: 'Replaced the failing disk on the 3rd; old one is in the cupboard.', author_id: 'u-other', author_name: 'Sam Technician', pinned: false, created_at: ago(60 * 24 * 20), updated_at: ago(60 * 24 * 19), can_edit: false }
+];
+const savedViews = [
+	{ id: 'sv-1', page: 'agents', name: 'Windows servers', shared: false, query: 'os=windows&health=attention%2Cunhealthy', hidden_columns: null, client_id: null, owner_id: 'u-admin', owner_name: 'Dana Admin', can_edit: true, created_at: ago(60 * 24 * 3), updated_at: ago(60 * 24 * 3) },
+	{ id: 'sv-2', page: 'agents', name: 'VIP machines', shared: true, query: 'tag=tg-vip', hidden_columns: null, client_id: null, owner_id: 'u-other', owner_name: 'Sam Technician', can_edit: true, created_at: ago(60 * 24 * 8), updated_at: ago(60 * 24 * 8) }
+];
 
 // --- monitoring -----------------------------------------------------------------------------
 const policies = [
@@ -158,6 +199,7 @@ const detail = (a: Agent) => ({
 	machine_id: 'm-' + a.id,
 	// globex-db01 runs an agent build without remote desktop.
 	capabilities: a.id === 'a-6' ? ['patch'] : ['patch', 'desktop', 'tools'],
+	pinned_note: a.id === 'a-3' ? notes[0] : null,
 	inventory_at: ago(12),
 	inventory: {
 		collected_at: ago(12), cpu_brand: 'Intel(R) Xeon(R) Silver 4314 CPU @ 2.40GHz', cpu_cores_physical: 16, cpu_cores_logical: 32, mem_total: 64 * 2 ** 30,
@@ -1151,6 +1193,11 @@ export async function mockApi(p: Page, opts: { signedIn?: boolean; ssoRequired?:
 		if ((m = path.match(/^\/doc-templates\/([^/]+)$/))) return json({ ...docTemplates.find((t) => t.id === m![1])!, body: '# {{client.name}}\n\n```fields\nLabel:\n```\n' });
 		if ((m = path.match(/^\/clients\/([^/]+)\/vault$/))) return json(vaultItems.filter((v) => v.client_id === m![1]));
 		if ((m = path.match(/^\/vault\/([^/]+)$/))) return json(vaultDetail(m![1]));
+		if (path === '/tags') return json(tagsOut());
+		if (path === '/custom-fields') return json(fieldDefs.filter((f) => !q.get('entity') || f.entity === q.get('entity')));
+		if ((m = path.match(/^\/(agents|clients|sites)\/([^/]+)\/fields$/))) return json(fieldValues(m[1].slice(0, -1)).filter((f) => m![1] !== 'agents' || f.client_id !== 'c-acme' || m![2] === 'a-1' || m![2] === 'a-2' || m![2] === 'a-3'));
+		if ((m = path.match(/^\/agents\/([^/]+)\/notes$/))) return json(notes.filter((n) => n.agent_id === m![1]));
+		if (path === '/saved-views') return json(savedViews);
 		if (path === '/agents') {
 			let list = agents.filter((a) => (!q.get('client_id') || a.client_id === q.get('client_id')) && (!q.get('online') || String(a.online) === q.get('online')));
 			if (q.get('health')) list = list.filter((a) => q.get('health')!.split(',').includes(a.health));
@@ -1159,6 +1206,7 @@ export async function mockApi(p: Page, opts: { signedIn?: boolean; ssoRequired?:
 			if (q.get('category_id')) list = list.filter((a) => a.category_id === q.get('category_id'));
 			if (q.get('policy_set_id')) list = list.filter((a) => a.policy_set_id === q.get('policy_set_id'));
 			if (q.get('q')) list = list.filter((a) => a.hostname.includes(q.get('q')!));
+			if (q.get('tag')) list = list.filter((a) => q.get('tag')!.split(',').every((t) => a.tags.some((x) => x.id === t)));
 			return json(page(list, Number(q.get('limit') ?? 50)));
 		}
 		if ((m = path.match(/^\/agents\/([^/]+)$/))) return json(detail(agents.find((a) => a.id === m![1])!));

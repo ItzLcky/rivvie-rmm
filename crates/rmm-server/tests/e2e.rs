@@ -571,6 +571,7 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
     // RMM_E2E_ONLY=api: just the API keys and webhooks, on the freshly enrolled agent.
     if std::env::var("RMM_E2E_ONLY").as_deref() == Ok("api") {
         api_keys_and_webhooks(&url, &admin, db, &id1, a_id, b_id).await;
+        fields_tags_notes_views(&url, &admin, db, dir, &id1, a_id, b_id).await;
         a1.kill();
         return Ok(());
     }
@@ -1183,6 +1184,7 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
     docs_and_vault(&url, &admin, db, a_id, b_id).await;
     ticket_docs(&url, &admin, a_id, b_id).await;
     api_keys_and_webhooks(&url, &admin, db, &id1, a_id, b_id).await;
+    fields_tags_notes_views(&url, &admin, db, dir, &id1, a_id, b_id).await;
     sso_and_passkeys(server, db, dir, &secret).await;
 
     // --- rate limits ------------------------------------------------------------------------------
@@ -6348,4 +6350,313 @@ async fn signed_in_at(public: &str, admin: &Api, email: &str, role: &str) -> Api
 /// `/start` for a provider that is switched off.
 async fn sso_walk_start_only(public: &str, provider: &str) -> String {
     location(&browser().get(format!("{public}/api/auth/sso/{provider}/start")).send().await.unwrap())
+}
+
+/// Tags, custom fields (with script output → field), agent notes and saved views
+/// (docs/design/fields.md): who may do what, what is validated, scoping to a client, the audit
+/// log, and the same data through an API key.
+async fn fields_tags_notes_views(url: &str, admin: &Api, db: &sqlx::PgPool, dir: &Path, id1: &str, a_id: &str, b_id: &str) {
+    use reqwest::Method;
+    let tech = signed_in(url, admin, "fields-tech@e2e.test", "technician", None, false).await;
+    let tech_b = signed_in(url, admin, "fields-tech-b@e2e.test", "technician", Some(b_id), false).await;
+    let readonly = signed_in(url, admin, "fields-readonly@e2e.test", "readonly", None, false).await;
+
+    // An agent of client B (never started: only its record matters here).
+    let sites = admin.get("/sites").await;
+    let b_site = sites.as_array().unwrap().iter().find(|s| s["client_id"] == b_id).unwrap()["id"].as_str().unwrap().to_string();
+    let b_token = admin.post(&format!("/sites/{b_site}/enrollment-tokens"), json!({ "label": "fields" })).await["token"].as_str().unwrap().to_string();
+    let b_agent = Agent::new(dir, "fields-b").enroll(url, &b_token).unwrap();
+
+    // --- tags ------------------------------------------------------------------------------------------------------
+    let (s, v) = readonly.call(Method::POST, "/tags", Some(json!({ "name": "VIP" }))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "read-only users can't create tags: {v}");
+    let vip = tech.post("/tags", json!({ "name": " VIP ", "color": "red" })).await;
+    assert_eq!((vip["name"].as_str(), vip["color"].as_str()), (Some("VIP"), Some("red")), "{vip}");
+    let vip_id = vip["id"].as_str().unwrap().to_string();
+    let (s, v) = tech.call(Method::POST, "/tags", Some(json!({ "name": "vip" }))).await;
+    assert_eq!(s, StatusCode::CONFLICT, "names are unique ignoring case: {v}");
+    for body in [json!({ "name": "" }), json!({ "name": "x".repeat(41) }), json!({ "name": "ok", "color": "#f00" })] {
+        assert_eq!(tech.call(Method::POST, "/tags", Some(body)).await.0, StatusCode::BAD_REQUEST);
+    }
+    let server_tag = tech.post("/tags", json!({ "name": "Servers" })).await["id"].as_str().unwrap().to_string();
+    let (s, _) = tech.call(Method::PUT, &format!("/tags/{vip_id}"), Some(json!({ "color": "blue" }))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "recolouring a shared tag is for admins");
+    admin.put(&format!("/tags/{vip_id}"), json!({ "color": "violet" })).await;
+
+    // Putting tags on agents: scoped to the agents the user can see.
+    let (s, _) = tech_b.call(Method::PUT, &format!("/agents/{id1}/tags"), Some(json!({ "tag_ids": [vip_id] }))).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "an agent of another client isn't there");
+    let (s, _) = readonly.call(Method::PUT, &format!("/agents/{id1}/tags"), Some(json!({ "tag_ids": [vip_id] }))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    let (s, _) = tech.call(Method::PUT, &format!("/agents/{id1}/tags"), Some(json!({ "tag_ids": [uuid::Uuid::nil()] }))).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "an unknown tag");
+    tech.put(&format!("/agents/{id1}/tags"), json!({ "tag_ids": [vip_id, server_tag, vip_id] })).await;
+    let a = admin.get(&format!("/agents/{id1}")).await;
+    let names: Vec<&str> = a["tags"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["Servers", "VIP"], "by name: {a}");
+    assert_eq!(a["tags"][1]["color"], "violet");
+    // Bulk: add to both agents of A and B's agent, all or nothing.
+    let (s, _) = tech_b.call(Method::POST, "/agents/tags", Some(json!({ "agent_ids": [b_agent, id1], "add": [vip_id] }))).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "one agent out of reach refuses the whole request");
+    let r = tech_b.post("/agents/tags", json!({ "agent_ids": [b_agent], "add": [vip_id, server_tag] })).await;
+    assert_eq!((r["agents"].as_i64(), r["added"].as_i64()), (Some(1), Some(2)), "{r}");
+    let (s, _) = tech.call(Method::POST, "/agents/tags", Some(json!({ "agent_ids": [id1], "add": [vip_id], "remove": [vip_id] }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let r = tech.post("/agents/tags", json!({ "agent_ids": [id1, b_agent], "remove": [server_tag] })).await;
+    assert_eq!(r["removed"].as_i64(), Some(2), "{r}");
+    // The tag list counts only the agents the user can see.
+    let count = |tags: &Value, id: &str| tags.as_array().unwrap().iter().find(|t| t["id"] == id).unwrap()["agents"].as_i64().unwrap();
+    assert_eq!(count(&admin.get("/tags").await, &vip_id), 2);
+    assert_eq!(count(&tech_b.get("/tags").await, &vip_id), 1, "client B's technician sees one");
+    // The agents list filters on tags (all of them).
+    let list = |q: String| async move { admin.get(&format!("/agents{q}")).await };
+    let both = list(format!("?tag={vip_id}")).await;
+    assert_eq!(both["total"].as_i64(), Some(2), "{both}");
+    tech.put(&format!("/agents/{id1}/tags"), json!({ "tag_ids": [vip_id, server_tag] })).await;
+    let only = list(format!("?tag={vip_id},{server_tag}")).await;
+    assert_eq!((only["total"].as_i64(), only["items"][0]["id"].as_str()), (Some(1), Some(id1)), "{only}");
+    assert_eq!(admin.call(Method::GET, "/agents?tag=nope", None).await.0, StatusCode::BAD_REQUEST);
+
+    // --- custom fields: definitions --------------------------------------------------------------------------------
+    let def = |entity: &str, name: &str, kind: &str, extra: Value| {
+        let mut b = json!({ "entity": entity, "name": name, "label": name.replace('_', " "), "kind": kind });
+        b.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        b
+    };
+    let (s, _) = tech.call(Method::POST, "/custom-fields", Some(def("agent", "owner", "text", json!({})))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "definitions are for admins");
+    for (what, body) in [
+        ("bad name", def("agent", "Owner Name", "text", json!({}))),
+        ("bad kind", def("agent", "x1", "json", json!({}))),
+        ("select without options", def("agent", "x2", "select", json!({}))),
+        ("options on a text field", def("agent", "x3", "text", json!({ "options": ["a"] }))),
+        ("duplicate options", def("agent", "x4", "select", json!({ "options": ["a", "A"] }))),
+        ("script-writable client field", def("client", "x5", "text", json!({ "script_writable": true }))),
+        ("a client field limited to a client", def("client", "x6", "text", json!({ "client_id": a_id }))),
+        ("bad entity", def("ticket", "x7", "text", json!({}))),
+    ] {
+        assert_eq!(admin.call(Method::POST, "/custom-fields", Some(body)).await.0, StatusCode::BAD_REQUEST, "{what}");
+    }
+    let warranty = admin.post("/custom-fields", def("agent", "warranty_end", "date", json!({ "script_writable": true }))).await;
+    let owner = admin.post("/custom-fields", def("agent", "owner", "text", json!({}))).await;
+    let tier = admin.post("/custom-fields", def("agent", "tier", "select", json!({ "options": ["Gold", "Silver"], "script_writable": true }))).await;
+    admin.post("/custom-fields", def("agent", "seats", "number", json!({ "script_writable": true }))).await;
+    admin.post("/custom-fields", def("agent", "managed", "bool", json!({ "script_writable": true }))).await;
+    let only_b = admin.post("/custom-fields", def("agent", "b_only", "text", json!({ "client_id": b_id, "script_writable": true }))).await;
+    let client_field = admin.post("/custom-fields", def("client", "account_manager", "text", json!({}))).await;
+    let site_field = admin.post("/custom-fields", def("site", "rack", "text", json!({}))).await;
+    let (s, v) = admin.call(Method::POST, "/custom-fields", Some(def("agent", "owner", "text", json!({})))).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    let id_of = |v: &Value| v["id"].as_str().unwrap().to_string();
+    let (warranty_id, owner_id, tier_id, b_only_id) = (id_of(&warranty), id_of(&owner), id_of(&tier), id_of(&only_b));
+    // A field limited to client B is invisible to a technician of client A... who has all clients here, so
+    // check with B's technician and an A-only one instead.
+    let tech_a = signed_in(url, admin, "fields-tech-a@e2e.test", "technician", Some(a_id), false).await;
+    let seen = |defs: &Value| defs.as_array().unwrap().iter().map(|d| d["name"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+    assert!(seen(&tech_a.get("/custom-fields?entity=agent").await).iter().all(|n| n != "b_only"), "limited to B");
+    assert!(seen(&tech_b.get("/custom-fields?entity=agent").await).contains(&"b_only".to_string()));
+    assert_eq!(tech_a.call(Method::GET, "/custom-fields?entity=ticket", None).await.0, StatusCode::BAD_REQUEST);
+    let (s, _) = admin.call(Method::PUT, &format!("/custom-fields/{tier_id}"), Some(json!({ "options": ["Gold", "Silver", "Bronze"], "label": "Support tier" }))).await;
+    assert!(s.is_success());
+    assert_eq!(admin.get("/custom-fields?entity=agent").await.as_array().unwrap().iter().find(|d| d["name"] == "tier").unwrap()["options"].as_array().unwrap().len(), 3);
+
+    // --- values: typed, checked before anything is stored ------------------------------------------------------------
+    async fn fields(api: &Api, id: String) -> Value {
+        api.get(&format!("/agents/{id}/fields")).await
+    }
+    let value_of = |v: &Value, name: &str| v.as_array().unwrap().iter().find(|f| f["name"] == name).map(|f| f["value"].clone());
+    let initial = fields(admin, id1.to_string()).await;
+    assert_eq!(value_of(&initial, "warranty_end"), Some(Value::Null));
+    assert_eq!(value_of(&initial, "b_only"), None, "client B's field doesn't apply to client A's agent");
+    let path = format!("/agents/{id1}/fields");
+    for (what, values) in [
+        ("a bad date", json!({ "warranty_end": "01/03/2027" })),
+        ("a bad select", json!({ "tier": "Platinum" })),
+        ("a bad number", json!({ "seats": "many" })),
+        ("a bad bool", json!({ "managed": "maybe" })),
+        ("an unknown field", json!({ "nope": "x" })),
+        ("another client's field", json!({ "b_only": "x" })),
+        ("one bad value spoils the request", json!({ "owner": "Alice", "warranty_end": "tomorrow" })),
+    ] {
+        let (s, v) = tech.call(Method::PUT, &path, Some(json!({ "values": values }))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{what}: {v}");
+    }
+    assert_eq!(value_of(&fields(admin, id1.to_string()).await, "owner"), Some(Value::Null), "nothing was stored");
+    let (s, _) = readonly.call(Method::PUT, &path, Some(json!({ "values": { "owner": "x" } }))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    let (s, _) = tech_b.call(Method::PUT, &path, Some(json!({ "values": { "owner": "x" } }))).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    let set = tech
+        .put(&path, json!({ "values": { "owner": " Alice ", "warranty_end": "2027-3-1", "tier": "gold", "seats": "12", "managed": "yes" } }))
+        .await;
+    assert_eq!(value_of(&set, "owner"), Some(json!("Alice")));
+    assert_eq!(value_of(&set, "warranty_end"), Some(json!("2027-03-01")));
+    assert_eq!(value_of(&set, "tier"), Some(json!("Gold")), "matched ignoring case");
+    assert_eq!((value_of(&set, "seats"), value_of(&set, "managed")), (Some(json!(12)), Some(json!(true))));
+    assert_eq!(set.as_array().unwrap().iter().find(|f| f["name"] == "owner").unwrap()["source"], "user");
+    // Clearing, and leaving the rest alone.
+    let set = tech.put(&path, json!({ "values": { "owner": null } })).await;
+    assert_eq!((value_of(&set, "owner"), value_of(&set, "tier")), (Some(Value::Null), Some(json!("Gold"))));
+    tech.put(&path, json!({ "values": { "owner": "Alice" } })).await;
+    // Client and site fields follow the client's scoping.
+    let (client_field_id, site_field_id) = (id_of(&client_field), id_of(&site_field));
+    tech.put(&format!("/clients/{a_id}/fields"), json!({ "values": { "account_manager": "Bob" } })).await;
+    assert_eq!(value_of(&tech.get(&format!("/clients/{a_id}/fields")).await, "account_manager"), Some(json!("Bob")));
+    assert_eq!(tech_b.call(Method::GET, &format!("/clients/{a_id}/fields"), None).await.0, StatusCode::NOT_FOUND);
+    let a_site = admin.get("/sites").await.as_array().unwrap().iter().find(|s| s["client_id"] == a_id).unwrap()["id"].as_str().unwrap().to_string();
+    tech.put(&format!("/sites/{a_site}/fields"), json!({ "values": { "rack": "R12" } })).await;
+    assert_eq!(value_of(&tech.get(&format!("/sites/{a_site}/fields")).await, "rack"), Some(json!("R12")));
+    assert_eq!(tech_b.call(Method::GET, &format!("/sites/{a_site}/fields"), None).await.0, StatusCode::NOT_FOUND);
+    // The agents list filters on a field: exact for typed fields, a substring for text.
+    let by_owner = list(format!("?cf={owner_id}&cfv=lic")).await;
+    assert_eq!(by_owner["total"].as_i64(), Some(1), "a substring of a text field: {by_owner}");
+    let by_tier = list(format!("?cf={tier_id}&cfv=gold")).await;
+    assert_eq!(by_tier["total"].as_i64(), Some(1), "{by_tier}");
+    assert_eq!(list(format!("?cf={tier_id}&cfv=Silver")).await["total"].as_i64(), Some(0));
+    assert_eq!(list(format!("?cf={warranty_id}")).await["total"].as_i64(), Some(1), "any value");
+    assert_eq!(admin.call(Method::GET, &format!("/agents?cf={client_field_id}"), None).await.0, StatusCode::BAD_REQUEST, "agent fields only");
+    assert_eq!(admin.call(Method::GET, &format!("/agents?cf={tier_id}&cfv=Platinum"), None).await.0, StatusCode::BAD_REQUEST);
+    assert!(site_field_id.len() == 36);
+
+    // --- script output → field --------------------------------------------------------------------------------------
+    let marker = |body: &str| {
+        let body = body.to_string();
+        async move {
+            let job = admin.run_script(id1, &body, 30).await;
+            let j = admin.wait_job(&job, 30).await;
+            assert_eq!(j["status"], "succeeded", "{j}");
+            // The server reads the output when the result arrives; the values land just after.
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            job
+        }
+    };
+    let job = marker(
+        "echo 'RMM-FIELD warranty_end=2028-01-31'; echo 'RMM-FIELD tier=silver'; echo 'RMM-FIELD seats=abc'; echo 'RMM-FIELD owner=Mallory'; \
+         echo 'RMM-FIELD b_only=x'; echo 'RMM-FIELD nope=1'; echo 'RMM-FIELD managed=no'; echo 'RMM-FIELD managed=true'; echo ' RMM-FIELD seats=99'",
+    )
+    .await;
+    let vals = fields(admin, id1.to_string()).await;
+    assert_eq!(value_of(&vals, "warranty_end"), Some(json!("2028-01-31")));
+    assert_eq!(value_of(&vals, "tier"), Some(json!("Silver")));
+    assert_eq!(value_of(&vals, "managed"), Some(json!(true)), "the last line of a name wins");
+    assert_eq!(value_of(&vals, "seats"), Some(json!(12)), "a value that doesn't fit is skipped, an indented marker isn't one");
+    assert_eq!(value_of(&vals, "owner"), Some(json!("Alice")), "a field nobody flagged can't be written by a script");
+    assert_eq!(vals.as_array().unwrap().iter().find(|f| f["name"] == "warranty_end").unwrap()["source"], "script");
+    let audit: Value = sqlx::query_scalar("SELECT details FROM audit_log WHERE action = 'agent.field_script' ORDER BY ts DESC LIMIT 1").fetch_one(db).await.unwrap();
+    assert_eq!(audit["job_id"], job.as_str());
+    let reasons: Vec<String> = audit["refused"].as_array().unwrap().iter().map(|r| format!("{}: {}", r["name"].as_str().unwrap(), r["reason"].as_str().unwrap())).collect();
+    assert!(reasons.iter().any(|r| r.starts_with("seats: expected a number")) && reasons.iter().any(|r| r.starts_with("owner: the field isn't flagged")), "{reasons:?}");
+    assert!(reasons.iter().any(|r| r.starts_with("b_only: no such field")) && reasons.iter().any(|r| r.starts_with("nope: no such field")), "{reasons:?}");
+    // A script that fails changes nothing; an empty value clears.
+    let failing = admin.run_script(id1, "echo 'RMM-FIELD tier=Gold'; exit 1", 30).await;
+    assert_eq!(admin.wait_job(&failing, 30).await["status"], "failed");
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(value_of(&fields(admin, id1.to_string()).await, "tier"), Some(json!("Silver")), "failed jobs set nothing");
+    marker("echo 'RMM-FIELD warranty_end='").await;
+    assert_eq!(value_of(&fields(admin, id1.to_string()).await, "warranty_end"), Some(Value::Null), "an empty value clears");
+    // The same script can't be told to reach another agent: the marker names a field, never an agent.
+    assert_eq!(value_of(&fields(admin, b_agent.clone()).await, "tier"), Some(Value::Null));
+
+    // Deleting a field takes its values with it, and an admin does it.
+    let (s, _) = tech.call(Method::DELETE, &format!("/custom-fields/{b_only_id}"), None).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    assert!(admin.call(Method::DELETE, &format!("/custom-fields/{b_only_id}"), None).await.0.is_success());
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM custom_field_values WHERE field_id = $1::uuid").bind(&b_only_id).fetch_one(db).await.unwrap();
+    assert_eq!(left, 0);
+
+    // --- notes -----------------------------------------------------------------------------------------------------------
+    let notes = format!("/agents/{id1}/notes");
+    assert_eq!(readonly.call(Method::POST, &notes, Some(json!({ "body": "x" }))).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(tech_b.call(Method::GET, &notes, None).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(tech.call(Method::POST, &notes, Some(json!({ "body": "   " }))).await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(tech.call(Method::POST, &notes, Some(json!({ "body": "x".repeat(10_001) }))).await.0, StatusCode::BAD_REQUEST);
+    let n1 = tech.post(&notes, json!({ "body": "Gate code is 4711\nCall ahead.", "pinned": true })).await;
+    assert_eq!((n1["author_name"].as_str(), n1["pinned"].as_bool(), n1["can_edit"].as_bool()), (Some("fields-tech@e2e.test"), Some(true), Some(true)), "{n1}");
+    let n1_id = n1["id"].as_str().unwrap().to_string();
+    let n2 = admin.post(&notes, json!({ "body": "<script>alert(1)</script> stays text" })).await;
+    let n2_id = n2["id"].as_str().unwrap().to_string();
+    assert_eq!(n2["body"], "<script>alert(1)</script> stays text", "stored as written; the dashboard shows it as text");
+    let (s, _) = tech.call(Method::PUT, &format!("{notes}/{n2_id}"), Some(json!({ "body": "mine now" }))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "only the author or an admin edits the text");
+    let pinned = tech.put(&format!("{notes}/{n2_id}"), json!({ "pinned": true })).await;
+    assert_eq!(pinned["pinned"], true, "anyone who can work on the agent pins");
+    let all = tech.get(&notes).await;
+    assert_eq!(all.as_array().unwrap().iter().filter(|n| n["pinned"] == true).count(), 1, "one pinned note: {all}");
+    assert_eq!(all[0]["id"], n2_id.as_str(), "the pinned note first");
+    assert_eq!(admin.get(&format!("/agents/{id1}")).await["pinned_note"]["id"], n2_id.as_str());
+    let edited = admin.put(&format!("{notes}/{n1_id}"), json!({ "body": "Gate code is 4712" })).await;
+    assert_eq!((edited["body"].as_str(), edited["can_edit"].as_bool()), (Some("Gate code is 4712"), Some(true)), "admins edit any note");
+    assert!(edited["updated_at"] != edited["created_at"]);
+    let (s, _) = tech.call(Method::DELETE, &format!("{notes}/{n2_id}"), None).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    assert!(admin.call(Method::DELETE, &format!("{notes}/{n2_id}"), None).await.0.is_success());
+    assert_eq!(admin.get(&format!("/agents/{id1}")).await["pinned_note"], Value::Null);
+    // --- saved views ------------------------------------------------------------------------------------------------------
+    let q = format!("client={a_id}&os=linux&sort=hostname&dir=desc&tag={vip_id}&health=");
+    let view = tech.post("/saved-views", json!({ "page": "agents", "name": "Linux of A", "query": q, "hidden_columns": ["version", "cpu"] })).await;
+    assert_eq!(view["query"], format!("client={a_id}&os=linux&sort=hostname&dir=desc&tag={vip_id}"), "re-encoded, empty values dropped: {view}");
+    assert_eq!((view["client_id"].as_str(), view["shared"].as_bool(), view["can_edit"].as_bool()), (Some(a_id), Some(false), Some(true)));
+    let view_id = view["id"].as_str().unwrap().to_string();
+    for (what, body) in [
+        ("another page", json!({ "page": "tickets", "name": "x", "query": "q=1" })),
+        ("an unknown key", json!({ "page": "agents", "name": "x", "query": "evil=1" })),
+        ("a paging cursor", json!({ "page": "agents", "name": "x", "query": "after=abc" })),
+        ("a client that isn't one", json!({ "page": "agents", "name": "x", "query": "client=nope" })),
+        ("no name", json!({ "page": "agents", "name": " ", "query": "os=linux" })),
+        ("bad column ids", json!({ "page": "agents", "name": "x", "query": "os=linux", "hidden_columns": ["a b"] })),
+    ] {
+        assert_eq!(tech.call(Method::POST, "/saved-views", Some(body)).await.0, StatusCode::BAD_REQUEST, "{what}");
+    }
+    let (s, _) = tech.call(Method::POST, "/saved-views", Some(json!({ "page": "agents", "name": "linux OF a", "query": "os=windows" }))).await;
+    assert_eq!(s, StatusCode::CONFLICT, "names are unique per person, ignoring case");
+    let (s, _) = tech_b.call(Method::POST, "/saved-views", Some(json!({ "page": "agents", "name": "A's", "query": format!("client={a_id}") }))).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "a view can't name a client its saver can't see");
+    // Personal views are private; shared ones are listed to everyone who can see their client.
+    assert_eq!(admin.get("/saved-views?page=agents").await.as_array().unwrap().len(), 0);
+    assert_eq!(tech_b.get("/saved-views").await.as_array().unwrap().len(), 0);
+    assert_eq!(tech.call(Method::GET, "/saved-views?page=agents", None).await.1.as_array().unwrap().len(), 1);
+    let (s, _) = readonly.call(Method::POST, "/saved-views", Some(json!({ "page": "agents", "name": "Mine", "query": "os=linux" }))).await;
+    assert!(s.is_success(), "everyone may keep personal views");
+    let (s, _) = readonly.call(Method::POST, "/saved-views", Some(json!({ "page": "agents", "name": "Shared", "query": "os=linux", "shared": true }))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "sharing is for technicians");
+    let shared = tech.put(&format!("/saved-views/{view_id}"), json!({ "shared": true, "name": "Linux of A (shared)", "hidden_columns": null })).await;
+    assert_eq!((shared["shared"].as_bool(), shared["hidden_columns"].clone()), (Some(true), Value::Null), "{shared}");
+    let seen_by_admin = admin.get("/saved-views?page=agents").await;
+    assert_eq!((seen_by_admin.as_array().unwrap().len(), seen_by_admin[0]["owner_name"].as_str()), (1, Some("fields-tech@e2e.test")));
+    assert_eq!(seen_by_admin[0]["can_edit"], true, "an admin can change a shared view");
+    assert_eq!(tech_b.get("/saved-views?page=agents").await.as_array().unwrap().len(), 0, "a view of client A isn't listed to B's technician");
+    let (s, _) = readonly.call(Method::PUT, &format!("/saved-views/{view_id}"), Some(json!({ "name": "hijack" }))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "a shared view is read-only for others");
+    let (s, _) = tech_b.call(Method::DELETE, &format!("/saved-views/{view_id}"), None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    assert!(tech.call(Method::DELETE, &format!("/saved-views/{view_id}"), None).await.0.is_success());
+
+    // --- audit and the public API -------------------------------------------------------------------------------------
+    let actions: Vec<String> =
+        sqlx::query_scalar("SELECT DISTINCT action FROM audit_log WHERE action IN ('tag.create','agent.tags','agent.tags_bulk','custom_field.create','agent.fields','agent.field_script','agent.note_create','saved_view.create') ")
+            .fetch_all(db)
+            .await
+            .unwrap();
+    assert_eq!(actions.len(), 8, "{actions:?}");
+    let key = admin
+        .post("/api-keys", json!({ "name": "fields key", "access": "write", "scopes": ["clients", "agents"], "client_ids": [a_id] }))
+        .await["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let v1 = format!("{url}/api/v1");
+    let (s, tags, _) = key_call(&key, &v1, Method::GET, "/tags", None).await;
+    assert!(s.is_success() && tags.as_array().unwrap().iter().any(|t| t["name"] == "VIP"), "{tags}");
+    let (s, vals, _) = key_call(&key, &v1, Method::PUT, &format!("/agents/{id1}/fields"), Some(json!({ "values": { "seats": 7 } }))).await;
+    assert!(s.is_success() && value_of(&vals, "seats") == Some(json!(7)), "{vals}");
+    assert_eq!(vals.as_array().unwrap().iter().find(|f| f["name"] == "seats").unwrap()["source"], "api");
+    let (s, _, _) = key_call(&key, &v1, Method::PUT, &format!("/agents/{b_agent}/fields"), Some(json!({ "values": { "seats": 7 } }))).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "a key sees only its client's agents");
+    let (s, note, _) = key_call(&key, &v1, Method::POST, &format!("/agents/{id1}/notes"), Some(json!({ "body": "from the API" }))).await;
+    assert!(s.is_success() && note["body"] == "from the API", "{note}");
+    let (s, v, _) = key_call(&key, &v1, Method::GET, "/saved-views", None).await;
+    assert_ne!(s, StatusCode::OK, "views aren't part of the public API: {v}");
+    let (s, spec, _) = key_call(&key, &v1, Method::GET, "/openapi.json", None).await;
+    assert!(s.is_success() && spec["paths"]["/agents/{id}/fields"]["put"]["operationId"] == "setAgentFields", "documented in the OpenAPI document");
+    println!("tags, custom fields, notes, saved views: ok");
 }

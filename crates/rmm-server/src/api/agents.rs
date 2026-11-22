@@ -79,6 +79,8 @@ pub struct AgentSummary {
     /// The policy set it uses (see `/agents/{id}/policy` for why).
     policy_set_id: Uuid,
     policy_set_name: String,
+    /// `[{id, name, color}]`, by name.
+    tags: serde_json::Value,
     #[sqlx(default)]
     #[serde(skip)]
     sort_key: String,
@@ -92,7 +94,9 @@ pub(crate) const SUMMARY_COLS: &str = concat!(
     " AS health, a.disk_max_pct, a.failed_jobs_24h::bigint AS failed_jobs_24h, a.open_alerts::bigint AS open_alerts,
        a.patches_overdue::bigint AS patches_overdue, a.patches_failed::bigint AS patches_failed, a.reboot_pending, a.reboot_pending_since, agent_muted(a.id, now()) AS alerts_muted, a.platform, a.category_id,
        (SELECT dc.name FROM device_categories dc WHERE dc.id = a.category_id) AS category_name, a.policy_set_id,
-       (SELECT ps.name FROM policy_sets ps WHERE ps.id = a.policy_set_id) AS policy_set_name"
+       (SELECT ps.name FROM policy_sets ps WHERE ps.id = a.policy_set_id) AS policy_set_name,
+       coalesce((SELECT jsonb_agg(jsonb_build_object('id', t.id, 'name', t.name, 'color', t.color) ORDER BY lower(t.name))
+                   FROM agent_tags atg JOIN tags t ON t.id = atg.tag_id WHERE atg.agent_id = a.id), '[]'::jsonb) AS tags"
 );
 const AGENT_FROM: &str = "FROM agents a JOIN sites s ON s.id = a.site_id JOIN clients c ON c.id = s.client_id";
 
@@ -129,6 +133,12 @@ pub struct ListQuery {
     new_days: Option<i32>,
     category_id: Option<Uuid>,
     policy_set_id: Option<Uuid>,
+    /// Comma-separated tag ids: agents that have all of them.
+    tag: Option<String>,
+    /// A custom field of agents (its id): agents with a value for it...
+    cf: Option<Uuid>,
+    /// ...and, with `cf`, that value: matched exactly, or as a case-insensitive substring for text fields.
+    cfv: Option<String>,
 }
 
 /// Matches hostname, OS name, an IP address prefix or a logged-in user. `$n` is the search text.
@@ -150,7 +160,9 @@ pub async fn list(
     Query(q): Query<ListQuery>,
     Query(page): Query<PageQuery>,
 ) -> ApiResult<Json<Page<AgentSummary>>> {
-    let plan = Plan::new(SORT_KEYS, ("hostname", false), &page, "a.id", "uuid", 11)?;
+    let plan = Plan::new(SORT_KEYS, ("hostname", false), &page, "a.id", "uuid", 15)?;
+    let tags = super::tags::parse_filter(q.tag.as_deref())?;
+    let cf = super::fields::filter(&st, &u, q.cf, q.cfv.as_deref()).await?;
     let health: Option<Vec<String>> =
         q.health.as_deref().filter(|h| !h.is_empty()).map(|h| h.split(',').map(str::to_string).collect());
     let filters = format!(
@@ -164,7 +176,11 @@ pub async fn list(
             AND ($7::text[] IS NULL OR {health} = ANY($7))
             AND ($8::int IS NULL OR a.enrolled_at > now() - make_interval(days => $8))
             AND ($9::uuid IS NULL OR a.category_id = $9)
-            AND ($10::uuid IS NULL OR a.policy_set_id = $10)",
+            AND ($10::uuid IS NULL OR a.policy_set_id = $10)
+            AND ($11::uuid[] IS NULL OR (SELECT count(*) FROM agent_tags x WHERE x.agent_id = a.id AND x.tag_id = ANY($11)) = cardinality($11))
+            AND ($12::uuid IS NULL OR EXISTS (SELECT 1 FROM custom_field_values v WHERE v.field_id = $12 AND v.agent_id = a.id
+                   AND ($13::jsonb IS NULL OR v.value = $13)
+                   AND ($14::text IS NULL OR strpos(lower(v.value #>> '{{}}'), lower($14)) > 0)))",
         search = agent_search(3),
         health = health_name!(),
     );
@@ -173,7 +189,7 @@ pub async fn list(
     let os = q.os.as_deref().filter(|s| !s.is_empty());
     macro_rules! bind_filters {
         ($query:expr) => {
-            $query.bind(q.client_id).bind(q.site_id).bind(search).bind(q.online).bind(os).bind(u.scope()).bind(&health).bind(q.new_days).bind(q.category_id).bind(q.policy_set_id)
+            $query.bind(q.client_id).bind(q.site_id).bind(search).bind(q.online).bind(os).bind(u.scope()).bind(&health).bind(q.new_days).bind(q.category_id).bind(q.policy_set_id).bind(&tags).bind(cf.field).bind(&cf.exact).bind(&cf.contains)
         };
     }
     let mut rows = bind_filters!(sqlx::query_as::<_, AgentSummary>(AssertSqlSafe(sql)));
@@ -195,6 +211,8 @@ pub struct AgentDetail {
     inventory_at: Option<DateTime<Utc>>,
     /// Optional features its build supports, as of its last connection (`patch`, `desktop`).
     capabilities: Vec<String>,
+    /// The pinned note, shown in the header.
+    pinned_note: Option<super::notes::Note>,
 }
 
 pub async fn get(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uuid>) -> ApiResult<Json<AgentDetail>> {
@@ -216,7 +234,8 @@ pub async fn get(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uuid>)
         .bind(id)
         .fetch_one(&st.db)
         .await?;
-    Ok(Json(AgentDetail { summary, kernel_version, machine_id, inventory, inventory_at, capabilities }))
+    let pinned_note = super::notes::pinned(&st, &u, id).await?;
+    Ok(Json(AgentDetail { summary, kernel_version, machine_id, inventory, inventory_at, capabilities, pinned_note }))
 }
 
 pub async fn remove(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uuid>) -> ApiResult<Json<serde_json::Value>> {

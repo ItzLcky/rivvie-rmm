@@ -17,9 +17,11 @@ mod clients;
 mod desk;
 mod docs;
 mod downloads;
+mod fields;
 mod kb;
 mod jobs;
 mod msi;
+mod notes;
 mod mutes;
 mod packages;
 mod passkeys;
@@ -39,11 +41,13 @@ mod settings;
 mod sso;
 pub(crate) mod sla;
 pub(crate) mod tickets;
+mod tags;
 mod time;
 mod tools;
 mod totp;
 pub(crate) mod users;
 mod vault;
+mod views;
 mod webhooks;
 
 pub use agents::refresh_health as refresh_agent_health;
@@ -122,6 +126,19 @@ pub fn router(attachment_max: u64) -> Router<Arc<AppState>> {
         .route("/agents", get(agents::list))
         .route("/agents/{id}", get(agents::get).delete(agents::remove))
         .route("/agents/{id}/metrics", get(agents::metrics))
+        .route("/tags", get(tags::list).post(tags::create))
+        .route("/tags/{id}", axum::routing::put(tags::update).delete(tags::remove))
+        .route("/agents/tags", post(tags::bulk))
+        .route("/agents/{id}/tags", axum::routing::put(tags::set_for_agent))
+        .route("/custom-fields", get(fields::list_defs).post(fields::create_def))
+        .route("/custom-fields/{id}", axum::routing::put(fields::update_def).delete(fields::delete_def))
+        .route("/agents/{id}/fields", get(fields::agent_values).put(fields::set_agent_values))
+        .route("/clients/{id}/fields", get(fields::client_values).put(fields::set_client_values))
+        .route("/sites/{id}/fields", get(fields::site_values).put(fields::set_site_values))
+        .route("/agents/{id}/notes", get(notes::list).post(notes::create))
+        .route("/agents/{id}/notes/{note_id}", axum::routing::put(notes::update).delete(notes::remove))
+        .route("/saved-views", get(views::list).post(views::create))
+        .route("/saved-views/{id}", axum::routing::put(views::update).delete(views::remove))
         .route("/agents/{id}/activity", get(agents::activity))
         .route("/agents/{id}/inventory/refresh", post(agents::refresh_inventory))
         .route("/agents/{id}/update", post(agents::update))
