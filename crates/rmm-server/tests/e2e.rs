@@ -38,6 +38,13 @@
 //! restore drill (`scripts/restore-drill.sh`) backs them up with the compose stack's scripts,
 //! restores into an empty database and directory, and checks them with `tests/drill.rs`.
 //!
+//! `RMM_E2E_SNMP=<ip>[:<docker container>]` is a net-snmp `snmpd` (the recipe is in
+//! `crates/rmm-snmp/tests/netsnmp.rs`; it needs the users and community that file creates, on a
+//! private address such as the Docker bridge's) for the network section: scan, monitor, rates,
+//! device-down alerts. The container name, if given, is paused and unpaused to make it go
+//! quiet. Without it that section checks everything that doesn't need a device.
+//! `RMM_E2E_ONLY=network` runs only that section (after the enrollment it needs).
+//!
 //! `RMM_E2E_ONLY=desk` runs only the core and service desk sections (faster while working on
 //! tickets, the portal and billing); `RMM_E2E_ONLY=api` only enrollment and the API keys and webhooks.
 //!
@@ -574,6 +581,12 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
     if std::env::var("RMM_E2E_ONLY").as_deref() == Ok("api") {
         api_keys_and_webhooks(&url, &admin, db, &id1, a_id, b_id).await;
         fields_tags_notes_views(&url, &admin, db, dir, &id1, a_id, b_id).await;
+        a1.kill();
+        return Ok(());
+    }
+
+    if std::env::var("RMM_E2E_ONLY").as_deref() == Ok("network") {
+        network(&url, &admin, db, &id1, a_id, a_site, b_id).await;
         a1.kill();
         return Ok(());
     }
@@ -1188,6 +1201,7 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
     ticket_docs(&url, &admin, a_id, b_id).await;
     api_keys_and_webhooks(&url, &admin, db, &id1, a_id, b_id).await;
     fields_tags_notes_views(&url, &admin, db, dir, &id1, a_id, b_id).await;
+    network(&url, &admin, db, &id1, a_id, a_site, b_id).await;
     sso_and_passkeys(server, db, dir, &secret).await;
 
     // --- rate limits ------------------------------------------------------------------------------
@@ -1312,6 +1326,7 @@ const SEALED: &[(&str, &str, &str)] = &[
     ("company_settings", "smtp_password_enc", "smtp_password_sealed"),
     ("notification_channels", "secret", "secret_sealed"),
     ("siem_destinations", "token", "token_sealed"),
+    ("net_credentials", "secret", "secret_sealed"),
 ];
 
 async fn sealed_values(db: &sqlx::PgPool) -> Vec<(&'static str, Vec<u8>)> {
@@ -1324,6 +1339,215 @@ async fn sealed_values(db: &sqlx::PgPool) -> Vec<(&'static str, Vec<u8>)> {
         all.extend(rows.into_iter().map(|(v,)| (*table, v)));
     }
     all
+}
+
+/// Network discovery and SNMP monitoring: the designated agent, credentials sealed at rest, what
+/// a site may be told to scan, and, with `RMM_E2E_SNMP`, a real scan and reading of a net-snmp
+/// device, its counters and alerts, and the public API.
+async fn network(url: &str, admin: &Api, db: &sqlx::PgPool, id1: &str, a_id: &str, a_site: &str, b_id: &str) {
+    use reqwest::Method;
+    let snmp = std::env::var("RMM_E2E_SNMP").ok().filter(|s| !s.is_empty());
+    let (snmp_ip, snmp_container) = match snmp.as_deref().map(|s| s.split_once(':').map_or((s, None), |(a, b)| (a, Some(b)))) {
+        Some((ip, c)) => (Some(ip.to_string()), c.map(str::to_string)),
+        None => (None, None),
+    };
+
+    // --- the site starts with nothing, and the agent says it can do this -------------------------------
+    let site = admin.get(&format!("/sites/{a_site}/network")).await;
+    assert!(site["agent_id"].is_null() && site["subnets"].as_array().unwrap().is_empty() && site["devices"] == 0, "{site}");
+    let candidate = eventually(30, "the agent lists the network capability", || async {
+        let s = admin.get(&format!("/sites/{a_site}/network")).await;
+        s["candidates"].as_array().unwrap().iter().find(|c| c["id"] == id1 && c["capable"] == true).cloned()
+    })
+    .await;
+    assert_eq!(candidate["online"], true);
+    let summary = admin.get("/network/summary").await;
+    assert_eq!((summary["devices"].as_i64(), summary["unmanaged"].as_i64(), summary["down"].as_i64()), (Some(0), Some(0), Some(0)), "{summary}");
+
+    // --- credentials: sealed, never returned, and checked ---------------------------------------------
+    let bad = |body: Value| async move { admin.call(Method::POST, &format!("/clients/{a_id}/network-credentials"), Some(body)).await.0 };
+    assert_eq!(bad(json!({ "name": "no community", "version": "v2c" })).await, StatusCode::BAD_REQUEST);
+    assert_eq!(bad(json!({ "name": "no user", "version": "v3" })).await, StatusCode::BAD_REQUEST);
+    assert_eq!(bad(json!({ "name": "short", "version": "v3", "username": "u", "auth_proto": "sha1", "auth_secret": "short" })).await, StatusCode::BAD_REQUEST);
+    assert_eq!(bad(json!({ "name": "priv alone", "version": "v3", "username": "u", "priv_proto": "aes128", "priv_secret": "longenough1" })).await, StatusCode::BAD_REQUEST);
+    assert_eq!(bad(json!({ "name": "v1", "version": "v1", "community": "x" })).await, StatusCode::BAD_REQUEST);
+    let v2c = admin.post(&format!("/clients/{a_id}/network-credentials"), json!({ "name": "E2E v2c", "version": "v2c", "community": "e2ecomm" })).await;
+    let v3 = admin
+        .post(
+            &format!("/clients/{a_id}/network-credentials"),
+            json!({ "name": "E2E v3", "version": "v3", "username": "e2ev3", "auth_proto": "sha1", "auth_secret": "e2eauthpass", "priv_proto": "aes128", "priv_secret": "e2eprivpass" }),
+        )
+        .await;
+    let (v2c_id, v3_id) = (v2c["id"].as_str().unwrap().to_string(), v3["id"].as_str().unwrap().to_string());
+    let listed = admin.get(&format!("/clients/{a_id}/network-credentials")).await;
+    assert_eq!(listed.as_array().unwrap().len(), 2, "{listed}");
+    let text = listed.to_string();
+    assert!(!text.contains("e2ecomm") && !text.contains("e2eauthpass") && !text.contains("e2eprivpass") && !text.contains("secret"), "secrets are write-only: {text}");
+    assert!(admin.get(&format!("/clients/{b_id}/network-credentials")).await.as_array().unwrap().is_empty());
+    let (stored, sealed): (Vec<u8>, bool) = sqlx::query_as("SELECT secret, secret_sealed FROM net_credentials WHERE id = $1::uuid").bind(&v2c_id).fetch_one(db).await.unwrap();
+    assert!(sealed && !String::from_utf8_lossy(&stored).contains("e2ecomm"), "the community is sealed at rest");
+    // An edit keeps the secret it wasn't given.
+    admin.put(&format!("/network-credentials/{v2c_id}"), json!({ "name": "E2E v2c (read-only)" })).await;
+    let (stored_after, _): (Vec<u8>, bool) = sqlx::query_as("SELECT secret, secret_sealed FROM net_credentials WHERE id = $1::uuid").bind(&v2c_id).fetch_one(db).await.unwrap();
+    assert!(!stored_after.is_empty());
+
+    // --- what a site may be told ---------------------------------------------------------------------
+    let put = |body: Value| async move { admin.call(Method::PUT, &format!("/sites/{a_site}/network"), Some(body)).await };
+    for (what, body) in [
+        ("a public block", json!({ "agent_id": id1, "subnets": ["8.8.8.0/24"] })),
+        ("a block that is too large", json!({ "agent_id": id1, "subnets": ["10.0.0.0/16"] })),
+        ("not a block", json!({ "agent_id": id1, "subnets": ["nope"] })),
+        ("an agent that isn't in the site", json!({ "agent_id": uuid::Uuid::new_v4() })),
+        ("another client's credentials", json!({ "agent_id": id1, "credential_ids": [uuid::Uuid::new_v4()] })),
+        ("an interval that's too short", json!({ "agent_id": id1, "poll_secs": 5 })),
+    ] {
+        let (s, v) = put(body).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{what}: {v}");
+    }
+    let (s, _) = admin.call(Method::POST, &format!("/sites/{a_site}/network/scan"), None).await;
+    assert!(s.is_client_error(), "no scan without a designated agent ({s})");
+    let (s, v) = admin
+        .call(Method::POST, "/network/devices", Some(json!({ "site_id": a_site, "name": "public", "host": "8.8.8.8", "credential_id": v2c_id })))
+        .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "devices are read on private addresses only: {v}");
+
+    // --- no SNMP device: the rest ends here ------------------------------------------------------------
+    let Some(ip) = snmp_ip else {
+        println!("network: RMM_E2E_SNMP not set, skipping the scan and the device");
+        return;
+    };
+    let parts: Vec<&str> = ip.split('.').collect();
+    let block = format!("{}.{}.{}.0/24", parts[0], parts[1], parts[2]);
+
+    // --- a scan finds the device, tries the credentials and says what it is -------------------------------
+    admin
+        .put(&format!("/sites/{a_site}/network"), json!({ "agent_id": id1, "subnets": [block], "discovery_hours": 0, "credential_ids": [v3_id, v2c_id], "poll_secs": 60 }))
+        .await;
+    let started = admin.post(&format!("/sites/{a_site}/network/scan"), json!({})).await;
+    assert!(started["id"].is_string(), "{started}");
+    let (s, v) = admin.call(Method::POST, &format!("/sites/{a_site}/network/scan"), None).await;
+    assert!(s == StatusCode::CONFLICT || s.is_success(), "a second scan while one runs is refused, or it was already over: {s} {v}");
+    let found = eventually(120, "the scan to find the snmpd", || async {
+        let all = admin.get(&format!("/network/discovered?site_id={a_site}&state=all")).await;
+        all.as_array().unwrap().iter().find(|d| d["ip"] == ip.as_str() && d["sys_name"] == "e2e-snmpd").cloned()
+    })
+    .await;
+    assert_eq!(found["state"], "unmanaged", "{found}");
+    assert!(found["credential_id"].is_string(), "a credential set answered: {found}");
+    assert!(found["methods"].as_array().unwrap().iter().any(|m| m == "snmp"), "{found}");
+    assert!(found["sys_descr"].as_str().unwrap().contains("Linux"), "{found}");
+    let scans = admin.get(&format!("/sites/{a_site}/network/scans")).await;
+    assert_eq!(scans[0]["status"], "done", "{scans}");
+    assert!(scans[0]["found"].as_i64() >= Some(1) && scans[0]["scanned"].as_i64() >= Some(1), "{scans}");
+    // The agent's own machine is in the list too, and matched to the agent by IP or MAC (managed), or at least listed.
+    let unmanaged = admin.get("/network/discovered").await;
+    assert!(unmanaged.as_array().unwrap().iter().any(|d| d["id"] == found["id"]), "the unmanaged list is the default");
+    let summary = admin.get("/network/summary").await;
+    assert!(summary["unmanaged"].as_i64() >= Some(1), "{summary}");
+
+    // --- ignore, mark as known, put back -----------------------------------------------------------------
+    let fid = found["id"].as_str().unwrap().to_string();
+    admin.post("/network/discovered/bulk", json!({ "ids": [fid], "status": "ignored" })).await;
+    assert!(!admin.get("/network/discovered").await.to_string().contains(&fid), "ignored hosts leave the list");
+    assert!(admin.get("/network/discovered?state=ignored").await.to_string().contains(&fid));
+    admin.post("/network/discovered/bulk", json!({ "ids": [fid], "status": "known", "note": "e2e snmpd" })).await;
+    let known = admin.get("/network/discovered?state=known").await;
+    assert_eq!(known[0]["note"], "e2e snmpd", "{known}");
+    admin.post("/network/discovered/bulk", json!({ "ids": [fid], "status": "unmanaged" })).await;
+    let hint = admin.get(&format!("/network/discovered/{fid}/deploy")).await;
+    assert!(hint["os"].is_string() && hint["ways"].is_array() && hint["site_id"] == a_site, "{hint}");
+
+    // --- monitor it -----------------------------------------------------------------------------------------
+    let (s, _) = admin.call(Method::POST, &format!("/network/discovered/{fid}/monitor"), Some(json!({ "name": "E2E snmpd", "credential_id": uuid::Uuid::new_v4() }))).await;
+    assert!(s.is_client_error());
+    let mon = admin.post(&format!("/network/discovered/{fid}/monitor"), json!({ "name": "E2E snmpd", "kind": "server", "credential_id": v2c_id })).await;
+    let dev = mon["id"].as_str().unwrap().to_string();
+    let (s, _) = admin.call(Method::POST, &format!("/network/discovered/{fid}/monitor"), Some(json!({ "name": "again", "credential_id": v2c_id }))).await;
+    assert_eq!(s, StatusCode::CONFLICT, "one device per host");
+    let d = eventually(90, "the first reading", || async {
+        let d = admin.get(&format!("/network/devices/{dev}")).await;
+        (d["state"] == "up" && !d["interfaces"].as_array().unwrap().is_empty()).then_some(d)
+    })
+    .await;
+    assert_eq!(d["sys_name"], "e2e-snmpd", "{d}");
+    assert!(d["uptime_secs"].as_i64() >= Some(0) && d["agent_id"] == id1, "{d}");
+    assert_eq!(d["kind"], "server");
+    assert!(d["interfaces"].as_array().unwrap().iter().any(|i| i["oper_status"] == 1), "{d}");
+    assert_eq!(admin.get("/network/discovered?state=monitored").await[0]["net_device_id"], dev.as_str());
+    // Counters turn into rates from the second reading on, and the history keeps the readings.
+    admin.post(&format!("/network/devices/{dev}/poll"), json!({})).await;
+    let metrics = eventually(120, "device history", || async {
+        let m = admin.get(&format!("/network/devices/{dev}/metrics?hours=1")).await;
+        (!m.as_array().unwrap().is_empty() && m[0]["reachable_pct"].as_f64() == Some(100.0)).then_some(m)
+    })
+    .await;
+    assert!(metrics[0]["rtt_ms"].is_number(), "{metrics}");
+    let list = admin.get(&format!("/network/devices?site_id={a_site}&state=up&q=snmpd")).await;
+    assert_eq!(list.as_array().unwrap().len(), 1, "{list}");
+    assert_eq!(admin.get("/network/devices?kind=switch").await.as_array().unwrap().len(), 0);
+    let eth = d["interfaces"].as_array().unwrap().iter().find(|i| i["oper_status"] == 1 && i["name"].as_str().is_some_and(|n| n.starts_with("eth"))).cloned();
+    if let Some(i) = eth {
+        let idx = i["if_index"].as_i64().unwrap();
+        admin.put(&format!("/network/devices/{dev}/interfaces/{idx}"), json!({ "monitored": true })).await;
+        let (s, _) = admin.call(Method::GET, &format!("/network/devices/{dev}/interfaces/{idx}/metrics?hours=1"), None).await;
+        assert!(s.is_success());
+    }
+
+    // --- the public API: the network scope, and client scoping -----------------------------------------------
+    let made = admin.post("/api-keys", json!({ "name": "e2e network", "access": "read", "scopes": ["network"], "client_ids": [a_id] })).await;
+    let key = made["token"].as_str().unwrap().to_string();
+    let v1 = format!("{url}/api/v1");
+    let (s, devs, _) = key_call(&key, &v1, Method::GET, "/network/devices", None).await;
+    assert!(s.is_success() && devs.as_array().unwrap().iter().any(|x| x["id"] == dev.as_str()), "{s} {devs}");
+    assert!(!devs.to_string().contains("e2ecomm") && !devs.to_string().contains("credential_id\":\"\""), "no secrets in the public API");
+    assert!(key_call(&key, &v1, Method::GET, &format!("/network/devices/{dev}"), None).await.0.is_success());
+    assert!(key_call(&key, &v1, Method::GET, "/network/discovered?state=all", None).await.0.is_success());
+    assert_eq!(key_call(&key, &v1, Method::POST, "/network/devices", Some(json!({}))).await.0, StatusCode::FORBIDDEN, "a key can't change the network");
+    assert!(!key_call(&key, &v1, Method::POST, &format!("/sites/{a_site}/network/scan"), None).await.0.is_success(), "nor start scans");
+    assert!(!key_call(&key, &v1, Method::GET, &format!("/clients/{a_id}/network-credentials"), None).await.0.is_success(), "nor reach credentials");
+    let spec: Value = reqwest::get(format!("{url}/api/v1/openapi.json")).await.unwrap().json().await.unwrap();
+    assert!(spec["paths"]["/network/devices"]["get"]["operationId"] == "listNetworkDevices", "documented");
+
+    // --- alerts: a device that stops answering, then comes back --------------------------------------------------
+    let item = admin.alert_policy(json!({ "name": "E2E network down", "kind": "net_down", "params": { "minutes": 1 }, "severity": "critical" })).await;
+    let item_id = item["id"].as_str().unwrap().to_string();
+    let (s, v) = admin.alert_policy_call(json!({ "name": "bad", "kind": "net_threshold", "params": { "metric": "bogus", "threshold": 5 }, "severity": "info" })).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    if let Some(container) = snmp_container {
+        let docker = |what: &str| {
+            let ok = Command::new("docker").args([what, &container]).stdout(Stdio::null()).status().map(|s| s.success()).unwrap_or(false);
+            assert!(ok, "docker {what} {container}");
+        };
+        docker("pause");
+        let alert = eventually(240, "a device-down alert", || async {
+            let items = alerts_for(admin, "state=open&kind=net_down").await;
+            items.into_iter().find(|a| a["device_id"] == dev.as_str())
+        })
+        .await;
+        assert_eq!(alert["agent_id"], id1, "belongs to the designated agent: {alert}");
+        assert_eq!(alert["device_name"], "E2E snmpd");
+        assert_eq!(admin.get(&format!("/network/devices/{dev}")).await["state"], "down");
+        docker("unpause");
+        eventually(240, "the device-down alert to clear", || async {
+            let items = alerts_for(admin, "state=open&kind=net_down").await;
+            (!items.iter().any(|a| a["device_id"] == dev.as_str())).then_some(())
+        })
+        .await;
+        assert_eq!(admin.get(&format!("/network/devices/{dev}")).await["state"], "up");
+    }
+    assert!(admin.delete_policy(&item_id).await.is_success());
+
+    // --- pausing and deleting ----------------------------------------------------------------------------------
+    admin.put(&format!("/network/devices/{dev}"), json!({ "enabled": false })).await;
+    assert_eq!(admin.get(&format!("/network/devices/{dev}")).await["enabled"], false);
+    let (s, _) = admin.call(Method::DELETE, &format!("/network-credentials/{v2c_id}"), None).await;
+    assert!(s.is_client_error(), "credentials in use can't be deleted ({s})");
+    let (s, _) = admin.call(Method::DELETE, &format!("/network/devices/{dev}"), None).await;
+    assert!(s.is_success());
+    let after = admin.get(&format!("/network/discovered?state=unmanaged&site_id={a_site}")).await;
+    assert!(after.to_string().contains(&fid), "a deleted device is an unmanaged host again: {after}");
+    admin.put(&format!("/sites/{a_site}/network"), json!({ "agent_id": null })).await;
+    assert!(admin.get(&format!("/sites/{a_site}/network")).await["agent_id"].is_null());
 }
 
 /// `rmm-server rotate-data-key`: dry run, a wrong old key, the real run, a second run that

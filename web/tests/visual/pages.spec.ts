@@ -108,7 +108,14 @@ const pages: [string, string][] = [
 	['settings-api', '/settings/api-keys'],
 	['settings-webhooks', '/settings/webhooks'],
 	['settings-siem', '/settings/siem'],
-	['developers', '/developers']
+	['developers', '/developers'],
+	['network', '/network'],
+	['network-discovered', '/network?tab=discovered'],
+	['network-discovered-all', '/network?tab=discovered&found=all'],
+	['network-device', '/network/devices/nd-1?port=1'],
+	['network-device-down', '/network/devices/nd-2'],
+	['network-device-printer', '/network/devices/nd-3'],
+	['network-settings', '/network/settings?client=c-acme']
 ];
 const phone: [string, string][] = [
 	['dashboard', '/'],
@@ -142,7 +149,9 @@ const phone: [string, string][] = [
 	['client-docs-edit', '/clients/c-acme?tab=docs&doc=d-network&edit=1'],
 	['client-passwords', '/clients/c-acme?tab=passwords'],
 	['settings-webhooks', '/settings/webhooks'],
-	['settings-siem', '/settings/siem']
+	['settings-siem', '/settings/siem'],
+	['network', '/network'],
+	['network-device', '/network/devices/nd-1']
 ];
 
 const jpeg = readFileSync(new URL('./fixtures/desktop.jpg', import.meta.url));

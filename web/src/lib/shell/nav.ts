@@ -1,5 +1,5 @@
 import type { Component } from 'svelte';
-import { Boxes, BarChart3, BellRing, BookOpen, CalendarDays, Clock, FileSignature, FolderKanban, Receipt, Building2, LifeBuoy, CalendarClock, FileCode2, History, LayoutDashboard, ListChecks, Monitor, PackageCheck, Settings, Shield, ShieldCheck } from '@lucide/svelte';
+import { Boxes, BarChart3, BellRing, BookOpen, CalendarDays, Clock, FileSignature, FolderKanban, Receipt, Building2, LifeBuoy, CalendarClock, FileCode2, History, LayoutDashboard, ListChecks, Monitor, Network, PackageCheck, Settings, Shield, ShieldCheck } from '@lucide/svelte';
 import type { Role } from '#lib/types.js';
 import type { Permission } from '#lib/session.svelte.js';
 
@@ -48,6 +48,7 @@ export const nav: NavGroup[] = [
 		label: 'Devices',
 		items: [
 			{ href: '/agents', label: 'Agents', icon: Monitor, key: 'a', scoped: true },
+			{ href: '/network', label: 'Network', icon: Network, key: 'y', scoped: true },
 			{ href: '/clients', label: 'Clients & Sites', icon: Building2, key: 'c', scoped: true }
 		]
 	},

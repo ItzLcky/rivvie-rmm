@@ -19,6 +19,7 @@ yara = ["rmm-scan/yara"]
 rmm-proto.workspace = true
 rmm-content.workspace = true
 rmm-scan.workspace = true
+rmm-snmp = { path = "../rmm-snmp" }
 anyhow.workspace = true
 serde.workspace = true
 uuid.workspace = true

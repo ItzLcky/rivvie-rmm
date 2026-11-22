@@ -15,7 +15,10 @@ mod events;
 mod fields;
 mod hub;
 mod metrics;
+mod netalerts;
+mod netmon;
 mod notify;
+mod oui;
 mod oidc;
 mod paging;
 mod patches;
@@ -344,6 +347,7 @@ async fn serve(db: sqlx::PgPool, args: ServeArgs) -> Result<()> {
     tokio::spawn(metrics::probe_pool(state.clone()));
     tokio::spawn(updates::run(state.clone()));
     tokio::spawn(siem::run(state.clone()));
+    tokio::spawn(netmon::run(state.clone()));
     if state.cfg.metrics_token.is_some() {
         info!("metrics: GET /metrics (bearer token required)");
     }
@@ -480,6 +484,9 @@ async fn housekeeping(state: Arc<AppState>) {
             .execute(db)
             .await,
         );
+        if let Err(e) = netmon::rollup(db).await {
+            warn!("housekeeping: rolling up network samples: {e}");
+        }
         // The rest is bulk deletion; hourly is plenty.
         if runs.is_multiple_of(12) {
             state.limits.prune();
@@ -495,6 +502,9 @@ async fn housekeeping(state: Arc<AppState>) {
                 .execute(db)
                 .await,
             );
+            if let Err(e) = netmon::prune(db, state.cfg.metrics_raw_days as i32, state.cfg.metrics_retention_days as i32).await {
+                warn!("housekeeping: pruning network samples: {e}");
+            }
             if let Err(e) = patches::prune(db).await {
                 warn!("housekeeping: pruning patches: {e}");
             }

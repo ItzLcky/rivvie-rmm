@@ -59,6 +59,7 @@ enum Key {
     Patches(Uuid),
     Software(Uuid),
     Security(Uuid),
+    Network(Uuid),
     Ticket(Uuid),
 }
 
@@ -72,6 +73,7 @@ fn key(ev: &Event) -> Key {
         Event::Patches { agent_id, .. } => Key::Patches(*agent_id),
         Event::Software { agent_id, .. } => Key::Software(*agent_id),
         Event::Security { agent_id, .. } => Key::Security(*agent_id),
+        Event::Network { site_id, .. } => Key::Network(*site_id),
         Event::Ticket { id, .. } => Key::Ticket(*id),
     }
 }

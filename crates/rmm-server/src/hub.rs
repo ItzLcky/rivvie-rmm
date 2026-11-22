@@ -71,6 +71,12 @@ pub enum Event {
         #[serde(skip)]
         client_id: Uuid,
     },
+    /// A site's network changed: a scan stored, a device read.
+    Network {
+        site_id: Uuid,
+        #[serde(skip)]
+        client_id: Uuid,
+    },
     /// A ticket was created or changed (fields, timeline).
     Ticket {
         id: Uuid,
@@ -89,7 +95,8 @@ impl Event {
             | Event::Services { client_id, .. }
             | Event::Patches { client_id, .. }
             | Event::Software { client_id, .. }
-            | Event::Security { client_id, .. } => Some(*client_id),
+            | Event::Security { client_id, .. }
+            | Event::Network { client_id, .. } => Some(*client_id),
             Event::Ticket { client_id, .. } => *client_id,
             Event::Jobs => None,
         }

@@ -17,6 +17,7 @@
 //! | `company_settings`      | `smtp_password_enc`                            | `smtp_password_sealed` |
 //! | `notification_channels` | `secret` (webhook channel signing secret)      | `secret_sealed`     |
 //! | `siem_destinations`     | `token`                                        | `token_sealed`      |
+//! | `net_credentials`       | `secret` (SNMP community or passphrases)       | `secret_sealed`     |
 //! | `vault_keys`            | `wrapped_key` (AAD `vault-key:<client id>`)    | always sealed       |
 //!
 //! The vault's items are sealed with the per-client keys, not with `RMM_DATA_KEY`, so
@@ -93,6 +94,7 @@ pub const TABLES: &[Table] = &[
     },
     Table { name: "notification_channels", pk: "id", pk_type: "uuid", columns: &["secret"], flag: Some("secret_sealed"), aad_prefix: None },
     Table { name: "siem_destinations", pk: "id", pk_type: "uuid", columns: &["token"], flag: Some("token_sealed"), aad_prefix: None },
+    Table { name: "net_credentials", pk: "id", pk_type: "uuid", columns: &["secret"], flag: Some("secret_sealed"), aad_prefix: None },
     Table { name: "vault_keys", pk: "client_id", pk_type: "uuid", columns: &["wrapped_key"], flag: None, aad_prefix: Some("vault-key:") },
 ];
 

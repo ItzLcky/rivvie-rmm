@@ -302,6 +302,41 @@ pub static OPS: &[Op] = &[
         note: "Only catalog packages can be deployed, never arbitrary commands. Offline devices run it when they reconnect. Devices that can't take it (another client's package, an agent without software support, a run already in progress) are listed under `skipped`. Needs a write key whose owner is a technician or admin.",
         query: NONE, paged: false, body: Some("SoftwareDeploy"), response: Resp::Object,
     },
+    // ---- network discovery and SNMP devices (read) ------------------------------------------
+    Op {
+        id: "listNetworkDevices", method: "GET", path: "/network/devices", group: "network", summary: "List SNMP-monitored network devices",
+        note: "Switches, routers, firewalls, printers and the like read through a site's designated agent. Credentials are never returned.",
+        query: &[
+            CLIENT_Q,
+            ("site_id", "uuid", "Only this site."),
+            ("state", "string", "`up`, `down` or `unknown`."),
+            ("kind", "string", "`switch`, `router`, `firewall`, `ap`, `printer`, `ups`, `nas`, `server`, `windows`, `linux` or `other`."),
+            ("q", "string", "Name, address, description or vendor."),
+        ],
+        paged: false, body: None, response: Resp::List("NetworkDevice"),
+    },
+    Op {
+        id: "getNetworkDevice", method: "GET", path: "/network/devices/{id}", group: "network", summary: "Get a network device with its interfaces and open alerts",
+        note: "", query: NONE, paged: false, body: None, response: Resp::One("NetworkDeviceDetail"),
+    },
+    Op {
+        id: "getNetworkDeviceMetrics", method: "GET", path: "/network/devices/{id}/metrics", group: "network", summary: "Reachability, latency, CPU and memory history of a device",
+        note: "About 500 points whatever the range; beyond 48 hours from hourly rollups.",
+        query: &[("hours", "integer", "How far back, 1-8784. Default 24.")], paged: false, body: None, response: Resp::List("NetworkDevicePoint"),
+    },
+    Op {
+        id: "listDiscoveredDevices", method: "GET", path: "/network/discovered", group: "network", summary: "List the hosts that network scans found",
+        note: "`state` says whether a host is managed (an agent runs on it), monitored (read over SNMP), ignored, known or still unmanaged.",
+        query: &[
+            CLIENT_Q,
+            ("site_id", "uuid", "Only this site."),
+            ("state", "string", "`unmanaged` (default), `managed`, `monitored`, `ignored`, `known` or `all`."),
+            ("online", "boolean", "Seen (or not) by the latest scan."),
+            ("q", "string", "Name, address, MAC, vendor or note."),
+            ("limit", "integer", "At most this many, 1-2000. Default 500."),
+        ],
+        paged: false, body: None, response: Resp::List("DiscoveredDevice"),
+    },
     // ---- endpoint protection (read) -------------------------------------------------------
     Op {
         id: "securitySummary", method: "GET", path: "/security/summary", group: "security", summary: "Protection state of the fleet",
@@ -602,6 +637,28 @@ fn base_schemas() -> Value {
         "AuditEvent": object("One entry of the audit log.", &[
             ("id", "integer"), ("ts", "datetime"), ("user_name", "string?"), ("action", "string"), ("target_type", "string?"),
             ("target_id", "uuid?"), ("details", "object"),
+        ]),
+        "NetworkDevice": object("A device read over SNMP.", &[
+            ("id", "uuid"), ("site_id", "uuid"), ("site_name", "string"), ("client_id", "uuid"), ("client_name", "string"), ("name", "string"),
+            ("host", "string"), ("port", "integer"), ("kind", "string"), ("enabled", "boolean"), ("sys_descr", "string?"), ("sys_name", "string?"),
+            ("sys_object_id", "string?"), ("sys_location", "string?"), ("vendor", "string?"), ("mac", "string?"), ("state", "string"),
+            ("state_since", "datetime"), ("last_poll_at", "datetime?"), ("last_ok_at", "datetime?"), ("last_error", "string?"), ("rtt_ms", "integer?"),
+            ("uptime_secs", "integer?"), ("cpu_percent", "number?"), ("mem_used", "integer?"), ("mem_total", "integer?"), ("storage", "array"),
+            ("supplies", "array"), ("agent_id", "uuid?"), ("agent_hostname", "string?"), ("agent_online", "boolean"), ("open_alerts", "integer"),
+            ("interfaces", "integer"), ("interfaces_up", "integer"),
+        ]),
+        "NetworkDeviceDetail": {
+            "allOf": [reference("NetworkDevice"), object("Interfaces and open alerts.", &[("interfaces", "array"), ("alerts", "array")])],
+        },
+        "NetworkDevicePoint": object("One point of a device's history.", &[
+            ("ts", "datetime"), ("reachable_pct", "number"), ("rtt_ms", "number?"), ("cpu_percent", "number?"), ("mem_used", "integer?"), ("mem_total", "integer?"),
+        ]),
+        "DiscoveredDevice": object("A host a network scan found.", &[
+            ("id", "uuid"), ("site_id", "uuid"), ("site_name", "string"), ("client_id", "uuid"), ("client_name", "string"), ("ip", "string"),
+            ("mac", "string?"), ("hostname", "string?"), ("mdns_name", "string?"), ("vendor", "string?"), ("sys_name", "string?"), ("sys_descr", "string?"),
+            ("kind", "string"), ("open_ports", "array"), ("methods", "array"), ("state", "string"), ("note", "string"), ("agent_id", "uuid?"),
+            ("agent_hostname", "string?"), ("net_device_id", "uuid?"), ("online", "boolean"), ("first_seen_at", "datetime"), ("last_seen_at", "datetime"),
+            ("name", "string"),
         ]),
         "Webhook": object("The body of every webhook delivery. `data` depends on the event.", &[
             ("id", "uuid"), ("event", "string"), ("created_at", "datetime"), ("data", "object"),

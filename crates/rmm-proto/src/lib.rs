@@ -9,6 +9,7 @@
 //! interactive shells, patching, remote desktop streams and endpoint protection.
 
 pub mod desktop;
+pub mod net;
 pub mod patch;
 pub mod security;
 pub mod software;
@@ -270,6 +271,27 @@ pub enum AgentMsg {
     ReputationQuery {
         hashes: Vec<security::HashSeen>,
     },
+    /// Answer to [`ServerMsg::NetScan`], when the scan is over.
+    NetScanResult {
+        scan_id: Uuid,
+        /// The blocks that were scanned (the agent's own subnets when none were asked for).
+        #[serde(default)]
+        subnets: Vec<String>,
+        /// Addresses probed.
+        #[serde(default)]
+        scanned: u32,
+        hosts: Vec<net::Host>,
+        /// The scan couldn't run or stopped early; `hosts` is then what was found so far.
+        #[serde(default)]
+        error: Option<String>,
+        #[serde(default)]
+        duration_ms: u64,
+    },
+    /// Answer to [`ServerMsg::SnmpPoll`]: one result per target, devices that didn't answer included.
+    SnmpPollResult {
+        poll_id: Uuid,
+        results: Vec<net::PollResult>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -483,6 +505,18 @@ pub enum ServerMsg {
     /// The hashes of a [`AgentMsg::ReputationQuery`] the server knows as malicious.
     ReputationResult {
         known: Vec<security::HashKnown>,
+    },
+    /// Scan the network for devices (only to agents listing [`net::CAPABILITY`]); answered with
+    /// [`AgentMsg::NetScanResult`]. The agent runs one scan at a time.
+    NetScan {
+        scan_id: Uuid,
+        spec: net::ScanSpec,
+    },
+    /// Read these devices over SNMP (only to agents listing [`net::CAPABILITY`]); answered with
+    /// [`AgentMsg::SnmpPollResult`].
+    SnmpPoll {
+        poll_id: Uuid,
+        targets: Vec<net::PollTarget>,
     },
 }
 
@@ -914,6 +948,50 @@ mod tests {
         };
         assert!(matches!(decode::<ServerMsg>(&encode(&r).unwrap()).unwrap(), ServerMsg::ReputationResult { known } if known[0].source == "list:x"));
         assert_eq!(security::RealtimeMode::parse("block").map(security::RealtimeMode::as_str), Some("block"));
+    }
+
+    #[test]
+    fn network_messages_roundtrip_and_hide_secrets() {
+        let creds = net::SnmpCreds::V3 {
+            user: "monitor".into(),
+            auth_proto: Some("sha1".into()),
+            auth_secret: Some("hunter2hunter2".into()),
+            priv_proto: Some("aes128".into()),
+            priv_secret: Some("correct-horse".into()),
+            context: String::new(),
+        };
+        let msg = ServerMsg::SnmpPoll {
+            poll_id: Uuid::nil(),
+            targets: vec![net::PollTarget { device_id: Uuid::nil(), host: "10.0.0.2".into(), port: 161, creds: creds.clone(), supplies: true }],
+        };
+        let dbg = format!("{msg:?}");
+        assert!(!dbg.contains("hunter2") && !dbg.contains("correct-horse"), "{dbg}");
+        match decode::<ServerMsg>(&encode(&msg).unwrap()).unwrap() {
+            ServerMsg::SnmpPoll { targets, .. } => assert_eq!(targets[0].creds, creds),
+            other => panic!("{other:?}"),
+        }
+        let scan = ServerMsg::NetScan {
+            scan_id: Uuid::nil(),
+            spec: net::ScanSpec { subnets: vec!["192.168.1.0/24".into()], max_hosts: 256, profiles: vec![], names: true },
+        };
+        assert!(matches!(decode::<ServerMsg>(&encode(&scan).unwrap()).unwrap(), ServerMsg::NetScan { spec, .. } if spec.max_hosts == 256));
+        let result = AgentMsg::NetScanResult {
+            scan_id: Uuid::nil(),
+            subnets: vec![],
+            scanned: 1,
+            hosts: vec![net::Host { ip: "192.168.1.9".into(), mac: Some("aa:bb:cc:00:11:22".into()), hostname: None, mdns_name: None, methods: vec!["arp".into()], open_ports: vec![22], snmp: None, rtt_ms: Some(2) }],
+            error: None,
+            duration_ms: 5,
+        };
+        assert!(matches!(decode::<AgentMsg>(&encode(&result).unwrap()).unwrap(), AgentMsg::NetScanResult { hosts, .. } if hosts[0].open_ports == [22]));
+        // Fields a newer agent adds, and a result that says almost nothing, still decode.
+        #[derive(Serialize)]
+        struct Bare {
+            device_id: Uuid,
+            ok: bool,
+        }
+        let r: net::PollResult = decode(&encode(&Bare { device_id: Uuid::nil(), ok: false }).unwrap()).unwrap();
+        assert!(!r.ok && r.interfaces.is_empty() && r.supplies.is_empty());
     }
 
     #[test]

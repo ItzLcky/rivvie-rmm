@@ -23,6 +23,7 @@ mod jobs;
 mod msi;
 mod notes;
 mod mutes;
+mod network;
 mod packages;
 mod passkeys;
 mod schedules;
@@ -394,6 +395,23 @@ pub fn router(attachment_max: u64) -> Router<Arc<AppState>> {
         .route("/reports/utilisation", get(reports::utilisation))
         .route("/reports/profitability", get(reports::profitability))
         .route("/reports/qbr/{id}", get(reports::qbr))
+        .route("/sites/{id}/network", get(network::site_settings).put(network::update_settings))
+        .route("/sites/{id}/network/scan", post(network::scan))
+        .route("/sites/{id}/network/scans", get(network::scans))
+        .route("/network/summary", get(network::summary))
+        .route("/network/discovered", get(network::list_discovered))
+        .route("/network/discovered/bulk", post(network::bulk_discovered))
+        .route("/network/discovered/{id}", axum::routing::patch(network::update_discovered))
+        .route("/network/discovered/{id}/deploy", get(network::deploy_hint))
+        .route("/network/discovered/{id}/monitor", post(network::monitor_discovered))
+        .route("/network/devices", get(network::list_devices).post(network::create_device))
+        .route("/network/devices/{id}", get(network::get_device).put(network::update_device).delete(network::remove_device))
+        .route("/network/devices/{id}/poll", post(network::poll_now))
+        .route("/network/devices/{id}/metrics", get(network::device_metrics))
+        .route("/network/devices/{id}/interfaces/{index}", axum::routing::put(network::set_interface))
+        .route("/network/devices/{id}/interfaces/{index}/metrics", get(network::interface_metrics))
+        .route("/clients/{id}/network-credentials", get(network::list_credentials).post(network::create_credential))
+        .route("/network-credentials/{id}", axum::routing::put(network::update_credential).delete(network::remove_credential))
         .route("/agents/{id}/processes", get(tools::processes))
         .route("/agents/{id}/processes/{pid}/kill", post(tools::kill))
         .route("/agents/{id}/files", get(tools::list))
