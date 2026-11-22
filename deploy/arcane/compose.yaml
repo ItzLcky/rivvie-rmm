@@ -43,14 +43,17 @@ services:
       # RMM_ATTACHMENT_MAX_MB: 100
     ports:
       - "${RMM_PORT:-8080}:8080"
-    # Ticket attachments and raw email. Back this up along with the database dumps.
+    # Ticket attachments, raw email, invoice PDFs, triage packages. The backup service archives it.
     volumes:
       - rmm-files:/srv/data
 
-  # Nightly pg_dump (custom format), pruned after BACKUP_KEEP_DAYS. Dumps hold password
-  # hashes, 2FA secrets and agent credential hashes, so they're written mode 0600.
+  # Nightly backup: a pg_dump (custom format) and a tarball of the local object storage (ticket
+  # attachments, raw email, invoice PDFs, triage packages) with the same timestamp, pruned after
+  # BACKUP_KEEP_DAYS. The dumps hold password hashes, 2FA secrets and agent credential hashes, so
+  # the files are written mode 0600.
   # Copy the rmm-backups volume somewhere off this host; a backup on the same disk isn't a backup.
-  # Restore: see "Backups" in the README.
+  # With RMM_S3_BUCKET the tarball is empty: turn on versioning on the bucket (see "Backups" in
+  # the README). Restore: the `restore` service below.
   backup:
     image: postgres:17-alpine
     restart: unless-stopped
@@ -66,20 +69,150 @@ services:
       BACKUP_INTERVAL_HOURS: ${BACKUP_INTERVAL_HOURS:-24}
     volumes:
       - rmm-backups:/backups
+      - rmm-files:/srv/data:ro
+    configs:
+      - source: backup.sh
+        target: /backup.sh
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
-        umask 077
         while true; do
-          f=/backups/rmm-$$(date -u +%Y%m%dT%H%M%SZ).dump
-          if pg_dump -Fc -f "$$f.part"; then
-            mv "$$f.part" "$$f" && echo "backup: wrote $$f ($$(du -h "$$f" | cut -f1))"
-          else
-            rm -f "$$f.part"; echo "backup: pg_dump failed" >&2
-          fi
-          find /backups -name 'rmm-*.dump' -mtime +"$$BACKUP_KEEP_DAYS" -delete
+          sh /backup.sh || echo "backup: failed" >&2
           sleep $$((BACKUP_INTERVAL_HOURS * 3600))
         done
+
+  # Not started with the stack. With the server stopped, restores a backup into the database and
+  # the files volume (`latest`, or a name like rmm-20260101T030000Z):
+  #   docker compose --profile restore run --rm restore latest
+  restore:
+    profiles: [restore]
+    image: postgres:17-alpine
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PGHOST: db
+      PGUSER: rmm
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: rmm
+      RESTORE_REPLACE_STORAGE: ${RESTORE_REPLACE_STORAGE:-}
+    volumes:
+      - rmm-backups:/backups:ro
+      - rmm-files:/srv/data
+    configs:
+      - source: restore.sh
+        target: /restore.sh
+    entrypoint: ["/bin/sh", "/restore.sh"]
+
+# Copies of deploy/backup.sh and deploy/restore.sh, because this file is pasted into Arcane on its
+# own. `$` is doubled for Compose. scripts/restore-drill.sh checks that they match the originals.
+configs:
+  backup.sh:
+    content: |
+      #!/bin/sh
+      # One backup of everything the server keeps: a pg_dump of the database and, beside it, a
+      # tarball of the local object storage (ticket attachments, raw inbound email, invoice PDFs,
+      # triage packages), then pruning of backups older than BACKUP_KEEP_DAYS.
+      #
+      # Used by the `backup` service of both compose stacks and by the CI restore drill
+      # (scripts/restore-drill.sh), so what CI restores is what production writes. Runs in the
+      # postgres image (pg_dump, busybox tar). Settings, all optional but the PG* connection:
+      #   PGHOST PGUSER PGPASSWORD PGDATABASE   where the database is
+      #   BACKUP_DIR        where backups go (default /backups)
+      #   STORAGE_DIR       the server's RMM_STORAGE_DIR as mounted here (default /srv/data/storage);
+      #                     skipped if it isn't a directory (RMM_S3_BUCKET set: back the bucket up instead)
+      #   BACKUP_KEEP_DAYS  default 14
+      #
+      # The two files share a timestamp: rmm-<ts>.dump and rmm-<ts>.files.tar.gz.
+      # The dump goes first. A file uploaded in between is in the tarball without a database row
+      # (harmless); the other order could leave a row whose file isn't in the tarball.
+      # Exits non-zero if either part failed (the other is kept, and pruning still runs).
+      set -u
+      umask 077
+      dir=$${BACKUP_DIR:-/backups}
+      storage=$${STORAGE_DIR:-/srv/data/storage}
+      keep=$${BACKUP_KEEP_DAYS:-14}
+      ts=$$(date -u +%Y%m%dT%H%M%SZ)
+      status=0
+
+      dump="$$dir/rmm-$$ts.dump"
+      if pg_dump -Fc -f "$$dump.part"; then
+          mv "$$dump.part" "$$dump" && echo "backup: wrote $$dump ($$(du -h "$$dump" | cut -f1))"
+      else
+          rm -f "$$dump.part"; echo "backup: pg_dump failed" >&2; status=1
+      fi
+
+      if [ -d "$$storage" ]; then
+          files="$$dir/rmm-$$ts.files.tar.gz"
+          # *.partial are uploads in flight (written beside the final name, then renamed).
+          if tar -C "$$storage" --exclude='*.partial' -czf "$$files.part" . ; then
+              mv "$$files.part" "$$files" && echo "backup: wrote $$files ($$(du -h "$$files" | cut -f1))"
+          else
+              rm -f "$$files.part"; echo "backup: archiving $$storage failed" >&2; status=1
+          fi
+      else
+          echo "backup: $$storage isn't a directory: no local storage to archive (back up your S3 bucket separately)"
+      fi
+
+      find "$$dir" \( -name 'rmm-*.dump' -o -name 'rmm-*.files.tar.gz' \) -mtime +"$$keep" -delete
+      exit $$status
+  restore.sh:
+    content: |
+      #!/bin/sh
+      # Restores a backup made by backup.sh: the database and the local object storage. Used by the
+      # `restore` service of the compose stacks and by the CI restore drill (scripts/restore-drill.sh).
+      #
+      #   restore.sh <name | latest>      e.g. rmm-20260101T030000Z
+      #
+      # STOP THE SERVER FIRST. Then, for the compose stacks, from the repository root:
+      #   docker compose -f deploy/docker-compose.yml stop server
+      #   docker compose -f deploy/docker-compose.yml --profile restore run --rm restore rmm-20260101T030000Z
+      #   docker compose -f deploy/docker-compose.yml start server
+      #
+      # Settings: the PG* connection (PGHOST PGUSER PGPASSWORD PGDATABASE), BACKUP_DIR (default
+      # /backups) and STORAGE_DIR (default /srv/data/storage).
+      #  - The database is replaced: tables are dropped and recreated from the dump, all in one
+      #    transaction, so a failed restore leaves the old data. The target should be the empty database
+      #    of a fresh stack, or the one you mean to overwrite.
+      #  - The storage directory must be empty, or RESTORE_REPLACE_STORAGE=1 empties it first.
+      #    A backup without a files tarball (S3 storage) leaves it alone.
+      # Start the server with the RMM_DATA_KEY the backup was taken under: 2FA secrets, mailbox and
+      # accounting credentials, detection context and the vault are sealed with it.
+      set -eu
+      dir=$${BACKUP_DIR:-/backups}
+      storage=$${STORAGE_DIR:-/srv/data/storage}
+      name=$${1:-}
+      [ -n "$$name" ] || { echo "usage: restore.sh <rmm-YYYYMMDDTHHMMSSZ | latest>" >&2; exit 2; }
+      if [ "$$name" = latest ]; then
+          newest=$$(ls -1 "$$dir"/rmm-*.dump 2>/dev/null | sort | tail -n 1)
+          [ -n "$$newest" ] || { echo "restore: no rmm-*.dump in $$dir" >&2; exit 1; }
+          name=$$(basename "$$newest" .dump)
+      fi
+      name=$${name%.dump}
+      dump="$$dir/$$name.dump"
+      files="$$dir/$$name.files.tar.gz"
+      [ -f "$$dump" ] || { echo "restore: $$dump not found" >&2; exit 1; }
+
+      if [ -f "$$files" ]; then
+          mkdir -p "$$storage"
+          if [ -n "$$(ls -A "$$storage")" ]; then
+              [ "$${RESTORE_REPLACE_STORAGE:-}" = 1 ] || { echo "restore: $$storage isn't empty; empty it, or set RESTORE_REPLACE_STORAGE=1 to have it emptied first" >&2; exit 1; }
+          fi
+          # Checked before anything is touched.
+          tar -tzf "$$files" > /dev/null || { echo "restore: $$files is damaged" >&2; exit 1; }
+      fi
+
+      echo "restore: database from $$dump"
+      pg_restore --single-transaction --clean --if-exists --no-owner --exit-on-error -d "$$PGDATABASE" "$$dump"
+
+      if [ -f "$$files" ]; then
+          echo "restore: storage from $$files into $$storage"
+          find "$$storage" -mindepth 1 -delete
+          tar -C "$$storage" -xzf "$$files"
+      else
+          echo "restore: no $$files: storage left as it is"
+      fi
+      echo "restore: done; start the server with the RMM_DATA_KEY of the backup"
 
 volumes:
   rmm-pgdata:
