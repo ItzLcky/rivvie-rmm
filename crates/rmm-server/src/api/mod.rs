@@ -41,6 +41,7 @@ mod totp;
 pub(crate) mod users;
 mod vault;
 
+pub use agents::refresh_health as refresh_agent_health;
 pub use jobs::{FAILED as JOB_FAILED, deliver as deliver_job};
 pub use portal::PORTAL_LINK_MINUTES;
 pub use totp::{clear as clear_totp, seal_existing as seal_totp_secrets};

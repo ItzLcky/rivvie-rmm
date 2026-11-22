@@ -604,6 +604,37 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
     assert_eq!(dash["offline"][0]["id"], id3.as_str());
     assert!(dash["failed_jobs"].as_array().unwrap().iter().any(|j| j["id"] == job.as_str()));
     assert_eq!(dash["client_health"][0]["id"], a_id, "the client with problems sorts first: {dash}");
+    // Stored columns (migration 0026): the dashboard counts the stored health, and the agent's
+    // addresses and users are in the search table, found by prefix through the API.
+    let by_rank: Vec<(i16, i64)> = sqlx::query_as("SELECT health_rank, count(*) FROM agents GROUP BY 1").fetch_all(db).await.unwrap();
+    assert!(by_rank.len() >= 2, "{by_rank:?}");
+    for (rank, n) in by_rank {
+        let name = ["healthy", "unknown", "attention", "unhealthy"][rank as usize];
+        assert_eq!(dash["health"][name].as_i64(), Some(n), "dashboard health counts the stored rank: {dash}");
+    }
+    let by_health: Value = admin.get("/agents?health=attention,unhealthy").await;
+    assert!(by_health["items"].as_array().unwrap().iter().any(|a| a["id"] == id1.as_str()), "{by_health}");
+    let ip = a1_info["inventory"]["network"].as_array().and_then(|n| n.iter().find_map(|i| i["addrs"][0].as_str().map(str::to_string)));
+    if let Some(ip) = ip {
+        let terms: i64 = sqlx::query_scalar("SELECT count(*) FROM agent_search_terms WHERE agent_id = $1::text::uuid AND kind = 'ip' AND term = $2")
+            .bind(&id1)
+            .bind(&ip)
+            .fetch_one(db)
+            .await
+            .unwrap();
+        assert_eq!(terms, 1, "inventory addresses are stored for search");
+        let prefix = &ip[..ip.len().min(6)];
+        let hits = admin.get(&format!("/agents?q={}", url_escape(prefix))).await;
+        assert!(hits["items"].as_array().unwrap().iter().any(|a| a["id"] == id1.as_str()), "address prefix {prefix}: {hits}");
+        let hits = admin.get(&format!("/search?q={}", url_escape(&ip))).await;
+        assert!(hits["agents"].as_array().unwrap().iter().any(|a| a["id"] == id1.as_str()), "address {ip}: {hits}");
+        let miss = admin.get(&format!("/agents?q={}", url_escape(&format!("9{ip}")))).await;
+        assert!(!miss["items"].as_array().unwrap().iter().any(|a| a["id"] == id1.as_str()), "an address matches from its start only: {miss}");
+    }
+    if let Some(user) = a1_info["inventory"]["logged_in_users"][0].as_str() {
+        let hits = admin.get(&format!("/agents?q={}", url_escape(&user.to_uppercase()))).await;
+        assert!(hits["items"].as_array().unwrap().iter().any(|a| a["id"] == id1.as_str()), "logged-in user {user}, any case: {hits}");
+    }
     assert_eq!(admin.get(&format!("/dashboard?client_id={b_id}")).await["agents_total"], 0);
     let detail = admin.get(&format!("/clients/{a_id}")).await;
     assert_eq!((detail["name"].as_str(), detail["sites"][0]["agent_count"].as_i64()), (Some("Client A"), Some(2)));
