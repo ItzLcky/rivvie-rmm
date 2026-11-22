@@ -30,6 +30,8 @@
 		{ value: '/settings/service-desk', label: 'Service desk' },
 		{ value: '/settings/sla', label: 'SLAs' },
 		{ value: '/settings/documentation', label: 'Documentation' },
+		{ value: '/settings/api-keys', label: 'API' },
+		{ value: '/settings/webhooks', label: 'Webhooks' },
 		{ value: '/settings/billing', label: 'Billing' }
 	]}
 />

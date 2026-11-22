@@ -69,9 +69,10 @@ pub async fn add_event(
     .bind(author.contact_id)
     .bind(&author.name)
     .bind(body)
-    .bind(data)
+    .bind(&data)
     .fetch_one(&mut *db)
     .await?;
+    let data_for_hooks = data;
     sqlx::query(
         "UPDATE tickets SET updated_at = now(), touched_at = CASE WHEN $2 THEN now() ELSE touched_at END WHERE id = $1",
     )
@@ -79,6 +80,8 @@ pub async fn add_event(
     .bind(author.user_id.is_some())
     .execute(&mut *db)
     .await?;
+    // Webhook subscribers hear about it in the same transaction, so it's all or nothing.
+    crate::webhooks::ticket_event(db, ticket_id, kind, public, id, author, body, &data_for_hooks).await?;
     Ok(id)
 }
 
@@ -258,6 +261,8 @@ pub async fn notify_created(st: &AppState, ticket_id: Uuid) {
 
 /// Tells dashboards the ticket changed.
 pub async fn announce(st: &AppState, ticket_id: Uuid) {
+    // Whatever was committed may have queued webhooks.
+    st.notify_wake.notify_one();
     let client: sqlx::Result<Option<Option<Uuid>>> =
         sqlx::query_scalar("SELECT client_id FROM tickets WHERE id = $1").bind(ticket_id).fetch_optional(&st.db).await;
     match client {

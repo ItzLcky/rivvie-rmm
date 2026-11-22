@@ -29,6 +29,8 @@
 		sso_only?: boolean;
 		passkeys?: number;
 		sso_providers?: string[];
+		/** Can't sign in; owns API keys (Company settings → API). */
+		service_account?: boolean;
 	}
 	const res = resource(() => api.get<UserRow[]>('/users'));
 
@@ -143,8 +145,8 @@
 
 {#snippet nameCell(u: UserRow)}
 	<div class={u.disabled ? 'opacity-60' : ''}>
-		<div class="font-medium">{u.name}{#if u.id === session.user?.id}<span class="text-muted font-normal"> (you)</span>{/if}</div>
-		<div class="text-muted text-xs">{u.email}</div>
+		<div class="font-medium">{u.name}{#if u.id === session.user?.id}<span class="text-muted font-normal"> (you)</span>{/if}{#if u.service_account} <Badge>Service account</Badge>{/if}</div>
+		<div class="text-muted text-xs">{u.service_account ? 'Can’t sign in' : u.email}</div>
 		{#if u.sso_providers?.length || u.sso_exempt}
 			<div class="mt-1 flex flex-wrap gap-1">
 				{#if u.sso_providers?.length}<Badge>SSO: {u.sso_providers.join(', ')}</Badge>{/if}
@@ -177,10 +179,10 @@
 					? [{ label: 'Client access', icon: Building2, onSelect: () => ((editingAccess = u), (accessForm = { all_clients: u.all_clients, client_ids: [...u.client_ids] })) }]
 					: []),
 				...(u.role !== 'admin' ? [{ label: 'Permissions', icon: ShieldCheck, onSelect: () => openPerms(u) }] : []),
-				{ label: 'Sessions', icon: MonitorSmartphone, onSelect: () => (viewing = u) },
-				{ label: 'Reset password', icon: KeyRound, onSelect: () => ((resetting = u), (resetPw = '')) },
+				...(u.service_account ? [] : [{ label: 'Sessions', icon: MonitorSmartphone, onSelect: () => (viewing = u) }]),
+				...(u.service_account ? [] : [{ label: 'Reset password', icon: KeyRound, onSelect: () => ((resetting = u), (resetPw = '')) }]),
 				...(u.totp_enabled || u.passkeys ? [{ label: 'Reset 2FA', icon: ShieldOff, onSelect: () => reset2fa(u) }] : []),
-				...(u.sso_only ? [] : [{ label: u.sso_exempt ? 'Follow the SSO requirement' : 'Allow password sign-in (break-glass)', icon: LifeBuoy, onSelect: () => setExempt(u) }]),
+				...(u.sso_only || u.service_account ? [] : [{ label: u.sso_exempt ? 'Follow the SSO requirement' : 'Allow password sign-in (break-glass)', icon: LifeBuoy, onSelect: () => setExempt(u) }]),
 				{ separator: true },
 				{ label: 'Disable user', icon: UserX, danger: true, onSelect: () => disable(u) }
 			]}

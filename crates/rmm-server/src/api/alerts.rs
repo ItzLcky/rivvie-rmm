@@ -254,6 +254,7 @@ async fn act(st: &AppState, u: &User, ids: &[Uuid], action: &str) -> ApiResult<u
     let mut woke = false;
     for (id, agent_id, client_id, policy_id) in &rows {
         st.hub.publish(Event::Alert { id: *id, agent_id: *agent_id, client_id: *client_id, state: state.into() });
+        crate::webhooks::alert_event(st, *id, if action == "resolve" { "alert.resolved" } else { "alert.acknowledged" }).await;
         if action == "resolve" {
             crate::tickets::alert_resolved(st, *id).await;
         }

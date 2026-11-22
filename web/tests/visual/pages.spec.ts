@@ -92,7 +92,10 @@ const pages: [string, string][] = [
 	['client-password', '/clients/c-acme?tab=passwords&item=6f1c0c1e-9a51-4c0e-b6c9-0a4de1f3a111'],
 	['settings-documentation', '/settings/documentation'],
 	['agent-tickets', '/agents/a-3?tab=tickets'],
-	['service-desk', '/settings/service-desk']
+	['service-desk', '/settings/service-desk'],
+	['settings-api', '/settings/api-keys'],
+	['settings-webhooks', '/settings/webhooks'],
+	['developers', '/developers']
 ];
 const phone: [string, string][] = [
 	['dashboard', '/'],
@@ -119,7 +122,8 @@ const phone: [string, string][] = [
 	['client-policies', '/clients/c-acme?tab=policies'],
 	['client-docs', '/clients/c-acme?tab=docs&doc=d-network'],
 	['client-docs-edit', '/clients/c-acme?tab=docs&doc=d-network&edit=1'],
-	['client-passwords', '/clients/c-acme?tab=passwords']
+	['client-passwords', '/clients/c-acme?tab=passwords'],
+	['settings-webhooks', '/settings/webhooks']
 ];
 
 const jpeg = readFileSync(new URL('./fixtures/desktop.jpg', import.meta.url));
@@ -743,6 +747,76 @@ test.describe('vault', () => {
 		expect(calls).toEqual([{ method: 'PUT', path: `/vault/${fw}`, body: { name: 'FortiGate admin', username: 'fgadmin', url: 'https://10.0.0.1:4443' } }]);
 		await expect(drawer).toBeVisible();
 		await expect(drawer.getByText('fgadmin')).toBeVisible();
+	});
+});
+
+test.describe('API keys and webhooks', () => {
+	test('create an API key', async ({ page }) => {
+		await mockApi(page);
+		const token = `rmm_k_${'a1'.repeat(32)}`;
+		const calls = await routeApi(page, (method, path) => {
+			if (method === 'POST' && path === '/api-keys') return { json: { token, key: { ...{ id: 'k-9', name: 'Dashboard feed', prefix: token.slice(0, 12), owner_id: 'u-1', owner_name: 'Dana Admin', service_account: false, access: 'read', scopes: ['agents'], permissions: [], client_ids: ['c-acme'], rate_limit_per_min: 600, expires_at: null, last_used_at: null, last_used_ip: null, revoked_at: null, created_at: NOW.toISOString(), status: 'active' } } } };
+		});
+		await page.goto('/account');
+		await settle(page);
+		await page.getByRole('button', { name: 'Create key' }).click();
+		const dialog = page.getByRole('dialog', { name: 'Create API key' });
+		await expect(dialog.getByRole('button', { name: 'Create key' })).toBeDisabled();
+		await dialog.getByLabel('Name').fill('Dashboard feed');
+		await dialog.getByRole('checkbox', { name: 'Agents, inventory and metrics' }).click();
+		await dialog.getByRole('switch', { name: 'Limit to some clients' }).click();
+		await dialog.getByRole('checkbox', { name: 'Acme Corp' }).click();
+		await dialog.getByLabel('Expires').selectOption('never');
+		await dialog.getByRole('button', { name: 'Create key' }).click();
+		expect(calls).toEqual([
+			{ method: 'POST', path: '/api-keys', body: { name: 'Dashboard feed', access: 'read', scopes: ['agents'], permissions: [], client_ids: ['c-acme'], expires_in_days: null, rate_limit_per_min: 600 } }
+		]);
+		const shown = page.getByRole('dialog', { name: 'Copy your key now' });
+		await expect(shown.getByText(token)).toBeVisible();
+		await shown.getByRole('button', { name: 'I’ve copied it' }).click();
+		await expect(shown).toHaveCount(0);
+	});
+
+	test('revoke an API key', async ({ page }) => {
+		await mockApi(page);
+		const calls = await routeApi(page, () => undefined);
+		await page.goto('/account');
+		await settle(page);
+		await page.getByRole('button', { name: 'Revoke Reporting script' }).click();
+		await page.getByRole('alertdialog').getByRole('button', { name: 'Revoke key' }).click();
+		await expect(page.getByText('Reporting script revoked.')).toBeVisible();
+		expect(calls).toEqual([{ method: 'DELETE', path: '/api-keys/k-1', body: null }]);
+	});
+
+	test('add a webhook, see its secret and its log', async ({ page }) => {
+		await mockApi(page);
+		const calls = await routeApi(page, (method, path) => {
+			if (method === 'POST' && path === '/webhooks') return { json: { webhook: { id: 'wh-9' }, secret: 'whsec_0123456789abcdef' } };
+		});
+		await page.goto('/settings/webhooks');
+		await settle(page);
+		await page.getByRole('button', { name: 'Add webhook' }).click();
+		const dialog = page.getByRole('dialog', { name: 'Add webhook' });
+		await dialog.getByLabel('Name').fill('Status page');
+		await dialog.getByLabel('URL').fill('https://status.example/hook');
+		await dialog.getByRole('checkbox', { name: 'Alert acknowledged' }).click();
+		await dialog.getByRole('button', { name: 'Save' }).click();
+		expect(calls).toEqual([
+			{
+				method: 'POST',
+				path: '/webhooks',
+				body: { name: 'Status page', url: 'https://status.example/hook', events: ['ticket.created', 'ticket.updated', 'ticket.status_changed', 'ticket.resolved', 'ticket.comment', 'alert.created', 'alert.resolved'], client_id: null, internal_notes: false, enabled: true }
+			}
+		]);
+		await expect(page.getByRole('dialog', { name: 'Signing secret for Status page' }).getByText('whsec_0123456789abcdef')).toBeVisible();
+		await page.getByRole('button', { name: 'I’ve copied it' }).click();
+
+		await page.getByRole('listitem').filter({ hasText: 'Acme dashboard' }).getByRole('button', { name: 'Log' }).click();
+		const log = page.getByRole('dialog', { name: 'Deliveries to Acme dashboard' });
+		await expect(log.getByText('HTTP 502', { exact: true })).toBeVisible();
+		await expect(log.getByText('Retry 2')).toBeVisible();
+		await log.getByRole('row').filter({ hasText: 'ticket.comment' }).getByRole('button', { name: 'Send again' }).click();
+		expect(calls.at(-1)).toEqual({ method: 'POST', path: '/webhook-deliveries/8/redeliver', body: {} });
 	});
 });
 

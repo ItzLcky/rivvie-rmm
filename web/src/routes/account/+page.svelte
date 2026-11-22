@@ -10,6 +10,7 @@
 	import Input from '#lib/ui/Input.svelte';
 	import PageHeader from '#lib/ui/PageHeader.svelte';
 	import Segmented from '#lib/ui/Segmented.svelte';
+	import ApiKeys from '#lib/components/ApiKeys.svelte';
 	import Passkeys from '#lib/components/Passkeys.svelte';
 	import Sessions from '#lib/components/Sessions.svelte';
 	import TwoFactor from '#lib/components/TwoFactor.svelte';
@@ -118,5 +119,7 @@
 			<p class="text-muted mt-0.5 mb-4 text-sm">Browsers and API clients signed in as you. Sessions end after a period of inactivity, or after 7 days.</p>
 			{#key gen}<Sessions base="/auth/sessions" />{/key}
 		</section>
+
+		<div class="lg:col-span-2"><ApiKeys /></div>
 	{/if}
 </div>

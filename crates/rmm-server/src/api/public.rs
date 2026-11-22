@@ -1,0 +1,551 @@
+//! The public REST API: which routes API keys may call, and its OpenAPI 3.1 description.
+//!
+//! [`OPS`] is the one list both come from. A route that isn't in it is unreachable with a
+//! key (see [`crate::apikeys`]), however the handler is written, so adding a route to the
+//! dashboard API doesn't publish it. Each entry names the resource group a key must hold,
+//! and `GET` entries need only read access; anything else needs a `write` key.
+//!
+//! The same router answers on `/api` (the dashboard's own, cookie-authenticated) and
+//! `/api/v1`, the versioned path integrations should use and the one the document's `servers`
+//! entry names. `GET /api/v1/openapi.json` needs no credentials.
+
+use std::sync::OnceLock;
+
+use axum::Json;
+use serde_json::{Map, Value, json};
+
+/// One public operation.
+pub struct Op {
+    /// `operationId`.
+    pub id: &'static str,
+    pub method: &'static str,
+    /// The route pattern as registered in `api::router`, relative to `/api`.
+    pub path: &'static str,
+    /// Resource group the key needs (see `apikeys::GROUPS`).
+    pub group: &'static str,
+    pub summary: &'static str,
+    /// Extra requirements and behaviour that don't fit the summary.
+    pub note: &'static str,
+    /// Query parameters: (name, type, description). `type` is a JSON Schema type, or `uuid`.
+    pub query: &'static [(&'static str, &'static str, &'static str)],
+    /// Takes the keyset paging parameters (`sort`, `dir`, `after`, `before`, `limit`).
+    pub paged: bool,
+    /// Schema name of the JSON request body.
+    pub body: Option<&'static str>,
+    pub response: Resp,
+}
+
+#[derive(Clone, Copy)]
+pub enum Resp {
+    One(&'static str),
+    List(&'static str),
+    Paged(&'static str),
+    /// A small ad-hoc object (documented in the summary or note).
+    Object,
+}
+
+impl Op {
+    pub fn writes(&self) -> bool {
+        self.method != "GET"
+    }
+}
+
+const NONE: &[(&str, &str, &str)] = &[];
+const CLIENT_Q: (&str, &str, &str) = ("client_id", "uuid", "Only this client.");
+
+pub static OPS: &[Op] = &[
+    // ---- clients and sites -------------------------------------------------------------
+    Op {
+        id: "listClients", method: "GET", path: "/clients", group: "clients", summary: "List clients with their sites",
+        note: "Only the clients the key can see.", query: NONE, paged: false, body: None, response: Resp::List("Client"),
+    },
+    Op {
+        id: "getClient", method: "GET", path: "/clients/{id}", group: "clients", summary: "Get a client",
+        note: "", query: NONE, paged: false, body: None, response: Resp::One("Client"),
+    },
+    Op {
+        id: "listSites", method: "GET", path: "/sites", group: "clients", summary: "List sites",
+        note: "", query: &[CLIENT_Q], paged: false, body: None, response: Resp::List("Site"),
+    },
+    Op {
+        id: "getSite", method: "GET", path: "/sites/{id}", group: "clients", summary: "Get a site",
+        note: "", query: NONE, paged: false, body: None, response: Resp::One("Site"),
+    },
+    // ---- agents ------------------------------------------------------------------------
+    Op {
+        id: "listAgents", method: "GET", path: "/agents", group: "agents", summary: "List agents (devices)",
+        note: "Search matches hostname, OS, IP address prefix and logged-in user.",
+        query: &[
+            CLIENT_Q,
+            ("site_id", "uuid", "Only this site."),
+            ("q", "string", "Search text."),
+            ("online", "boolean", "Only online or only offline agents."),
+            ("os", "string", "`linux`, `windows` or `macos`."),
+            ("health", "string", "Comma-separated: healthy, attention, unhealthy, unknown."),
+        ],
+        paged: true, body: None, response: Resp::Paged("Agent"),
+    },
+    Op {
+        id: "getAgent", method: "GET", path: "/agents/{id}", group: "agents", summary: "Get an agent with its hardware and software inventory",
+        note: "`inventory` is what the agent last reported: hardware, network interfaces, installed software, logged-in users.",
+        query: NONE, paged: false, body: None, response: Resp::One("AgentDetail"),
+    },
+    Op {
+        id: "getAgentMetrics", method: "GET", path: "/agents/{id}/metrics", group: "agents", summary: "CPU, memory, disk and network history",
+        note: "About 500 points whatever the range; beyond 48 hours from hourly rollups.",
+        query: &[("hours", "integer", "How far back, 1-8784. Default 24.")], paged: false, body: None, response: Resp::List("Metric"),
+    },
+    Op {
+        id: "refreshAgentInventory", method: "POST", path: "/agents/{id}/inventory/refresh", group: "agents",
+        summary: "Ask an online agent to report its inventory now",
+        note: "409 when the agent is offline.", query: NONE, paged: false, body: None, response: Resp::Object,
+    },
+    // ---- jobs and scripts ----------------------------------------------------------------
+    Op {
+        id: "listJobs", method: "GET", path: "/jobs", group: "jobs", summary: "List jobs, newest first",
+        note: "", query: &[
+            ("status", "string", "Comma-separated; `failed` also matches error, timed_out and lost."),
+            ("script_id", "uuid", "Only runs of this script."),
+            CLIENT_Q,
+            ("agent_id", "uuid", "Only this agent."),
+            ("q", "string", "Hostname or script name."),
+        ],
+        paged: true, body: None, response: Resp::Paged("Job"),
+    },
+    Op {
+        id: "getJob", method: "GET", path: "/jobs/{id}", group: "jobs", summary: "Get a job with its output",
+        note: "Output is the whole of stdout and stderr; pass `since_stdout` and `since_stderr` (the lengths already read) to fetch only what's new.",
+        query: &[("since_stdout", "integer", "Skip this many characters of stdout."), ("since_stderr", "integer", "Skip this many characters of stderr.")],
+        paged: false, body: None, response: Resp::One("JobDetail"),
+    },
+    Op {
+        id: "listAgentJobs", method: "GET", path: "/agents/{id}/jobs", group: "jobs", summary: "The agent's 100 latest jobs",
+        note: "", query: NONE, paged: false, body: None, response: Resp::List("Job"),
+    },
+    Op {
+        id: "createJobs", method: "POST", path: "/jobs", group: "jobs", summary: "Run a saved script on agents",
+        note: "Keys run saved scripts only (`script_id`): ad-hoc code is refused. Agents that are offline get the job when they reconnect. Needs a write key whose owner is a technician or admin.",
+        query: NONE, paged: false, body: Some("NewJob"), response: Resp::Object,
+    },
+    Op {
+        id: "listScripts", method: "GET", path: "/scripts", group: "scripts", summary: "List scripts",
+        note: "The MSP-wide scripts and the ones belonging to clients the key can see.", query: NONE, paged: false, body: None, response: Resp::List("Script"),
+    },
+    Op {
+        id: "getScript", method: "GET", path: "/scripts/{id}", group: "scripts", summary: "Get a script",
+        note: "", query: NONE, paged: false, body: None, response: Resp::One("Script"),
+    },
+    // ---- alerts --------------------------------------------------------------------------
+    Op {
+        id: "listAlerts", method: "GET", path: "/alerts", group: "alerts", summary: "List alerts",
+        note: "", query: &[
+            ("state", "string", "`active` (open and acknowledged, the default), `open`, `acknowledged`, `resolved` or `all`."),
+            ("severity", "string", "Comma-separated: critical, warning, info."),
+            CLIENT_Q,
+            ("agent_id", "uuid", "Only this agent."),
+            ("kind", "string", "Alert kind, e.g. `offline`, `cpu`, `disk`."),
+            ("q", "string", "Hostname or title."),
+        ],
+        paged: true, body: None, response: Resp::Paged("Alert"),
+    },
+    Op {
+        id: "alertSummary", method: "GET", path: "/alerts/summary", group: "alerts", summary: "Open alert counts by severity",
+        note: "", query: &[CLIENT_Q], paged: false, body: None, response: Resp::Object,
+    },
+    Op {
+        id: "getAlert", method: "GET", path: "/alerts/{id}", group: "alerts", summary: "Get an alert with its notifications and linked ticket",
+        note: "", query: NONE, paged: false, body: None, response: Resp::One("Alert"),
+    },
+    Op {
+        id: "acknowledgeAlert", method: "POST", path: "/alerts/{id}/acknowledge", group: "alerts", summary: "Acknowledge an alert",
+        note: "", query: NONE, paged: false, body: None, response: Resp::One("Alert"),
+    },
+    Op {
+        id: "resolveAlert", method: "POST", path: "/alerts/{id}/resolve", group: "alerts", summary: "Resolve an alert",
+        note: "Resolved by hand; if its condition is still true it opens again.", query: NONE, paged: false, body: None, response: Resp::One("Alert"),
+    },
+    // ---- tickets -------------------------------------------------------------------------
+    Op {
+        id: "listTickets", method: "GET", path: "/tickets", group: "tickets", summary: "List tickets",
+        note: "", query: &[
+            ("view", "string", "`open` (default), `mine`, `unassigned`, `waiting`, `triage`, `done` or `all`."),
+            ("board_id", "uuid", "Only this board."),
+            ("status_id", "uuid", "Only this status."),
+            ("priority", "string", "Comma-separated, 1-4."),
+            ("assignee", "string", "A user id, or `none`."),
+            CLIENT_Q,
+            ("agent_id", "uuid", "Tickets this agent is linked to."),
+            ("q", "string", "A ticket number (`T-10423`) or words from the subject, timeline and contact."),
+        ],
+        paged: true, body: None, response: Resp::Paged("Ticket"),
+    },
+    Op {
+        id: "ticketMeta", method: "GET", path: "/tickets/meta", group: "tickets", summary: "Boards with their statuses, ticket types, technicians and teams",
+        note: "The ids to use in `board_id`, `status_id`, `type_id`, `assignee_id` and `team_id`.", query: NONE, paged: false, body: None, response: Resp::Object,
+    },
+    Op {
+        id: "ticketSummary", method: "GET", path: "/tickets/summary", group: "tickets", summary: "Open ticket counts",
+        note: "", query: &[CLIENT_Q], paged: false, body: None, response: Resp::Object,
+    },
+    Op {
+        id: "getTicket", method: "GET", path: "/tickets/{id}", group: "tickets", summary: "Get a ticket with its timeline",
+        note: "The timeline includes internal notes.", query: NONE, paged: false, body: None, response: Resp::One("TicketDetail"),
+    },
+    Op {
+        id: "createTicket", method: "POST", path: "/tickets", group: "tickets", summary: "Open a ticket",
+        note: "Needs a write key whose owner is a technician or admin.", query: NONE, paged: false, body: Some("NewTicket"), response: Resp::One("Ticket"),
+    },
+    Op {
+        id: "updateTicket", method: "PATCH", path: "/tickets/{id}", group: "tickets", summary: "Change a ticket's status, priority, assignee and other fields",
+        note: "Only the fields sent change. Send `null` to clear `assignee_id`, `contact_id`, `type_id` and the like.",
+        query: NONE, paged: false, body: Some("TicketPatch"), response: Resp::One("Ticket"),
+    },
+    Op {
+        id: "addTicketEvent", method: "POST", path: "/tickets/{id}/events", group: "tickets", summary: "Reply to the client or add an internal note",
+        note: "A `reply` is public and emailed to the contact.", query: NONE, paged: false, body: Some("NewTicketEvent"), response: Resp::Object,
+    },
+    // ---- endpoint protection (read) -------------------------------------------------------
+    Op {
+        id: "securitySummary", method: "GET", path: "/security/summary", group: "security", summary: "Protection state of the fleet",
+        note: "Needs the `security.read` permission on the key.", query: &[CLIENT_Q], paged: false, body: None, response: Resp::Object,
+    },
+    Op {
+        id: "listDetections", method: "GET", path: "/security/detections", group: "security", summary: "List detections",
+        note: "Needs the `security.read` permission on the key.", query: &[
+            ("view", "string", "`active` (default) or `all`."),
+            ("severity", "string", "Comma-separated."),
+            CLIENT_Q,
+            ("q", "string", "Search text."),
+        ],
+        paged: true, body: None, response: Resp::Paged("Detection"),
+    },
+];
+
+/// The operation for a request: HTTP method and route pattern relative to `/api`.
+pub fn find(method: &str, path: &str) -> Option<&'static Op> {
+    OPS.iter().find(|o| o.method == method && o.path == path)
+}
+
+// ---------------------------------------------------------------------------
+// OpenAPI
+// ---------------------------------------------------------------------------
+
+fn prop(ty: &str) -> Value {
+    match ty {
+        "uuid" => json!({ "type": "string", "format": "uuid" }),
+        "datetime" => json!({ "type": "string", "format": "date-time" }),
+        t => json!({ "type": t }),
+    }
+}
+
+/// An object schema from `(name, type)` pairs; a type ending in `?` is nullable.
+fn object(description: &str, fields: &[(&str, &str)]) -> Value {
+    let mut props = Map::new();
+    for (name, ty) in fields {
+        let (ty, nullable) = ty.strip_suffix('?').map_or((*ty, false), |t| (t, true));
+        let mut p = prop(ty);
+        if nullable {
+            let base = p["type"].take();
+            p["type"] = json!([base, "null"]);
+        }
+        props.insert((*name).into(), p);
+    }
+    json!({ "type": "object", "description": description, "properties": props })
+}
+
+fn reference(name: &str) -> Value {
+    json!({ "$ref": format!("#/components/schemas/{name}") })
+}
+
+fn schemas() -> Value {
+    json!({
+        "Error": { "type": "object", "properties": { "error": { "type": "string" } }, "required": ["error"] },
+        "Client": object("A customer of the MSP, with its sites.", &[
+            ("id", "uuid"), ("name", "string"), ("created_at", "datetime"), ("email_domains", "array"), ("security_canary", "boolean"),
+            ("sla_policy_id", "uuid?"), ("portal_devices", "boolean"), ("sites", "array"),
+        ]),
+        "Site": object("A location of a client; agents enroll into a site.", &[
+            ("id", "uuid"), ("client_id", "uuid"), ("name", "string"), ("agent_count", "integer"), ("online_count", "integer"),
+        ]),
+        "Agent": object("A managed device.", &[
+            ("id", "uuid"), ("hostname", "string"), ("os_family", "string"), ("os_name", "string"), ("os_version", "string"), ("arch", "string"),
+            ("agent_version", "string"), ("online", "boolean"), ("last_seen_at", "datetime?"), ("enrolled_at", "datetime"),
+            ("site_id", "uuid"), ("site_name", "string"), ("client_id", "uuid"), ("client_name", "string"), ("last_metrics", "object?"),
+            ("health", "string"), ("open_alerts", "integer"), ("failed_jobs_24h", "integer"), ("reboot_pending", "boolean"),
+            ("platform", "string"), ("category_name", "string"), ("policy_set_name", "string"),
+        ]),
+        "AgentDetail": {
+            "allOf": [reference("Agent"), object("The agent's inventory.", &[
+                ("kernel_version", "string"), ("machine_id", "string?"), ("inventory", "object?"), ("inventory_at", "datetime?"), ("capabilities", "array"),
+            ])],
+        },
+        "Metric": object("One point of an agent's history.", &[
+            ("ts", "datetime"), ("cpu_percent", "number"), ("mem_used", "integer"), ("mem_total", "integer"), ("disk_max_pct", "number"),
+            ("net_rx_bytes", "integer"), ("net_tx_bytes", "integer"),
+        ]),
+        "Job": object("A script run on one agent.", &[
+            ("id", "uuid"), ("agent_id", "uuid"), ("hostname", "string"), ("script_id", "uuid?"), ("script_name", "string?"), ("interpreter", "string"),
+            ("status", "string"), ("exit_code", "integer?"), ("created_by_name", "string?"), ("created_at", "datetime"), ("sent_at", "datetime?"),
+            ("finished_at", "datetime?"), ("duration_ms", "integer?"),
+        ]),
+        "JobDetail": {
+            "allOf": [reference("Job"), object("The job's script and output.", &[
+                ("body", "string"), ("args", "array"), ("timeout_secs", "integer"), ("stdout", "string"), ("stderr", "string"),
+                ("stdout_len", "integer"), ("stderr_len", "integer"),
+            ])],
+        },
+        "NewJob": {
+            "type": "object",
+            "required": ["agent_ids", "script_id"],
+            "properties": {
+                "agent_ids": { "type": "array", "items": { "type": "string", "format": "uuid" }, "minItems": 1, "maxItems": 5000 },
+                "script_id": { "type": "string", "format": "uuid", "description": "A saved script. API keys can't run ad-hoc code." },
+                "args": { "type": "array", "items": { "type": "string" } },
+                "timeout_secs": { "type": "integer", "description": "Default: the script's own." },
+                "ticket_id": { "type": "string", "format": "uuid", "description": "Run from this ticket: the result is added to its timeline." },
+            },
+        },
+        "Script": object("A saved script.", &[
+            ("id", "uuid"), ("name", "string"), ("description", "string"), ("interpreter", "string"), ("body", "string"),
+            ("timeout_secs", "integer"), ("client_id", "uuid?"), ("client_name", "string?"), ("created_at", "datetime"), ("updated_at", "datetime"),
+        ]),
+        "Alert": object("An alert: something that needs attention on an agent.", &[
+            ("id", "uuid"), ("policy_id", "uuid?"), ("policy_name", "string?"), ("agent_id", "uuid"), ("hostname", "string"),
+            ("client_id", "uuid"), ("client_name", "string"), ("site_name", "string"), ("kind", "string"), ("severity", "string"),
+            ("title", "string"), ("details", "object"), ("occurrences", "integer"), ("state", "string"), ("opened_at", "datetime"),
+            ("last_seen_at", "datetime"), ("acknowledged_at", "datetime?"), ("acknowledged_by_name", "string?"), ("resolved_at", "datetime?"),
+            ("resolved_by_name", "string?"), ("resolution", "string?"), ("suppressed", "boolean"),
+        ]),
+        "Ticket": object("A service desk ticket.", &[
+            ("id", "uuid"), ("number", "integer"), ("subject", "string"), ("client_id", "uuid?"), ("client_name", "string?"), ("site_id", "uuid?"),
+            ("contact_id", "uuid?"), ("contact_name", "string?"), ("board_id", "uuid"), ("board_name", "string"), ("status_id", "uuid"),
+            ("status_name", "string"), ("status_category", "string"), ("type_id", "uuid?"), ("priority", "integer"), ("impact", "integer?"),
+            ("urgency", "integer?"), ("source", "string"), ("assignee_id", "uuid?"), ("assignee_name", "string?"), ("requester_name", "string"),
+            ("requester_email", "string"), ("created_at", "datetime"), ("updated_at", "datetime"), ("first_response_at", "datetime?"),
+            ("resolved_at", "datetime?"), ("closed_at", "datetime?"), ("sla_due", "datetime?"),
+        ]),
+        "TicketDetail": {
+            "allOf": [reference("Ticket"), object("The timeline and links.", &[
+                ("events", "array"), ("attachments", "array"), ("agents", "array"), ("docs", "array"), ("statuses", "array"),
+            ])],
+        },
+        "NewTicket": {
+            "type": "object",
+            "required": ["subject"],
+            "properties": {
+                "subject": { "type": "string", "maxLength": 300 },
+                "description": { "type": "string" },
+                "client_id": { "type": "string", "format": "uuid" },
+                "site_id": { "type": "string", "format": "uuid" },
+                "contact_id": { "type": "string", "format": "uuid" },
+                "board_id": { "type": "string", "format": "uuid", "description": "Default: the default board." },
+                "type_id": { "type": "string", "format": "uuid" },
+                "priority": { "type": "integer", "minimum": 1, "maximum": 4 },
+                "impact": { "type": "integer", "minimum": 1, "maximum": 3 },
+                "urgency": { "type": "integer", "minimum": 1, "maximum": 3 },
+                "assignee_id": { "type": "string", "format": "uuid" },
+                "team_id": { "type": "string", "format": "uuid" },
+                "agent_ids": { "type": "array", "items": { "type": "string", "format": "uuid" } },
+            },
+        },
+        "TicketPatch": {
+            "type": "object",
+            "properties": {
+                "subject": { "type": "string" },
+                "board_id": { "type": "string", "format": "uuid" },
+                "status_id": { "type": "string", "format": "uuid" },
+                "priority": { "type": "integer", "minimum": 1, "maximum": 4 },
+                "impact": { "type": ["integer", "null"] },
+                "urgency": { "type": ["integer", "null"] },
+                "type_id": { "type": ["string", "null"], "format": "uuid" },
+                "assignee_id": { "type": ["string", "null"], "format": "uuid" },
+                "client_id": { "type": ["string", "null"], "format": "uuid" },
+                "site_id": { "type": ["string", "null"], "format": "uuid" },
+                "contact_id": { "type": ["string", "null"], "format": "uuid" },
+                "team_id": { "type": ["string", "null"], "format": "uuid" },
+            },
+        },
+        "NewTicketEvent": {
+            "type": "object",
+            "required": ["kind", "body"],
+            "properties": {
+                "kind": { "type": "string", "enum": ["reply", "note"], "description": "`reply` is public and emailed; `note` is internal." },
+                "body": { "type": "string" },
+                "status_id": { "type": "string", "format": "uuid", "description": "Change the status in the same step." },
+            },
+        },
+        "Detection": object("A detection from the endpoint protection.", &[
+            ("id", "uuid"), ("agent_id", "uuid"), ("hostname", "string"), ("client_id", "uuid"), ("client_name", "string"), ("product", "string"),
+            ("name", "string"), ("severity", "string"), ("status", "string"), ("resources", "array"), ("first_seen_at", "datetime"),
+            ("last_seen_at", "datetime"), ("resolved_at", "datetime?"), ("source", "string"), ("sha256", "string?"),
+        ]),
+        "Webhook": object("The body of every webhook delivery. `data` depends on the event.", &[
+            ("id", "uuid"), ("event", "string"), ("created_at", "datetime"), ("data", "object"),
+        ]),
+    })
+}
+
+fn response_schema(r: Resp) -> Option<Value> {
+    match r {
+        Resp::One(n) => Some(reference(n)),
+        Resp::List(n) => Some(json!({ "type": "array", "items": reference(n) })),
+        Resp::Paged(n) => Some(json!({
+            "type": "object",
+            "properties": {
+                "items": { "type": "array", "items": reference(n) },
+                "next": { "type": ["string", "null"], "description": "Pass as `after` for the next page." },
+                "prev": { "type": ["string", "null"], "description": "Pass as `before` for the previous page." },
+                "total": { "type": "integer" },
+            },
+        })),
+        Resp::Object => None,
+    }
+}
+
+fn operation(op: &Op) -> Value {
+    let mut params: Vec<Value> = Vec::new();
+    let mut rest = op.path;
+    while let Some(start) = rest.find('{') {
+        let end = rest[start..].find('}').map_or(rest.len(), |e| start + e);
+        params.push(json!({ "name": &rest[start + 1..end], "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }));
+        rest = &rest[(end + 1).min(rest.len())..];
+    }
+    for (name, ty, description) in op.query {
+        params.push(json!({ "name": name, "in": "query", "description": description, "schema": prop(ty) }));
+    }
+    if op.paged {
+        params.extend([
+            json!({ "name": "sort", "in": "query", "description": "Sort key; the allowed ones depend on the list.", "schema": { "type": "string" } }),
+            json!({ "name": "dir", "in": "query", "schema": { "type": "string", "enum": ["asc", "desc"] } }),
+            json!({ "name": "after", "in": "query", "description": "`next` of the previous page.", "schema": { "type": "string" } }),
+            json!({ "name": "before", "in": "query", "description": "`prev` of the next page.", "schema": { "type": "string" } }),
+            json!({ "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 200 } }),
+        ]);
+    }
+    let access = if op.writes() { "A key with `write` access" } else { "Any key" };
+    let mut description = format!("{access} that holds the `{}` scope. {}", op.group, op.note);
+    description = description.trim().to_string();
+    let ok = match response_schema(op.response) {
+        Some(s) => json!({ "description": "Success.", "content": { "application/json": { "schema": s } } }),
+        None => json!({ "description": "Success.", "content": { "application/json": { "schema": { "type": "object" } } } }),
+    };
+    let err = |d: &str| json!({ "description": d, "content": { "application/json": { "schema": reference("Error") } } });
+    let mut responses = json!({
+        "200": ok,
+        "401": err("No key, or the key is unknown, revoked or expired."),
+        "403": err("The key's scope, access level or the owner's rights don't allow this."),
+        "429": err("The key's rate limit is used up; wait `Retry-After` seconds."),
+    });
+    if op.path.contains('{') {
+        responses["404"] = err("Not found, or not one of the clients the key can see.");
+    }
+    if op.body.is_some() {
+        responses["400"] = err("The request was invalid.");
+    }
+    let mut out = json!({
+        "operationId": op.id,
+        "summary": op.summary,
+        "description": description,
+        "tags": [op.group],
+        "parameters": params,
+        "responses": responses,
+        "x-rmm-scope": op.group,
+        "x-rmm-access": if op.writes() { "write" } else { "read" },
+    });
+    if let Some(body) = op.body {
+        out["requestBody"] = json!({ "required": true, "content": { "application/json": { "schema": reference(body) } } });
+    }
+    out
+}
+
+fn build() -> Value {
+    let mut paths = Map::new();
+    for op in OPS {
+        paths.entry(op.path.to_string()).or_insert_with(|| json!({}))[op.method.to_lowercase()] = operation(op);
+    }
+    let tags: Vec<Value> = crate::apikeys::GROUPS.iter().map(|(id, label)| json!({ "name": id, "description": label })).collect();
+    let events: Vec<&str> = crate::webhooks::EVENTS.to_vec();
+    json!({
+        "openapi": "3.1.0",
+        "info": {
+            "title": "RMM API",
+            "version": "1.0.0",
+            "description": format!(
+                "Authenticate with an API key: `Authorization: Bearer rmm_k_…`. Create keys under Account → API keys; \
+                 admins create keys for service accounts under Company settings → API. A key acts as its owner and never \
+                 with more: it is limited to the scopes (resource groups) and clients it was given, and read-only keys can \
+                 only `GET`. Lists page with keyset cursors (`next`/`prev`). Errors are `{{\"error\": \"…\"}}`. Each key has its \
+                 own request budget (HTTP 429 with `Retry-After` when it is used up).\n\n\
+                 **Webhooks.** Admins subscribe a URL to ticket and alert events ({}). Each delivery is a `POST` of the `Webhook` \
+                 schema, signed like the webhook notification channel: `X-RMM-Signature: sha256=<hex HMAC-SHA256 of the raw body \
+                 with the subscription's secret>`, with `X-RMM-Event` and `X-RMM-Delivery` (the delivery id; the same on retries). \
+                 Any 2xx counts as delivered; anything else is retried after 1, 5, 30 minutes and 2 hours.",
+                events.join(", ")
+            ),
+        },
+        "servers": [{ "url": "/api/v1", "description": "This server" }],
+        "security": [{ "bearer": [] }],
+        "tags": tags,
+        "paths": paths,
+        "components": {
+            "securitySchemes": { "bearer": { "type": "http", "scheme": "bearer", "description": "An API key: rmm_k_…" } },
+            "schemas": schemas(),
+        },
+    })
+}
+
+/// `GET /api/openapi.json`: the description of the public API. No credentials needed.
+pub async fn openapi() -> Json<&'static Value> {
+    static SPEC: OnceLock<Value> = OnceLock::new();
+    Json(SPEC.get_or_init(build))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_operation_is_a_real_route() {
+        let router = include_str!("mod.rs");
+        for op in OPS {
+            assert!(router.contains(&format!("\"{}\"", op.path)), "{} isn't routed", op.path);
+            assert!(crate::apikeys::valid_group(op.group), "{}: unknown group {}", op.id, op.group);
+        }
+    }
+
+    #[test]
+    fn operations_are_unique() {
+        for (i, a) in OPS.iter().enumerate() {
+            for b in &OPS[i + 1..] {
+                assert!(a.id != b.id && !(a.method == b.method && a.path == b.path), "{} duplicated", a.id);
+            }
+        }
+    }
+
+    #[test]
+    fn nothing_dangerous_is_public() {
+        for op in OPS {
+            for bad in ["/shell", "/desktop", "/vault", "/processes", "/files", "/services/control"] {
+                assert!(!op.path.contains(bad), "{} must not be reachable with a key", op.path);
+            }
+            for bad in ["/auth", "/users", "/settings", "/agent/", "/events", "/billing", "/invoices", "/api-keys", "/service-accounts", "/webhook"] {
+                assert!(!op.path.starts_with(bad), "{} must not be reachable with a key", op.path);
+            }
+        }
+    }
+
+    #[test]
+    fn the_document_is_openapi_3_1_and_resolves_its_references() {
+        let doc = build();
+        assert_eq!(doc["openapi"], "3.1.0");
+        let text = doc.to_string();
+        let schemas = doc["components"]["schemas"].as_object().unwrap();
+        for part in text.split("#/components/schemas/").skip(1) {
+            let name: String = part.chars().take_while(|c| c.is_alphanumeric()).collect();
+            assert!(schemas.contains_key(&name), "dangling reference {name}");
+        }
+        assert_eq!(doc["paths"]["/agents/{id}"]["get"]["parameters"][0]["name"], "id");
+        assert_eq!(doc["paths"]["/tickets"]["post"]["x-rmm-access"], "write");
+        assert!(doc["paths"]["/tickets/{id}"]["patch"]["requestBody"].is_object());
+    }
+}

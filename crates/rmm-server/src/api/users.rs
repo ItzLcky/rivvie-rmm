@@ -36,6 +36,8 @@ pub struct UserRow {
     passkeys: i64,
     /// Identity providers the account is linked to.
     sso_providers: Vec<String>,
+    /// Can't sign in; owns API keys (Company settings → API).
+    service_account: bool,
 }
 
 pub async fn list(State(st): State<Arc<AppState>>, u: User) -> ApiResult<Json<Vec<UserRow>>> {
@@ -45,7 +47,8 @@ pub async fn list(State(st): State<Arc<AppState>>, u: User) -> ApiResult<Json<Ve
             "SELECT id, email, name, role, disabled, totp_secret IS NOT NULL AS totp_enabled, created_at, last_login_at,
                     all_clients, ARRAY(SELECT client_id FROM user_clients WHERE user_id = users.id) AS client_ids, permissions,
                     sso_exempt, sso_only, (SELECT count(*) FROM user_passkeys k WHERE k.user_id = users.id) AS passkeys,
-                    ARRAY(SELECT p.name FROM user_identities i JOIN sso_providers p ON p.id = i.provider_id WHERE i.user_id = users.id ORDER BY p.name) AS sso_providers
+                    ARRAY(SELECT p.name FROM user_identities i JOIN sso_providers p ON p.id = i.provider_id WHERE i.user_id = users.id ORDER BY p.name) AS sso_providers,
+                    service_account
                FROM users ORDER BY email",
         )
         .fetch_all(&st.db)
@@ -202,7 +205,7 @@ pub async fn reset_password(
     }
     let hash = auth::hash_password_async(&b.password).await?;
     let mut tx = st.db.begin().await?;
-    let n = sqlx::query("UPDATE users SET password_hash = $2, sso_only = false WHERE id = $1")
+    let n = sqlx::query("UPDATE users SET password_hash = $2, sso_only = false WHERE id = $1 AND NOT service_account")
         .bind(id)
         .bind(hash)
         .execute(&mut *tx)

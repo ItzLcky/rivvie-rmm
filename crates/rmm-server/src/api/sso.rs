@@ -645,7 +645,7 @@ pub(super) async fn lockout_check(tx: &mut sqlx::PgConnection) -> ApiResult<()> 
 }
 
 async fn exempt_admin_check(tx: &mut sqlx::PgConnection) -> ApiResult<()> {
-    let (n,): (i64,) = sqlx::query_as("SELECT count(*) FROM users WHERE role = 'admin' AND sso_exempt AND NOT disabled AND NOT sso_only")
+    let (n,): (i64,) = sqlx::query_as("SELECT count(*) FROM users WHERE role = 'admin' AND sso_exempt AND NOT disabled AND NOT sso_only AND NOT service_account")
         .fetch_one(&mut *tx)
         .await?;
     if n == 0 {
@@ -688,7 +688,7 @@ pub struct Exempt {
 pub async fn set_exempt(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uuid>, Json(b): Json<Exempt>) -> ApiResult<Json<serde_json::Value>> {
     u.require(Role::Admin)?;
     let mut tx = st.db.begin().await?;
-    let n = sqlx::query("UPDATE users SET sso_exempt = $2 WHERE id = $1").bind(id).bind(b.exempt).execute(&mut *tx).await?.rows_affected();
+    let n = sqlx::query("UPDATE users SET sso_exempt = $2 WHERE id = $1 AND NOT service_account").bind(id).bind(b.exempt).execute(&mut *tx).await?.rows_affected();
     if n == 0 {
         return Err(ApiError::NotFound("user"));
     }
@@ -960,13 +960,15 @@ async fn callback_inner(st: &AppState, headers: &HeaderMap, ip: &str, q: Callbac
             let Some(email) = identity.email.as_deref().filter(|_| identity.email_verified) else {
                 return Err(with_email(Fail::new("not_allowed", "the provider sent no verified email address")));
             };
-            let existing: Option<(Uuid, bool)> =
-                sqlx::query_as("SELECT id, sso_exempt FROM users WHERE lower(email) = $1").bind(email).fetch_optional(&mut *tx).await?;
+            let existing: Option<(Uuid, bool, bool)> =
+                sqlx::query_as("SELECT id, sso_exempt, service_account FROM users WHERE lower(email) = $1").bind(email).fetch_optional(&mut *tx).await?;
             match existing {
+                // Service accounts only own API keys: nobody signs in as one.
+                Some((_, _, true)) => return Err(with_email(Fail::new("not_allowed", "service accounts can't sign in"))),
                 // Break-glass accounts are the ones that must keep working when the provider doesn't,
                 // so a claim from the provider never reaches them.
-                Some((_, true)) => return Err(with_email(Fail::new("not_allowed", "break-glass accounts aren't linked by email"))),
-                Some((id, false)) => {
+                Some((_, true, _)) => return Err(with_email(Fail::new("not_allowed", "break-glass accounts aren't linked by email"))),
+                Some((id, false, _)) => {
                     linked_now = true;
                     id
                 }
