@@ -13,6 +13,10 @@
 //! | `security_detections`   | `context`                                      | `context_encrypted` |
 //! | `sso_providers`         | `client_secret`                                | `secret_sealed`     |
 //! | `webhook_subscriptions` | `secret`                                       | `secret_sealed`     |
+//! | `mailboxes` (second row)| `imap_password_enc`                            | `imap_password_sealed` |
+//! | `company_settings`      | `smtp_password_enc`                            | `smtp_password_sealed` |
+//! | `notification_channels` | `secret` (webhook channel signing secret)      | `secret_sealed`     |
+//! | `siem_destinations`     | `token`                                        | `token_sealed`      |
 //! | `vault_keys`            | `wrapped_key` (AAD `vault-key:<client id>`)    | always sealed       |
 //!
 //! The vault's items are sealed with the per-client keys, not with `RMM_DATA_KEY`, so
@@ -78,6 +82,17 @@ pub const TABLES: &[Table] = &[
     Table { name: "security_detections", pk: "id", pk_type: "uuid", columns: &["context"], flag: Some("context_encrypted"), aad_prefix: None },
     Table { name: "sso_providers", pk: "id", pk_type: "uuid", columns: &["client_secret"], flag: Some("secret_sealed"), aad_prefix: None },
     Table { name: "webhook_subscriptions", pk: "id", pk_type: "uuid", columns: &["secret"], flag: Some("secret_sealed"), aad_prefix: None },
+    Table { name: "mailboxes", pk: "id", pk_type: "uuid", columns: &["imap_password_enc"], flag: Some("imap_password_sealed"), aad_prefix: None },
+    Table {
+        name: "company_settings",
+        pk: "id",
+        pk_type: "boolean",
+        columns: &["smtp_password_enc"],
+        flag: Some("smtp_password_sealed"),
+        aad_prefix: None,
+    },
+    Table { name: "notification_channels", pk: "id", pk_type: "uuid", columns: &["secret"], flag: Some("secret_sealed"), aad_prefix: None },
+    Table { name: "siem_destinations", pk: "id", pk_type: "uuid", columns: &["token"], flag: Some("token_sealed"), aad_prefix: None },
     Table { name: "vault_keys", pk: "client_id", pk_type: "uuid", columns: &["wrapped_key"], flag: None, aad_prefix: Some("vault-key:") },
 ];
 
@@ -236,6 +251,61 @@ async fn rotate_table(tx: &mut sqlx::PgConnection, t: &Table, old: Option<&DataK
             return Ok(counts);
         }
     }
+}
+
+/// The (table, flag) pairs of [`TABLES`] whose values the server seals at startup when a key is
+/// set and they were stored in the clear (the credentials that were plaintext before 0031).
+const SEALED_AT_STARTUP: &[(&str, &str)] = &[
+    ("mailboxes", "imap_password_sealed"),
+    ("company_settings", "smtp_password_sealed"),
+    ("notification_channels", "secret_sealed"),
+];
+
+/// Seals what 0031 moved over in the clear. Without a key, values that are already sealed can't
+/// be read: the server refuses to start rather than send mail with a garbage password.
+pub async fn seal_plaintext_credentials(db: &sqlx::PgPool, key: Option<&DataKey>) -> Result<()> {
+    for t in TABLES.iter().filter(|t| SEALED_AT_STARTUP.iter().any(|(n, f)| *n == t.name && Some(*f) == t.flag)) {
+        let flag = t.flag.expect("filtered on the flag");
+        let any = t.columns.iter().map(|c| format!("{c} IS NOT NULL")).collect::<Vec<_>>().join(" OR ");
+        let Some(key) = key else {
+            let (n,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!("SELECT count(*) FROM {} WHERE {flag} AND ({any})", t.name))).fetch_one(db).await?;
+            anyhow::ensure!(
+                n == 0,
+                "{n} row(s) of {} hold credentials encrypted with RMM_DATA_KEY, but it isn't set; set it again",
+                t.name
+            );
+            continue;
+        };
+        // One transaction per table: the row is locked while it is read, sealed and written.
+        let mut tx = db.begin().await?;
+        let counts = rotate_table_plain(&mut tx, t, key).await.with_context(|| format!("sealing {}", t.name))?;
+        tx.commit().await?;
+        if counts > 0 {
+            tracing::info!(table = t.name, rows = counts, "encrypted credentials with RMM_DATA_KEY");
+        }
+    }
+    Ok(())
+}
+
+/// Seals the rows of `t` flagged as not sealed; leaves the rest alone.
+async fn rotate_table_plain(tx: &mut sqlx::PgConnection, t: &Table, key: &DataKey) -> Result<u64> {
+    let flag = t.flag.expect("a flag");
+    let cols = t.columns.join(", ");
+    let any = t.columns.iter().map(|c| format!("{c} IS NOT NULL")).collect::<Vec<_>>().join(" OR ");
+    let select = format!("SELECT {pk}::text AS pk, {cols} FROM {table} WHERE NOT {flag} AND ({any}) FOR UPDATE", pk = t.pk, table = t.name);
+    let set = t.columns.iter().enumerate().map(|(i, c)| format!("{c} = ${}", i + 2)).collect::<Vec<_>>().join(", ");
+    let update = format!("UPDATE {table} SET {set}, {flag} = true WHERE {pk} = $1::text::{ty}", table = t.name, pk = t.pk, ty = t.pk_type);
+    let rows = sqlx::query(sqlx::AssertSqlSafe(select)).fetch_all(&mut *tx).await?;
+    for row in &rows {
+        let pk: String = row.try_get("pk")?;
+        let mut q = sqlx::query(sqlx::AssertSqlSafe(update.clone())).bind(&pk);
+        for i in 0..t.columns.len() {
+            let stored: Option<Vec<u8>> = row.try_get(i + 1)?;
+            q = q.bind(stored.map(|s| key.seal(&s)));
+        }
+        q.execute(&mut *tx).await?;
+    }
+    Ok(rows.len() as u64)
 }
 
 /// The audit-log entry of a finished (not dry) run.

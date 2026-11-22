@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { History } from '@lucide/svelte';
+	import { Download, History } from '@lucide/svelte';
 	import { api } from '#lib/api.js';
 	import { ago, datetime } from '#lib/format.js';
 	import { paged } from '#lib/paged.svelte.js';
@@ -11,9 +11,17 @@
 	import ErrorState from '#lib/ui/ErrorState.svelte';
 	import PageHeader from '#lib/ui/PageHeader.svelte';
 	import Pagination from '#lib/ui/Pagination.svelte';
+	import Button from '#lib/ui/Button.svelte';
+	import Input from '#lib/ui/Input.svelte';
 	import Select from '#lib/ui/Select.svelte';
 
-	const list = paged<AuditRow>(() => `/audit${qs({ action: param('action'), user_id: param('user') })}`);
+	// The date filters are local days (`from` is the start of one, `to` the end of one).
+	const dayStart = (d: string) => (d ? new Date(`${d}T00:00:00`).toISOString() : '');
+	const dayEnd = (d: string) => (d ? new Date(`${d}T23:59:59.999`).toISOString() : '');
+	const filters = () => ({ action: param('action'), user_id: param('user'), from: dayStart(param('from')), to: dayEnd(param('to')) });
+	const list = paged<AuditRow>(() => `/audit${qs(filters())}`);
+	// The export takes the same filters and covers every match, not just this page.
+	const exportHref = (format: 'csv' | 'jsonl') => `/api/audit/export${qs({ ...filters(), format })}`;
 	const users = resource(() => api.get<{ id: string; name: string; email: string }[]>('/users'));
 
 	const groups = [
@@ -27,14 +35,22 @@
 		['job.', 'Jobs'],
 		['shell.', 'Terminal sessions'],
 		['script.', 'Scripts'],
-		['settings.', 'Company settings']
+		['settings.', 'Company settings'],
+		['siem.', 'SIEM destinations'],
+		['audit.', 'Audit log exports'],
+		['api.', 'API key requests']
 	];
 	const targetHref = (r: AuditRow) =>
 		r.target_id && ({ agent: `/agents/${r.target_id}`, client: `/clients/${r.target_id}`, script: `/scripts/${r.target_id}` } as Record<string, string>)[r.target_type ?? ''];
 	let open = $state<number | null>(null);
 </script>
 
-<PageHeader title="Audit log" count={list.data ? `${list.data.total}${list.data.total_exact ? '' : '+'}` : null} description="Every change made through the dashboard or API, and agent update results." />
+<PageHeader title="Audit log" count={list.data ? `${list.data.total}${list.data.total_exact ? '' : '+'}` : null} description="Every change made through the dashboard or API, and agent update results.">
+	{#snippet actions()}
+		<Button href={exportHref('csv')} download icon={Download}>Export CSV</Button>
+		<Button href={exportHref('jsonl')} download icon={Download}>Export JSON Lines</Button>
+	{/snippet}
+</PageHeader>
 
 {#if list.error && !list.data}
 	<div class="card"><ErrorState error={list.error} onretry={() => list.reload()} /></div>
@@ -79,6 +95,8 @@
 				onchange={(e) => setParams({ user: e.currentTarget.value })}
 				options={[{ value: '', label: 'Any user' }, ...(users.data ?? []).map((u) => ({ value: u.id, label: u.name || u.email }))]}
 			/>
+			<Input type="date" aria-label="From" class="w-auto" value={param('from')} max={param('to') || undefined} onchange={(e) => setParams({ from: e.currentTarget.value })} />
+			<Input type="date" aria-label="To" class="w-auto" value={param('to')} min={param('from') || undefined} onchange={(e) => setParams({ to: e.currentTarget.value })} />
 		{/snippet}
 		{#snippet empty()}<EmptyState icon={History} compact title="No entries match" />{/snippet}
 		{#snippet footer()}

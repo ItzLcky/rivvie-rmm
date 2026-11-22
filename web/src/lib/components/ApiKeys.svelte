@@ -44,7 +44,8 @@
 		'billing.manage': 'Manage billing',
 		'time.approve': 'Approve timesheets',
 		'vault.read': 'See vault passwords',
-		'vault.manage': 'Manage vault passwords'
+		'vault.manage': 'Manage vault passwords',
+		'audit.read': 'Read and export the audit log'
 	};
 
 	const blank = () => ({

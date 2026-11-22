@@ -21,13 +21,43 @@ use crate::state::AppState;
 pub const MAX_ATTEMPTS: i32 = 5;
 const BATCH: i64 = 20;
 
-#[derive(Debug, Clone, sqlx::FromRow)]
+/// A notification channel. A webhook channel's signing secret is kept sealed in its own
+/// column; `config` here has it put back under `secret`, opened (so a `Channel` must never be
+/// serialised to a client: the API view is built from the row, not from this).
+#[derive(Debug, Clone)]
 pub struct Channel {
     pub id: Uuid,
     pub name: String,
     pub kind: String,
     pub config: Value,
     pub enabled: bool,
+}
+
+#[derive(sqlx::FromRow)]
+pub struct ChannelRow {
+    pub id: Uuid,
+    pub name: String,
+    pub kind: String,
+    pub config: Value,
+    pub enabled: bool,
+    pub secret: Option<Vec<u8>>,
+    pub secret_sealed: bool,
+}
+
+impl ChannelRow {
+    pub const COLUMNS: &str = "id, name, kind, config, enabled, secret, secret_sealed";
+
+    pub fn open(self, key: Option<&crate::crypto::DataKey>) -> Result<Channel, String> {
+        let mut config = self.config;
+        if let Some(stored) = self.secret.as_deref() {
+            let plain = crate::crypto::load(key, stored, self.secret_sealed)
+                .ok_or("the signing secret can't be read: RMM_DATA_KEY is missing or changed")?;
+            if let Some(o) = config.as_object_mut() {
+                o.insert("secret".into(), String::from_utf8_lossy(&plain).into_owned().into());
+            }
+        }
+        Ok(Channel { id: self.id, name: self.name, kind: self.kind, config, enabled: self.enabled })
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -189,11 +219,12 @@ async fn drain(st: &AppState) -> anyhow::Result<usize> {
 }
 
 async fn load_channel(st: &AppState, id: Uuid) -> Result<Option<Channel>, String> {
-    sqlx::query_as("SELECT id, name, kind, config, enabled FROM notification_channels WHERE id = $1")
+    let row: Option<ChannelRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!("SELECT {} FROM notification_channels WHERE id = $1", ChannelRow::COLUMNS)))
         .bind(id)
         .fetch_optional(&st.db)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    row.map(|r| r.open(st.cfg.data_key.as_ref())).transpose()
 }
 
 /// A rendered notification, shared by every channel type.
@@ -515,7 +546,11 @@ pub(crate) fn mailer(
     };
     let mut builder = builder.port(c.smtp_port as u16).timeout(Some(Duration::from_secs(30)));
     if !c.smtp_username.is_empty() {
-        builder = builder.credentials(Credentials::new(c.smtp_username.clone(), c.smtp_password.clone()));
+        let password = c.smtp_password(st.cfg.data_key.as_ref()).unwrap_or_default();
+        if password.is_empty() && c.smtp_password_enc.is_some() {
+            return Err("the mail server password can't be read: RMM_DATA_KEY is missing or changed".into());
+        }
+        builder = builder.credentials(Credentials::new(c.smtp_username.clone(), password));
     }
     let from = c.smtp_from.trim().parse().map_err(|_| format!("sender address {:?} is invalid", c.smtp_from))?;
     Ok((builder.build(), from))

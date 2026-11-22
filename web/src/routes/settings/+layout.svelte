@@ -32,6 +32,7 @@
 		{ value: '/settings/documentation', label: 'Documentation' },
 		{ value: '/settings/api-keys', label: 'API' },
 		{ value: '/settings/webhooks', label: 'Webhooks' },
+		{ value: '/settings/siem', label: 'SIEM' },
 		{ value: '/settings/billing', label: 'Billing' }
 	]}
 />

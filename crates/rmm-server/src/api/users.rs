@@ -1,8 +1,7 @@
 use std::sync::Arc;
 
 use axum::Json;
-use axum::extract::{Path, Query, State};
-use sqlx::AssertSqlSafe;
+use axum::extract::{Path, State};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -10,7 +9,6 @@ use uuid::Uuid;
 
 use crate::auth::{self, Role, User};
 use crate::error::{ApiError, ApiResult};
-use crate::paging::{self, Page, PageQuery, Plan, SortKey};
 use crate::state::AppState;
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -280,7 +278,7 @@ pub async fn revoke_session(
 
 #[derive(Serialize, sqlx::FromRow)]
 pub struct AuditRow {
-    id: i64,
+    pub(super) id: i64,
     ts: DateTime<Utc>,
     user_name: Option<String>,
     action: String,
@@ -289,55 +287,7 @@ pub struct AuditRow {
     details: serde_json::Value,
     #[sqlx(default)]
     #[serde(skip)]
-    sort_key: String,
-}
-
-const AUDIT_KEYS: &[SortKey] = &[SortKey { name: "ts", expr: "l.ts", ty: "timestamptz" }];
-
-#[derive(Deserialize)]
-pub struct AuditQuery {
-    /// Exact action, or a prefix ending in `.` (`agent.`).
-    action: Option<String>,
-    user_id: Option<Uuid>,
-    target_type: Option<String>,
-    target_id: Option<Uuid>,
-}
-
-pub async fn audit_log(
-    State(st): State<Arc<AppState>>,
-    u: User,
-    Query(q): Query<AuditQuery>,
-    Query(page): Query<PageQuery>,
-) -> ApiResult<Json<Page<AuditRow>>> {
-    u.require(Role::Admin)?;
-    let plan = Plan::new(AUDIT_KEYS, ("ts", true), &page, "l.id", "bigint", 5)?;
-    let filters = "FROM audit_log l LEFT JOIN users u ON u.id = l.user_id
-          WHERE ($1::text IS NULL OR l.action = $1 OR (right($1, 1) = '.' AND starts_with(l.action, $1)))
-            AND ($2::uuid IS NULL OR l.user_id = $2)
-            AND ($3::text IS NULL OR l.target_type = $3)
-            AND ($4::uuid IS NULL OR l.target_id = $4)";
-    let action = q.action.as_deref().filter(|s| !s.is_empty());
-    let target_type = q.target_type.as_deref().filter(|s| !s.is_empty());
-    let sql = format!(
-        "SELECT l.id, l.ts, u.name AS user_name, l.action, l.target_type, l.target_id, l.details, {} {filters} {} {} {}",
-        plan.key_select,
-        plan.keyset,
-        plan.order,
-        plan.limit_sql()
-    );
-    let mut rows = sqlx::query_as::<_, AuditRow>(AssertSqlSafe(sql)).bind(action).bind(q.user_id).bind(target_type).bind(q.target_id);
-    if let Some((k, id)) = &plan.cursor {
-        rows = rows.bind(k).bind(id);
-    }
-    let rows = rows.fetch_all(&st.db).await?;
-    let total: i64 = sqlx::query_scalar(AssertSqlSafe(paging::count_sql(filters)))
-        .bind(action)
-        .bind(q.user_id)
-        .bind(target_type)
-        .bind(q.target_id)
-        .fetch_one(&st.db)
-        .await?;
-    Ok(Json(plan.finish(rows, |r| (r.sort_key.clone(), r.id.to_string()), total)))
+    pub(super) sort_key: String,
 }
 
 #[derive(Deserialize)]

@@ -40,7 +40,10 @@ pub struct Company {
     /// starttls / tls / none
     pub smtp_security: String,
     pub smtp_username: String,
-    pub smtp_password: String,
+    /// The password, sealed with RMM_DATA_KEY when the server has one (`smtp_password_sealed`);
+    /// read it with [`Company::smtp_password`].
+    pub smtp_password_enc: Option<Vec<u8>>,
+    pub smtp_password_sealed: bool,
     pub smtp_from: String,
     /// Satisfaction surveys on resolve.
     pub csat_enabled: bool,
@@ -49,8 +52,14 @@ pub struct Company {
 }
 
 impl Company {
+    /// The mail server password, opened. `None` when none is set, or when it can't be opened.
+    pub fn smtp_password(&self, key: Option<&crate::crypto::DataKey>) -> Option<String> {
+        let stored = self.smtp_password_enc.as_deref()?;
+        crate::crypto::load(key, stored, self.smtp_password_sealed).map(|p| String::from_utf8_lossy(&p).into_owned())
+    }
+
     pub const COLUMNS: &str = "company_name, session_idle_hours, require_2fa_all,
-        smtp_host, smtp_port, smtp_security, smtp_username, smtp_password, smtp_from, csat_enabled, sso_required";
+        smtp_host, smtp_port, smtp_security, smtp_username, smtp_password_enc, smtp_password_sealed, smtp_from, csat_enabled, sso_required";
 
     pub async fn load(db: &PgPool) -> sqlx::Result<Self> {
         sqlx::query_as(sqlx::AssertSqlSafe(format!("SELECT {} FROM company_settings", Self::COLUMNS))).fetch_one(db).await

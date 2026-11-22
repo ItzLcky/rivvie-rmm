@@ -95,6 +95,7 @@ const pages: [string, string][] = [
 	['service-desk', '/settings/service-desk'],
 	['settings-api', '/settings/api-keys'],
 	['settings-webhooks', '/settings/webhooks'],
+	['settings-siem', '/settings/siem'],
 	['developers', '/developers']
 ];
 const phone: [string, string][] = [
@@ -123,7 +124,8 @@ const phone: [string, string][] = [
 	['client-docs', '/clients/c-acme?tab=docs&doc=d-network'],
 	['client-docs-edit', '/clients/c-acme?tab=docs&doc=d-network&edit=1'],
 	['client-passwords', '/clients/c-acme?tab=passwords'],
-	['settings-webhooks', '/settings/webhooks']
+	['settings-webhooks', '/settings/webhooks'],
+	['settings-siem', '/settings/siem']
 ];
 
 const jpeg = readFileSync(new URL('./fixtures/desktop.jpg', import.meta.url));
@@ -817,6 +819,51 @@ test.describe('API keys and webhooks', () => {
 		await expect(log.getByText('Retry 2')).toBeVisible();
 		await log.getByRole('row').filter({ hasText: 'ticket.comment' }).getByRole('button', { name: 'Send again' }).click();
 		expect(calls.at(-1)).toEqual({ method: 'POST', path: '/webhook-deliveries/8/redeliver', body: {} });
+	});
+});
+
+test.describe('Audit export and SIEM', () => {
+	test('the export links carry the filters', async ({ page }) => {
+		await mockApi(page);
+		await page.goto('/audit?action=user.&from=2026-11-01&to=2026-11-02');
+		await settle(page);
+		const csv = await page.getByRole('link', { name: 'Export CSV' }).getAttribute('href');
+		const url = new URL(csv!, 'http://x');
+		expect(url.pathname).toBe('/api/audit/export');
+		expect(url.searchParams.get('action')).toBe('user.');
+		expect(url.searchParams.get('format')).toBe('csv');
+		expect(new Date(url.searchParams.get('from')!).getTime()).toBeLessThan(new Date(url.searchParams.get('to')!).getTime());
+		expect(await page.getByRole('link', { name: 'Export JSON Lines' }).getAttribute('href')).toContain('format=jsonl');
+	});
+
+	test('add a destination and test another', async ({ page }) => {
+		await mockApi(page);
+		const calls = await routeApi(page, (method, path) => {
+			if (method === 'POST' && path === '/siem/destinations/sd-2/test') return { json: { ok: false, error: 'TLS handshake: invalid peer certificate: UnknownIssuer' } };
+			if (method === 'POST' && path === '/siem/destinations') return { json: { id: 'sd-9' } };
+		});
+		await page.goto('/settings/siem');
+		await settle(page);
+		await expect(page.getByText('Failing (6)')).toBeVisible();
+		await page.getByRole('listitem').filter({ hasText: 'Graylog (TLS)' }).getByRole('button', { name: 'Test' }).click();
+		await expect(page.getByText(/UnknownIssuer/).first()).toBeVisible();
+
+		await page.getByRole('button', { name: 'Add destination' }).click();
+		const dialog = page.getByRole('dialog', { name: 'Add destination' });
+		await dialog.getByLabel('Name').fill('Elastic');
+		await dialog.getByLabel('Type').selectOption('https');
+		await dialog.getByLabel('URL').fill('https://elastic.example/ingest');
+		await dialog.getByLabel('Bearer token').fill('s3cret');
+		await dialog.getByRole('checkbox', { name: 'Alerts' }).click();
+		await dialog.getByRole('button', { name: 'Save' }).click();
+		expect(calls.at(-1)).toEqual({
+			method: 'POST',
+			path: '/siem/destinations',
+			body: {
+				name: 'Elastic', kind: 'https', address: 'https://elastic.example/ingest', framing: 'octet', https_format: 'generic', facility: 13, ca_pem: '',
+				send_audit: true, send_detections: false, send_alerts: true, enabled: true, token: 's3cret'
+			}
+		});
 	});
 });
 
