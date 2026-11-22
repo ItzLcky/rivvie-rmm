@@ -13,6 +13,7 @@
 //! | `security_detections`   | `context`                                      | `context_encrypted` |
 //! | `sso_providers`         | `client_secret`                                | `secret_sealed`     |
 //! | `webhook_subscriptions` | `secret`                                       | `secret_sealed`     |
+//! | `net_credentials`       | `secret` (SNMP community or passphrases)       | `secret_sealed`     |
 //! | `vault_keys`            | `wrapped_key` (AAD `vault-key:<client id>`)    | always sealed       |
 //!
 //! The vault's items are sealed with the per-client keys, not with `RMM_DATA_KEY`, so
@@ -78,6 +79,7 @@ pub const TABLES: &[Table] = &[
     Table { name: "security_detections", pk: "id", pk_type: "uuid", columns: &["context"], flag: Some("context_encrypted"), aad_prefix: None },
     Table { name: "sso_providers", pk: "id", pk_type: "uuid", columns: &["client_secret"], flag: Some("secret_sealed"), aad_prefix: None },
     Table { name: "webhook_subscriptions", pk: "id", pk_type: "uuid", columns: &["secret"], flag: Some("secret_sealed"), aad_prefix: None },
+    Table { name: "net_credentials", pk: "id", pk_type: "uuid", columns: &["secret"], flag: Some("secret_sealed"), aad_prefix: None },
     Table { name: "vault_keys", pk: "client_id", pk_type: "uuid", columns: &["wrapped_key"], flag: None, aad_prefix: Some("vault-key:") },
 ];
 

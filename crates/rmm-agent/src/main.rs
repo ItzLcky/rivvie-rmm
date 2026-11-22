@@ -6,6 +6,7 @@ mod fetch;
 mod fsutil;
 mod jobs;
 mod logwatch;
+mod net;
 mod patch;
 mod security;
 mod sensor;

@@ -13,6 +13,7 @@
 		stale_check: boolean; stale_hours: number;
 		patch_failed: boolean; reboot_check: boolean; reboot_hours: number;
 		renotify: boolean; renotify_minutes: number;
+		metric: 'cpu' | 'memory' | 'interface_util' | 'supply'; net_kinds: string; net_names: string;
 	};
 	const defaults: Record<PolicyKind, Partial<Draft>> = {
 		offline: { minutes: 10 },
@@ -23,13 +24,16 @@
 		job_failed: {},
 		log: {},
 		security: {},
-		patch: {}
+		patch: {},
+		net_down: { minutes: 5 },
+		net_interface: { minutes: 5 },
+		net_threshold: { threshold: 90, minutes: 10, metric: 'cpu' }
 	};
 	const blank = (kind: PolicyKind): Draft => ({
 		kind, severity: 'warning', channel_ids: [], notify_resolved: true, ticket_board_id: null, ticket_priority: 3, ticket_auto_resolve: true, run_script_id: '',
 		minutes: 10, threshold: 90, services: '', auto_only: false, exclude: '', script_id: '', min_level: 'error', channels: '', sources: '', event_ids: '', pattern: '',
 		unprotected: true, realtime_off: false, sensor_down: true, sig_check: true, sig_hours: 72, threats: 'active', sensor_realtime: true, database_stale: true,
-		stale_check: false, stale_hours: 24, patch_failed: true, reboot_check: true, reboot_hours: 72, renotify: false, renotify_minutes: 240,
+		stale_check: false, stale_hours: 24, patch_failed: true, reboot_check: true, reboot_hours: 72, renotify: false, renotify_minutes: 240, metric: 'cpu', net_kinds: '', net_names: '',
 		...defaults[kind]
 	});
 	const list = (s: string) => s.split(/[\n,]/).map((x) => x.trim()).filter(Boolean);
@@ -51,7 +55,8 @@
 			sensor_realtime: !!q.sensor_realtime, database_stale: !!q.database_stale,
 			stale_check: q.stale_hours != null, stale_hours: Number(q.stale_hours ?? 24),
 			patch_failed: q.failed !== false, reboot_check: q.reboot_hours != null, reboot_hours: Number(q.reboot_hours ?? 72),
-			renotify: c.renotify_minutes != null, renotify_minutes: (c.renotify_minutes as number) ?? 240
+			renotify: c.renotify_minutes != null, renotify_minutes: (c.renotify_minutes as number) ?? 240,
+			metric: (q.metric as Draft['metric']) ?? 'cpu', net_kinds: text(q.kinds).replaceAll('\n', ', '), net_names: text(q.names)
 		};
 	}
 	function params(d: Draft): Record<string, unknown> {
@@ -77,6 +82,12 @@
 					sensor_realtime: d.sensor_realtime, database_stale: d.database_stale,
 					stale_hours: d.stale_check ? Number(d.stale_hours) : null
 				};
+			case 'net_down':
+				return { minutes: Number(d.minutes), kinds: list(d.net_kinds) };
+			case 'net_interface':
+				return { minutes: Number(d.minutes), names: list(d.net_names), kinds: list(d.net_kinds) };
+			case 'net_threshold':
+				return { metric: d.metric, threshold: Number(d.threshold), minutes: Number(d.minutes), names: d.metric === 'interface_util' ? list(d.net_names) : [], kinds: list(d.net_kinds) };
 			case 'patch':
 				return { failed: d.patch_failed, reboot_hours: d.reboot_check ? Number(d.reboot_hours) : null };
 		}
@@ -258,6 +269,46 @@
 				<Select id="p-threats" class="max-w-80" bind:value={draft.threats} options={[{ value: 'active', label: 'Alert on active threats' }, { value: 'any', label: 'Alert on every detection' }, { value: 'off', label: 'Don’t alert on threats' }]} />
 			</PField>
 			<p class="hint -mt-2">Agents report Microsoft Defender and other Windows Security Center products, ClamAV, XProtect and our own sensor. The <a class="link" href="/security">Security</a> page shows every agent's state.</p>
+		{:else if draft.kind === 'net_down' || draft.kind === 'net_interface' || draft.kind === 'net_threshold'}
+			{#if draft.kind === 'net_threshold'}
+				<PField path="params.metric" label="Measure" id="p-metric">
+					<Select
+						id="p-metric"
+						class="max-w-72"
+						value={draft.metric}
+						onchange={(e) => {
+							draft.metric = e.currentTarget.value as Draft['metric'];
+							draft.threshold = draft.metric === 'supply' ? 10 : 90;
+						}}
+						options={[{ value: 'cpu', label: 'CPU load' }, { value: 'memory', label: 'Memory use' }, { value: 'interface_util', label: 'Port use (of its speed)' }, { value: 'supply', label: 'Toner or ink left' }]}
+					/>
+				</PField>
+			{/if}
+			<div class="grid gap-3 sm:grid-cols-2">
+				{#if draft.kind === 'net_threshold'}
+					<PField path="params.threshold" label={draft.metric === 'supply' ? 'At or below (%)' : 'At or above (%)'} id="p-thr">
+						<Input id="p-thr" type="number" min={draft.metric === 'supply' ? 0 : 1} max={draft.metric === 'supply' ? 99 : 100} step="0.5" bind:value={draft.threshold} />
+					</PField>
+				{/if}
+				{#if !(draft.kind === 'net_threshold' && draft.metric === 'supply')}
+					<PField path="params.minutes" label={draft.kind === 'net_threshold' ? 'Held for (minutes)' : draft.kind === 'net_down' ? 'No answer for (minutes)' : 'Down for (minutes)'} id="p-min">
+						<Input id="p-min" type="number" min="1" max="1440" bind:value={draft.minutes} />
+					</PField>
+				{/if}
+			</div>
+			{#if draft.kind === 'net_interface' || (draft.kind === 'net_threshold' && draft.metric === 'interface_util')}
+				<PField path="params.names" label="Only ports named" id="p-names" hint="One per line; * matches anything (uplink*, *trunk*). Matches the port's name, description or alias. Empty: every monitored port.">
+					<Textarea id="p-names" rows={2} class="font-mono text-[13px]" bind:value={draft.net_names} placeholder={'uplink*\nGi1/0/48'} />
+				</PField>
+			{/if}
+			<PField path="params.kinds" label="Only these kinds of device" id="p-kinds" hint="Comma-separated: switch, router, firewall, printer, ap, ups, nas. Empty: all.">
+				<Input id="p-kinds" bind:value={draft.net_kinds} placeholder="switch, firewall" />
+			</PField>
+			<p class="hint -mt-2">
+				{#if draft.kind === 'net_down'}Opens when a monitored device hasn’t answered SNMP for that long. If the site’s designated agent is offline nothing opens: the devices aren’t being read.
+				{:else if draft.kind === 'net_interface'}Only ports that are switched on in the device’s configuration and have been seen up count; a port someone turned off isn’t a fault.
+				{:else}Evaluated whenever the designated agent reads the device. Add this item to the <em>designated agent’s</em> policy set; scope it with the item’s client and site.{/if}
+			</p>
 		{:else if draft.kind === 'patch'}
 			<div class="space-y-3">
 				<PField path="params.failed" name="Failed installs" hint="One alert per agent, listing the updates. It clears once they install, or once someone declines them.">

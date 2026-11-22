@@ -115,13 +115,13 @@ export interface Session { id: string; created_at: string; last_seen_at: string;
 
 export type Severity = 'critical' | 'warning' | 'info';
 export type AlertState = 'open' | 'acknowledged' | 'resolved';
-export type PolicyKind = 'offline' | 'cpu' | 'memory' | 'disk' | 'service' | 'job_failed' | 'log' | 'security' | 'patch';
+export type PolicyKind = 'offline' | 'cpu' | 'memory' | 'disk' | 'service' | 'job_failed' | 'log' | 'security' | 'patch' | 'net_down' | 'net_interface' | 'net_threshold';
 export type LogLevel = 'critical' | 'error' | 'warning' | 'info';
 
 export interface Alert {
 	id: string; policy_id: string | null; policy_name: string | null; agent_id: string; hostname: string; client_id: string;
 	client_name: string; site_name: string; kind: PolicyKind; severity: Severity; title: string; details: Record<string, unknown>;
-	occurrences: number; state: AlertState; opened_at: string; last_seen_at: string; acknowledged_at: string | null;
+	occurrences: number; state: AlertState; device_id?: string | null; device_name?: string | null; opened_at: string; last_seen_at: string; acknowledged_at: string | null;
 	acknowledged_by_name: string | null; resolved_at: string | null; resolved_by_name: string | null;
 	/** cleared (condition went away), manual, policy (policy changed or deleted) */
 	resolution: 'cleared' | 'manual' | 'policy' | null;

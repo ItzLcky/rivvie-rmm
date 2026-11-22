@@ -105,7 +105,7 @@ re-request them (Let's Encrypt rate-limits that). The compose file already sets
 
 | Secret | What it protects | If it leaks | If it's lost |
 |---|---|---|---|
-| `RMM_DATA_KEY` | Two-factor secrets, single sign-on client secrets, webhook signing secrets, the password vault's per-client keys, mailbox and accounting (QuickBooks, Xero) credentials, and detection context, all encrypted at rest | The encryption in the database and in backups is worthless to anyone who also gets the dump. Replacing the key needs the rotation procedure ([below](#rotating-rmm_data_key)) | The vault is gone for good; users with 2FA can't sign in until `rmm-server reset2fa` clears it; the server refuses to start once anything has been encrypted. **Keep it with your backups, in a password manager and a sealed copy off-site.** A backup without its key is half a backup |
+| `RMM_DATA_KEY` | Two-factor secrets, single sign-on client secrets, webhook signing secrets, SNMP community strings and passphrases, the password vault's per-client keys, mailbox and accounting (QuickBooks, Xero) credentials, and detection context, all encrypted at rest | The encryption in the database and in backups is worthless to anyone who also gets the dump. Replacing the key needs the rotation procedure ([below](#rotating-rmm_data_key)) | The vault is gone for good; users with 2FA can't sign in until `rmm-server reset2fa` clears it; the server refuses to start once anything has been encrypted. **Keep it with your backups, in a password manager and a sealed copy off-site.** A backup without its key is half a backup |
 | `POSTGRES_PASSWORD` | The database | Full read/write of everything. The database isn't published, so this takes access to the host or its Docker network first | Reset it in Postgres (`ALTER USER`) and in `deploy/.env` |
 | Release signing key (`release.key`, from `rmm-sign keygen`) | Every agent self-update and all detection content: agents only run code signed by it | Anyone holding it can push their own binary to every agent. Treat it like a CA key: offline, never on the RMM server or the image, in CI only as the `RMM_UPDATE_SIGNING_KEY` secret | Agents can't be updated again; the public half is compiled into them, so they have to be reinstalled with a new key. Keep two copies off-site |
 | `RMM_METRICS_TOKEN` | `/metrics` | Series names and fleet sizes; low impact. Rotate by changing it and the scraper | Set a new one |
@@ -387,3 +387,32 @@ server URL and a dedicated token baked in (for Group Policy, Intune or other dep
 The README's [Installing an agent](../README.md#deploying) covers the options. Set up the
 [policies](../README.md#policies) your fleet should have, and an alert notification channel
 (Company settings → Notifications), before enrolling many machines.
+
+## Network discovery and SNMP
+
+Nothing to install or open on the server: the site's **designated agent** (Network → Settings)
+does the scanning and the SNMP reads, and sends the results over its normal connection. What it
+needs from the network:
+
+- **Reach.** The agent must be on (or routed to) the networks it scans and the devices it reads.
+  Scans stay inside private address space (`10/8`, `172.16/12`, `192.168/16`, `100.64/10`,
+  `169.254/16`), at most 4,096 addresses at once, and the server and the agent both refuse
+  anything else. Devices are read on UDP 161 (or the port you set).
+- **Privileges.** None. ICMP is used when Linux lets the agent open a ping socket (running as
+  root, or a group in `net.ipv4.ping_group_range`); otherwise discovery relies on TCP probes and
+  the neighbour table. On Windows and macOS the same applies.
+- **Credentials.** Make a read-only community or SNMPv3 user on the devices, add it under Network →
+  Settings, and tick it for the site's scans. Secrets are sealed with `RMM_DATA_KEY` (listed in
+  [Secrets to keep safe](#secrets-to-keep-safe), and resealed by `rotate-data-key`), travel to the
+  designated agent only when it scans or reads, are never kept on it, and are never shown again.
+- **Alerts.** Network alerts are items in the *designated agent's* policy set (Policies →
+  Alerts: Network device down, Network interface down, Network device threshold). They are
+  ordinary alerts, but do not count against that agent's health.
+- **Storage.** Samples of monitored interfaces are kept for `RMM_METRICS_RAW_DAYS`, hourly
+  rollups for `RMM_METRICS_RETENTION_DAYS`, like the agents' own. A device with 48 monitored ports
+  read every five minutes is about 14,000 interface rows a day; ports become monitored the first
+  time they're seen up, so unused ones cost nothing.
+- **Agents older than this release** don't list the `network` capability and can't be designated;
+  update them first.
+
+Design and limits: [design/network.md](design/network.md).

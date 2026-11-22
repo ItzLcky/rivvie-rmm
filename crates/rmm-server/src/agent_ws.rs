@@ -561,6 +561,10 @@ async fn on_message(
                 let _ = tx.send(ServerMsg::ReputationResult { known }).await;
             }
         }
+        AgentMsg::NetScanResult { scan_id, subnets, scanned, hosts, error, duration_ms: _ } => {
+            crate::netmon::ingest_scan(state, agent_id, scan_id, subnets, scanned, hosts, error).await?
+        }
+        AgentMsg::SnmpPollResult { poll_id, results } => crate::netmon::ingest_poll(state, agent_id, poll_id, results).await,
         AgentMsg::Pong { .. } => {}
         AgentMsg::Enroll { .. } | AgentMsg::Auth { .. } => {}
     }
@@ -601,6 +605,8 @@ fn message_type(m: &AgentMsg) -> usize {
         AgentMsg::TriageChunk { .. } => 28,
         AgentMsg::ToolReply { .. } => 29,
         AgentMsg::ReputationQuery { .. } => 30,
+        AgentMsg::NetScanResult { .. } => 31,
+        AgentMsg::SnmpPollResult { .. } => 32,
     }
 }
 

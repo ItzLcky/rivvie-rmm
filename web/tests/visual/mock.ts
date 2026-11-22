@@ -1077,6 +1077,68 @@ const categoryOut = (c: (typeof docCategories)[number]) => ({ ...c, docs: client
 
 const admin = { id: 'u-1', email: 'dana@northwind.example', name: 'Dana Admin', role: 'admin', totp_enabled: true, mfa_setup_required: false, client_ids: null, preferences: {}, permissions: ['security.read', 'security.respond', 'security.manage', 'vault.read', 'vault.manage'] };
 
+// --- Network discovery and SNMP devices ------------------------------------------------------------
+const netDev = (n: number, name: string, kind: string, host: string, state: 'up' | 'down', extra: Record<string, unknown> = {}) => ({
+	id: `nd-${n}`, site_id: 's-acme-hq', site_name: 'Head office', client_id: 'c-acme', client_name: 'Acme Corp', name, host, port: 161, credential_id: 'nc-1', credential_name: 'Switches (read-only)',
+	kind, enabled: true, poll_secs: null, sys_descr: null as string | null, sys_name: name.toLowerCase().replace(/ /g, '-'), sys_object_id: '1.3.6.1.4.1.9.1.1208', sys_location: 'Comms room, level 1', vendor: null as string | null,
+	mac: null as string | null, state, state_since: ago(state === 'down' ? 47 : 60 * 24 * 12), last_poll_at: ago(state === 'down' ? 0 : 2), last_ok_at: state === 'down' ? ago(47) : ago(2),
+	last_error: state === 'down' ? 'timeout after 3 tries' : null, rtt_ms: state === 'down' ? null : 3, uptime_secs: state === 'down' ? null : 86400 * 41 + 3600 * 5, cpu_percent: null as number | null, mem_used: null as number | null,
+	mem_total: null as number | null, storage: [] as unknown[], supplies: [] as unknown[], created_at: ago(60 * 24 * 30), agent_id: 'a-1', agent_hostname: 'acme-dc01', agent_online: true,
+	open_alerts: state === 'down' ? 1 : 0, interfaces: 0, interfaces_up: 0, ...extra
+});
+const netPorts = Array.from({ length: 8 }, (_, i) => ({
+	if_index: i + 1, name: i === 7 ? 'Gi1/0/48' : `Gi1/0/${i + 1}`, descr: `GigabitEthernet1/0/${i + 1}`, alias: ['Uplink to firewall', 'Reception PC', 'Accounts PC', '', 'Wi-Fi AP lobby', 'Meeting room', '', 'Spare'][i], if_type: 6,
+	speed_bps: 1_000_000_000, admin_status: i === 7 ? 2 : 1, oper_status: [1, 1, 1, 2, 1, 1, 2, 2][i], status_since: ago(60 * 24 * (i + 2)), monitored: i !== 7 && [1, 1, 1, 0, 1, 1, 0, 0][i] === 1,
+	in_bps: [i === 0 ? 182_000_000 : 3_400_000 * i, 0][oper(i)], out_bps: [i === 0 ? 96_000_000 : 1_100_000 * i, 0][oper(i)], util_pct: i === 0 ? 18 : oper(i) ? null : 0.3 * i,
+	in_errors: i === 4 ? 312 : 0, out_errors: 0, in_discards: i === 0 ? 14 : 0, out_discards: 0, last_at: ago(2)
+}));
+function oper(i: number) {
+	return [0, 0, 0, 1, 0, 0, 1, 1][i];
+}
+const netDevices = [
+	netDev(1, 'Core switch', 'switch', '192.168.10.2', 'up', { sys_descr: 'Cisco IOS Software, Catalyst L3 Switch Software (CAT9K_IOSXE), Version 17.9.4', vendor: 'Cisco Systems', mac: '00:1b:54:aa:10:02', cpu_percent: 17, mem_used: 612_000_000, mem_total: 2_000_000_000, interfaces: 8, interfaces_up: 5, storage: [{ descr: 'flash:', kind: 'disk', used: 410_000_000, total: 1_600_000_000 }] }),
+	netDev(2, 'Edge firewall', 'firewall', '192.168.10.1', 'down', { sys_descr: 'Fortinet FortiGate-60F v7.4.3', vendor: 'Fortinet', mac: '90:6c:ac:11:22:33', interfaces: 4, interfaces_up: 0 }),
+	netDev(3, 'Reception printer', 'printer', '192.168.10.41', 'up', {
+		sys_descr: 'HP LaserJet MFP M430f', vendor: 'HP', mac: '3c:2a:f4:5d:0e:91', uptime_secs: 86400 * 3,
+		supplies: [{ index: 1, description: 'Black Toner Cartridge', class: 3, kind: 3, percent: 8 }, { index: 2, description: 'Imaging Drum', class: 3, kind: 9, percent: 64 }, { index: 3, description: 'Waste Toner Box', class: 4, kind: 4, percent: 31 }]
+	})
+];
+const netDetail = (d: (typeof netDevices)[number]) => ({
+	...d, interfaces: d.id === 'nd-1' ? netPorts : [],
+	alerts: d.state === 'down' ? [{ id: 'al-net-1', title: 'Edge firewall isn’t answering SNMP', severity: 'critical', kind: 'net_down', opened_at: ago(46), acknowledged_at: null }] : []
+});
+const netPoints = (dev: string) =>
+	Array.from({ length: 48 }, (_, i) => ({
+		ts: new Date(NOW.getTime() - (47 - i) * 30 * 60_000).toISOString(), reachable_pct: dev === 'nd-2' && i > 45 ? 0 : 100, rtt_ms: dev === 'nd-2' && i > 45 ? null : 2 + ((i * 7) % 5),
+		cpu_percent: dev === 'nd-1' ? 12 + ((i * 5) % 14) : null, mem_used: dev === 'nd-1' ? 580_000_000 + ((i * 3) % 9) * 6_000_000 : null, mem_total: dev === 'nd-1' ? 2_000_000_000 : null
+	}));
+const discovered = (n: number, ip: string, name: string, kind: string, state: string, extra: Record<string, unknown> = {}) => ({
+	id: `dd-${n}`, site_id: 's-acme-hq', site_name: 'Head office', client_id: 'c-acme', client_name: 'Acme Corp', ip, mac: null as string | null, hostname: null as string | null, mdns_name: null as string | null,
+	vendor: null as string | null, sys_name: null as string | null, sys_descr: null as string | null, sys_object_id: null, sys_location: null, credential_id: null as string | null, open_ports: [] as number[],
+	methods: ['tcp', 'arp'], kind, status: state === 'unmanaged' || state === 'managed' || state === 'monitored' ? 'unmanaged' : state, note: '', agent_id: null as string | null, agent_hostname: null as string | null,
+	net_device_id: null as string | null, online: true, rtt_ms: 2, first_seen_at: ago(60 * 24 * 9), last_seen_at: ago(14), state, name, ...extra
+});
+const discoveredHosts = [
+	discovered(1, '192.168.10.88', 'CAM-LOBBY', 'other', 'unmanaged', { mac: '9c:8e:cd:01:7a:42', vendor: 'Amcrest Technologies', open_ports: [80, 554], first_seen_at: ago(60 * 5) }),
+	discovered(2, '192.168.10.130', 'jsmith-laptop', 'windows', 'unmanaged', { mac: 'f8:75:a4:6e:12:09', vendor: 'LCFC(HeFei) Electronics', hostname: 'jsmith-laptop.acme.local', open_ports: [135, 445, 3389], methods: ['icmp', 'tcp', 'arp', 'dns'] }),
+	discovered(3, '192.168.10.45', 'switch-2f', 'switch', 'unmanaged', { mac: '24:a4:3c:9b:aa:10', vendor: 'Ubiquiti Inc', sys_name: 'switch-2f', sys_descr: 'UniFi US-24-250W, 6.6.65', credential_id: 'nc-1', open_ports: [22, 80, 443], methods: ['tcp', 'arp', 'snmp'] }),
+	discovered(4, '192.168.10.12', 'acme-dc01', 'windows', 'managed', { mac: '00:15:5d:0a:0b:0c', agent_id: 'a-1', agent_hostname: 'acme-dc01', open_ports: [135, 445, 3389] }),
+	discovered(5, '192.168.10.2', 'Core switch', 'switch', 'monitored', { net_device_id: 'nd-1', sys_name: 'core-switch', credential_id: 'nc-1', methods: ['tcp', 'snmp'] }),
+	discovered(6, '192.168.10.201', 'Label printer', 'printer', 'known', { note: 'Dispatch label printer', open_ports: [9100], vendor: 'Zebra Technologies', mac: '00:07:4d:11:22:33' }),
+	discovered(7, '192.168.10.99', 'unknown-99', 'other', 'unmanaged', { online: false, last_seen_at: ago(60 * 30), mac: 'b8:27:eb:12:34:56', vendor: 'Raspberry Pi Foundation' })
+];
+const netCredentials = [
+	{ id: 'nc-1', client_id: 'c-acme', name: 'Switches (read-only)', version: 'v2c', username: '', auth_proto: null, priv_proto: null, context: '', devices: 2, created_at: ago(60 * 24 * 30), updated_at: ago(60 * 24 * 30) },
+	{ id: 'nc-2', client_id: 'c-acme', name: 'Firewall (SNMPv3)', version: 'v3', username: 'rmm-monitor', auth_proto: 'sha256', priv_proto: 'aes128', context: '', devices: 1, created_at: ago(60 * 24 * 12), updated_at: ago(60 * 24 * 2) }
+];
+const siteNetwork = (site: (typeof sites)[number]) => ({
+	site_id: site.id, site_name: site.name, client_id: site.client_id, agent_id: site.id === 's-acme-hq' ? 'a-1' : null, agent_hostname: site.id === 's-acme-hq' ? 'acme-dc01' : null,
+	agent_online: site.id === 's-acme-hq', agent_capable: site.id === 's-acme-hq', subnets: site.id === 's-acme-hq' ? ['192.168.10.0/24'] : [], discovery_hours: site.id === 's-acme-hq' ? 24 : 0, credential_ids: site.id === 's-acme-hq' ? ['nc-1'] : [],
+	poll_secs: 300, candidates: agents.filter((a) => a.site_id === site.id).map((a) => ({ id: a.id, hostname: a.hostname, online: a.online, capable: a.os_family === 'windows' })),
+	last_scan: site.id === 's-acme-hq' ? { id: 'sc-n1', status: 'done', subnets: ['192.168.10.0/24'], scanned: 254, found: 31, new_hosts: 2, error: null, requested_by_name: null, created_at: ago(60 * 3), finished_at: ago(60 * 3 - 2) } : null,
+	devices: site.id === 's-acme-hq' ? 3 : 0
+});
+
 // --- API keys, service accounts and webhooks -----------------------------------------------------
 const apiKeys = [
 	{ id: 'k-1', name: 'Reporting script', prefix: 'rmm_k_3f9a1c', owner_id: 'u-1', owner_name: 'Dana Admin', service_account: false, access: 'read', scopes: ['clients', 'agents', 'alerts'], permissions: [] as string[], client_ids: null as string[] | null, rate_limit_per_min: 600, expires_at: ago(-60 * 24 * 80), last_used_at: ago(12), last_used_ip: '203.0.113.20', revoked_at: null as string | null, created_at: ago(60 * 24 * 10), status: 'active' },
@@ -1321,6 +1383,19 @@ export async function mockApi(p: Page, opts: { signedIn?: boolean; ssoRequired?:
 		if (path === '/settings/smtp') return json({ host: 'smtp.office365.com', port: 587, security: 'starttls', username: 'rmm@northwind.example', password_set: true, from: 'Northwind RMM <rmm@northwind.example>' });
 		if (path === '/api-keys') return json(q.get('all') ? allApiKeys : apiKeys);
 		if (path === '/api-keys/options') return json({ groups: [{ id: 'clients', label: 'Clients and sites' }, { id: 'agents', label: 'Agents, inventory and metrics' }, { id: 'jobs', label: 'Jobs and results' }, { id: 'scripts', label: 'Script library' }, { id: 'alerts', label: 'Alerts' }, { id: 'tickets', label: 'Tickets' }, { id: 'security', label: 'Endpoint protection (needs the security.read permission)' }], permissions: admin.permissions, can_write: true, default_rate_limit: 600 });
+		if (path === '/network/summary') return json({ unmanaged: discoveredHosts.filter((d) => d.state === 'unmanaged' && d.online).length, devices: netDevices.length, down: netDevices.filter((d) => d.state === 'down').length });
+		if (path === '/network/devices')
+			return json(netDevices.filter((d) => (!q.get('state') || d.state === q.get('state')) && (!q.get('kind') || d.kind === q.get('kind')) && (!q.get('client_id') || d.client_id === q.get('client_id'))));
+		if ((m = path.match(/^\/network\/devices\/([^/]+)\/metrics$/))) return json(netPoints(m[1]));
+		if ((m = path.match(/^\/network\/devices\/([^/]+)\/interfaces\/(\d+)\/metrics$/)))
+			return json(Array.from({ length: 48 }, (_, i) => ({ ts: new Date(NOW.getTime() - (47 - i) * 30 * 60_000).toISOString(), in_bps: 90_000_000 + ((i * 13) % 17) * 6_000_000, out_bps: 40_000_000 + ((i * 7) % 11) * 5_000_000, util_pct: 14, up_pct: 100 })));
+		if ((m = path.match(/^\/network\/devices\/([^/]+)$/))) return json(netDetail(netDevices.find((d) => d.id === m![1])!));
+		if (path === '/network/discovered') {
+			const st = q.get('state') ?? 'unmanaged';
+			return json(discoveredHosts.filter((d) => (st === 'all' || d.state === st) && (!q.get('client_id') || d.client_id === q.get('client_id'))));
+		}
+		if ((m = path.match(/^\/clients\/([^/]+)\/network-credentials$/))) return json(netCredentials.filter((c) => c.client_id === m![1]));
+		if ((m = path.match(/^\/sites\/([^/]+)\/network$/))) return json(siteNetwork(sites.find((x) => x.id === m![1])!));
 		if (path === '/service-accounts') return json(serviceAccounts);
 		if (path === '/webhooks') return json({ webhooks, events: webhookEvents });
 		if ((m = path.match(/^\/webhooks\/([^/]+)\/deliveries$/))) return json(q.get('status') ? webhookDeliveries.filter((d) => d.status === q.get('status')) : webhookDeliveries);

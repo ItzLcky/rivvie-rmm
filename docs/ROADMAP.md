@@ -64,7 +64,7 @@ Every Windows feature is compile-checked (clippy via mingw) and unit-tested agai
 ### 4. Reach: more devices and platforms
 
 - [ ] **Software deployment**: winget and Chocolatey on Windows, apt/dnf on Linux, MSI push; doubles as third-party patching. Lives in policy sets like patching.
-- [ ] **Network discovery** from an agent (ARP/ping sweep, mDNS, SNMP sysDescr) to find unmanaged devices, and **SNMP monitoring** for switches, firewalls and printers through a designated agent.
+- [x] **Network discovery** from an agent (ICMP/TCP sweep, neighbour table, reverse DNS, mDNS, SNMP `sysDescr`) to find unmanaged devices, and **SNMP monitoring** (v2c and v3) for switches, firewalls and printers through a designated agent, with device-down, interface-down and threshold alerts. Design: [design/network.md](design/network.md). Not yet: traps, LLDP/CDP topology, vendor MIBs, IPv6 scans.
 - [ ] **Windows real-time protection** (antivirus milestone 6): ETW for process starts and file writes instead of polling, scan on write and on start, and an AMSI provider for script content. Two earlier attempts stopped before any code was written; notes are in [design/antivirus.md](design/antivirus.md). Needs block 1's hosts to test on.
 - [ ] **macOS as a supported platform**: launchd install, a signed and notarised `.pkg`, launchd services and the unified log, ScreenCaptureKit + `CGEvent` remote desktop, the Endpoint Security framework for the sensor. Pieces exist (patches, XProtect); the platform as a whole doesn't.
 - [ ] Remote desktop on Wayland (GNOME Mutter RemoteDesktop/ScreenCast, then the portal for KDE/wlroots).

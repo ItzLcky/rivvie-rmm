@@ -93,6 +93,12 @@ RMM_E2E_DATABASE_URL=postgres://rmm:rmm@localhost:5432/postgres \
   cargo test -p rmm-server --test e2e -- --ignored --nocapture
 ```
 
+The network section (`RMM_E2E_ONLY=network` runs just that) needs an SNMP device to scan and read:
+a net-snmp `snmpd` in a container, whose address (and name, so the test can pause it to make it go
+quiet) is passed as `RMM_E2E_SNMP=<ip>:<container>`. The recipe, with the users and community it
+needs, is in `crates/rmm-snmp/tests/netsnmp.rs`, which also tests the SNMP client against it.
+Without `RMM_E2E_SNMP` the section checks what doesn't need a device.
+
 `tests/e2e_windows.rs` is the Windows counterpart: it installs the agent from the generated MSI as
 a real service and runs PowerShell and cmd jobs, a Job Object tree kill, a service restart, an
 upgrade, ConPTY terminals, Event Log watchers, a Windows Update scan, Defender, the sensor, a
@@ -739,6 +745,10 @@ Design: [docs/design/api.md](docs/design/api.md).
   Postgres outbox, written in the transaction that changed the ticket, retried after 1, 5, 30 and 120
   minutes with identical bytes, and logged in the dashboard (HTTP status, duration, error, *Send again*).
   Internal notes are only sent when a subscription asks for them.
+
+## Network discovery and SNMP
+
+A site's designated agent scans its network (ICMP where it may, TCP, the ARP table, reverse DNS, mDNS, SNMP `sysDescr`) and lists what it finds under **Network**: hosts matched to agents by MAC or IP, and an *unmanaged devices* list with ignore, mark-as-known, monitor and deploy-an-agent actions. The same agent reads switches, firewalls and printers over SNMP v2c or v3 (uptime, interface status and traffic, CPU and memory, toner), with charts, hourly rollups and three new alert kinds: device down, interface down and thresholds. SNMP credentials are per client, sealed with `RMM_DATA_KEY`, and never shown again. Scans stay in private address space and are bounded. Design: [docs/design/network.md](docs/design/network.md).
 
 ## Remote desktop
 
