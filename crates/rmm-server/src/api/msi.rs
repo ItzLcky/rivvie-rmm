@@ -45,6 +45,8 @@ const SC_INSTALL_STOP: i32 = 0x0001;
 const SC_UNINSTALL_STOP: i32 = 0x0010;
 const SC_UNINSTALL_DELETE: i32 = 0x0080;
 
+/// RemoveFile.InstallMode: when the component is removed.
+const REMOVE_ON_UNINSTALL: i32 = 2;
 /// msidbComponentAttributes64bit.
 const COMPONENT_64BIT: i32 = 0x0100;
 /// msidbUpgradeAttributesVersionMinInclusive.
@@ -216,6 +218,24 @@ pub fn build(input: &MsiInput) -> anyhow::Result<Vec<u8>> {
         Value::Null,
         Value::Null,
         i(1),
+    ]))?;
+
+    // The agent's self-update leaves its previous binary (the watchdog's own copy) and a staged
+    // download next to the agent; neither is part of the package, so uninstall removes them
+    // (InstallMode 2: on removal only), and the agent's directory goes with them.
+    pkg.create_table(
+        "RemoveFile",
+        vec![
+            Column::build("FileKey").primary_key().id_string(72),
+            id("Component_", 72),
+            Column::build("FileName").nullable().text_string(255),
+            id("DirProperty", 72),
+            Column::build("InstallMode").int16(),
+        ],
+    )?;
+    pkg.insert_rows(Insert::into("RemoveFile").rows(vec![
+        vec![s("RemoveOldAgent"), s("AgentExe"), s("RMMAGE~1.EXE|rmm-agent.old.exe"), s("INSTALLDIR"), i(REMOVE_ON_UNINSTALL)],
+        vec![s("RemoveNewAgent"), s("AgentExe"), s("RMMAGE~2.EXE|rmm-agent.new.exe"), s("INSTALLDIR"), i(REMOVE_ON_UNINSTALL)],
     ]))?;
 
     pkg.create_table(
@@ -422,6 +442,10 @@ mod tests {
         let at = |a: &str| seq.iter().find(|(n, _)| n == a).unwrap().1;
         assert!(at("InstallFiles") < at("EnrollAgent") && at("EnrollAgent") < at("InstallFinalize"));
         assert!(at("StopServices") < at("RemoveFiles"));
+
+        // Uninstall also removes what the self-update leaves beside the binary.
+        let removed: Vec<String> = pkg.select_rows(msi::Select::table("RemoveFile")).unwrap().map(|r| r[2].as_str().unwrap().to_string()).collect();
+        assert_eq!(removed, ["RMMAGE~1.EXE|rmm-agent.old.exe", "RMMAGE~2.EXE|rmm-agent.new.exe"]);
 
         // The cabinet holds the binary under the File table's key.
         let mut cab_bytes = Vec::new();
