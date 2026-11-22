@@ -133,8 +133,20 @@ mod imp {
     pub fn start_service() -> Result<()> {
         let mgr = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
         let svc = mgr.open_service(NAME, ServiceAccess::START | ServiceAccess::QUERY_STATUS)?;
-        svc.start::<&str>(&[])?;
+        // The SCM's recovery action (or someone at the console) may have started it already
+        // since it stopped: that is what the watchdog wants, not an error that would roll a
+        // good update back.
+        match svc.start::<&str>(&[]) {
+            Ok(()) => {}
+            Err(e) if already_running(&e) => {}
+            Err(e) => return Err(e.into()),
+        }
         wait_for(&svc, ServiceState::Running)
+    }
+
+    /// ERROR_SERVICE_ALREADY_RUNNING (1056).
+    fn already_running(e: &windows_service::Error) -> bool {
+        matches!(e, windows_service::Error::Winapi(io) if io.raw_os_error() == Some(1056))
     }
 
     pub fn install(config: &Path) -> Result<()> {

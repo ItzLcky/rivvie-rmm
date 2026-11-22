@@ -100,20 +100,35 @@ pub fn guarded(path: &Path) -> Option<&'static str> {
     if forms.iter().any(|f| state.iter().any(|s| f.starts_with(s))) {
         return Some("it is the RMM agent's own state");
     }
-    let system: &[&str] = if cfg!(windows) {
-        &["c:/windows/system32/", "c:/windows/syswow64/", "c:/windows/winsxs/", "c:/windows/explorer.exe", "c:/windows/servicing/", "c:/windows/boot/"]
+    let windows_dirs;
+    let system: Vec<&str> = if cfg!(windows) {
+        windows_dirs = windows_system_dirs(std::env::var("SystemRoot").ok().as_deref());
+        windows_dirs.iter().map(String::as_str).collect()
     } else if cfg!(target_os = "macos") {
-        &["/system/", "/usr/bin/", "/usr/sbin/", "/usr/lib/", "/bin/", "/sbin/"]
+        vec!["/system/", "/usr/bin/", "/usr/sbin/", "/usr/lib/", "/bin/", "/sbin/"]
     } else {
-        &["/bin/", "/sbin/", "/usr/bin/", "/usr/sbin/", "/usr/lib/", "/usr/lib64/", "/usr/libexec/", "/lib/", "/lib64/", "/boot/"]
+        vec!["/bin/", "/sbin/", "/usr/bin/", "/usr/sbin/", "/usr/lib/", "/usr/lib64/", "/usr/libexec/", "/lib/", "/lib64/", "/boot/"]
     };
     let os_file = |f: &PathBuf| {
         let p = f.to_string_lossy().replace('\\', "/").to_ascii_lowercase();
         // `canonicalize` on Windows gives `\\?\C:\...`.
         let p = p.strip_prefix("//?/").unwrap_or(&p);
-        system.iter().any(|s| p.starts_with(s))
+        system.iter().any(|s| p.starts_with(*s))
     };
     forms.iter().any(os_file).then_some("it is an operating system file")
+}
+
+/// The operating system's own directories, lower-cased with forward slashes, for a Windows
+/// installed at `system_root` (`%SystemRoot%`; `C:\Windows` when unknown). Windows is not
+/// always on C:, so a hard-coded `c:/windows/` would leave the real one unguarded.
+pub fn windows_system_dirs(system_root: Option<&str>) -> Vec<String> {
+    let root = system_root.map(|r| r.replace('\\', "/").to_ascii_lowercase()).filter(|r| r.len() > 3 && r.as_bytes()[1] == b':');
+    let root = root.map(|r| r.trim_end_matches('/').to_string()).unwrap_or_else(|| "c:/windows".into());
+    let mut dirs: Vec<String> = ["system32/", "syswow64/", "winsxs/", "explorer.exe", "servicing/", "boot/"].iter().map(|d| format!("{root}/{d}")).collect();
+    if root != "c:/windows" {
+        dirs.extend(["system32/", "syswow64/", "winsxs/", "explorer.exe", "servicing/", "boot/"].iter().map(|d| format!("c:/windows/{d}")));
+    }
+    dirs
 }
 
 /// Largest file that can be quarantined.
@@ -366,6 +381,18 @@ mod tests {
             assert!(guarded(Path::new("C:\\Users\\x\\Downloads\\a.exe")).is_none());
             assert!(guarded(Path::new("C:\\Users\\x\\..\\..\\Windows\\System32\\x.dll")).is_some());
         }
+    }
+
+    #[test]
+    fn windows_system_dirs_follow_systemroot() {
+        let d = windows_system_dirs(Some("D:\\Windows\\"));
+        assert!(d.contains(&"d:/windows/system32/".to_string()) && d.contains(&"d:/windows/explorer.exe".to_string()), "{d:?}");
+        assert!(d.contains(&"c:/windows/system32/".to_string()), "the usual place stays guarded: {d:?}");
+        assert_eq!(windows_system_dirs(None)[0], "c:/windows/system32/");
+        assert_eq!(windows_system_dirs(Some("")), windows_system_dirs(None), "an unset or empty SystemRoot means C:\\Windows");
+        assert_eq!(windows_system_dirs(Some("\\\\?\\x")), windows_system_dirs(None), "junk is ignored");
+        let c = windows_system_dirs(Some("C:\\WINDOWS"));
+        assert_eq!(c.len(), 6, "no duplicates when it is the default: {c:?}");
     }
 
     #[test]

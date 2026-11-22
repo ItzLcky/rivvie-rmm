@@ -95,8 +95,11 @@ RMM_E2E_DATABASE_URL=postgres://rmm:rmm@localhost:5432/postgres \
 
 `tests/e2e_windows.rs` is the Windows counterpart: it installs the agent from the generated MSI as
 a real service and runs PowerShell and cmd jobs, a Job Object tree kill, a service restart, an
-upgrade and an uninstall. It changes the machine it runs on, so it runs in CI (`windows-latest`)
-or on a throwaway VM; see the file for the command.
+upgrade, ConPTY terminals, Event Log watchers, a Windows Update scan, Defender, the sensor, a
+signed self-update with a forced rollback, and an uninstall. `RMM_E2E_ONLY` / `RMM_E2E_SKIP` pick
+sections. It changes the machine it runs on, so it runs in CI (`windows-latest`) or on a throwaway
+VM; see the file for the command. What CI can't cover (real hardware, RDP, third-party antivirus,
+Server editions) is a checklist in [docs/design/windows-testing.md](docs/design/windows-testing.md).
 
 The dashboard has visual regression and accessibility tests. Playwright screenshots every page,
 in light and dark, against a mocked API, and runs WCAG 2.2 AA checks with axe. The baselines are

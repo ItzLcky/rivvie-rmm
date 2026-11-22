@@ -268,8 +268,11 @@ jobs:
 
   # The agent installed from the generated MSI as a real Windows service: install, jobs
   # (PowerShell, cmd), Job Object tree kill, results across a service restart, services,
-  # upgrade over itself, uninstall. See crates/rmm-server/tests/e2e_windows.rs. The runner
-  # image ships PostgreSQL (service disabled; user postgres, password root).
+  # upgrade over itself, then ConPTY shells, Event Log watchers, a Windows Update scan,
+  # Defender (with the EICAR file), the sensor, a signed self-update with a forced rollback,
+  # and uninstall. See crates/rmm-server/tests/e2e_windows.rs (RMM_E2E_ONLY / RMM_E2E_SKIP pick
+  # sections; the logs of a failed run are uploaded). The runner image ships PostgreSQL
+  # (service disabled; user postgres, password root).
   #
   # On ab72ebc the tests passed and the job then hung in its post-job steps (rust-cache's save)
   # until GitHub killed it at the default limit; that run's log was never written, so what was
@@ -277,7 +280,7 @@ jobs:
   # left (so the next hang says why) and then stops it before the post-job steps run.
   e2e-windows:
     runs-on: windows-latest
-    timeout-minutes: 40
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -288,12 +291,27 @@ jobs:
           $pg = Get-Service -Name postgresql*
           Set-Service -InputObject $pg -Status Running -StartupType Automatic
           & "$env:PGBIN\pg_isready.exe" -h localhost -t 60
-      - run: cargo build -p rmm-agent
+      # The agent is built with the e2e's release key (the fixed test seed, "09" x 32), twice:
+      # a newer one for the self-update to install, then the one the MSI installs.
+      - name: Release key and agent builds
+        shell: pwsh
+        run: |
+          cargo build -p rmm-sign
+          New-Item -ItemType Directory -Force target | Out-Null
+          Set-Content -NoNewline -Path target/e2e-release.key -Value ('09' * 32)
+          $pub = (& target/debug/rmm-sign.exe pubkey --key target/e2e-release.key).Trim()
+          $env:RMM_UPDATE_PUBKEY = $pub
+          $env:RMM_AGENT_VERSION = '99.0.0'
+          cargo build -p rmm-agent
+          Copy-Item target/debug/rmm-agent.exe target/e2e-agent-new.exe
+          Remove-Item Env:RMM_AGENT_VERSION
+          cargo build -p rmm-agent
       - name: End-to-end (Windows)
-        timeout-minutes: 20
+        timeout-minutes: 30
         run: cargo test -p rmm-server --test e2e_windows -- --ignored --nocapture
         env:
           RMM_E2E_DATABASE_URL: postgres://postgres:root@localhost:5432/postgres
+          RMM_E2E_NEW_AGENT_BIN: ${{ github.workspace }}/target/e2e-agent-new.exe
       - name: Stop what the test started
         if: always()
         timeout-minutes: 5
