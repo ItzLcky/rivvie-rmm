@@ -21,6 +21,7 @@ mod jobs;
 mod msi;
 mod mutes;
 mod packages;
+mod passkeys;
 mod schedules;
 mod patches;
 mod pm;
@@ -33,6 +34,7 @@ mod security;
 mod servicedesk;
 mod services;
 mod settings;
+mod sso;
 pub(crate) mod sla;
 pub(crate) mod tickets;
 mod time;
@@ -43,6 +45,7 @@ mod vault;
 
 pub use jobs::{FAILED as JOB_FAILED, deliver as deliver_job};
 pub use portal::PORTAL_LINK_MINUTES;
+pub use sso::seal_existing as seal_sso_secrets;
 pub use totp::{clear as clear_totp, seal_existing as seal_totp_secrets};
 pub use users::create_user as create_user_cli;
 
@@ -65,6 +68,10 @@ pub fn router(attachment_max: u64) -> Router<Arc<AppState>> {
     let upload_limit = |files: usize| axum::extract::DefaultBodyLimit::max((attachment_max as usize).saturating_mul(files).saturating_add(1 << 20));
     Router::new()
         .route("/auth/login", post(auth::login))
+        .route("/auth/login/passkey", post(passkeys::login_challenge))
+        .route("/auth/sso/providers", get(sso::public_providers))
+        .route("/auth/sso/callback", get(sso::callback))
+        .route("/auth/sso/{id}/start", get(sso::start))
         .route("/auth/logout", post(auth::logout))
         .route("/auth/me", get(auth::me))
         .route("/auth/preferences", axum::routing::put(auth::update_preferences))
@@ -78,6 +85,12 @@ pub fn router(attachment_max: u64) -> Router<Arc<AppState>> {
         .route("/auth/totp/enable", post(totp::enable))
         .route("/auth/totp/disable", post(totp::disable))
         .route("/auth/totp/recovery-codes", post(totp::regenerate_recovery))
+        .route("/auth/passkeys", get(passkeys::list))
+        .route("/auth/passkeys/register/start", post(passkeys::register_start))
+        .route("/auth/passkeys/register/finish", post(passkeys::register_finish))
+        .route("/auth/passkeys/recovery-codes", post(passkeys::recovery_codes))
+        .route("/auth/passkeys/{id}", axum::routing::patch(passkeys::rename))
+        .route("/auth/passkeys/{id}/remove", post(passkeys::remove))
         .route("/dashboard", get(agents::dashboard))
         .route("/clients", get(clients::list).post(clients::create))
         .route("/clients/{id}", get(clients::get).put(clients::rename).delete(clients::remove))
@@ -151,11 +164,17 @@ pub fn router(attachment_max: u64) -> Router<Arc<AppState>> {
         .route("/users/{id}/access", axum::routing::put(users::update_access))
         .route("/users/{id}/password", post(users::reset_password))
         .route("/users/{id}/totp", delete(users::reset_totp))
+        .route("/users/{id}/sso-exempt", axum::routing::put(sso::set_exempt))
         .route("/users/{id}/sessions", get(users::sessions).delete(users::revoke_sessions))
         .route("/users/{id}/sessions/{sid}", delete(users::revoke_session))
         .route("/audit", get(users::audit_log))
         .route("/settings", get(settings::get).put(settings::update))
         .route("/settings/public", get(settings::public))
+        .route("/settings/sso", get(sso::settings).put(sso::set_required))
+        .route("/settings/sso/providers", post(sso::create_provider))
+        .route("/settings/sso/providers/{id}", axum::routing::put(sso::update_provider).delete(sso::delete_provider))
+        .route("/settings/sso/providers/{id}/maps", axum::routing::put(sso::update_maps))
+        .route("/settings/sso/providers/{id}/test", post(sso::test_provider))
         .route("/settings/smtp", get(channels::get_smtp).put(channels::update_smtp))
         .route("/notification-channels", get(channels::list).post(channels::create))
         .route("/notification-channels/{id}", axum::routing::put(channels::update).delete(channels::remove))

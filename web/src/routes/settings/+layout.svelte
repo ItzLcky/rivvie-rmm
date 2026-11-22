@@ -25,6 +25,7 @@
 	items={billingOnly ? [{ value: '/settings/billing', label: 'Billing' }] : [
 		{ value: '/settings', label: 'General' },
 		{ value: '/settings/users', label: 'Users' },
+		{ value: '/settings/sso', label: 'Single sign-on' },
 		{ value: '/settings/notifications', label: 'Notifications' },
 		{ value: '/settings/service-desk', label: 'Service desk' },
 		{ value: '/settings/sla', label: 'SLAs' },

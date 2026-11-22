@@ -13,6 +13,7 @@ mod events;
 mod hub;
 mod metrics;
 mod notify;
+mod oidc;
 mod paging;
 mod patches;
 mod ratelimit;
@@ -28,6 +29,7 @@ mod storage;
 mod tickets;
 mod totp;
 mod updates;
+mod webauthn;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -227,7 +229,7 @@ async fn main() -> Result<()> {
             sqlx::query("DELETE FROM user_sessions WHERE user_id = $1").bind(id).execute(&mut *tx).await?;
             tx.commit().await?;
             auth::audit(&db, None, "user.mfa_reset", Some(("user", id)), serde_json::json!({ "via": "cli" })).await;
-            println!("two-factor auth removed for {email}; they will be asked to set it up again if required");
+            println!("two-factor auth (authenticator app, passkeys and recovery codes) removed for {email}; they will be asked to set it up again if required");
             Ok(())
         }
         Cmd::Serve(args) => serve(db, args).await,
@@ -260,6 +262,7 @@ async fn serve(db: sqlx::PgPool, args: ServeArgs) -> Result<()> {
         }
     };
     api::seal_totp_secrets(&db, data_key.as_ref()).await.context("encrypting two-factor secrets")?;
+    api::seal_sso_secrets(&db, data_key.as_ref()).await.context("encrypting single sign-on secrets")?;
     if data_key.is_none() {
         let (n,): (i64,) = sqlx::query_as("SELECT count(*) FROM vault_keys").fetch_one(&db).await.context("checking vault keys")?;
         if n > 0 {
@@ -298,6 +301,8 @@ async fn serve(db: sqlx::PgPool, args: ServeArgs) -> Result<()> {
             metrics_token: args.metrics_token.clone().map(|t| t.trim().to_string()).filter(|t| !t.is_empty()),
         },
         triage: Default::default(),
+        oidc: oidc::Cache::new(),
+        passkeys: webauthn::Passkeys::new(args.public_url.trim_end_matches('/')),
     });
     tokio::spawn(housekeeping(state.clone()));
     tokio::spawn(alerts::run(state.clone()));
@@ -441,6 +446,9 @@ async fn housekeeping(state: Arc<AppState>) {
         // The rest is bulk deletion; hourly is plenty.
         if runs.is_multiple_of(12) {
             state.limits.prune();
+            state.passkeys.prune();
+            // Sign-ins started but never finished at the identity provider.
+            results.push(sqlx::query("DELETE FROM sso_login_states WHERE expires_at < now()").execute(db).await);
             results.push(
                 sqlx::query(
                     "DELETE FROM user_sessions

@@ -28,6 +28,14 @@ pub struct UserRow {
     client_ids: Vec<Uuid>,
     /// Explicit permission set; null = the role's defaults.
     permissions: Option<Vec<String>>,
+    /// May sign in with a password when SSO is required.
+    sso_exempt: bool,
+    /// Created by SSO, with no password.
+    sso_only: bool,
+    /// Passkeys registered.
+    passkeys: i64,
+    /// Identity providers the account is linked to.
+    sso_providers: Vec<String>,
 }
 
 pub async fn list(State(st): State<Arc<AppState>>, u: User) -> ApiResult<Json<Vec<UserRow>>> {
@@ -35,7 +43,9 @@ pub async fn list(State(st): State<Arc<AppState>>, u: User) -> ApiResult<Json<Ve
     Ok(Json(
         sqlx::query_as(
             "SELECT id, email, name, role, disabled, totp_secret IS NOT NULL AS totp_enabled, created_at, last_login_at,
-                    all_clients, ARRAY(SELECT client_id FROM user_clients WHERE user_id = users.id) AS client_ids, permissions
+                    all_clients, ARRAY(SELECT client_id FROM user_clients WHERE user_id = users.id) AS client_ids, permissions,
+                    sso_exempt, sso_only, (SELECT count(*) FROM user_passkeys k WHERE k.user_id = users.id) AS passkeys,
+                    ARRAY(SELECT p.name FROM user_identities i JOIN sso_providers p ON p.id = i.provider_id WHERE i.user_id = users.id ORDER BY p.name) AS sso_providers
                FROM users ORDER BY email",
         )
         .fetch_all(&st.db)
@@ -156,6 +166,8 @@ pub async fn disable(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uu
     let mut tx = st.db.begin().await?;
     sqlx::query("UPDATE users SET disabled = true WHERE id = $1").bind(id).execute(&mut *tx).await?;
     sqlx::query("DELETE FROM user_sessions WHERE user_id = $1").bind(id).execute(&mut *tx).await?;
+    // With SSO required, the last break-glass admin has to stay able to sign in.
+    super::sso::lockout_check(&mut tx).await?;
     tx.commit().await?;
     auth::audit(&st.db, Some(u.id), "user.disable", Some(("user", id)), json!({})).await;
     Ok(Json(json!({ "ok": true })))
@@ -190,7 +202,7 @@ pub async fn reset_password(
     }
     let hash = auth::hash_password_async(&b.password).await?;
     let mut tx = st.db.begin().await?;
-    let n = sqlx::query("UPDATE users SET password_hash = $2 WHERE id = $1")
+    let n = sqlx::query("UPDATE users SET password_hash = $2, sso_only = false WHERE id = $1")
         .bind(id)
         .bind(hash)
         .execute(&mut *tx)
