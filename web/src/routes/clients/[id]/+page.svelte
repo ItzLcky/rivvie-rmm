@@ -34,6 +34,7 @@
 	import Stat from '#lib/ui/Stat.svelte';
 	import Switch from '#lib/ui/Switch.svelte';
 	import Tabs from '#lib/ui/Tabs.svelte';
+	import FieldsCard from '#lib/components/fields/FieldsCard.svelte';
 	import EnrollDialog from '#lib/components/EnrollDialog.svelte';
 	import AssignmentGrid from '#lib/components/policy/AssignmentGrid.svelte';
 	import SetDialog from '#lib/components/policy/SetDialog.svelte';
@@ -218,6 +219,7 @@
 				{ value: 'sites', label: 'Sites & enrollment', count: c.sites.length },
 				{ value: 'tickets', label: 'Tickets' },
 				{ value: 'contacts', label: 'Contacts' },
+				{ value: 'fields', label: 'Fields' },
 				{ value: 'docs', label: 'Docs' },
 				{ value: 'passwords', label: 'Passwords', hidden: !allowed('vault.read') },
 				{ value: 'policies', label: 'Policies' },
@@ -317,6 +319,12 @@
 					<EmptyState compact icon={MapPin} title="No sites" description="Agents enroll into a site, so add one first." />
 				{/if}
 			</section>
+		{:else if tab === 'fields'}
+			<div class="grid items-start gap-4 lg:grid-cols-2">
+				{#key c.id}<FieldsCard entity="client" id={c.id} title={c.name} />{/key}
+				{#each c.sites as s (s.id)}<FieldsCard entity="site" id={s.id} title="Site: {s.name}" />{/each}
+			</div>
+			<p class="text-muted mt-3 text-xs">Fields show up here once someone defines them{#if can('admin')}, in <a class="link" href="/settings/fields">Fields &amp; tags</a>{/if}.</p>
 		{:else if tab === 'tickets'}
 			<TicketTable id="client-tickets" caption="Tickets of {c.name}" list={tickets} sort={ticketSort} hide={['client']}>
 				{#snippet toolbar()}

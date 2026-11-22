@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { CloudDownload, FolderInput, Play, Plus, Search, X } from '@lucide/svelte';
+	import { CloudDownload, FolderInput, Play, Plus, Search, Tags, X } from '@lucide/svelte';
 	import { api } from '#lib/api.js';
 	import { ago, num, plural } from '#lib/format.js';
 	import { liveReload, onLive } from '#lib/live.svelte.js';
@@ -9,9 +9,12 @@
 	import { can } from '#lib/session.svelte.js';
 	import { attempt, toast } from '#lib/toast.svelte.js';
 	import { confirmAction } from '#lib/confirm.svelte.js';
-	import type { AgentSummary, Page, Release } from '#lib/types.js';
+	import type { AgentSummary, CustomField, Page, Release, Tag } from '#lib/types.js';
 	import type { Category } from '#lib/policy/types.js';
 	import CategoryChange from '#lib/components/policy/CategoryChange.svelte';
+	import SavedViews from '#lib/components/SavedViews.svelte';
+	import BulkTags from '#lib/components/tags/BulkTags.svelte';
+	import TagChip from '#lib/components/tags/TagChip.svelte';
 	import { param, qs, setParams, sortState } from '#lib/url.svelte.js';
 	import Button from '#lib/ui/Button.svelte';
 	import DataTable, { type Column } from '#lib/ui/DataTable.svelte';
@@ -56,6 +59,9 @@
 			os: param('os'),
 			category_id: param('category'),
 			policy_set_id: param('set'),
+			tag: param('tag'),
+			cf: param('cf'),
+			cfv: param('cf') ? param('cfv') : '',
 			health: param('health') || (views[view] as { health?: string }).health,
 			q: param('q'),
 			sort: sort.key,
@@ -110,16 +116,30 @@
 	// A count for every view, under the other filters (client, site, OS, search): one cheap
 	// limit=1 request each, refreshed when agents go online or offline.
 	const viewCounts = resource(async () => {
-		const base = { client_id: clientId(), site_id: param('site'), os: param('os'), category_id: param('category'), policy_set_id: param('set'), q: param('q'), limit: 1 };
+		const base = { client_id: clientId(), site_id: param('site'), os: param('os'), category_id: param('category'), policy_set_id: param('set'), tag: param('tag'), cf: param('cf'), cfv: param('cf') ? param('cfv') : '', q: param('q'), limit: 1 };
 		const keys = Object.keys(views) as View[];
 		const pages = await Promise.all(keys.map((k) => api.get<Page<AgentSummary>>(`/agents${qs({ ...views[k], ...base })}`)));
 		return Object.fromEntries(keys.map((k, i) => [k, `${num(pages[i].total)}${pages[i].total_exact ? '' : '+'}`])) as Record<View, string>;
 	});
 	liveReload(() => viewCounts.reload(), (e) => e.type === 'agent' && !e.last_metrics, { debounceMs: 1500 });
-	const filtered = $derived(!!(param('q') || param('os') || param('site') || param('health') || param('category') || param('set') || view !== 'all'));
+	const filtered = $derived(!!(param('q') || param('os') || param('site') || param('health') || param('category') || param('set') || param('tag') || param('cf') || view !== 'all'));
 
 	const categories = resource(() => api.get<Category[]>('/device-categories'));
 	let categorizing = $state(false);
+	let tagging = $state(false);
+
+	const tags = resource(() => api.get<Tag[]>('/tags'));
+	const agentFields = resource(() => api.get<CustomField[]>('/custom-fields?entity=agent'));
+	const field = $derived(agentFields.data?.find((f) => f.id === param('cf')));
+	// The value box of a field filter updates the URL as you type, like the search box.
+	let cfv = $state(param('cfv'));
+	$effect(() => {
+		const v = cfv;
+		const t = setTimeout(() => setParams({ cfv: v.trim() || null }), 250);
+		return () => clearTimeout(t);
+	});
+	const cfValueOptions = $derived(field?.kind === 'select' ? field.options : field?.kind === 'bool' ? ['yes', 'no'] : null);
+	const defaultHidden = ['tags', 'set', 'version', 'enrolled'];
 </script>
 
 <PageHeader
@@ -170,12 +190,15 @@
 	{#snippet versionCell(a: AgentSummary)}<span class="text-muted font-mono text-[13px]">{a.agent_version}</span>{/snippet}
 	{#snippet categoryCell(a: AgentSummary)}<span class="text-muted whitespace-nowrap">{a.category_name ?? '–'}</span>{/snippet}
 	{#snippet setCell(a: AgentSummary)}{#if a.policy_set_id}<a class="text-muted hover:text-fg whitespace-nowrap" href="/policies/sets/{a.policy_set_id}">{a.policy_set_name}</a>{:else}<span class="text-muted">–</span>{/if}{/snippet}
+	{#snippet tagsCell(a: AgentSummary)}
+		<span class="flex flex-wrap gap-1">{#each a.tags ?? [] as t (t.id)}<TagChip name={t.name} color={t.color} />{:else}<span class="text-muted" aria-label="no tags">–</span>{/each}</span>
+	{/snippet}
 	{#snippet enrolledCell(a: AgentSummary)}<span class="text-muted">{ago(a.enrolled_at)}</span>{/snippet}
 
 	<DataTable
 		id="agents"
 		caption="Agents"
-		activeFilters={[param('site'), param('os'), param('health'), param('category'), param('set')].filter(Boolean).length}
+		activeFilters={[param('site'), param('os'), param('health'), param('category'), param('set'), param('tag'), param('cf')].filter(Boolean).length}
 		rows={list.rows}
 		key={(a) => a.id}
 		loading={list.loading}
@@ -189,6 +212,7 @@
 			{ id: 'client', label: scoped ? 'Site' : 'Client / site', sort: 'client', cell: clientCell, from: 'md' },
 			{ id: 'os', label: 'OS', sort: 'os', cell: osCell, from: 'lg' },
 			{ id: 'category', label: 'Category', sort: 'category', cell: categoryCell, from: 'lg' },
+			{ id: 'tags', label: 'Tags', cell: tagsCell, defaultHidden: true },
 			{ id: 'set', label: 'Policy set', cell: setCell, defaultHidden: true },
 			{ id: 'status', label: 'Status', sort: 'status', cell: statusCell, from: 'md' },
 			{ id: 'health', label: 'Health', sort: 'health', cell: healthCell, from: 'sm' },
@@ -202,6 +226,13 @@
 	>
 		{#snippet toolbar()}
 			<Input icon={Search} data-search placeholder="Hostname, IP, user…" aria-label="Search agents" class="min-w-0 flex-1 sm:w-64 sm:flex-none" bind:value={q} />
+			<SavedViews
+				pageId="agents"
+				path="/agents"
+				keys={['client', 'site', 'view', 'q', 'os', 'health', 'category', 'set', 'tag', 'cf', 'cfv', 'sort', 'dir']}
+				columnTable="agents"
+				{defaultHidden}
+			/>
 		{/snippet}
 		{#snippet filters()}
 			{#if sites.length > 1}
@@ -232,6 +263,40 @@
 				onchange={(e) => setParams({ category: e.currentTarget.value })}
 				options={[{ value: '', label: 'Any category' }, ...(categories.data ?? []).map((c) => ({ value: c.id, label: c.name }))]}
 			/>
+			{#if tags.data?.length}
+				<Select
+					aria-label="Tag"
+					class="w-full sm:w-auto"
+					value={param('tag')}
+					onchange={(e) => setParams({ tag: e.currentTarget.value })}
+					options={[{ value: '', label: 'Any tag' }, ...tags.data.map((t) => ({ value: t.id, label: t.name }))]}
+				/>
+			{/if}
+			{#if agentFields.data?.length}
+				<Select
+					aria-label="Custom field"
+					class="w-full sm:w-auto"
+					value={param('cf')}
+					onchange={(e) => {
+						cfv = '';
+						setParams({ cf: e.currentTarget.value, cfv: null });
+					}}
+					options={[{ value: '', label: 'Any field' }, ...agentFields.data.map((f) => ({ value: f.id, label: f.label }))]}
+				/>
+				{#if field}
+					{#if cfValueOptions}
+						<Select
+							aria-label="{field.label} value"
+							class="w-full sm:w-auto"
+							value={param('cfv')}
+							onchange={(e) => setParams({ cfv: e.currentTarget.value })}
+							options={[{ value: '', label: 'Has a value' }, ...cfValueOptions.map((o) => ({ value: o, label: o }))]}
+						/>
+					{:else}
+						<Input type={field.kind === 'number' ? 'number' : field.kind === 'date' ? 'date' : 'text'} aria-label="{field.label} value" placeholder={field.kind === 'text' ? 'Contains…' : 'Has a value'} class="w-full sm:w-40" bind:value={cfv} />
+					{/if}
+				{/if}
+			{/if}
 			{#if param('set')}
 				<Button size="sm" variant="ghost" iconRight={X} onclick={() => setParams({ set: null })}>Policy set: {list.rows[0]?.policy_set_name ?? 'one set'}</Button>
 			{/if}
@@ -242,12 +307,13 @@
 		{#snippet bulk(n)}
 			{#if can('technician')}<Button size="sm" variant="primary" icon={Play} onclick={() => (running = true)}>Run script</Button>{/if}
 			{#if can('technician')}<Button size="sm" icon={FolderInput} onclick={() => (categorizing = true)}>Change category</Button>{/if}
+			{#if can('technician')}<Button size="sm" icon={Tags} onclick={() => (tagging = true)}>Tags</Button>{/if}
 			{#if can('admin') && outdated > 0}<Button size="sm" icon={CloudDownload} onclick={() => rollout([...selected])}>Update agent{n === 1 ? '' : 's'}</Button>{/if}
 		{/snippet}
 		{#snippet empty()}
 			{#if filtered}
 				<EmptyState title="No agents match" description="Try another view or clear the filters.">
-					{#snippet action()}<Button size="sm" onclick={() => { q = ''; setParams({ q: null, os: null, site: null, health: null, category: null, set: null, view: null }); }}>Clear filters</Button>{/snippet}
+					{#snippet action()}<Button size="sm" onclick={() => { q = ''; setParams({ q: null, os: null, site: null, health: null, category: null, set: null, tag: null, cf: null, cfv: null, view: null }); }}>Clear filters</Button>{/snippet}
 				</EmptyState>
 			{:else}
 				<EmptyState title={scoped ? `No agents for ${scoped.name} yet` : 'No agents yet'} description="Create an enrollment token for a site and run the install command on each machine.">
@@ -276,6 +342,9 @@
 
 {#if categorizing}
 	<CategoryChange agentIds={[...selected]} onclose={() => (categorizing = false)} ondone={() => ((selected = new Set()), list.reload(), viewCounts.reload())} />
+{/if}
+{#if tagging}
+	<BulkTags agentIds={[...selected]} onclose={() => (tagging = false)} ondone={() => ((selected = new Set()), list.reload(), tags.reload())} />
 {/if}
 {#if running}
 	<RunScript agents={[...picked.values()]} onclose={() => (running = false)} />

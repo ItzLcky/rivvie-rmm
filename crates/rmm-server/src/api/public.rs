@@ -71,6 +71,22 @@ pub static OPS: &[Op] = &[
         id: "getSite", method: "GET", path: "/sites/{id}", group: "clients", summary: "Get a site",
         note: "", query: NONE, paged: false, body: None, response: Resp::One("Site"),
     },
+    Op {
+        id: "listClientFields", method: "GET", path: "/clients/{id}/fields", group: "clients", summary: "A client's custom fields and their values",
+        note: "", query: NONE, paged: false, body: None, response: Resp::List("FieldValue"),
+    },
+    Op {
+        id: "setClientFields", method: "PUT", path: "/clients/{id}/fields", group: "clients", summary: "Set a client's custom fields",
+        note: "As `setAgentFields`.", query: NONE, paged: false, body: Some("SetFieldValues"), response: Resp::List("FieldValue"),
+    },
+    Op {
+        id: "listSiteFields", method: "GET", path: "/sites/{id}/fields", group: "clients", summary: "A site's custom fields and their values",
+        note: "", query: NONE, paged: false, body: None, response: Resp::List("FieldValue"),
+    },
+    Op {
+        id: "setSiteFields", method: "PUT", path: "/sites/{id}/fields", group: "clients", summary: "Set a site's custom fields",
+        note: "As `setAgentFields`.", query: NONE, paged: false, body: Some("SetFieldValues"), response: Resp::List("FieldValue"),
+    },
     // ---- agents ------------------------------------------------------------------------
     Op {
         id: "listAgents", method: "GET", path: "/agents", group: "agents", summary: "List agents (devices)",
@@ -82,6 +98,9 @@ pub static OPS: &[Op] = &[
             ("online", "boolean", "Only online or only offline agents."),
             ("os", "string", "`linux`, `windows` or `macos`."),
             ("health", "string", "Comma-separated: healthy, attention, unhealthy, unknown."),
+            ("tag", "string", "Comma-separated tag ids: agents that have all of them."),
+            ("cf", "uuid", "An agent custom field (its id): agents with a value for it."),
+            ("cfv", "string", "With `cf`: the value. Matched exactly, or as a case-insensitive substring for a text field."),
         ],
         paged: true, body: None, response: Resp::Paged("Agent"),
     },
@@ -99,6 +118,46 @@ pub static OPS: &[Op] = &[
         id: "refreshAgentInventory", method: "POST", path: "/agents/{id}/inventory/refresh", group: "agents",
         summary: "Ask an online agent to report its inventory now",
         note: "409 when the agent is offline.", query: NONE, paged: false, body: None, response: Resp::Object,
+    },
+    // ---- tags, custom fields and notes ---------------------------------------------------
+    Op {
+        id: "listTags", method: "GET", path: "/tags", group: "agents", summary: "List tags",
+        note: "Tags are shared by the whole MSP; `agents` counts the agents the key can see.", query: NONE, paged: false, body: None, response: Resp::List("Tag"),
+    },
+    Op {
+        id: "createTag", method: "POST", path: "/tags", group: "agents", summary: "Create a tag",
+        note: "Needs a write key whose owner is a technician or admin. 409 if the name is taken (ignoring case).", query: NONE, paged: false, body: Some("NewTag"), response: Resp::One("Tag"),
+    },
+    Op {
+        id: "setAgentTags", method: "PUT", path: "/agents/{id}/tags", group: "agents", summary: "Set an agent's tags",
+        note: "Replaces the agent's tags with exactly `tag_ids`.", query: NONE, paged: false, body: Some("SetTags"), response: Resp::Object,
+    },
+    Op {
+        id: "tagAgents", method: "POST", path: "/agents/tags", group: "agents", summary: "Add and remove tags on many agents",
+        note: "Up to 5000 agents; every one must be visible to the key or nothing changes (404).", query: NONE, paged: false, body: Some("BulkTags"), response: Resp::Object,
+    },
+    Op {
+        id: "listCustomFields", method: "GET", path: "/custom-fields", group: "agents", summary: "List custom field definitions",
+        note: "For agents, clients and sites. Fields limited to a client are listed only if the key can see that client. A field's `name` is what the values are set by.",
+        query: &[("entity", "string", "`agent`, `client` or `site`.")], paged: false, body: None, response: Resp::List("CustomField"),
+    },
+    Op {
+        id: "listAgentFields", method: "GET", path: "/agents/{id}/fields", group: "agents", summary: "An agent's custom fields and their values",
+        note: "Every field that applies to the agent, with `value` null where none is set.", query: NONE, paged: false, body: None, response: Resp::List("FieldValue"),
+    },
+    Op {
+        id: "setAgentFields", method: "PUT", path: "/agents/{id}/fields", group: "agents", summary: "Set an agent's custom fields",
+        note: "Only the fields named change; `null` or an empty string clears one. Every value is checked first and nothing is stored if one is wrong (400). Returns the fields as `listAgentFields` does.",
+        query: NONE, paged: false, body: Some("SetFieldValues"), response: Resp::List("FieldValue"),
+    },
+    Op {
+        id: "listAgentNotes", method: "GET", path: "/agents/{id}/notes", group: "agents", summary: "An agent's notes",
+        note: "The pinned note first, then newest first.", query: NONE, paged: false, body: None, response: Resp::List("Note"),
+    },
+    Op {
+        id: "addAgentNote", method: "POST", path: "/agents/{id}/notes", group: "agents", summary: "Add a note to an agent",
+        note: "Needs a write key whose owner is a technician or admin; the note is authored by the key's owner. `pinned` replaces the agent's pinned note.",
+        query: NONE, paged: false, body: Some("NewNote"), response: Resp::One("Note"),
     },
     // ---- jobs and scripts ----------------------------------------------------------------
     Op {
@@ -294,7 +353,76 @@ fn reference(name: &str) -> Value {
     json!({ "$ref": format!("#/components/schemas/{name}") })
 }
 
+/// Tags, custom fields and notes (a second `json!`, which would otherwise pass the macro's recursion limit).
+fn field_schemas() -> Value {
+    json!({
+        "Tag": object("A label on agents, shared by the whole MSP.", &[
+            ("id", "uuid"), ("name", "string"), ("color", "string"), ("agents", "integer"), ("created_at", "datetime"),
+        ]),
+        "NewTag": {
+            "type": "object",
+            "required": ["name"],
+            "properties": {
+                "name": { "type": "string", "maxLength": 40 },
+                "color": { "type": "string", "enum": ["slate", "red", "orange", "amber", "green", "teal", "blue", "violet", "pink"] },
+            },
+        },
+        "SetTags": {
+            "type": "object",
+            "required": ["tag_ids"],
+            "properties": { "tag_ids": { "type": "array", "items": { "type": "string", "format": "uuid" }, "maxItems": 50 } },
+        },
+        "BulkTags": {
+            "type": "object",
+            "required": ["agent_ids"],
+            "properties": {
+                "agent_ids": { "type": "array", "items": { "type": "string", "format": "uuid" }, "minItems": 1, "maxItems": 5000 },
+                "add": { "type": "array", "items": { "type": "string", "format": "uuid" } },
+                "remove": { "type": "array", "items": { "type": "string", "format": "uuid" } },
+            },
+        },
+        "CustomField": object("The definition of a custom field.", &[
+            ("id", "uuid"), ("entity", "string"), ("name", "string"), ("label", "string"), ("description", "string"),
+            ("kind", "string"), ("options", "array"), ("client_id", "uuid?"), ("client_name", "string?"),
+            ("script_writable", "boolean"), ("position", "integer"), ("in_use", "integer"),
+        ]),
+        "FieldValue": object("A custom field with the value of one agent, client or site. `kind` is text, number, bool, date (`YYYY-MM-DD`) or select (one of `options`).", &[
+            ("field_id", "uuid"), ("name", "string"), ("label", "string"), ("description", "string"), ("kind", "string"), ("options", "array"),
+            ("script_writable", "boolean"), ("client_id", "uuid?"), ("value", "object?"), ("source", "string?"), ("updated_at", "datetime?"),
+            ("updated_by_name", "string?"),
+        ]),
+        "SetFieldValues": {
+            "type": "object",
+            "required": ["values"],
+            "properties": {
+                "values": {
+                    "type": "object",
+                    "description": "Field name to value. A string, number, boolean or `YYYY-MM-DD` date as the field's type needs (strings are accepted for numbers and booleans); `null` or an empty string clears.",
+                    "additionalProperties": true,
+                },
+            },
+        },
+        "Note": object("A note on an agent.", &[
+            ("id", "uuid"), ("agent_id", "uuid"), ("body", "string"), ("author_id", "uuid?"), ("author_name", "string"), ("pinned", "boolean"),
+            ("created_at", "datetime"), ("updated_at", "datetime"), ("can_edit", "boolean"),
+        ]),
+        "NewNote": {
+            "type": "object",
+            "required": ["body"],
+            "properties": { "body": { "type": "string", "maxLength": 10000 }, "pinned": { "type": "boolean" } },
+        },
+    })
+}
+
 fn schemas() -> Value {
+    let mut all = base_schemas();
+    if let (Some(all), Value::Object(more)) = (all.as_object_mut(), field_schemas()) {
+        all.extend(more);
+    }
+    all
+}
+
+fn base_schemas() -> Value {
     json!({
         "Error": { "type": "object", "properties": { "error": { "type": "string" } }, "required": ["error"] },
         "Client": object("A customer of the MSP, with its sites.", &[
@@ -309,11 +437,12 @@ fn schemas() -> Value {
             ("agent_version", "string"), ("online", "boolean"), ("last_seen_at", "datetime?"), ("enrolled_at", "datetime"),
             ("site_id", "uuid"), ("site_name", "string"), ("client_id", "uuid"), ("client_name", "string"), ("last_metrics", "object?"),
             ("health", "string"), ("open_alerts", "integer"), ("failed_jobs_24h", "integer"), ("reboot_pending", "boolean"),
-            ("platform", "string"), ("category_name", "string"), ("policy_set_name", "string"),
+            ("platform", "string"), ("category_name", "string"), ("policy_set_name", "string"), ("tags", "array"),
         ]),
         "AgentDetail": {
             "allOf": [reference("Agent"), object("The agent's inventory.", &[
                 ("kernel_version", "string"), ("machine_id", "string?"), ("inventory", "object?"), ("inventory_at", "datetime?"), ("capabilities", "array"),
+                ("pinned_note", "object?"),
             ])],
         },
         "Metric": object("One point of an agent's history.", &[

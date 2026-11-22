@@ -12,6 +12,7 @@ mod auth;
 mod email;
 mod error;
 mod events;
+mod fields;
 mod hub;
 mod metrics;
 mod notify;
