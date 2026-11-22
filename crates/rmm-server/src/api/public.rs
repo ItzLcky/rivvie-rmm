@@ -204,6 +204,43 @@ pub static OPS: &[Op] = &[
         id: "addTicketEvent", method: "POST", path: "/tickets/{id}/events", group: "tickets", summary: "Reply to the client or add an internal note",
         note: "A `reply` is public and emailed to the contact.", query: NONE, paged: false, body: Some("NewTicketEvent"), response: Resp::Object,
     },
+    // ---- software ------------------------------------------------------------------------
+    Op {
+        id: "listSoftwarePackages", method: "GET", path: "/software/packages", group: "software", summary: "List the software catalog",
+        note: "MSP-wide packages and those of the clients the key can see. Each says how it's installed (winget, Chocolatey, apt, dnf, uploaded installer) and on how many devices it was last seen.",
+        query: &[CLIENT_Q, ("q", "string", "Name, publisher or package id."), ("platform", "string", "`windows` or `linux`: only packages deployable there.")],
+        paged: false, body: None, response: Resp::List("SoftwarePackage"),
+    },
+    Op {
+        id: "getSoftwarePackage", method: "GET", path: "/software/packages/{id}", group: "software", summary: "Get a catalog package",
+        note: "", query: NONE, paged: false, body: None, response: Resp::One("SoftwarePackage"),
+    },
+    Op {
+        id: "getAgentSoftware", method: "GET", path: "/agents/{id}/software", group: "software", summary: "What a device has of the catalog, what its policies ask, and its recent runs",
+        note: "`items[].compliant` is true or false when a policy asks for the package and the device has been scanned, else null.",
+        query: &[("all", "boolean", "Every package the device could use, not only those installed or required.")], paged: false, body: None, response: Resp::Object,
+    },
+    Op {
+        id: "listSoftwareRuns", method: "GET", path: "/software/runs", group: "software", summary: "List software installs, upgrades and removals, newest first",
+        note: "At most 500.", query: &[
+            ("agent_id", "uuid", "Only this device."),
+            ("package_id", "uuid", "Only this package."),
+            CLIENT_Q,
+            ("status", "string", "Comma-separated: queued, sent, succeeded, failed, lost, expired, cancelled."),
+            ("limit", "integer", "1-500, default 200."),
+        ],
+        paged: false, body: None, response: Resp::List("SoftwareRun"),
+    },
+    Op {
+        id: "listSoftwareUpdates", method: "GET", path: "/software/updates", group: "software", summary: "Installed catalog packages with a newer version on offer",
+        note: "One row per device and package.", query: &[CLIENT_Q, ("package_id", "uuid", "Only this package."), ("q", "string", "Hostname or package name."), ("ignored", "boolean", "Include versions someone chose to skip.")],
+        paged: false, body: None, response: Resp::Object,
+    },
+    Op {
+        id: "deploySoftware", method: "POST", path: "/software/deploy", group: "software", summary: "Install, upgrade or remove a catalog package on devices",
+        note: "Only catalog packages can be deployed, never arbitrary commands. Offline devices run it when they reconnect. Devices that can't take it (another client's package, an agent without software support, a run already in progress) are listed under `skipped`. Needs a write key whose owner is a technician or admin.",
+        query: NONE, paged: false, body: Some("SoftwareDeploy"), response: Resp::Object,
+    },
     // ---- endpoint protection (read) -------------------------------------------------------
     Op {
         id: "securitySummary", method: "GET", path: "/security/summary", group: "security", summary: "Protection state of the fleet",
@@ -372,6 +409,28 @@ fn schemas() -> Value {
                 "kind": { "type": "string", "enum": ["reply", "note"], "description": "`reply` is public and emailed; `note` is internal." },
                 "body": { "type": "string" },
                 "status_id": { "type": "string", "format": "uuid", "description": "Change the status in the same step." },
+            },
+        },
+        "SoftwarePackage": object("A package in the software catalog.", &[
+            ("id", "uuid"), ("client_id", "uuid?"), ("client_name", "string?"), ("name", "string"), ("description", "string"), ("publisher", "string?"),
+            ("winget_id", "string?"), ("choco_id", "string?"), ("apt_name", "string?"), ("dnf_name", "string?"), ("version", "string?"),
+            ("installer", "object?"), ("platforms", "array"), ("installed_on", "integer"), ("updates", "integer"), ("policies", "integer"),
+            ("created_at", "datetime"), ("updated_at", "datetime"),
+        ]),
+        "SoftwareRun": object("One install, upgrade or removal of a package on a device.", &[
+            ("id", "uuid"), ("agent_id", "uuid"), ("hostname", "string"), ("client_id", "uuid"), ("client_name", "string"), ("package_id", "uuid?"),
+            ("package_name", "string"), ("op", "string"), ("trigger", "string"), ("policy_item_id", "uuid?"), ("created_by_name", "string?"),
+            ("status", "string"), ("error", "string?"), ("provider", "string?"), ("from_version", "string?"), ("to_version", "string?"),
+            ("reboot_required", "boolean"), ("created_at", "datetime"), ("sent_at", "datetime?"), ("finished_at", "datetime?"), ("duration_ms", "integer?"),
+        ]),
+        "SoftwareDeploy": {
+            "type": "object",
+            "required": ["package_id", "op", "agent_ids"],
+            "properties": {
+                "package_id": { "type": "string", "format": "uuid" },
+                "op": { "type": "string", "enum": ["install", "upgrade", "uninstall"] },
+                "agent_ids": { "type": "array", "items": { "type": "string", "format": "uuid" }, "minItems": 1, "maxItems": 5000 },
+                "bootstrap_choco": { "type": "boolean", "description": "Allow installing Chocolatey first if the package needs it and the device lacks it." },
             },
         },
         "Detection": object("A detection from the endpoint protection.", &[

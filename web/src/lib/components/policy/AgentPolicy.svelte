@@ -93,6 +93,7 @@
 		[
 			{ m: 'alert', label: moduleLabels.alert, list: p.policies.filter((x) => x.module === 'alert') },
 			{ m: 'schedule', label: moduleLabels.schedule, list: p.policies.filter((x) => x.module === 'schedule') },
+			{ m: 'software', label: moduleLabels.software, list: p.policies.filter((x) => x.module === 'software') },
 			{ m: 'settings', label: 'Settings', list: p.policies.filter((x) => singleModules.includes(x.module)) }
 		].filter((g) => g.list.length);
 	const onlyFor = (v: ItemView) => (v.limit.client_id && v.limit.client_id !== agent.client_id ? v.limit.client_name : v.limit.site_name) ?? 'other devices';

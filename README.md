@@ -51,6 +51,7 @@ docs/           Roadmap and design notes
 - **Processes and files:** technicians see an agent's processes live and kill them (or a whole tree), and browse its file system, downloading and uploading files of any size in pieces over the agent's socket. Kills and transfers are audited.
 - **Schedules:** saved scripts run on a cron timetable, in any time zone, on every device using a policy set (or a set below it), optionally limited to one client or site. Each schedule keeps its runs' output for as many days as you choose.
 - **Patch management:** agents scan for OS updates (Windows Update Agent, apt, dnf/yum, pacman, softwareupdate) when they connect and every `RMM_PATCH_SCAN_HOURS`. The patch policy approves updates by category or severity and can install them during each site's maintenance window (or a window of its own, so servers and workstations at one site patch at different times), with a reboot policy. Technicians approve, decline and install from the Patches page or an agent's Patches tab, and the Compliance tab shows how many agents per client are fully patched. See [Patch management](#patch-management).
+- **Software deployment:** a catalog of packages (MSP-wide or per client) installed with winget, Chocolatey, apt, dnf or an uploaded MSI/EXE, deployed to chosen devices or required in policy sets (present, kept current, or absent), with per-device status, history and a view of available third-party updates. See [Software deployment](#software-deployment).
 - **Endpoint protection:** agents report the antivirus the machine already has (Microsoft Defender and other Windows Security Center products, ClamAV, XProtect), and can run our own sensor: telemetry, behaviour rules and file scanning from signed content rolled out to canary clients first, quarantine, network isolation, triage packages and fleet-wide hunting. Technicians start scans and signature updates from the Security page or an agent's Security tab, and alert policies raise alerts for protection that's off or out of date and for threats. See [Endpoint protection](#endpoint-protection).
 - **Self-update:** agents install new versions signed with an offline ed25519 key whose public half is compiled into the agent, and roll themselves back if the new version can't reconnect. See [Agent updates](#agent-updates).
 - **Security:** argon2id passwords; opaque, revocable session tokens in an HttpOnly SameSite=Strict cookie, with an idle timeout and a 7-day cap; users can change their password and review or revoke their sessions, and admins can reset passwords, re-enable users, and revoke anyone's sessions; TOTP or passkey (WebAuthn) two-factor auth with single-use recovery codes, required for admins and optionally for everyone; single sign-on for technicians with OpenID Connect ([design](docs/design/sso.md)); an Origin check on the terminal and desktop sockets; three roles (admin / technician / readonly); an audit log covering logins, shells, remote desktop sessions, jobs, enrollment, and deletes. Failed sign-ins are rate-limited per client IP and per account, and bad enrollment tokens per IP (see `RMM_TRUSTED_PROXIES`). The dashboard ships a hash-based script CSP, so no inline or third-party script runs.
@@ -429,7 +430,7 @@ says which and why, lets technicians change its category, pin a set, or **Custom
 device** (a new set below its current one, named after the host and pinned to it), and lists every
 policy that reaches it with the set it's defined in and the sets that change it.
 
-**Inheritance.** A set gets every policy of the sets above it. Alert policies and scheduled scripts
+**Inheritance.** A set gets every policy of the sets above it. Alert policies, scheduled scripts and software requirements
 can be added to any set (and optionally limited to one client or site, minus single devices).
 Patching, the security policy, remote access and the agent policy exist once, in All devices. On a
 set's page each policy, and each of its fields, says whether it's defined here, inherited (and from
@@ -581,6 +582,42 @@ Limits: Debian/Ubuntu/Arch don't publish severities, so approve those by categor
 security tags either: include **Updates** in the policy for Arch machines). On Apple silicon,
 macOS updates that need a restart may need a signed-in user to approve them. The Windows provider
 is compile-checked only so far, like the rest of the Windows agent.
+
+## Software deployment
+
+**Software** (Automation → Software) holds a catalog of packages. A package says how to get it on
+each platform: a winget id, a Chocolatey id, an apt and/or dnf package, or an MSI or EXE you
+upload (stored and hashed in object storage, limited by `RMM_ATTACHMENT_MAX_MB`; an EXE needs
+silent arguments, an MSI gets `/qn /norestart`). Packages are MSP-wide (admins) or one client's
+own (technicians of that client). A **version** holds devices at that version (older installs are
+brought up to it, newer ones are left alone); empty means the latest. A device uses the first way
+it has: winget, then Chocolatey, then the uploaded installer on Windows; apt, then dnf or yum on
+Linux.
+
+- **Deploy by hand**: a package's page lists devices; pick some and Install, Upgrade or
+  Uninstall. An agent's **Deployments** tab does the same for one device and shows what it has of
+  the catalog, what its policies ask and its recent runs.
+- **Desired state**: in a policy set, **Software** requirements say a package must be *installed*,
+  *installed and kept current* (upgraded whenever the provider offers a newer version, inside the
+  site's maintenance window or one of its own) or *not installed*. They're enforced when a scan
+  arrives, when a device joins the set, when policies change and every minute for retries, one run
+  per device at a time. Failures back off (15 minutes, doubling to a day) and show on the device.
+  A package can't be deleted while a policy requires it.
+- **Updates**: the Updates tab lists installed catalog packages with a newer version on offer
+  (winget's *Available* column, `choco outdated`, `apt-get -s dist-upgrade`, `dnf check-update`).
+  *Upgrade now* is the approval; a version can be skipped. Packages in a *kept current* requirement
+  upgrade by themselves.
+- **History**: every run, with the provider's output, who or which policy started it, and the
+  versions before and after. The agent checks what is installed after each run, so a provider
+  that says "done" without installing is reported as a failure.
+
+Winget runs as SYSTEM, which has no `winget` on its PATH: the agent finds the newest App Installer
+under `Program Files\WindowsApps` itself. Chocolatey is only installed on a device when the
+requirement (or the person deploying) allows it, because that downloads and runs Chocolatey's
+install script. Package ids and versions are checked against a strict character set before they
+reach a command line. Scans use `RMM_PATCH_SCAN_HOURS`. The Windows providers are compile-checked
+and tested against recorded output only (see the roadmap's Windows block). Design and API:
+[docs/design/software.md](docs/design/software.md).
 
 ## Service desk (tickets)
 

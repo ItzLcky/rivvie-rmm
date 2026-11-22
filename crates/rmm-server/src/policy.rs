@@ -40,6 +40,7 @@ pub enum Module {
     Security,
     RemoteAccess,
     Agent,
+    Software,
 }
 
 impl Module {
@@ -51,6 +52,7 @@ impl Module {
             "security" => Module::Security,
             "remote_access" => Module::RemoteAccess,
             "agent" => Module::Agent,
+            "software" => Module::Software,
             _ => return None,
         })
     }
@@ -63,12 +65,13 @@ impl Module {
             Module::Security => "security",
             Module::RemoteAccess => "remote_access",
             Module::Agent => "agent",
+            Module::Software => "software",
         }
     }
 
     /// Lives once, in All devices; everything else can only override it.
     pub fn single(self) -> bool {
-        !matches!(self, Module::Alert | Module::Schedule)
+        !matches!(self, Module::Alert | Module::Schedule | Module::Software)
     }
 
     /// Top-level config fields a descendant set may override.
@@ -82,6 +85,8 @@ impl Module {
             Module::Security => SECURITY_FIELDS.contains(&field),
             Module::RemoteAccess => REMOTE_FIELDS.contains(&field),
             Module::Agent => field == "auto_update",
+            // Which package is what the item is; the rest can differ per set.
+            Module::Software => SOFTWARE_FIELDS.contains(&field),
         }
     }
 }
@@ -112,6 +117,7 @@ const SECURITY_FIELDS: &[&str] = &[
     "archive_depth",
     "database_max_age_hours",
 ];
+const SOFTWARE_FIELDS: &[&str] = &["state", "bootstrap_choco", "window"];
 const REMOTE_FIELDS: &[&str] = &["desktop_enabled", "desktop_consent", "shell_enabled", "files_enabled"];
 
 // ---------------------------------------------------------------------------
@@ -252,19 +258,24 @@ impl PatchConfig {
             return Err("reboot_policy must be never, if_required or always".into());
         }
         if let Some(w) = &self.window {
-            if w.days.iter().any(|d| !(0..=6).contains(d)) {
-                return Err("window days are 0 (Sunday) to 6 (Saturday)".into());
-            }
-            NaiveTime::parse_from_str(w.start.trim(), "%H:%M").map_err(|_| "window start must be a time like 02:00".to_string())?;
-            if !(15..=1440).contains(&w.minutes) {
-                return Err("the window must last 15 minutes to 24 hours".into());
-            }
-            if w.tz != "site" && chrono_tz::Tz::from_str(&w.tz).is_err() {
-                return Err(format!("unknown time zone {}", w.tz));
-            }
+            validate_window(w)?;
         }
         Ok(())
     }
+}
+
+fn validate_window(w: &PatchWindow) -> Result<(), String> {
+    if w.days.iter().any(|d| !(0..=6).contains(d)) {
+        return Err("window days are 0 (Sunday) to 6 (Saturday)".into());
+    }
+    NaiveTime::parse_from_str(w.start.trim(), "%H:%M").map_err(|_| "window start must be a time like 02:00".to_string())?;
+    if !(15..=1440).contains(&w.minutes) {
+        return Err("the window must last 15 minutes to 24 hours".into());
+    }
+    if w.tz != "site" && chrono_tz::Tz::from_str(&w.tz).is_err() {
+        return Err(format!("unknown time zone {}", w.tz));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -320,6 +331,31 @@ pub struct AgentConfig {
     pub auto_update: bool,
 }
 
+/// One package requirement: the package, and whether it must be there, kept current, or gone.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SoftwareConfig {
+    pub package_id: Uuid,
+    pub state: crate::software::Want,
+    /// Install Chocolatey if a package needs it and the machine doesn't have it. It downloads
+    /// and runs Chocolatey's installer script, so it's off unless asked for.
+    #[serde(default)]
+    pub bootstrap_choco: bool,
+    /// When upgrades of an installed package may start: `null` is the site's maintenance
+    /// window. (Installs and removals don't wait.)
+    #[serde(default)]
+    pub window: Option<PatchWindow>,
+}
+
+impl SoftwareConfig {
+    fn validate(&self) -> Result<(), String> {
+        if let Some(w) = &self.window {
+            validate_window(w)?;
+        }
+        Ok(())
+    }
+}
+
 fn parse<T: serde::de::DeserializeOwned>(v: &Value) -> Result<T, String> {
     serde_json::from_value(v.clone()).map_err(|e| e.to_string())
 }
@@ -351,6 +387,11 @@ pub fn validate(module: Module, config: &Value) -> Result<Value, String> {
         }
         Module::RemoteAccess => serde_json::to_value(parse::<RemoteAccessConfig>(config)?),
         Module::Agent => serde_json::to_value(parse::<AgentConfig>(config)?),
+        Module::Software => {
+            let c: SoftwareConfig = parse(config)?;
+            c.validate()?;
+            serde_json::to_value(c)
+        }
     };
     out.map_err(|e| e.to_string())
 }
@@ -623,6 +664,10 @@ pub async fn changed(st: &Arc<AppState>, ch: Change) {
     if let Err(e) = res {
         warn!("re-applying patch approvals: {e}");
     }
+    // Devices that joined a set, and requirements added or changed: scan what's missing and enforce.
+    let st = st.clone();
+    let list = ch.agents;
+    tokio::spawn(async move { crate::software::policy_changed(&st, list.as_deref()).await });
 }
 
 #[cfg(test)]

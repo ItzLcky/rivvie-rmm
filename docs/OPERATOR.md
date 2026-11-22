@@ -206,7 +206,7 @@ that fails to parse falls back to its default.
 |---|---|---|
 | `RMM_HEARTBEAT_SECS` | `30` | Agent metrics interval |
 | `RMM_INVENTORY_SECS` | `21600` | Agent inventory interval (6 h) |
-| `RMM_PATCH_SCAN_HOURS` | `12` | Online agents scan for OS updates when their last scan is older |
+| `RMM_PATCH_SCAN_HOURS` | `12` | Online agents scan for OS updates, and for the software catalog's installed versions, when their last scan is older |
 | `RMM_JOB_QUEUE_DAYS` | `7` | Jobs queued for an offline agent expire after this |
 | `RMM_ALERT_EVAL_SECS` | `60` | How often polled alert policies (offline, CPU, memory, disk) are evaluated |
 | `RMM_CONTENT_SOAK_MINUTES` | `1440` | How long new detection content stays on canary clients before everyone gets it |
@@ -312,7 +312,7 @@ the source for these commands.
 
 The `backup` job writes two files per run: `rmm-<ts>.dump` (the database) and
 `rmm-<ts>.files.tar.gz` (the local object storage: ticket attachments, raw inbound email,
-invoice PDFs, triage packages), taken dump first so a file is never missing for a row. Both are
+invoice PDFs, triage packages, uploaded software installers), taken dump first so a file is never missing for a row. Both are
 written mode 0600 and pruned after `BACKUP_KEEP_DAYS`; copy them off the host.
 
 With `RMM_S3_BUCKET` the tarball is empty: the files live in your bucket, so **turn on bucket

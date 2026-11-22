@@ -303,6 +303,44 @@ const runs = [
 		created_at: ago(r.created), sent_at: r.status === 'queued' ? null : ago(r.created), finished_at: r.finished == null ? null : ago(r.finished), duration_ms: r.finished == null ? null : (r.created - r.finished) * 60_000
 	};
 });
+
+// --- software deployment ---------------------------------------------------------------------------------
+const swPackages = [
+	{ id: 'sw-ff', client_id: null, client_name: null, name: 'Mozilla Firefox', description: 'The browser, from winget, Chocolatey and apt.', publisher: 'Mozilla', winget_id: 'Mozilla.Firefox', choco_id: 'firefox', apt_name: 'firefox', dnf_name: 'firefox', version: null as string | null, installer: null as null | { name: string; kind: 'msi' | 'exe'; size: number; sha256: string }, silent_args: '', uninstall_cmd: null, product_code: null, detect_name: null, platforms: ['windows', 'linux'], installed_on: 3, updates: 2, policies: 1, created_at: ago(60 * 24 * 40), updated_at: ago(60 * 24 * 3) },
+	{ id: 'sw-7z', client_id: null, client_name: null, name: '7-Zip', description: '', publisher: 'Igor Pavlov', winget_id: '7zip.7zip', choco_id: '7zip', apt_name: null, dnf_name: null, version: '23.01', installer: null, silent_args: '', uninstall_cmd: null, product_code: null, detect_name: null, platforms: ['windows'], installed_on: 2, updates: 0, policies: 0, created_at: ago(60 * 24 * 30), updated_at: ago(60 * 24 * 30) },
+	{ id: 'sw-crm', client_id: 'c-acme', client_name: 'Acme Corp', name: 'Acme CRM agent', description: 'Line-of-business app, uploaded MSI.', publisher: 'Acme IT', winget_id: null, choco_id: null, apt_name: null, dnf_name: null, version: '4.2.1', installer: { name: 'AcmeCRM-4.2.1.msi', kind: 'msi' as const, size: 48_220_160, sha256: 'c4'.repeat(32) }, silent_args: 'SERVER=crm.acme.test', uninstall_cmd: null, product_code: '{4C1D7A52-0E6B-4F0A-9A34-2B8C5E7D1F93}', detect_name: null, platforms: ['windows'], installed_on: 1, updates: 0, policies: 0, created_at: ago(60 * 24 * 12), updated_at: ago(60 * 24 * 2) },
+	{ id: 'sw-new', client_id: null, client_name: null, name: 'Vendor tool (installer to come)', description: '', publisher: null, winget_id: null, choco_id: null, apt_name: null, dnf_name: null, version: null, installer: null, silent_args: '', uninstall_cmd: null, product_code: null, detect_name: null, platforms: [], installed_on: 0, updates: 0, policies: 0, created_at: ago(60), updated_at: ago(60) }
+];
+const swDev = (agent: string, pkg: string, o: Record<string, unknown>) => {
+	const a = agents.find((x) => x.id === agent)!;
+	const p = swPackages.find((x) => x.id === pkg)!;
+	return { agent_id: a.id, hostname: a.hostname, os_family: a.os_family, online: a.online, client_id: a.client_id, client_name: a.client_name, site_name: a.site_name, package_id: p.id, package_name: p.name, pin: p.version,
+		installed: null as string | null, available: null as string | null, ignored: null as string | null, provider: 'winget' as string | null, checked_at: ago(95), desired: null as string | null, policy_items: [] as string[], compliant: null as boolean | null, last_run: null as unknown, fail_count: 0, last_error: null as string | null, ...o };
+};
+const swDevices = [
+	swDev('a-1', 'sw-ff', { installed: '124.0.1', available: '125.0.3', desired: 'latest', policy_items: ['sw-req'], compliant: false }),
+	swDev('a-3', 'sw-ff', { installed: '124.0.1', available: '125.0.3', provider: 'apt', desired: 'latest', policy_items: ['sw-req'], compliant: false }),
+	swDev('a-2', 'sw-ff', { installed: '125.0.3', desired: 'latest', policy_items: ['sw-req'], compliant: true }),
+	swDev('a-1', 'sw-7z', { installed: '23.01' }),
+	swDev('a-2', 'sw-7z', { installed: null, desired: 'present', policy_items: ['sw-req-7z'], compliant: false, fail_count: 2, last_error: 'winget install failed (exit 0x8a150010): No applicable installer found', last_run: { id: 'sr-2', op: 'install', status: 'failed', trigger: 'policy', at: ago(40), error: 'winget install failed (exit 0x8a150010): No applicable installer found' } }),
+	swDev('a-1', 'sw-crm', { installed: '4.2.0', available: '4.2.1', provider: 'installer', desired: 'present', policy_items: ['sw-req-crm'], compliant: false })
+];
+const swRuns = [
+	{ id: 'sr-1', agent_id: 'a-1', package_id: 'sw-ff', package_name: 'Mozilla Firefox', op: 'upgrade', trigger: 'policy', policy_item_id: 'sw-req', created_by_name: null, status: 'sent', stage: 'installing', progress: 'winget upgrade Mozilla.Firefox', error: null, provider: null, from_version: '124.0.1', to_version: null, reboot_required: false, created: 3, finished: null as number | null, duration_ms: null as number | null },
+	{ id: 'sr-2', agent_id: 'a-2', package_id: 'sw-7z', package_name: '7-Zip', op: 'install', trigger: 'policy', policy_item_id: 'sw-req-7z', created_by_name: null, status: 'failed', stage: null, progress: null, error: 'winget install failed (exit 0x8a150010): No applicable installer found', provider: 'winget', from_version: null, to_version: null, reboot_required: false, created: 40, finished: 39, duration_ms: 41_000 },
+	{ id: 'sr-3', agent_id: 'a-3', package_id: 'sw-ff', package_name: 'Mozilla Firefox', op: 'install', trigger: 'manual', policy_item_id: null, created_by_name: 'Dana Admin', status: 'succeeded', stage: null, progress: null, error: null, provider: 'apt', from_version: null, to_version: '124.0.1', reboot_required: false, created: 60 * 26, finished: 60 * 26 - 1, duration_ms: 52_000 },
+	{ id: 'sr-4', agent_id: 'a-1', package_id: 'sw-crm', package_name: 'Acme CRM agent', op: 'upgrade', trigger: 'manual', policy_item_id: null, created_by_name: 'Dana Admin', status: 'queued', stage: null, progress: null, error: null, provider: null, from_version: '4.2.0', to_version: null, reboot_required: false, created: 8, finished: null, duration_ms: null }
+].map((r) => {
+	const a = agents.find((x) => x.id === r.agent_id)!;
+	const { created, finished, ...rest } = r;
+	return { ...rest, hostname: a.hostname, client_id: a.client_id, client_name: a.client_name, created_at: ago(created), sent_at: r.status === 'queued' ? null : ago(created), finished_at: finished == null ? null : ago(finished), output: r.status === 'sent' ? '' : '$ winget install --exact --id 7zip.7zip --source winget --silent\nNo applicable installer found; see logs for more details.\n[exit -1978335216]\n' };
+});
+function agentSoftware(a: Agent) {
+	return {
+		capable: a.id !== 'a-7', providers: a.os_family === 'windows' ? ['winget', 'choco', 'installer'] : ['apt'], scanned_at: ago(95), scan_requested_at: null, scan_error: null,
+		items: swDevices.filter((d) => d.agent_id === a.id), runs: swRuns.filter((r) => r.agent_id === a.id)
+	};
+}
 function agentPatches(a: Agent) {
 	const rows = updates.filter((u) => u.on.includes(a.id) || u.installedOn.includes(a.id)).map((u) => ({
 		update_id: u.update_id, title: u.title, kb: u.kb, severity: u.severity, category: u.category, size: u.size, requires_reboot: u.requires_reboot,
@@ -783,6 +821,7 @@ const items: PItem[] = [
 	{ id: 'p-veeam', set: SET.acmeWin, module: 'alert', name: 'Backup service stopped', enabled: true, client_id: 'c-acme', site_id: null, excluded: [],
 		config: { kind: 'service', params: { services: ['VeeamBackupSvc'], auto_only: false, exclude: [] }, severity: 'critical', channel_ids: ['ch-mail'], notify_resolved: true, renotify_minutes: null, ticket_board_id: 'b-alerts', ticket_priority: 2, ticket_auto_resolve: true, run_script_id: null } },
 	...schedules.map((x) => ({ id: x.id, set: x.set_id, module: 'schedule', name: x.name, enabled: x.enabled, client_id: x.client_id, site_id: x.site_id, excluded: [], config: { script_id: x.script_id, cron: x.cron, timezone: x.timezone, args: x.args, timeout_secs: x.timeout_secs, retain_days: x.retain_days } })),
+	{ id: 'sw-req', set: SET.acmeWin, module: 'software', name: 'Firefox on Acme Windows devices', enabled: true, client_id: 'c-acme', site_id: null, excluded: [], config: { package_id: 'sw-ff', state: 'latest', bootstrap_choco: false, window: null } },
 	{ id: PATCH_ITEM, set: SET.root, module: 'patch', name: 'Patching', enabled: true, client_id: null, site_id: null, excluded: [],
 		config: { auto_approve_severities: [], auto_approve_categories: ['security', 'critical', 'definition'], deferral_days: 0, auto_install: false, reboot_policy: 'never', window: null } },
 	{ id: SECURITY_ITEM, set: SET.root, module: 'security', name: 'Security', enabled: true, client_id: null, site_id: null, excluded: [],
@@ -839,7 +878,7 @@ function chainOf(id: string): PSet[] {
 	for (let s: PSet | undefined = setOf(id); s; s = s.parent_id ? setOf(s.parent_id) : undefined) out.unshift(s);
 	return out;
 }
-const moduleOrder = ['alert', 'schedule', 'patch', 'security', 'remote_access', 'agent'];
+const moduleOrder = ['alert', 'schedule', 'software', 'patch', 'security', 'remote_access', 'agent'];
 function itemView(it: PItem, chain: PSet[], agent?: Agent) {
 	const ids = chain.map((c) => c.id);
 	const at = ids.indexOf(it.set);
@@ -1213,6 +1252,19 @@ export async function mockApi(p: Page, opts: { signedIn?: boolean; ssoRequired?:
 				)
 			);
 		}
+		if ((m = path.match(/^\/agents\/([^/]+)\/software$/))) return json(agentSoftware(agents.find((a) => a.id === m![1])!));
+		if (path === '/software/packages') {
+			const t = q.get('q')?.toLowerCase();
+			return json(swPackages.filter((p) => (!t || `${p.name} ${p.publisher ?? ''} ${p.winget_id ?? ''}`.toLowerCase().includes(t)) && (!q.get('platform') || p.platforms.includes(q.get('platform')!))));
+		}
+		if ((m = path.match(/^\/software\/packages\/([^/]+)$/))) return json(swPackages.find((p) => p.id === m![1])!);
+		if ((m = path.match(/^\/software\/packages\/([^/]+)\/devices$/))) return json({ items: swDevices.filter((d) => d.package_id === m![1] && (q.get('show') === 'all' || d.installed || d.desired) && (q.get('show') !== 'noncompliant' || d.compliant === false)) });
+		if (path === '/software/updates') {
+			const items = swDevices.filter((d) => d.installed && d.available && d.ignored !== d.available && (!q.get('client_id') || d.client_id === q.get('client_id')));
+			return json({ items, packages: [...new Set(items.map((d) => d.package_id))].map((id) => ({ package_id: id, name: swPackages.find((p) => p.id === id)!.name, devices: items.filter((d) => d.package_id === id).length })) });
+		}
+		if (path === '/software/runs') return json(swRuns.filter((r) => (!q.get('status') || q.get('status')!.split(',').includes(r.status)) && (!q.get('client_id') || r.client_id === q.get('client_id'))).map(({ output, ...r }) => r));
+		if ((m = path.match(/^\/software\/runs\/([^/]+)$/))) return json(swRuns.find((r) => r.id === m![1])!);
 		if (path === '/patches') {
 			let list = updateGroups();
 			if (q.get('client_id')) list = list.filter((u) => updates.find((x) => x.update_id === u.update_id)!.on.some((id) => agents.find((a) => a.id === id)!.client_id === q.get('client_id')));

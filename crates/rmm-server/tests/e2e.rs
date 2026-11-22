@@ -193,6 +193,8 @@ impl Agent {
                 .env("RUST_LOG", "info")
                 // Debug agents read updates from this file instead of the real package manager.
                 .env("RMM_PATCH_FAKE", log_dir.join(format!("{name}-patches.json")))
+                // And software providers from this one.
+                .env("RMM_SOFTWARE_FAKE", log_dir.join(format!("{name}-software.json")))
                 // And capture a synthetic screen, logging input here.
                 .env("RMM_DESKTOP_FAKE", log_dir.join(format!("{name}-desktop.jsonl")))
                 // And report antivirus state from this file.
@@ -1177,6 +1179,7 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
         monitoring(server, &admin, db, dir, &id1, &id3, a_id).await;
         day_to_day(&admin, &tech, db, dir, &id1, &id3, a_id).await;
         policies(&url, &admin, db, dir, &id1, &id3, a_id, a_site, b_id).await;
+        software(&url, &admin, db, dir, &id1, a_id, b_id).await;
     }
     portal_and_sla(&url, &admin, db, a_id, b_id).await;
     billing(&url, &admin, &tech, db, a_id, b_id).await;
@@ -6348,4 +6351,350 @@ async fn signed_in_at(public: &str, admin: &Api, email: &str, role: &str) -> Api
 /// `/start` for a provider that is switched off.
 async fn sso_walk_start_only(public: &str, provider: &str) -> String {
     location(&browser().get(format!("{public}/api/auth/sso/{provider}/start")).send().await.unwrap())
+}
+
+// ---------------------------------------------------------------------------------------------
+// Software deployment (docs/design/software.md): the catalog, uploaded installers, deploying to
+// a device, the third-party updates view, and desired state in policy sets (enforced when a
+// scan arrives, when a device joins a set, with back-off after failures).
+// The agent's providers are replaced by a JSON file (RMM_SOFTWARE_FAKE, debug builds).
+// ---------------------------------------------------------------------------------------------
+async fn software(url: &str, admin: &Api, db: &sqlx::PgPool, dir: &Path, id1: &str, a_id: &str, b_id: &str) {
+    use reqwest::Method;
+    let fake = dir.join("a1-software.json");
+    let fake_state = || -> Value { serde_json::from_str(&std::fs::read_to_string(&fake).unwrap_or_default()).unwrap_or(json!({})) };
+    let set_fake = |v: Value| std::fs::write(&fake, v.to_string()).unwrap();
+    set_fake(json!({ "installed": {}, "available": {} }));
+    let item = |v: &Value| v["id"].as_str().unwrap().to_string();
+
+    // --- the catalog -------------------------------------------------------------------------------
+    for (what, body) in [
+        ("an option as a package id", json!({ "name": "Bad", "apt_name": "--force-yes" })),
+        ("a space in an id", json!({ "name": "Bad", "winget_id": "Some App" })),
+        ("a shell in a version", json!({ "name": "Bad", "apt_name": "ok", "version": "1.0; rm -rf /" })),
+        ("no name", json!({ "name": "  ", "apt_name": "ok" })),
+        ("a bad product code", json!({ "name": "Bad", "apt_name": "ok", "product_code": "nope" })),
+        ("an unclosed quote", json!({ "name": "Bad", "apt_name": "ok", "silent_args": "/S \"x" })),
+    ] {
+        assert_eq!(admin.call(Method::POST, "/software/packages", Some(body)).await.0, StatusCode::BAD_REQUEST, "{what}");
+    }
+    let htop = admin.post("/software/packages", json!({ "name": "Htop (e2e)", "apt_name": "htop-e2e", "winget_id": "Htop.Htop", "publisher": "e2e" })).await;
+    let htop_id = item(&htop);
+    assert_eq!((htop["platforms"].clone(), htop["version"].clone()), (json!(["windows", "linux"]), Value::Null), "{htop}");
+    let (s, v) = admin.call(Method::POST, "/software/packages", Some(json!({ "name": "htop (E2E)", "apt_name": "x" }))).await;
+    assert_eq!(s, StatusCode::CONFLICT, "names are unique, whatever the case: {v}");
+    let b_only = admin.post("/software/packages", json!({ "name": "B only (e2e)", "client_id": b_id, "apt_name": "b-only-e2e" })).await;
+    let b_only_id = item(&b_only);
+    let a_only = admin.post("/software/packages", json!({ "name": "A only (e2e)", "client_id": a_id, "apt_name": "a-only-e2e" })).await;
+    let a_only_id = item(&a_only);
+    let acme = admin.post("/software/packages", json!({ "name": "Acme Tool (e2e)", "version": "2.0.0", "silent_args": "/qn" })).await;
+    assert_eq!(acme["platforms"], json!([]), "no source yet: it can't be deployed");
+    let acme_id = item(&acme);
+
+    // Scoping: a technician limited to client B sees MSP-wide packages and B's, never A's, and can't touch MSP-wide ones.
+    let tech_b = signed_in(url, admin, "swtech-b@e2e.test", "technician", Some(b_id), false).await;
+    let names = |v: &Value| v.as_array().unwrap().iter().map(|p| p["name"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+    let seen = names(&tech_b.get("/software/packages").await);
+    assert!(seen.contains(&"Htop (e2e)".to_string()) && seen.contains(&"B only (e2e)".to_string()) && !seen.contains(&"A only (e2e)".to_string()), "{seen:?}");
+    assert_eq!(tech_b.call(Method::GET, &format!("/software/packages/{a_only_id}"), None).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(tech_b.call(Method::POST, "/software/packages", Some(json!({ "name": "MSP-wide by a tech", "apt_name": "x" }))).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(tech_b.call(Method::PUT, &format!("/software/packages/{htop_id}"), Some(json!({ "name": "Htop (e2e)", "apt_name": "htop-e2e" }))).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(tech_b.call(Method::GET, &format!("/agents/{id1}/software"), None).await.0, StatusCode::NOT_FOUND, "a device of another client");
+    let (s, v) = tech_b.call(Method::POST, "/software/deploy", Some(json!({ "package_id": htop_id, "op": "install", "agent_ids": [id1] }))).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "deploying to another client's device: {v}");
+    let own = tech_b.post("/software/packages", json!({ "name": "Tech's own (e2e)", "client_id": b_id, "apt_name": "tech-own" })).await;
+    assert!(own["client_name"].is_string());
+    assert_eq!(tech_b.call(Method::DELETE, &format!("/software/packages/{}", item(&own)), None).await.0, StatusCode::OK);
+
+    // --- uploaded installers: stored, hashed, served to the agent that may use them -----------------------
+    let msi = {
+        let mut b = vec![0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
+        b.extend(pattern(4096, 7));
+        b
+    };
+    let upload = |id: String, name: &'static str, bytes: Vec<u8>| async move {
+        let form = reqwest::multipart::Form::new().part("file", reqwest::multipart::Part::bytes(bytes).file_name(name));
+        let res = admin.http.post(format!("{}/software/packages/{id}/installer", admin.base)).multipart(form).send().await.unwrap();
+        let s = res.status();
+        (s, res.json::<Value>().await.unwrap_or(Value::Null))
+    };
+    assert_eq!(upload(acme_id.clone(), "acme.msi", b"MZ not an msi".to_vec()).await.0, StatusCode::BAD_REQUEST, "the name and the bytes must agree");
+    assert_eq!(upload(acme_id.clone(), "acme.zip", msi.clone()).await.0, StatusCode::BAD_REQUEST);
+    let (s, up) = upload(acme_id.clone(), "acme.msi", msi.clone()).await;
+    assert_eq!(s, StatusCode::OK, "{up}");
+    assert_eq!((up["installer"]["kind"].as_str(), up["installer"]["sha256"].as_str(), up["platforms"].clone()), (Some("msi"), Some(sha256(&msi).as_str()), json!(["windows"])), "{up}");
+    assert!(!up.to_string().contains("attachments/"), "the storage key isn't exposed");
+    let cfg = std::fs::read_to_string(dir.join("a1.toml")).unwrap();
+    let secret = cfg.lines().find_map(|l| l.strip_prefix("secret = ")).unwrap().trim_matches('"').to_string();
+    let http = reqwest::Client::new();
+    let link = format!("{url}/api/agent/software/{acme_id}/installer");
+    assert_eq!(http.get(&link).send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(http.get(&link).header("X-Rmm-Agent", id1).header("Authorization", "Bearer wrong").send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    let res = http.get(&link).header("X-Rmm-Agent", id1).header("Authorization", format!("Bearer {secret}")).send().await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.bytes().await.unwrap(), msi, "the file comes back byte for byte");
+    let res = http.get(&link).header("X-Rmm-Agent", id1).header("Authorization", format!("Bearer {secret}")).header("Range", "bytes=10-19").send().await.unwrap();
+    assert_eq!((res.status(), res.bytes().await.unwrap().to_vec()), (StatusCode::PARTIAL_CONTENT, msi[10..20].to_vec()));
+    // Another client's installer isn't for this device.
+    assert_eq!(upload(b_only_id.clone(), "b.msi", msi.clone()).await.0, StatusCode::OK);
+    let res = http.get(format!("{url}/api/agent/software/{b_only_id}/installer")).header("X-Rmm-Agent", id1).header("Authorization", format!("Bearer {secret}")).send().await.unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    // An EXE package needs its arguments and the version; a replaced upload removes the old file.
+    let (s, v) = admin.call(Method::PUT, &format!("/software/packages/{acme_id}"), Some(json!({ "name": "Acme Tool (e2e)", "silent_args": "" }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "an uploaded installer needs the version it installs: {v}");
+    admin.put(&format!("/software/packages/{acme_id}"), json!({ "name": "Acme Tool (e2e)", "version": "2.0.0", "silent_args": "/qn", "product_code": "{11111111-2222-3333-4444-555555555555}" })).await;
+    let gone = admin.call(Method::DELETE, &format!("/software/packages/{acme_id}/installer"), None).await;
+    assert_eq!(gone.0, StatusCode::OK);
+    assert_eq!(http.get(&link).header("X-Rmm-Agent", id1).header("Authorization", format!("Bearer {secret}")).send().await.unwrap().status(), StatusCode::NOT_FOUND);
+
+    // --- a device scans the catalog and reports what it has ------------------------------------------------
+    let (s, v) = admin.call(Method::GET, &format!("/agents/{id1}/software"), None).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["capable"], true, "the agent announces the software capability: {v}");
+    admin.post("/software/scan", json!({ "agent_ids": [id1] })).await;
+    let sw = {
+        let this = admin;
+        eventually(30, "the first software scan", move || async move {
+            let v = this.get(&format!("/agents/{id1}/software?all=true")).await;
+            v["scanned_at"].is_string().then_some(v)
+        })
+        .await
+    };
+    assert_eq!(sw["providers"], json!(["fake"]), "{sw}");
+    let htop_row = |v: &Value| v["items"].as_array().unwrap().iter().find(|i| i["package_id"] == htop_id.as_str()).cloned();
+    let row = htop_row(&sw).expect("the catalog package is listed");
+    assert_eq!((row["installed"].clone(), row["provider"].as_str(), row["desired"].clone()), (Value::Null, Some("fake"), Value::Null), "{row}");
+    assert!(sw["items"].as_array().unwrap().iter().all(|i| i["package_id"] != b_only_id.as_str()), "another client's package isn't offered to this device");
+
+    // --- deploying by hand -----------------------------------------------------------------------------
+    let (s, v) = admin.call(Method::POST, "/software/deploy", Some(json!({ "package_id": htop_id, "op": "sideways", "agent_ids": [id1] }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    let r = admin.post("/software/deploy", json!({ "package_id": b_only_id, "op": "install", "agent_ids": [id1] })).await;
+    assert!(r["runs"].as_array().unwrap().is_empty() && r["skipped"][0]["reason"].as_str().unwrap().contains("another client"), "{r}");
+    let r = admin.post("/software/deploy", json!({ "package_id": acme_id, "op": "install", "agent_ids": [id1] })).await;
+    assert!(r["runs"].as_array().unwrap().is_empty() && r["skipped"][0]["reason"].as_str().unwrap().contains("no id or installer"), "{r}");
+    let wait_run = |rid: String| async move {
+        let rid = rid.as_str();
+        eventually(40, "the software run to finish", move || async move {
+            let r = admin.get(&format!("/software/runs/{rid}")).await;
+            (!matches!(r["status"].as_str(), Some("queued" | "sent"))).then_some(r)
+        })
+        .await
+    };
+    let r = admin.post("/software/deploy", json!({ "package_id": htop_id, "op": "install", "agent_ids": [id1] })).await;
+    assert_eq!(r["runs"].as_array().unwrap().len(), 1, "{r}");
+    let run = wait_run(r["runs"][0]["run_id"].as_str().unwrap().to_string()).await;
+    assert_eq!((run["status"].as_str(), run["provider"].as_str(), run["to_version"].as_str(), run["trigger"].as_str()), (Some("succeeded"), Some("fake"), Some("1.0.0"), Some("manual")), "{run}");
+    assert!(run["output"].as_str().unwrap().contains("install htop-e2e"), "the agent's log is kept: {run}");
+    assert_eq!(fake_state()["installed"]["htop-e2e"], "1.0.0", "the provider really ran");
+    let v = admin.get(&format!("/agents/{id1}/software")).await;
+    assert_eq!(htop_row(&v).unwrap()["installed"], "1.0.0", "{v}");
+    assert!(v["runs"].as_array().unwrap().iter().any(|r| r["package_name"] == "Htop (e2e)" && r["status"] == "succeeded"));
+    let devices = admin.get(&format!("/software/packages/{htop_id}/devices")).await;
+    assert!(devices["items"].as_array().unwrap().iter().any(|d| d["agent_id"] == id1 && d["installed"] == "1.0.0"), "{devices}");
+    assert!(audit_count(db, "software.deploy").await >= 1 && audit_count(db, "agent.software_result").await >= 1);
+    let listed = admin.get("/software/packages?q=htop").await;
+    assert_eq!((listed[0]["installed_on"].as_i64(), listed[0]["updates"].as_i64()), (Some(1), Some(0)), "{listed}");
+
+    // --- updates to third-party software: found, skipped, offered again, installed ----------------------------
+    set_fake(json!({ "installed": { "htop-e2e": "1.0.0" }, "available": { "htop-e2e": "2.0.0" } }));
+    admin.post("/software/scan", json!({ "agent_ids": [id1] })).await;
+    let ups = {
+        let this = admin;
+        let pid = htop_id.clone();
+        eventually(30, "the update to show up", move || {
+            let pid = pid.clone();
+            async move {
+                let u = this.get("/software/updates").await;
+                u["items"].as_array().unwrap().iter().any(|i| i["package_id"] == pid.as_str() && i["available"] == "2.0.0").then_some(u)
+            }
+        })
+        .await
+    };
+    assert_eq!(ups["packages"][0]["devices"], 1, "{ups}");
+    let one = json!({ "items": [{ "agent_id": id1, "package_id": htop_id }] });
+    admin.post("/software/updates/ignore", one.clone()).await;
+    assert!(admin.get("/software/updates").await["items"].as_array().unwrap().is_empty(), "a skipped version is hidden");
+    assert_eq!(admin.get("/software/updates?ignored=true").await["items"][0]["ignored"], "2.0.0");
+    admin.post("/software/updates/ignore", json!({ "items": one["items"], "ignore": false })).await;
+    assert_eq!(admin.get("/software/updates").await["items"].as_array().unwrap().len(), 1);
+    let r = admin.post("/software/updates/install", one.clone()).await;
+    let run = wait_run(r["runs"][0]["run_id"].as_str().unwrap().to_string()).await;
+    assert_eq!((run["op"].as_str(), run["status"].as_str(), run["from_version"].as_str(), run["to_version"].as_str()), (Some("upgrade"), Some("succeeded"), Some("1.0.0"), Some("2.0.0")), "{run}");
+    assert!(admin.get("/software/updates").await["items"].as_array().unwrap().is_empty(), "installed: nothing on offer");
+    let r = admin.post("/software/updates/install", one).await;
+    assert!(r["runs"].as_array().unwrap().is_empty() && r["skipped"][0]["reason"].as_str().unwrap().contains("no update"), "{r}");
+
+    // --- desired state: a requirement in a policy set ------------------------------------------------------------
+    let (s, v) = admin.call(Method::POST, &format!("/policy-sets/{ROOT_SET}/items"), Some(json!({ "module": "software", "name": "bad", "config": { "package_id": uuid::Uuid::new_v4(), "state": "present" } }))).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "the package must exist: {v}");
+    let (s, v) = admin.call(Method::POST, &format!("/policy-sets/{ROOT_SET}/items"), Some(json!({ "module": "software", "name": "bad", "config": { "package_id": b_only_id, "state": "present" }, "client_id": a_id }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "another client's package can't be required here: {v}");
+    let (s, v) = admin.call(Method::POST, &format!("/policy-sets/{ROOT_SET}/items"), Some(json!({ "module": "software", "name": "bad", "config": { "package_id": htop_id, "state": "sometimes" } }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    let req = admin
+        .post(
+            &format!("/policy-sets/{ROOT_SET}/items"),
+            json!({ "module": "software", "name": "Htop gone (e2e)", "config": { "package_id": htop_id, "state": "absent" }, "client_id": a_id }),
+        )
+        .await;
+    let req_id = item(&req);
+    let installed_is = |want: Option<&'static str>, what: &'static str| {
+        let pid = htop_id.clone();
+        async move {
+            eventually(60, what, || {
+                let pid = pid.clone();
+                async move {
+                    let v = admin.get(&format!("/agents/{id1}/software")).await;
+                    let row = v["items"].as_array().unwrap().iter().find(|i| i["package_id"] == pid.as_str()).cloned()?;
+                    (row["installed"].as_str() == want).then_some(row)
+                }
+            })
+            .await
+        }
+    };
+    let row = installed_is(None, "the policy to remove the package").await;
+    assert_eq!((row["desired"].as_str(), row["compliant"].as_bool()), (Some("absent"), Some(true)), "{row}");
+    let policy_runs = admin.get(&format!("/software/runs?agent_id={id1}&package_id={htop_id}")).await;
+    assert!(policy_runs.as_array().unwrap().iter().any(|r| r["trigger"] == "policy" && r["op"] == "uninstall" && r["status"] == "succeeded" && r["policy_item_id"] == req_id.as_str()), "{policy_runs}");
+    assert_eq!(fake_state()["installed"].get("htop-e2e"), None);
+    let (s, v) = admin.call(Method::DELETE, &format!("/software/packages/{htop_id}"), None).await;
+    assert_eq!(s, StatusCode::CONFLICT, "a required package can't be deleted: {v}");
+    assert!(v["error"].as_str().unwrap().contains("All devices"), "{v}");
+
+    // present: installed again, and left alone when a newer version appears
+    admin.put(&format!("/policy-items/{req_id}"), json!({ "config": { "package_id": htop_id, "state": "present" } })).await;
+    installed_is(Some("1.0.0"), "the policy to install the package").await;
+    set_fake(json!({ "installed": { "htop-e2e": "2.0.0" }, "available": { "htop-e2e": "3.0.0" } }));
+    admin.post("/software/scan", json!({ "agent_ids": [id1] })).await;
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert_eq!(fake_state()["installed"]["htop-e2e"], "2.0.0", "present doesn't chase upgrades");
+    let row = installed_is(Some("2.0.0"), "the scan").await;
+    assert_eq!((row["available"].as_str(), row["compliant"].as_bool()), (Some("3.0.0"), Some(true)), "{row}");
+    // latest: upgraded as soon as a newer version is on offer
+    admin.put(&format!("/policy-items/{req_id}"), json!({ "config": { "package_id": htop_id, "state": "latest" } })).await;
+    installed_is(Some("3.0.0"), "the policy to keep it current").await;
+
+    // a pin is a floor: older installs are brought up, newer ones are left alone
+    admin.put(&format!("/policy-items/{req_id}"), json!({ "config": { "package_id": htop_id, "state": "present" } })).await;
+    let pkg_body = |version: Value| json!({ "name": "Htop (e2e)", "apt_name": "htop-e2e", "winget_id": "Htop.Htop", "publisher": "e2e", "version": version });
+    admin.put(&format!("/software/packages/{htop_id}"), pkg_body(json!("4.0.0"))).await;
+    installed_is(Some("4.0.0"), "the pin to be applied").await;
+    admin.put(&format!("/software/packages/{htop_id}"), pkg_body(json!("1.2.0"))).await;
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert_eq!(fake_state()["installed"]["htop-e2e"], "4.0.0", "newer than the pin: left alone");
+    admin.put(&format!("/software/packages/{htop_id}"), pkg_body(Value::Null)).await;
+
+    // failures back off instead of looping
+    admin.put(&format!("/policy-items/{req_id}"), json!({ "config": { "package_id": htop_id, "state": "absent" } })).await;
+    installed_is(None, "the removal").await;
+    let mut st = fake_state();
+    st["fail"] = json!(["htop-e2e"]);
+    set_fake(st);
+    admin.put(&format!("/policy-items/{req_id}"), json!({ "config": { "package_id": htop_id, "state": "present" } })).await;
+    let failed = eventually(60, "the failing install", || async {
+        let r = admin.get(&format!("/software/runs?agent_id={id1}&package_id={htop_id}&status=failed")).await;
+        r.as_array().and_then(|l| l.first().cloned())
+    })
+    .await;
+    assert!(failed["error"].as_str().unwrap().contains("simulated failure") && failed["trigger"] == "policy", "{failed}");
+    let fails: i32 = sqlx::query_scalar("SELECT fail_count FROM software_state WHERE agent_id = $1::uuid AND package_id = $2::uuid").bind(id1).bind(&htop_id).fetch_one(db).await.unwrap();
+    assert_eq!(fails, 1);
+    let count = || async { admin.get(&format!("/software/runs?agent_id={id1}&package_id={htop_id}")).await.as_array().unwrap().len() };
+    let before = count().await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(count().await, before, "no retry before the back-off ends");
+    let row = admin.get(&format!("/agents/{id1}/software")).await["items"].as_array().unwrap().iter().find(|i| i["package_id"] == htop_id.as_str()).cloned().unwrap();
+    assert_eq!((row["compliant"].as_bool(), row["fail_count"].as_i64()), (Some(false), Some(1)), "{row}");
+    // Fixing the package (or the cause) lets it try again straight away.
+    let mut st = fake_state();
+    st["fail"] = json!([]);
+    set_fake(st);
+    admin.put(&format!("/software/packages/{htop_id}"), pkg_body(Value::Null)).await;
+    installed_is(Some("1.0.0"), "the retry after the package changed").await;
+
+    // a provider that says "done" without installing is a failure, not a success
+    admin.put(&format!("/policy-items/{req_id}"), json!({ "config": { "package_id": htop_id, "state": "absent" } })).await;
+    installed_is(None, "the removal").await;
+    let mut st = fake_state();
+    st["ghost"] = json!(["htop-e2e"]);
+    set_fake(st);
+    let r = admin.post("/software/deploy", json!({ "package_id": htop_id, "op": "install", "agent_ids": [id1] })).await;
+    let run = wait_run(r["runs"][0]["run_id"].as_str().unwrap().to_string()).await;
+    assert_eq!(run["status"], "failed", "{run}");
+    assert!(run["error"].as_str().unwrap().contains("isn't installed"), "{run}");
+    let mut st = fake_state();
+    st["ghost"] = json!([]);
+    set_fake(st);
+
+    // --- a device joins a set: its requirements arrive with it -------------------------------------------------
+    admin.delete_policy(&req_id).await;
+    let leaf = admin.get(&format!("/agents/{id1}/policy")).await["set"]["id"].as_str().unwrap().to_string();
+    let a_set = admin.post("/policy-sets", json!({ "name": "Software (e2e)", "parent_id": leaf, "client_id": a_id })).await;
+    let a_set_id = item(&a_set);
+    let join = admin
+        .post(
+            &format!("/policy-sets/{a_set_id}/items"),
+            json!({ "module": "software", "name": "A only, present", "config": { "package_id": a_only_id, "state": "present" } }),
+        )
+        .await;
+    assert_eq!(join["limit"]["client_id"], a_id, "a client's set limits its items to the client: {join}");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(fake_state()["installed"].get("a-only-e2e"), None, "no device uses the set yet");
+    admin.put(&format!("/agents/{id1}/policy-pin"), json!({ "policy_set_id": a_set_id })).await;
+    eventually(60, "the device to get the new set's requirement", || async {
+        (fake_state()["installed"].get("a-only-e2e").is_some()).then_some(())
+    })
+    .await;
+    let v = admin.get(&format!("/agents/{id1}/software")).await;
+    let row = v["items"].as_array().unwrap().iter().find(|i| i["package_id"] == a_only_id.as_str()).cloned().unwrap();
+    assert_eq!((row["desired"].as_str(), row["compliant"].as_bool()), (Some("present"), Some(true)), "{row}");
+    // The policy page of the device lists the requirement.
+    let pol = admin.get(&format!("/agents/{id1}/policy")).await;
+    assert!(pol["policies"].as_array().unwrap().iter().any(|p| p["module"] == "software"), "{pol}");
+    // Overrides: a set below can turn the requirement around, but not swap the package.
+    let child = admin.post("/policy-sets", json!({ "name": "Software child (e2e)", "parent_id": a_set_id })).await;
+    let child_id = item(&child);
+    let (s, v) = admin.call(Method::PUT, &format!("/policy-items/{}/overrides/{child_id}", item(&join)), Some(json!({ "config": { "package_id": htop_id } }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    let ov = admin.put(&format!("/policy-items/{}/overrides/{child_id}", item(&join)), json!({ "config": { "state": "absent" } })).await;
+    assert_eq!(ov["config"]["state"], "absent", "{ov}");
+    admin.put(&format!("/agents/{id1}/policy-pin"), json!({ "policy_set_id": child_id })).await;
+    eventually(60, "the override to take the package away", || async { fake_state()["installed"].get("a-only-e2e").is_none().then_some(()) }).await;
+    admin.put(&format!("/agents/{id1}/policy-pin"), json!({ "policy_set_id": null })).await;
+    admin.call(Method::DELETE, &format!("/policy-sets/{child_id}"), None).await;
+    admin.delete_policy(&item(&join)).await;
+    let (s, _) = admin.call(Method::DELETE, &format!("/policy-sets/{a_set_id}"), None).await;
+    assert_eq!(s, StatusCode::OK);
+
+    // --- the public API ----------------------------------------------------------------------------------------
+    let made = admin.post("/api-keys", json!({ "name": "e2e software", "access": "write", "scopes": ["software"], "client_ids": [a_id] })).await;
+    let token = made["token"].as_str().unwrap().to_string();
+    let v1 = format!("{url}/api/v1");
+    let (s, v, _) = key_call(&token, &v1, Method::GET, "/software/packages", None).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert!(names(&v).contains(&"Htop (e2e)".to_string()) && !names(&v).contains(&"B only (e2e)".to_string()), "a key sees what its clients see: {v}");
+    let (s, v, _) = key_call(&token, &v1, Method::GET, &format!("/agents/{id1}/software"), None).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let (s, _, _) = key_call(&token, &v1, Method::GET, "/agents", None).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "the key has the software scope only");
+    let (s, v, _) = key_call(&token, &v1, Method::POST, "/software/deploy", Some(json!({ "package_id": htop_id, "op": "install", "agent_ids": [id1] }))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    wait_run(v["runs"][0]["run_id"].as_str().unwrap().to_string()).await;
+    let (s, _, _) = key_call(&token, &v1, Method::POST, "/software/scan", Some(json!({ "agent_ids": [id1] }))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "scans aren't public");
+    let spec: Value = http.get(format!("{url}/api/v1/openapi.json")).send().await.unwrap().json().await.unwrap();
+    assert!(spec["paths"]["/software/deploy"]["post"]["operationId"] == "deploySoftware" && spec["components"]["schemas"]["SoftwareRun"].is_object(), "documented");
+    assert!(spec["paths"].get("/software/updates/install").is_none(), "only the public operations are described");
+    admin.call(Method::DELETE, &format!("/api-keys/{}", made["key"]["id"].as_str().unwrap()), None).await;
+
+    // clean up: the catalog goes (the device keeps what it has)
+    for id in [&htop_id, &acme_id, &b_only_id, &a_only_id] {
+        let (s, v) = admin.call(Method::DELETE, &format!("/software/packages/{id}"), None).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+    }
+    let (s, _) = admin.call(Method::GET, &format!("/software/packages/{htop_id}"), None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    let runs = admin.get(&format!("/software/runs?agent_id={id1}")).await;
+    assert!(runs.as_array().unwrap().iter().any(|r| r["package_id"].is_null() && r["package_name"] == "Htop (e2e)"), "runs outlive the package they installed");
 }

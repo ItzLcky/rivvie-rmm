@@ -1,6 +1,7 @@
 mod collect;
 mod config;
 mod conn;
+mod deploy;
 mod desktop;
 mod fetch;
 mod fsutil;

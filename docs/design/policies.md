@@ -141,7 +141,7 @@ A policy is an item in a set: `(id, set_id, module, name, enabled, config jsonb)
   the file tools: list, download, upload): a disabled feature answers 403 with a message naming
   the policy set. Single-instance items are always enabled; only their fields can be overridden.
 - `agent.auto_update` replaces the company-wide switch in the automatic rollout query.
-- A `software` module is reserved for roadmap block 7 and not built now.
+- A `software` module (multi-instance, like alerts and schedules; one package requirement per item) was added later: see [software.md](software.md).
 
 ### Inheritance and overrides
 
@@ -395,6 +395,6 @@ Web (step 5):
 
 ## Not in this design
 
-- Software deployment policies (roadmap block 7).
+- Software deployment policies: built later, see [software.md](software.md).
 - Run-on-enrollment scripts and other event triggers beyond `run_script_id`.
 - Importing or exporting policy sets, and policy change history beyond the audit log.

@@ -194,6 +194,7 @@
 
 	// Loaded with its tab.
 	const patches = $derived(tab === 'patches' ? import('#lib/components/AgentPatches.svelte') : null);
+	const deployments = $derived(tab === 'deployments' ? import('#lib/components/AgentDeployments.svelte') : null);
 	// The terminal (xterm.js) loads only when its tab opens.
 	const terminal = $derived(tab === 'terminal' ? import('#lib/components/Terminal.svelte') : null);
 	const desktop = $derived(tab === 'desktop' ? import('#lib/components/RemoteDesktop.svelte') : null);
@@ -269,6 +270,7 @@
 				{ label: 'Management', items: [
 					{ value: 'policy', label: 'Policy' },
 					{ value: 'patches', label: 'Patches', count: a.patches_overdue || a.patches_failed ? num(a.patches_overdue + a.patches_failed) : undefined, title: a.patches_overdue || a.patches_failed ? 'Overdue security updates and failed installs' : undefined },
+					{ value: 'deployments', label: 'Deployments' },
 					{ value: 'security', label: 'Security' },
 					{ value: 'jobs', label: 'Jobs' },
 					{ value: 'files', label: 'Files', hidden: !can('technician') }
@@ -437,6 +439,14 @@
 		{:else if tab === 'patches'}
 			{#if patches}
 				{#await patches}
+					<div class="card flex h-40 items-center justify-center" aria-busy="true"><Spinner label="Loading" /></div>
+				{:then P}
+					<P.default agent={a} />
+				{/await}
+			{/if}
+		{:else if tab === 'deployments'}
+			{#if deployments}
+				{#await deployments}
 					<div class="card flex h-40 items-center justify-center" aria-busy="true"><Spinner label="Loading" /></div>
 				{:then P}
 					<P.default agent={a} />
