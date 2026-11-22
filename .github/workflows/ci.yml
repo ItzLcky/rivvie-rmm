@@ -113,6 +113,66 @@ jobs:
             /tmp/rmm_e2e_*/*.log
             /tmp/load/*.log
 
+  # A backup nobody has restored is a hope. Runs the e2e suite, backs its database and storage up
+  # with the compose stack's own deploy/backup.sh (a pg_dump and a tarball of the attachments,
+  # invoice PDFs, triage packages), restores them with deploy/restore.sh into a new database and an
+  # empty directory, starts the server on them and reads the rows back, an attachment's bytes by hash
+  # among them (crates/rmm-server/tests/drill.rs). Locally: scripts/restore-drill.sh.
+  restore-drill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env: { POSTGRES_USER: rmm, POSTGRES_PASSWORD: rmm, POSTGRES_DB: rmm }
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U rmm" --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Package tools (to validate the generated .deb/.rpm)
+        run: sudo apt-get install -y --no-install-recommends rpm
+      - run: cargo build -p rmm-agent
+      - name: Restore drill
+        run: scripts/restore-drill.sh
+        env:
+          RMM_E2E_DATABASE_URL: postgres://rmm:rmm@localhost:5432/postgres
+      - name: Logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: restore-drill-logs
+          path: |
+            /tmp/rmm-drill.*/*.log
+            /tmp/rmm_e2e_*/*.log
+
+  # The S3 storage code (SigV4, multipart uploads around the part boundaries, ranged reads, aborted
+  # uploads) against a real MinIO. A step, not a service container: it needs `server /data`.
+  # The image is pinned: MinIO stopped publishing to Docker Hub, and this is the last tag of a
+  # community rebuild. Locally: scripts/minio-test.sh.
+  s3:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio -p 9000:9000 -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
+            ghcr.io/coollabsio/minio:RELEASE.2025-10-15T17-29-55Z server /data
+          for i in $(seq 60); do curl -fs http://127.0.0.1:9000/minio/health/ready && break; sleep 1; done
+          curl -fs http://127.0.0.1:9000/minio/health/ready
+      - name: S3 storage against MinIO
+        run: cargo test -p rmm-server s3_against_minio -- --ignored --nocapture
+        env:
+          RMM_TEST_S3_ENDPOINT: http://127.0.0.1:9000
+      - name: MinIO log
+        if: failure()
+        run: docker logs minio
+
   # An upgrade keeps data: the previous release (the newest v* tag, from its GHCR image) makes a
   # database with real rows in it (admin, client and site, its own agent enrolled with metrics
   # and inventory, a ticket; see crates/rmm-server/tests/upgrade.rs), then this commit's server

@@ -132,7 +132,7 @@ Per-client documentation pages are straightforward. A **password vault** is a se
 - permissions of their own, `vault.read` and `vault.manage`;
 - 2FA required for every vault request.
 
-Still open: an outside security review, and a command to rotate `RMM_DATA_KEY` (rewrap the client keys). TOTP secrets of user accounts have been sealed at rest since migration 0014.
+`rmm-server rotate-data-key` rewraps the client keys (and reseals everything else under `RMM_DATA_KEY`) in one transaction; see the README. Still open: an outside security review. TOTP secrets of user accounts have been sealed at rest since migration 0014.
 
 ## Reporting
 

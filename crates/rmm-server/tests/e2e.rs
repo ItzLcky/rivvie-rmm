@@ -31,6 +31,13 @@
 //!
 //! `RMM_E2E_ONLY=sso` runs only the sign-in and the single sign-on and passkey section.
 //!
+//! `RMM_E2E_DRILL=<file>` makes the run end by writing down what a restored backup must give
+//! back (a ticket with a 3 MiB attachment, a vault item, row counts, the key and the admin's
+//! 2FA secret) to that file, and `RMM_E2E_KEEP=1` keeps the database and storage directory
+//! afterwards (their names are printed as `RMM_E2E_KEPT database=... dir=...`). The CI
+//! restore drill (`scripts/restore-drill.sh`) backs them up with the compose stack's scripts,
+//! restores into an empty database and directory, and checks them with `tests/drill.rs`.
+//!
 //! `RMM_E2E_ONLY=desk` runs only the core and service desk sections (faster while working on
 //! tickets, the portal and billing); `RMM_E2E_ONLY=api` only enrollment and the API keys and webhooks.
 //!
@@ -76,6 +83,8 @@ struct Server {
     /// RMM_METRICS_TOKEN and JSON logs: off for the first start (`/metrics` must 404), on
     /// from the first restart.
     observability: bool,
+    /// RMM_DATA_KEY: changes when the key rotation section replaces it.
+    data_key: String,
 }
 
 /// RMM_METRICS_TOKEN once `observability` is on.
@@ -86,7 +95,7 @@ impl Server {
         format!("http://127.0.0.1:{}", self.port)
     }
 
-    fn start(db_url: &str, dir: &Path, port: u16, observability: bool) -> Child {
+    fn start(db_url: &str, dir: &Path, port: u16, observability: bool, data_key: &str) -> Child {
         let log = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("server.log")).unwrap();
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_rmm-server"));
         if observability {
@@ -106,7 +115,7 @@ impl Server {
             .env("RMM_ADMIN_PASSWORD", ADMIN_PASSWORD)
             .env("RMM_UPDATE_PUBKEY", content_pubkey())
             .env("RMM_CONTENT_SOAK_MINUTES", "0")
-            .env("RMM_DATA_KEY", "ab".repeat(32))
+            .env("RMM_DATA_KEY", data_key)
             .env("RMM_SLA_SWEEP_SECS", "2")
             // Small enough to test the limit quickly, over the 8 MB that other requests get.
             .env("RMM_ATTACHMENT_MAX_MB", ATTACHMENT_MAX_MB.to_string())
@@ -136,7 +145,7 @@ impl Server {
     }
 
     async fn start_again(&mut self) {
-        self.child = Self::start(&self.db_url, &self.dir, self.port, self.observability);
+        self.child = Self::start(&self.db_url, &self.dir, self.port, self.observability, &self.data_key);
         wait_healthy(&self.url()).await;
     }
 }
@@ -470,13 +479,18 @@ async fn end_to_end() {
     let _ = ACCT.set(acct);
     let result = {
         let port = free_port();
+        let data_key = "ab".repeat(32);
         let mut server =
-            Server { child: Server::start(&db_url, &dir, port, false), port, db_url: db_url.clone(), dir: dir.clone(), observability: false };
+            Server { child: Server::start(&db_url, &dir, port, false, &data_key), port, db_url: db_url.clone(), dir: dir.clone(), observability: false, data_key };
         wait_healthy(&server.url()).await;
         let db = sqlx::PgPool::connect(&db_url).await.unwrap();
         run(&mut server, &db, &dir).await
     };
 
+    if std::env::var("RMM_E2E_KEEP").as_deref() == Ok("1") && result.is_ok() {
+        println!("RMM_E2E_KEPT database={db_name} dir={}", dir.display());
+        return;
+    }
     sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE IF EXISTS {db_name} WITH (FORCE)")))
         .execute(&mut admin_conn)
         .await
@@ -1188,8 +1202,211 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
     assert_eq!(limited, Some(20));
 
     observability(&url, dir).await;
+    // Last but the drill: it restarts the server, which would reset the counters checked above.
+    key_rotation(server, &admin, db, &secret, a_id, all).await;
+    if let Ok(path) = std::env::var("RMM_E2E_DRILL") {
+        drill_expectations(server, &admin, db, &secret, a_id, &path).await;
+    }
     a1.kill();
     Ok(())
+}
+
+/// Rows a restored backup has to give back (see the module docs, `RMM_E2E_DRILL`).
+async fn drill_expectations(server: &Server, admin: &Api, db: &sqlx::PgPool, admin_secret: &str, a_id: &str, path: &str) {
+    const VAULT_PW: &str = "drill-vault-password";
+    let ticket = admin.post("/tickets", json!({ "subject": "Restore drill", "description": "Must survive a restore.", "client_id": a_id })).await;
+    let ticket_id = ticket["id"].as_str().unwrap().to_string();
+    let bytes = pattern(3 << 20, 42);
+    let form = reqwest::multipart::Form::new().part("file", reqwest::multipart::Part::bytes(bytes.clone()).file_name("drill.bin"));
+    let up: Value = admin.http.post(format!("{}/tickets/{ticket_id}/attachments", admin.base)).multipart(form).send().await.unwrap().json().await.unwrap();
+    let attachment_id = up[0]["id"].as_str().unwrap().to_string();
+    let item = admin.post(&format!("/clients/{a_id}/vault"), json!({ "name": "Drill item", "password": VAULT_PW })).await;
+    // Tables that don't change once the server and agents are stopped.
+    let mut counts = serde_json::Map::new();
+    for t in ["users", "clients", "tickets", "ticket_attachments", "ticket_events", "invoices", "vault_items", "vault_keys", "contacts", "client_docs", "mailboxes"] {
+        let (n,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!("SELECT count(*) FROM {t}"))).fetch_one(db).await.unwrap();
+        counts.insert(t.into(), n.into());
+    }
+    let expect = json!({
+        "data_key": server.data_key, "admin_email": ADMIN_EMAIL, "admin_password": ADMIN_PASSWORD, "admin_totp_secret": admin_secret,
+        "ticket_id": ticket_id, "attachment_id": attachment_id, "attachment_sha256": sha256(&bytes), "attachment_size": bytes.len(),
+        "vault_item_id": item["id"], "vault_password": VAULT_PW, "counts": counts,
+    });
+    std::fs::write(path, serde_json::to_vec_pretty(&expect).unwrap()).unwrap();
+    println!("restore drill expectations written to {path}");
+}
+
+/// True when `bytes` (nonce || ciphertext, as `crypto.rs` stores them) opens with this hex key.
+fn opens_with(key_hex: &str, bytes: &[u8]) -> bool {
+    use chacha20poly1305::aead::{Aead, KeyInit};
+    use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+    let key: [u8; 32] = hex::decode(key_hex).unwrap().try_into().unwrap();
+    let Some(nonce) = bytes.get(..12).and_then(|n| <[u8; 12]>::try_from(n).ok()) else { return false };
+    ChaCha20Poly1305::new(&Key::from(key)).decrypt(&Nonce::from(nonce), &bytes[12..]).is_ok()
+}
+
+/// A value sealed with this hex key, as `crypto.rs` stores it (nonce || ciphertext).
+fn seal_with(key_hex: &str, plain: &[u8]) -> Vec<u8> {
+    use chacha20poly1305::aead::{Aead, KeyInit};
+    use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+    let key: [u8; 32] = hex::decode(key_hex).unwrap().try_into().unwrap();
+    let nonce = [9u8; 12];
+    let mut out = nonce.to_vec();
+    out.extend(ChaCha20Poly1305::new(&Key::from(key)).encrypt(&Nonce::from(nonce), plain).unwrap());
+    out
+}
+
+/// Every value sealed without associated data, by table and column (the vault's wrapped keys
+/// carry AAD and are checked through the API).
+const SEALED: &[(&str, &str, &str)] = &[
+    ("users", "totp_secret", "totp_sealed"),
+    ("users", "totp_pending", "totp_sealed"),
+    ("contact_credentials", "totp_secret", "totp_sealed"),
+    ("contact_credentials", "totp_pending", "totp_sealed"),
+    ("mailboxes", "graph_secret", "graph_secret_sealed"),
+    ("accounting_connections", "client_secret", "sealed"),
+    ("accounting_connections", "access_token", "sealed"),
+    ("accounting_connections", "refresh_token", "sealed"),
+    ("security_detections", "context", "context_encrypted"),
+    ("sso_providers", "client_secret", "secret_sealed"),
+    ("webhook_subscriptions", "secret", "secret_sealed"),
+];
+
+async fn sealed_values(db: &sqlx::PgPool) -> Vec<(&'static str, Vec<u8>)> {
+    let mut all = Vec::new();
+    for (table, col, flag) in SEALED {
+        let rows: Vec<(Vec<u8>,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!("SELECT {col} FROM {table} WHERE {flag} AND {col} IS NOT NULL")))
+            .fetch_all(db)
+            .await
+            .unwrap();
+        all.extend(rows.into_iter().map(|(v,)| (*table, v)));
+    }
+    all
+}
+
+/// `rmm-server rotate-data-key`: dry run, a wrong old key, the real run, a second run that
+/// finds nothing to do, and then the server on the new key reading everything back: vault
+/// secrets and TOTP codes, and signing in with a TOTP code.
+async fn key_rotation(server: &mut Server, admin: &Api, db: &sqlx::PgPool, admin_secret: &str, a_id: &str, all: bool) {
+    const PW: &str = "rotation-vault-password";
+    const NOTE: &str = "rotation vault note";
+    const SECRET: &str = "JBSWY3DPEHPK3PXP";
+    let old_key = server.data_key.clone();
+    let new_key = "cd".repeat(32);
+    let item = admin
+        .post(
+            &format!("/clients/{a_id}/vault"),
+            json!({ "name": "Rotation test", "password": PW, "notes": NOTE, "totp": SECRET }),
+        )
+        .await;
+    let item_id = item["id"].as_str().unwrap().to_string();
+    // The other sealed secrets the later features added: a webhook's signing secret (through the
+    // API) and a single sign-on provider's client secret (a row of its own, disabled, so no
+    // identity provider needs to answer).
+    let events = admin.get("/webhooks").await["events"].clone();
+    let hook = admin.post("/webhooks", json!({ "name": "rotation", "url": "https://hooks.example.com/rotation", "events": events })).await;
+    let hook_id = hook["webhook"]["id"].as_str().unwrap().to_string();
+    sqlx::query("INSERT INTO sso_providers (name, issuer, client_id, client_secret, secret_sealed, enabled) VALUES ('Rotation IdP', 'https://idp.example.com', 'c', $1, true, false)")
+        .bind(seal_with(&server.data_key, b"idp-client-secret"))
+        .execute(db)
+        .await
+        .unwrap();
+    let wrapped = || async { sqlx::query_scalar::<_, Vec<u8>>("SELECT wrapped_key FROM vault_keys WHERE client_id = $1::uuid").bind(a_id).fetch_one(db).await.unwrap() };
+
+    let before = sealed_values(db).await;
+    let tables_before: std::collections::BTreeSet<_> = before.iter().map(|(t, _)| *t).collect();
+    assert!(tables_before.contains("users") && tables_before.contains("contact_credentials"), "TOTP secrets to rotate: {tables_before:?}");
+    if all {
+        assert!(tables_before.contains("security_detections"), "detection context to rotate: {tables_before:?}");
+    }
+    assert!(tables_before.contains("sso_providers") && tables_before.contains("webhook_subscriptions"), "SSO and webhook secrets to rotate: {tables_before:?}");
+    println!("key rotation: sealed values in {tables_before:?}");
+    assert!(before.iter().all(|(_, v)| opens_with(&old_key, v) && !opens_with(&new_key, v)));
+    let wrapped_before = wrapped().await;
+
+    server.stop();
+    let rotate = |old: &str, args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_rmm-server"))
+            .arg("rotate-data-key")
+            .args(args)
+            .env("DATABASE_URL", &server.db_url)
+            .env("RMM_DATA_KEY", old)
+            .env("RMM_DATA_KEY_NEW", &new_key)
+            .output()
+            .expect("running rmm-server rotate-data-key")
+    };
+    let (sealed_ref, wrapped_ref) = (&before, &wrapped_before);
+    let unchanged = |what: &'static str| async move {
+        assert_eq!(sealed_values(db).await, *sealed_ref, "{what}: nothing was written");
+        assert_eq!(wrapped().await, *wrapped_ref, "{what}: the vault keys weren't touched");
+    };
+
+    let out = rotate(&old_key, &["--dry-run"]);
+    assert!(out.status.success(), "dry run: {}", String::from_utf8_lossy(&out.stderr));
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(text.contains("dry run") && text.contains("vault_keys") && text.contains("1 to rotate"), "{text}");
+    unchanged("dry run").await;
+
+    let out = rotate(&"ef".repeat(32), &[]);
+    assert!(!out.status.success(), "a wrong old key must fail");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("opens with neither the old nor the new key") && err.contains("Nothing was changed"), "{err}");
+    unchanged("wrong old key").await;
+    let out = rotate(&new_key, &[]);
+    assert!(!out.status.success() && String::from_utf8_lossy(&out.stderr).contains("the same"), "old = new is refused");
+
+    let out = rotate(&old_key, &[]);
+    assert!(out.status.success(), "rotation: {}", String::from_utf8_lossy(&out.stderr));
+    let after = sealed_values(db).await;
+    assert_eq!(after.len(), before.len());
+    assert!(after.iter().all(|(_, v)| opens_with(&new_key, v) && !opens_with(&old_key, v)), "every sealed value is under the new key now");
+    let wrapped_after = wrapped().await;
+    assert_ne!(wrapped_after, wrapped_before, "the vault's client key was rewrapped");
+    // Again: nothing left to rotate, nothing written, still succeeds.
+    let out = rotate(&old_key, &[]);
+    assert!(out.status.success(), "second run: {}", String::from_utf8_lossy(&out.stderr));
+    for line in String::from_utf8_lossy(&out.stdout).lines().filter(|l| l.contains("to rotate")) {
+        assert!(line.split_whitespace().nth(1) == Some("0") && line.contains("0 stored in the clear"), "second run found work: {line}");
+    }
+    assert_eq!(sealed_values(db).await, after, "a second run writes nothing");
+    assert_eq!(wrapped().await, wrapped_after);
+    let (audited,): (i64,) = sqlx::query_as("SELECT count(*) FROM audit_log WHERE action = 'system.data_key_rotated'").fetch_one(db).await.unwrap();
+    assert_eq!(audited, 2, "both real runs are in the audit log");
+
+    // The server on the old key can't read the new rows; on the new key everything works.
+    server.data_key = new_key.clone();
+    server.start_again().await;
+    let url = server.url();
+    let reveal = |field: &str| {
+        let body = json!({ "field": field });
+        let path = format!("/vault/{item_id}/reveal");
+        async move { admin.post(&path, body).await["value"].clone() }
+    };
+    assert_eq!(reveal("password").await, PW);
+    assert_eq!(reveal("notes").await, NOTE);
+    let code = admin.post(&format!("/vault/{item_id}/totp"), json!({})).await;
+    let (c1, c2) = (totp(SECRET), totp(SECRET));
+    assert!(code["code"] == c1.as_str() || code["code"] == c2.as_str(), "the vault TOTP still computes: {code}");
+    let other = admin.get(&format!("/clients/{a_id}/vault")).await;
+    assert!(other.as_array().unwrap().iter().any(|i| i["id"] == item_id.as_str()));
+    // A new item sealed after the rotation, read back through the same client key.
+    let fresh = admin.post(&format!("/clients/{a_id}/vault"), json!({ "name": "After rotation", "password": "after-rot" })).await;
+    assert_eq!(admin.post(&format!("/vault/{}/reveal", fresh["id"].as_str().unwrap()), json!({ "field": "password" })).await["value"], "after-rot");
+    // Signing in needs the TOTP secret (sealed with the new key now).
+    sqlx::query("UPDATE users SET totp_last_step = NULL WHERE email = $1").bind(ADMIN_EMAIL).execute(db).await.unwrap();
+    let again = Api::new(&url);
+    let me = again.post("/auth/login", json!({ "email": ADMIN_EMAIL, "password": ADMIN_PASSWORD, "code": totp(admin_secret) })).await;
+    assert_eq!(me["user"]["totp_enabled"], true, "{me}");
+    // The provider list reads on the new key (the secret itself is never shown); the webhook's
+    // secret can be rotated again; then both are removed.
+    let listing = admin.get("/settings/sso").await;
+    assert!(listing["providers"].as_array().unwrap().iter().any(|p| p["name"] == "Rotation IdP" && p["has_secret"] == true), "{listing}");
+    assert!(admin.post(&format!("/webhooks/{hook_id}/rotate-secret"), json!({})).await["secret"].as_str().unwrap().starts_with("whsec_"));
+    sqlx::query("DELETE FROM sso_providers WHERE name = 'Rotation IdP'").execute(db).await.unwrap();
+    assert!(admin.call(reqwest::Method::DELETE, &format!("/webhooks/{hook_id}"), None).await.0.is_success());
+    admin.call(reqwest::Method::DELETE, &format!("/vault/{item_id}"), None).await;
+    admin.call(reqwest::Method::DELETE, &format!("/vault/{}", fresh["id"].as_str().unwrap()), None).await;
+    println!("key rotation: ok");
 }
 
 /// Policy management (docs/design/policies.md): the tree, inheritance with per-field overrides

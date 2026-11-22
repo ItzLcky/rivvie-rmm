@@ -144,20 +144,70 @@ the sign-in rate limit applies to all users at once.
 
 **Backups**
 
-The `backup` service runs `pg_dump` every `BACKUP_INTERVAL_HOURS` (default 24) and keeps
-`BACKUP_KEEP_DAYS` (default 14) of dumps in `deploy/backups/` (the `rmm-backups` volume in the
-Arcane stack). The dumps contain password hashes, 2FA secrets (encrypted with `RMM_DATA_KEY`, so keep the key with the backups) and agent credential hashes, so
-they're written mode 0600. Copy them off the host. To restore one into an empty database:
+The `backup` service ([`deploy/backup.sh`](deploy/backup.sh)) runs every `BACKUP_INTERVAL_HOURS`
+(default 24) and writes two files with one timestamp into `deploy/backups/` (the `rmm-backups`
+volume in the Arcane stack): `rmm-<ts>.dump`, a `pg_dump`, and `rmm-<ts>.files.tar.gz`, the local
+object storage (ticket attachments, raw inbound email, invoice PDFs, triage packages: everything
+the database points to that isn't in it). It keeps `BACKUP_KEEP_DAYS` (default 14) of both. The
+dumps contain password hashes, 2FA secrets (encrypted with `RMM_DATA_KEY`, so keep the key with the
+backups) and agent credential hashes, so the files are written mode 0600. **Copy them off the
+host.** The dump goes first, so a file uploaded in between is in the tarball without a row
+(harmless), never a row without its file.
+
+**With S3 storage** (`RMM_S3_BUCKET`) the tarball is empty: the files are in your bucket, and the
+dump's rows point at keys in it. **Turn on versioning on the bucket** (and, for real safety,
+replication to another account or region). The server never overwrites a key, but it does delete
+them (a deleted ticket attachment, a removed triage package); versioning is what lets you get
+those back, and what keeps the bucket consistent with a dump taken a few hours earlier. Restore
+the dump and leave the bucket alone.
+
+**Restoring.** [`deploy/restore.sh`](deploy/restore.sh) is the `restore` service, a profile that
+only runs when asked. Stop the server, pick a backup (`latest`, or a name from `deploy/backups/`),
+and start the server again when it's done:
 
 ```sh
 docker compose -f deploy/docker-compose.yml stop server
-docker compose -f deploy/docker-compose.yml exec -T db \
-  pg_restore -U rmm -d rmm --clean --if-exists < deploy/backups/rmm-20260101T030000Z.dump
+docker compose -f deploy/docker-compose.yml --profile restore run --rm restore rmm-20260101T030000Z
 docker compose -f deploy/docker-compose.yml start server
 ```
 
-Ticket attachments and raw inbound email aren't in the database: they're files in the `files`
-volume (`rmm-files` in the Arcane stack), or in your S3 bucket. Back that up too.
+The database is replaced in one transaction (a failed restore leaves the old data); the storage
+directory must be empty, or set `RESTORE_REPLACE_STORAGE=1` to have it emptied first. Start the
+server with the `RMM_DATA_KEY` the backup was taken under: it seals 2FA secrets, mailbox and
+accounting credentials, detection context and the vault's keys. (If the key was rotated since,
+a backup made before a rotation needs the old key.)
+
+CI runs this as a **restore drill** (the `restore-drill` job, `scripts/restore-drill.sh`, which
+you can run locally): it runs the e2e suite, backs its database and storage up with these exact
+scripts, restores them into a new database and an empty directory, starts the server on them and
+reads the rows back, including an attachment's bytes by hash. The `s3` job runs the storage code
+against MinIO (multipart uploads, ranged reads, aborted uploads; `scripts/minio-test.sh`).
+
+**Rotating `RMM_DATA_KEY`** (it leaked, or on a schedule): `rmm-server rotate-data-key` re-encrypts
+everything sealed with it under a new key, in one transaction: two-factor secrets of users and
+portal contacts, Microsoft Graph mailbox secrets, QuickBooks and Xero credentials and tokens,
+detection context, and the vault's per-client keys (the vault's items are sealed with those, so
+none of them is touched). The keys come from the environment, never the command line:
+`RMM_DATA_KEY_NEW`, and `RMM_DATA_KEY_OLD` (default: the `RMM_DATA_KEY` the container already
+has).
+
+```sh
+docker compose -f deploy/docker-compose.yml stop server backup
+NEW=$(openssl rand -hex 32)                 # keep it somewhere safe before going on
+docker compose -f deploy/docker-compose.yml run --rm -e RMM_DATA_KEY_NEW=$NEW server rotate-data-key --dry-run
+docker compose -f deploy/docker-compose.yml run --rm -e RMM_DATA_KEY_NEW=$NEW server rotate-data-key
+# put $NEW in deploy/.env as RMM_DATA_KEY, then
+docker compose -f deploy/docker-compose.yml up -d
+```
+
+`--dry-run` counts what would change and checks that the old key opens everything, writing
+nothing. A wrong old key, or a value nothing opens, stops the run with nothing changed and names
+the row. It is safe to run again: a value the old key opens is rotated, one that only the new key
+opens is already done (a server started on the new key in between, say), and a second run does
+nothing. **Stop the server first**: a running one holds the old key and would write new rows with
+it (running the command again picks those up). Take a backup before, and keep it with the old key
+until you no longer need to restore it. The IMAP and SMTP passwords of mailboxes are stored as they are (use an
+account limited to that mailbox), so they aren't touched.
 
 **Upgrading**
 
@@ -254,13 +304,14 @@ The settings most installs touch; [docs/OPERATOR.md](docs/OPERATOR.md#environmen
 | `RMM_JOB_QUEUE_DAYS` | `7` | Jobs (and patch installs) queued for an offline agent expire after this |
 | `RMM_PATCH_SCAN_HOURS` | `12` | Online agents scan for OS updates when their last scan is older than this |
 | `RMM_SESSION_IDLE_HOURS` | `12` | Dashboard sessions unused this long are signed out (sessions last 7 days at most). Admins can override it under Company settings |
-| `RMM_STORAGE_DIR` | `data/storage` (`/srv/data/storage` in the image) | Ticket attachments and raw inbound email, unless `RMM_S3_BUCKET` is set |
+| `RMM_STORAGE_DIR` | `data/storage` (`/srv/data/storage` in the image) | Ticket attachments, raw inbound email, invoice PDFs and triage packages, unless `RMM_S3_BUCKET` is set. The compose `backup` service archives it beside each database dump |
 | `RMM_S3_BUCKET` | empty | Store those files in an S3-compatible bucket instead. With `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `RMM_S3_REGION` (default `us-east-1`), and `RMM_S3_ENDPOINT` for MinIO and other non-AWS stores (path-style URLs then; `RMM_S3_PATH_STYLE` overrides) |
 | `RMM_MAIL_POLL_SECS` | `60` | How often IMAP support mailboxes are checked |
 | `RMM_TICKET_CLOSE_DAYS` | `7` | Resolved tickets move to Closed after this |
 | `RMM_PUBLIC_URL` callbacks | | QuickBooks and Xero redirect to `<RMM_PUBLIC_URL>/api/billing/accounting/qbo/callback` (or `/xero/callback`): register that in the provider's developer portal. For the QuickBooks sandbox set `RMM_QBO_API_URL=https://sandbox-quickbooks.api.intuit.com` |
 | `RMM_EMAIL_RAW_DAYS` | `90` | Raw MIME of inbound mail is deleted after this (the ticket keeps the text and attachments) |
-| `RMM_DATA_KEY` | empty (required by the compose files) | 32 bytes, hex or base64 (`openssl rand -hex 32`). Encrypts two-factor secrets, single sign-on client secrets and detection context at rest, and the password vault's per-client keys (the vault is unavailable without it). Secrets stored before it was set are encrypted at the next start. Keep a copy off the server: if it's lost, users with 2FA can't sign in until `rmm-server reset2fa` clears it, and the server refuses to start without it once anything has been encrypted |
+| `RMM_DATA_KEY` | empty (required by the compose files) | 32 bytes, hex or base64 (`openssl rand -hex 32`). Encrypts two-factor secrets, single sign-on client secrets and detection context at rest, and the password vault's per-client keys (the vault is unavailable without it). Secrets stored before it was set are encrypted at the next start. Keep a copy off the server: if it's lost, users with 2FA can't sign in until `rmm-server reset2fa` clears it, and the server refuses to start without it once anything has been encrypted. To replace it, see *Rotating `RMM_DATA_KEY`* under Backups |
+| `RMM_DATA_KEY_OLD`, `RMM_DATA_KEY_NEW` | none | Only read by `rmm-server rotate-data-key`: the key the data is sealed with now (default `RMM_DATA_KEY`) and the one to seal it with |
 | `RMM_TRUSTED_PROXIES` | empty | Reverse proxies whose `X-Forwarded-For` gives the client IP (for rate limiting and the audit log): comma-separated addresses/CIDRs, or `private` for loopback + RFC 1918 + IPv6 ULA. The bundled compose stack sets `private` for Caddy |
 | `RMM_ATTACHMENT_MAX_MB` | `100` | Largest ticket or portal attachment, per file. Uploads and downloads stream to and from storage (S3 multipart over 8 MB), so this bounds disk use, not server memory. Replies email attachments up to 15 MB in total; larger files go as links (the portal for contacts who can sign in, otherwise a download link valid for 30 days) |
 | `RMM_METRICS_TOKEN` | empty | Turns on `GET /metrics` (see [Monitoring the server](#monitoring-the-server)); without it the route answers 404 |
