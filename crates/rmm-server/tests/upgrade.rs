@@ -14,7 +14,8 @@
 //! ```
 //!
 //! Only the HTTP API and the agent protocol of the old release are used, so this file has to
-//! keep working against it: don't call endpoints the previous release doesn't have.
+//! keep working against it: don't call endpoints the previous release doesn't have, or probe
+//! for them first (as the documentation pages are) and record in the expect file what was seeded.
 
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -144,19 +145,34 @@ async fn seed_previous_release() {
     .await;
     put(&format!("/clients/{client_id}/desktop"), json!({ "consent": true })).await;
     // Documentation pages with free-text categories, for 0023 to turn into category rows: one
-    // new, one matching a seeded category in another case.
-    let doc = post(&format!("/clients/{client_id}/docs"), json!({ "title": "Alarm panel", "category": "Alarm codes", "body": "Code changes monthly." })).await;
-    let doc_seeded =
-        post(&format!("/clients/{client_id}/docs"), json!({ "title": "Core switch", "category": "infrastructure", "body": "Stack of two." })).await;
+    // new, one matching a seeded category in another case. Releases before documentation (v0.1.x)
+    // have no such route, so it is probed first; the expect file says whether anything was
+    // seeded, and the e2e suite reads the pages back only then.
+    let docs_url = format!("{api}/clients/{client_id}/docs");
+    let probe = http.post(&docs_url).json(&json!({ "title": "Alarm panel", "category": "Alarm codes", "body": "Code changes monthly." })).send().await.unwrap();
+    let docs = if matches!(probe.status(), reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::METHOD_NOT_ALLOWED) {
+        println!("the previous release has no documentation pages ({}); not seeding any", probe.status());
+        None
+    } else {
+        let s = probe.status();
+        let doc: Value = probe.json().await.unwrap_or(Value::Null);
+        assert!(s.is_success(), "POST {docs_url}: {s} {doc}");
+        let seeded = post(&format!("/clients/{client_id}/docs"), json!({ "title": "Core switch", "category": "infrastructure", "body": "Stack of two." })).await;
+        Some((doc["id"].clone(), seeded["id"].clone()))
+    };
 
-    let expect = json!({
+    let mut expect = json!({
         "admin_email": ADMIN_EMAIL,
         "client_id": client_id, "client_name": "Upgraded Client Ltd", "site_id": site_id,
         "agent_id": agent_id, "hostname": hostname, "metric_samples": samples,
         "ticket_id": ticket["id"], "ticket_number": ticket["number"], "ticket_subject": "Printer jammed before the upgrade",
         "alert_policy_id": alert["id"], "schedule_id": schedule["id"], "schedule_next_run_at": schedule["next_run_at"],
-        "doc_id": doc["id"], "doc_seeded_id": doc_seeded["id"],
+        "docs_seeded": docs.is_some(),
     });
+    if let Some((doc, doc_seeded)) = docs {
+        expect["doc_id"] = doc;
+        expect["doc_seeded_id"] = doc_seeded;
+    }
     std::fs::write(&out, serde_json::to_vec_pretty(&expect).unwrap()).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
     println!("seeded through the previous release: {expect}");
