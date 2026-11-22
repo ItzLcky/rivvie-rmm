@@ -174,7 +174,7 @@ docker compose -f deploy/docker-compose.yml start server
 The database is replaced in one transaction (a failed restore leaves the old data); the storage
 directory must be empty, or set `RESTORE_REPLACE_STORAGE=1` to have it emptied first. Start the
 server with the `RMM_DATA_KEY` the backup was taken under: it seals 2FA secrets, mailbox and
-accounting credentials, detection context and the vault's keys. (If the key was rotated since,
+accounting credentials, single sign-on and webhook secrets, detection context and the vault's keys. (If the key was rotated since,
 a backup made before a rotation needs the old key.)
 
 CI runs this as a **restore drill** (the `restore-drill` job, `scripts/restore-drill.sh`, which
@@ -186,7 +186,7 @@ against MinIO (multipart uploads, ranged reads, aborted uploads; `scripts/minio-
 **Rotating `RMM_DATA_KEY`** (it leaked, or on a schedule): `rmm-server rotate-data-key` re-encrypts
 everything sealed with it under a new key, in one transaction: two-factor secrets of users and
 portal contacts, Microsoft Graph mailbox secrets, QuickBooks and Xero credentials and tokens,
-detection context, and the vault's per-client keys (the vault's items are sealed with those, so
+single sign-on client secrets, webhook signing secrets, detection context, and the vault's per-client keys (the vault's items are sealed with those, so
 none of them is touched). The keys come from the environment, never the command line:
 `RMM_DATA_KEY_NEW`, and `RMM_DATA_KEY_OLD` (default: the `RMM_DATA_KEY` the container already
 has).

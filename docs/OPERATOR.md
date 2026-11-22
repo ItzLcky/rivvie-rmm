@@ -105,7 +105,7 @@ re-request them (Let's Encrypt rate-limits that). The compose file already sets
 
 | Secret | What it protects | If it leaks | If it's lost |
 |---|---|---|---|
-| `RMM_DATA_KEY` | Two-factor secrets, the password vault's per-client keys, mailbox and accounting (QuickBooks, Xero) credentials, and detection context, all encrypted at rest | The encryption in the database and in backups is worthless to anyone who also gets the dump. Replacing the key needs the rotation procedure ([below](#rotating-rmm_data_key)) | The vault is gone for good; users with 2FA can't sign in until `rmm-server reset2fa` clears it; the server refuses to start once anything has been encrypted. **Keep it with your backups, in a password manager and a sealed copy off-site.** A backup without its key is half a backup |
+| `RMM_DATA_KEY` | Two-factor secrets, single sign-on client secrets, webhook signing secrets, the password vault's per-client keys, mailbox and accounting (QuickBooks, Xero) credentials, and detection context, all encrypted at rest | The encryption in the database and in backups is worthless to anyone who also gets the dump. Replacing the key needs the rotation procedure ([below](#rotating-rmm_data_key)) | The vault is gone for good; users with 2FA can't sign in until `rmm-server reset2fa` clears it; the server refuses to start once anything has been encrypted. **Keep it with your backups, in a password manager and a sealed copy off-site.** A backup without its key is half a backup |
 | `POSTGRES_PASSWORD` | The database | Full read/write of everything. The database isn't published, so this takes access to the host or its Docker network first | Reset it in Postgres (`ALTER USER`) and in `deploy/.env` |
 | Release signing key (`release.key`, from `rmm-sign keygen`) | Every agent self-update and all detection content: agents only run code signed by it | Anyone holding it can push their own binary to every agent. Treat it like a CA key: offline, never on the RMM server or the image, in CI only as the `RMM_UPDATE_SIGNING_KEY` secret | Agents can't be updated again; the public half is compiled into them, so they have to be reinstalled with a new key. Keep two copies off-site |
 | `RMM_METRICS_TOKEN` | `/metrics` | Series names and fleet sizes; low impact. Rotate by changing it and the scraper | Set a new one |
@@ -119,9 +119,27 @@ covered in [RELEASING.md](RELEASING.md) and the README's [Agent updates](../READ
 
 ### Rotating `RMM_DATA_KEY`
 
-Not built in this release. Until the rotation command exists, a leaked key can't be replaced
-without losing what it protects. See the changelog for when it lands, and meanwhile keep the key
-off shared machines and out of shell history and CI logs.
+`rmm-server rotate-data-key` re-encrypts everything sealed with the key under a new one, in one
+transaction: two-factor secrets, single sign-on client secrets, webhook signing secrets, mailbox
+and accounting credentials, detection context, and the vault's per-client keys (the vault's items
+aren't touched). Stop the server first, then:
+
+```sh
+docker compose -f deploy/docker-compose.yml stop server backup
+NEW=$(openssl rand -hex 32)      # store it in your password manager before going on
+docker compose -f deploy/docker-compose.yml run --rm -e RMM_DATA_KEY_NEW=$NEW server rotate-data-key --dry-run
+docker compose -f deploy/docker-compose.yml run --rm -e RMM_DATA_KEY_NEW=$NEW server rotate-data-key
+# set RMM_DATA_KEY=$NEW in deploy/.env, then
+docker compose -f deploy/docker-compose.yml up -d
+```
+
+The dry run changes nothing and fails if the current key doesn't open every value, so a wrong key
+shows up before the real run. A failed run changes nothing and can be repeated; a finished one
+can be run again and does nothing. Take a backup first and **keep it with the old key**: a backup
+made before the rotation can only be restored with the key it was taken under. If the old key
+leaked, also treat what it protected as exposed (sign-in secrets can be reissued, but a copy of an
+old dump plus the old key still reads the vault as of that dump). The full procedure and what is
+and isn't covered are in the README's [Backups](../README.md#deploying) section.
 
 ## Sizing
 
@@ -250,10 +268,11 @@ exist only for tests and debug builds; never set them in production.
 ## Backups and restore
 
 **What to back up**: the database, the `files` volume (`rmm-files` in the Arcane stack) unless you
-use S3, and **`RMM_DATA_KEY`** (and your release key) kept with them. The database dump alone
-doesn't contain ticket attachments, invoice PDFs or triage packages.
+use S3, and **`RMM_DATA_KEY`** (and your release key) kept with them. The `backup` job writes the
+first two ([Object storage backups](#object-storage-backups)); the dump alone doesn't contain
+ticket attachments, invoice PDFs or triage packages.
 
-**Database.** The `backup` service writes `pg_dump -Fc` dumps every `BACKUP_INTERVAL_HOURS` into
+**Database and files.** The `backup` service writes `pg_dump -Fc` dumps (and the files tarball) every `BACKUP_INTERVAL_HOURS` into
 `deploy/backups/` (the `rmm-backups` volume in the Arcane stack) and deletes ones older than
 `BACKUP_KEEP_DAYS`. A backup on the same disk isn't a backup: copy the directory off the host
 (rsync, restic or borg to another machine or a bucket, encrypted, with its own retention) and
@@ -263,11 +282,10 @@ check that the copy happens. Take one by hand before any change:
 docker compose -f deploy/docker-compose.yml exec -T db pg_dump -U rmm -Fc rmm > rmm-before-change.dump
 ```
 
-**Files.** Back up the volume: for example
+**Files by hand.** The job already archives them; to take one yourself:
 `docker run --rm -v rmm_files:/data -v "$PWD":/out alpine tar czf /out/rmm-files.tgz -C /data .`
 (the volume's real name is `<project>_files`; see `docker volume ls`). With
 `RMM_S3_BUCKET`, enable bucket versioning instead and don't delete versions early.
-See [Object storage backups](#object-storage-backups) for what the nightly job does not cover.
 
 **Restore** into an empty stack with the same `RMM_DATA_KEY`:
 
@@ -292,9 +310,29 @@ the source for these commands.
 
 ### Object storage backups
 
-Not built in this release: the nightly job dumps the database only, so back up the `files` volume
-(or version your S3 bucket) as above until it also covers local object storage and CI drills a
-restore. See the changelog for when that lands.
+The `backup` job writes two files per run: `rmm-<ts>.dump` (the database) and
+`rmm-<ts>.files.tar.gz` (the local object storage: ticket attachments, raw inbound email,
+invoice PDFs, triage packages), taken dump first so a file is never missing for a row. Both are
+written mode 0600 and pruned after `BACKUP_KEEP_DAYS`; copy them off the host.
+
+With `RMM_S3_BUCKET` the tarball is empty: the files live in your bucket, so **turn on bucket
+versioning** (and replication for real safety) and leave the bucket alone when restoring the dump.
+
+To restore, stop the server, then run the `restore` service with a backup name (or `latest`);
+it replaces the database in one transaction and refuses a non-empty storage directory unless
+`RESTORE_REPLACE_STORAGE=1`:
+
+```sh
+docker compose -f deploy/docker-compose.yml stop server
+docker compose -f deploy/docker-compose.yml --profile restore run --rm restore rmm-20260101T030000Z
+docker compose -f deploy/docker-compose.yml start server
+```
+
+Start the server with the `RMM_DATA_KEY` the backup was taken under. CI runs the whole path as a
+restore drill (`scripts/restore-drill.sh`: back up the e2e database and files with these scripts,
+restore into an empty database and directory, read everything back including an attachment's
+bytes), so the commands above are exercised, but still **practise a restore on a spare host once**.
+See the README's [Backups](../README.md#deploying) section for details.
 
 ## Monitoring
 
