@@ -24,6 +24,8 @@
 		all_clients: boolean; client_ids: string[];
 		/** null = the role's defaults */
 		permissions?: string[] | null;
+		/** Can't sign in; owns API keys (Company settings → API). */
+		service_account?: boolean;
 	}
 	const res = resource(() => api.get<UserRow[]>('/users'));
 
@@ -133,8 +135,8 @@
 
 {#snippet nameCell(u: UserRow)}
 	<div class={u.disabled ? 'opacity-60' : ''}>
-		<div class="font-medium">{u.name}{#if u.id === session.user?.id}<span class="text-muted font-normal"> (you)</span>{/if}</div>
-		<div class="text-muted text-xs">{u.email}</div>
+		<div class="font-medium">{u.name}{#if u.id === session.user?.id}<span class="text-muted font-normal"> (you)</span>{/if}{#if u.service_account} <Badge>Service account</Badge>{/if}</div>
+		<div class="text-muted text-xs">{u.service_account ? 'Can’t sign in' : u.email}</div>
 	</div>
 {/snippet}
 {#snippet roleCell(u: UserRow)}<span class={u.disabled ? 'opacity-60' : ''}>{roles[u.role] ?? u.role}</span>{/snippet}
@@ -161,8 +163,8 @@
 					? [{ label: 'Client access', icon: Building2, onSelect: () => ((editingAccess = u), (accessForm = { all_clients: u.all_clients, client_ids: [...u.client_ids] })) }]
 					: []),
 				...(u.role !== 'admin' ? [{ label: 'Permissions', icon: ShieldCheck, onSelect: () => openPerms(u) }] : []),
-				{ label: 'Sessions', icon: MonitorSmartphone, onSelect: () => (viewing = u) },
-				{ label: 'Reset password', icon: KeyRound, onSelect: () => ((resetting = u), (resetPw = '')) },
+				...(u.service_account ? [] : [{ label: 'Sessions', icon: MonitorSmartphone, onSelect: () => (viewing = u) }]),
+				...(u.service_account ? [] : [{ label: 'Reset password', icon: KeyRound, onSelect: () => ((resetting = u), (resetPw = '')) }]),
 				...(u.totp_enabled ? [{ label: 'Reset 2FA', icon: ShieldOff, onSelect: () => reset2fa(u) }] : []),
 				{ separator: true },
 				{ label: 'Disable user', icon: UserX, danger: true, onSelect: () => disable(u) }

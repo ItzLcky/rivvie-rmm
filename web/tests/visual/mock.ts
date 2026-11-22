@@ -1077,6 +1077,47 @@ const categoryOut = (c: (typeof docCategories)[number]) => ({ ...c, docs: client
 
 const admin = { id: 'u-1', email: 'dana@northwind.example', name: 'Dana Admin', role: 'admin', totp_enabled: true, mfa_setup_required: false, client_ids: null, preferences: {}, permissions: ['security.read', 'security.respond', 'security.manage', 'vault.read', 'vault.manage'] };
 
+// --- API keys, service accounts and webhooks -----------------------------------------------------
+const apiKeys = [
+	{ id: 'k-1', name: 'Reporting script', prefix: 'rmm_k_3f9a1c', owner_id: 'u-1', owner_name: 'Dana Admin', service_account: false, access: 'read', scopes: ['clients', 'agents', 'alerts'], permissions: [] as string[], client_ids: null as string[] | null, rate_limit_per_min: 600, expires_at: ago(-60 * 24 * 80), last_used_at: ago(12), last_used_ip: '203.0.113.20', revoked_at: null as string | null, created_at: ago(60 * 24 * 10), status: 'active' },
+	{ id: 'k-2', name: 'Ticket sync', prefix: 'rmm_k_b84e07', owner_id: 'u-1', owner_name: 'Dana Admin', service_account: false, access: 'write', scopes: ['tickets', 'jobs'], permissions: [], client_ids: ['c-acme'], rate_limit_per_min: 120, expires_at: null, last_used_at: null, last_used_ip: null, revoked_at: null, created_at: ago(60 * 24 * 2), status: 'active' },
+	{ id: 'k-3', name: 'Old exporter', prefix: 'rmm_k_09d2c5', owner_id: 'u-1', owner_name: 'Dana Admin', service_account: false, access: 'read', scopes: ['agents', 'security'], permissions: ['security.read'], client_ids: null, rate_limit_per_min: 600, expires_at: ago(60 * 24 * 3), last_used_at: ago(60 * 24 * 40), last_used_ip: '198.51.100.4', revoked_at: null, created_at: ago(60 * 24 * 120), status: 'expired' }
+];
+const allApiKeys = [
+	...apiKeys,
+	{ id: 'k-4', name: 'Backup monitor', prefix: 'rmm_k_71c0aa', owner_id: 'u-sa', owner_name: 'Backup monitor', service_account: true, access: 'read', scopes: ['agents', 'alerts'], permissions: [], client_ids: ['c-globex'], rate_limit_per_min: 300, expires_at: ago(-60 * 24 * 300), last_used_at: ago(3), last_used_ip: '10.0.0.8', revoked_at: null, created_at: ago(60 * 24 * 30), status: 'active' },
+	{ id: 'k-5', name: 'Leaked in a gist', prefix: 'rmm_k_5e22f9', owner_id: 'u-2', owner_name: 'Terry Tech', service_account: false, access: 'read', scopes: ['tickets'], permissions: [], client_ids: null, rate_limit_per_min: 600, expires_at: null, last_used_at: ago(60 * 24), last_used_ip: '192.0.2.77', revoked_at: ago(60 * 24 * 2), created_at: ago(60 * 24 * 60), status: 'revoked' }
+];
+const serviceAccounts = [
+	{ id: 'u-sa', name: 'Backup monitor', role: 'readonly', disabled: false, all_clients: false, client_ids: ['c-globex'], keys: 1, created_at: ago(60 * 24 * 30) },
+	{ id: 'u-sa2', name: 'Reporting pipeline', role: 'technician', disabled: false, all_clients: true, client_ids: [] as string[], keys: 0, created_at: ago(60 * 24 * 5) }
+];
+const webhookEvents = ['ticket.created', 'ticket.updated', 'ticket.status_changed', 'ticket.resolved', 'ticket.comment', 'alert.created', 'alert.acknowledged', 'alert.resolved'];
+const webhooks = [
+	{ id: 'wh-1', name: 'Ticket mirror', url: 'https://hooks.northwind.example/rmm/tickets', client_id: null, client_name: null, events: webhookEvents.slice(0, 5), internal_notes: false, enabled: true, created_at: ago(60 * 24 * 20), pending: 0, failed_24h: 0, last_sent_at: ago(9) },
+	{ id: 'wh-2', name: 'Acme dashboard', url: 'https://acme.example/api/rmm-events', client_id: 'c-acme', client_name: 'Acme Corp', events: webhookEvents, internal_notes: true, enabled: true, created_at: ago(60 * 24 * 6), pending: 2, failed_24h: 1, last_sent_at: ago(60 * 5) },
+	{ id: 'wh-3', name: 'Chat bridge (paused)', url: 'http://10.0.0.30:8088/hook', client_id: null, client_name: null, events: ['alert.created', 'alert.resolved'], internal_notes: false, enabled: false, created_at: ago(60 * 24 * 40), pending: 0, failed_24h: 0, last_sent_at: null }
+];
+const webhookDeliveries = [
+	{ id: 9, delivery_id: '6f1c0c1e-9a51-4c0e-b6c9-0a4de1f3a111', event: 'ticket.status_changed', status: 'pending', attempts: 2, response_status: 502, duration_ms: 1840, last_error: 'HTTP 502 Bad Gateway: upstream timed out', created_at: ago(40), sent_at: null, next_attempt_at: ago(-20) },
+	{ id: 8, delivery_id: '2c7d9b30-5a0e-4a6f-8a1d-77f5a1b3c9e2', event: 'ticket.comment', status: 'failed', attempts: 5, response_status: null, duration_ms: 15012, last_error: 'request failed: error sending request for url (https://acme.example/api/rmm-events)', created_at: ago(60 * 20), sent_at: null, next_attempt_at: ago(60 * 17) },
+	{ id: 7, delivery_id: 'b0a84e2c-91d3-4b57-bf0a-35c2d1e8f640', event: 'alert.created', status: 'sent', attempts: 1, response_status: 200, duration_ms: 118, last_error: null, created_at: ago(60 * 5), sent_at: ago(60 * 5), next_attempt_at: ago(60 * 5) },
+	{ id: 6, delivery_id: '91e3f7a2-0c4b-4d18-a6e5-5d2b8c7f1a03', event: 'ticket.created', status: 'sent', attempts: 1, response_status: 204, duration_ms: 87, last_error: null, created_at: ago(60 * 7), sent_at: ago(60 * 7), next_attempt_at: ago(60 * 7) },
+	{ id: 5, delivery_id: '5d6a0f19-3e8c-4c72-9b41-e0a7c2d8b6f5', event: 'ping', status: 'sent', attempts: 1, response_status: 200, duration_ms: 64, last_error: null, created_at: ago(60 * 24), sent_at: ago(60 * 24), next_attempt_at: ago(60 * 24) }
+];
+const openapi = {
+	openapi: '3.1.0',
+	info: { title: 'RMM API', version: '1.0.0', description: 'Authenticate with an API key.' },
+	tags: [{ name: 'clients', description: 'Clients and sites' }, { name: 'agents', description: 'Agents, inventory and metrics' }, { name: 'tickets', description: 'Tickets' }],
+	paths: {
+		'/clients': { get: { operationId: 'listClients', summary: 'List clients with their sites', description: 'Any key that holds the `clients` scope. Only the clients the key can see.', tags: ['clients'], parameters: [], 'x-rmm-scope': 'clients', 'x-rmm-access': 'read' } },
+		'/agents': { get: { operationId: 'listAgents', summary: 'List agents (devices)', description: 'Any key that holds the `agents` scope. Search matches hostname, OS, IP address prefix and logged-in user.', tags: ['agents'], parameters: [{ name: 'client_id', in: 'query', description: 'Only this client.', schema: { type: 'string', format: 'uuid' } }, { name: 'online', in: 'query', description: 'Only online or only offline agents.', schema: { type: 'boolean' } }, { name: 'limit', in: 'query', schema: { type: 'integer' } }], 'x-rmm-scope': 'agents', 'x-rmm-access': 'read' } },
+		'/agents/{id}': { get: { operationId: 'getAgent', summary: 'Get an agent with its hardware and software inventory', description: 'Any key that holds the `agents` scope.', tags: ['agents'], parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string', format: 'uuid' } }], 'x-rmm-scope': 'agents', 'x-rmm-access': 'read' } },
+		'/tickets': { post: { operationId: 'createTicket', summary: 'Open a ticket', description: 'A key with `write` access that holds the `tickets` scope.', tags: ['tickets'], parameters: [], requestBody: { content: { 'application/json': { schema: { $ref: '#/components/schemas/NewTicket' } } } }, 'x-rmm-scope': 'tickets', 'x-rmm-access': 'write' } }
+	},
+	components: { schemas: { NewTicket: { type: 'object', required: ['subject'], properties: { subject: { type: 'string' }, client_id: { type: 'string', format: 'uuid' }, priority: { type: 'integer' } } } } }
+};
+
 export async function mockApi(p: Page, opts: { signedIn?: boolean } = {}) {
 	const signedIn = opts.signedIn ?? true;
 	await p.clock.setFixedTime(NOW);
@@ -1241,6 +1282,12 @@ export async function mockApi(p: Page, opts: { signedIn?: boolean } = {}) {
 		if (path === '/notification-channels') return json(channels);
 		if (path === '/notifications') return json(deliveries);
 		if (path === '/settings/smtp') return json({ host: 'smtp.office365.com', port: 587, security: 'starttls', username: 'rmm@northwind.example', password_set: true, from: 'Northwind RMM <rmm@northwind.example>' });
+		if (path === '/api-keys') return json(q.get('all') ? allApiKeys : apiKeys);
+		if (path === '/api-keys/options') return json({ groups: [{ id: 'clients', label: 'Clients and sites' }, { id: 'agents', label: 'Agents, inventory and metrics' }, { id: 'jobs', label: 'Jobs and results' }, { id: 'scripts', label: 'Script library' }, { id: 'alerts', label: 'Alerts' }, { id: 'tickets', label: 'Tickets' }, { id: 'security', label: 'Endpoint protection (needs the security.read permission)' }], permissions: admin.permissions, can_write: true, default_rate_limit: 600 });
+		if (path === '/service-accounts') return json(serviceAccounts);
+		if (path === '/webhooks') return json({ webhooks, events: webhookEvents });
+		if ((m = path.match(/^\/webhooks\/([^/]+)\/deliveries$/))) return json(q.get('status') ? webhookDeliveries.filter((d) => d.status === q.get('status')) : webhookDeliveries);
+		if (path === '/openapi.json') return json(openapi);
 		const pr = policyRoute(path, q);
 		if (pr !== undefined) return pr === null ? json({ error: 'policy set not found' }, 404) : json(pr);
 		if (path === '/schedules') return json(schedules.map(scheduleOut));

@@ -32,7 +32,7 @@ The same router is mounted at `/api` (the dashboard's, session cookies) and `/ap
 
 ## OpenAPI
 
-`GET /api/openapi.json` (and under `/api/v1`) returns an OpenAPI 3.1 document built from the registry, with schemas for the main resources. It needs no credentials: it describes the API, not data. The dashboard renders it at `/api-docs` (linked from Account and Company settings → API).
+`GET /api/openapi.json` (and under `/api/v1`) returns an OpenAPI 3.1 document built from the registry, with schemas for the main resources. It needs no credentials: it describes the API, not data. The dashboard renders it at `/developers` (linked from Account and Company settings → API).
 
 ## Webhooks
 

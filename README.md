@@ -654,7 +654,7 @@ Design: [docs/design/api.md](docs/design/api.md).
   key's last use.
 - **OpenAPI 3.1** at `/api/v1/openapi.json` (no credentials needed), generated from the same registry
   that decides which routes keys may call (`crates/rmm-server/src/api/public.rs`); the dashboard renders
-  it at **API reference** (`/api-docs`).
+  it at **API reference** (`/developers`).
 - **Webhooks** (Company settings → Webhooks, admins) post ticket events (`ticket.created`, `.updated`,
   `.status_changed`, `.resolved`, `.comment`) and alert events (`alert.created`, `.acknowledged`,
   `.resolved`) as signed JSON to a URL, for all clients or one. The body is signed like the webhook
