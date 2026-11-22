@@ -20,6 +20,7 @@ pub fn read() -> Vec<(Ipv4Addr, String)> {
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
 /// `/proc/net/arp`: `IP address, HW type, Flags, HW address, Mask, Device`. Flag 0x2 is "complete".
 pub fn parse_proc(text: &str) -> Vec<(Ipv4Addr, String)> {
     text.lines()
