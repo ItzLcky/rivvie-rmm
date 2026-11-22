@@ -1,6 +1,12 @@
 export type Role = 'admin' | 'technician' | 'readonly';
 export interface User {
 	id: string; email: string; name: string; role: Role; totp_enabled: boolean; mfa_setup_required: boolean;
+	/** An authenticator app or a passkey is set up. */
+	mfa_enabled?: boolean;
+	/** Signed in through single sign-on (the identity provider did the second factor). */
+	sso_session?: boolean;
+	/** Created by SSO: no password anyone knows. */
+	sso_only?: boolean;
 	/** null = every client */
 	client_ids: string[] | null;
 	preferences?: import('./prefs.svelte').Prefs;

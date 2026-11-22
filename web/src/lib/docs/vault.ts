@@ -28,9 +28,9 @@ export function retryIn(e: unknown): number | null {
 /** What the current user can do with credentials, before asking the server. */
 export function vaultAccess(): 'ok' | 'mfa' | 'none' {
 	if (!allowed('vault.read')) return 'none';
-	return session.user?.totp_enabled ? 'ok' : 'mfa';
+	return session.user?.mfa_enabled || session.user?.sso_session || session.user?.totp_enabled ? 'ok' : 'mfa';
 }
-export const canManageVault = () => allowed('vault.manage') && !!session.user?.totp_enabled;
+export const canManageVault = () => allowed('vault.manage') && !!(session.user?.mfa_enabled || session.user?.sso_session || session.user?.totp_enabled);
 
 /** A one-line, human message for a failed reveal or code. */
 export function secretError(e: unknown): string {

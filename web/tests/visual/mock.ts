@@ -1077,7 +1077,7 @@ const categoryOut = (c: (typeof docCategories)[number]) => ({ ...c, docs: client
 
 const admin = { id: 'u-1', email: 'dana@northwind.example', name: 'Dana Admin', role: 'admin', totp_enabled: true, mfa_setup_required: false, client_ids: null, preferences: {}, permissions: ['security.read', 'security.respond', 'security.manage', 'vault.read', 'vault.manage'] };
 
-export async function mockApi(p: Page, opts: { signedIn?: boolean } = {}) {
+export async function mockApi(p: Page, opts: { signedIn?: boolean; ssoRequired?: boolean } = {}) {
 	const signedIn = opts.signedIn ?? true;
 	await p.clock.setFixedTime(NOW);
 	await p.route('**/api/**', async (route: Route) => {
@@ -1211,10 +1211,47 @@ export async function mockApi(p: Page, opts: { signedIn?: boolean } = {}) {
 					{ ...admin, permissions: null },
 					{ ...admin, id: 'u-2', email: 'terry@northwind.example', name: 'Terry Tech', role: 'technician', totp_enabled: false, client_ids: ['c-acme'], permissions: null },
 					{ ...admin, id: 'u-3', email: 'sam@northwind.example', name: 'Sam Security', role: 'readonly', totp_enabled: true, client_ids: null, permissions: ['security.read', 'security.respond', 'security.manage'] }
-				].map((u) => ({ ...u, disabled: false, last_login_at: ago(60), all_clients: u.role === 'admin' || u.client_ids === null, client_ids: u.client_ids ?? [] }))
+				].map((u, i) => ({
+					...u, disabled: false, last_login_at: ago(60), all_clients: u.role === 'admin' || u.client_ids === null, client_ids: u.client_ids ?? [],
+					sso_exempt: i === 0, sso_only: i === 1, passkeys: i === 2 ? 1 : 0, sso_providers: i === 1 ? ['Microsoft'] : []
+				}))
 			);
 		if (path === '/settings') return json({ company_name: 'Northwind IT', session_idle_hours: null, session_idle_hours_default: 12, require_2fa_all: false });
 		if (path === '/auth/totp') return json({ enabled: true, required: true, recovery_codes_left: 8 });
+		if (path === '/auth/passkeys')
+			return json({
+				available: true,
+				recovery_codes_left: 10,
+				sso_only: false,
+				passkeys: [
+					{ id: 'pk-1', name: 'YubiKey 5C', created_at: ago(60 * 24 * 30), last_used_at: ago(60 * 5) },
+					{ id: 'pk-2', name: 'Work laptop', created_at: ago(60 * 24 * 3), last_used_at: null }
+				]
+			});
+		if (path === '/auth/sso/providers')
+			return json({ providers: [{ id: 'sso-entra', name: 'Microsoft', preset: 'entra' }, { id: 'sso-google', name: 'Google', preset: 'google' }], sso_required: opts.ssoRequired ?? false });
+		if (path === '/settings/sso')
+			return json({
+				redirect_uri: 'https://rmm.northwind.example/api/auth/sso/callback',
+				sso_required: false,
+				break_glass: [{ id: 'u-1', email: 'dana@northwind.example', name: 'Dana Admin' }],
+				providers: [
+					{
+						id: 'sso-entra', name: 'Microsoft', preset: 'entra', issuer: 'https://login.microsoftonline.com/6b1c0c1e-9a51-4c0e-b6c9-0a4de1f3a111/v2.0',
+						client_id: '3f2a1c9e-77aa-4c2c-9d1e-5b0e8c4d2a10', has_secret: true, scopes: 'openid email profile', enabled: true, groups_claim: 'groups', jit: true,
+						group_sync: true, default_role: null, allowed_domains: ['northwind.example'], allowed_tenants: [], trust_email: true, identities: 6,
+						maps: [
+							{ group_value: '0b8d1f64-2e7a-4a53-9c1b-6f1d3a7e9c02', role: 'admin', extra_permissions: [], all_clients: true, client_ids: [] },
+							{ group_value: '7c2e5a90-1b44-4d8e-a3f6-2d9b8e4c1f33', role: 'technician', extra_permissions: ['billing.read'], all_clients: false, client_ids: ['c-acme'] }
+						]
+					},
+					{
+						id: 'sso-google', name: 'Google', preset: 'google', issuer: 'https://accounts.google.com', client_id: '812345678901-abc.apps.googleusercontent.com',
+						has_secret: true, scopes: 'openid email profile', enabled: false, groups_claim: 'groups', jit: false, group_sync: false, default_role: null,
+						allowed_domains: [], allowed_tenants: [], trust_email: false, identities: 0, maps: []
+					}
+				]
+			});
 		if (path === '/auth/sessions') return json([{ id: 'x1', created_at: ago(600), last_seen_at: ago(0), expires_at: ago(-6000), user_agent: 'Mozilla/5.0 (X11; Linux x86_64) Chrome/140.0', current: true }]);
 		if (path.match(/^\/sites\/[^/]+\/enrollment-tokens$/)) return json([{ id: 't1', label: 'Office rollout', max_uses: 50, uses: 12, expires_at: ago(-60 * 24 * 20), created_at: ago(60 * 24 * 10), category_id: null, category_name: null }, { id: 't2', label: 'Warehouse tills', max_uses: null, uses: 3, expires_at: null, created_at: ago(60 * 24 * 4), category_id: 'cat-kiosk', category_name: 'Kiosks' }]);
 		if (path === '/alerts/summary') return json(alertSummary(q.get('client_id')));

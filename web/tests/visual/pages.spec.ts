@@ -78,6 +78,7 @@ const pages: [string, string][] = [
 	['audit', '/audit'],
 	['settings', '/settings'],
 	['users', '/settings/users'],
+	['settings-sso', '/settings/sso'],
 	['account', '/account'],
 	['tickets', '/tickets'],
 	['tickets-triage', '/tickets?view=triage'],
@@ -179,6 +180,54 @@ for (const theme of ['light', 'dark'] as const) {
 			await page.goto('/login');
 			await settle(page);
 			await expect(page).toHaveScreenshot(`${theme}-login.png`);
+		});
+
+		test('login with SSO required', async ({ page }) => {
+			await mockApi(page, { signedIn: false, ssoRequired: true });
+			await page.goto('/login?sso_error=not_allowed');
+			await page.getByRole('link', { name: 'Sign in with Microsoft' }).waitFor();
+			await settle(page);
+			await expect(page).toHaveScreenshot(`${theme}-login-sso-required.png`);
+			await page.getByRole('button', { name: /Use a password/ }).click();
+			await expect(page.getByLabel('Password')).toBeVisible();
+			const r = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa']).analyze();
+			expect(r.violations.filter((v) => v.impact === 'serious' || v.impact === 'critical').map((v) => v.id)).toEqual([]);
+		});
+
+		test('login second factor with a passkey', async ({ page }) => {
+			await mockApi(page, { signedIn: false });
+			await page.route('**/api/auth/login', (route) =>
+				route.fulfill({ status: 401, contentType: 'application/json', body: JSON.stringify({ error: 'two-factor code required', mfa_required: true, methods: { totp: true, passkey: true } }) })
+			);
+			await page.goto('/login');
+			await page.getByLabel('Email').fill('dana@northwind.example');
+			await page.getByLabel('Password').fill('correct horse battery');
+			await page.getByRole('button', { name: 'Sign in', exact: true }).click();
+			await page.getByRole('button', { name: 'Use a passkey' }).waitFor();
+			await settle(page);
+			await expect(page).toHaveScreenshot(`${theme}-login-passkey.png`);
+			const r = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa']).analyze();
+			expect(r.violations.filter((v) => v.impact === 'serious' || v.impact === 'critical').map((v) => v.id)).toEqual([]);
+		});
+
+		test('SSO provider form and group mappings', async ({ page }) => {
+			await mockApi(page);
+			await page.goto('/settings/sso');
+			await settle(page);
+			await page.getByRole('button', { name: 'Add provider' }).click();
+			await page.getByRole('dialog').getByLabel('Button label').fill('Contoso Entra');
+			await page.getByRole('dialog').getByLabel('Tenant').fill('organizations');
+			await page.getByRole('dialog').getByText('Allowed tenants').waitFor();
+			await expect(page).toHaveScreenshot(`${theme}-sso-provider-form.png`);
+			let r = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa']).analyze();
+			expect(r.violations.filter((v) => v.impact === 'serious' || v.impact === 'critical').map((v) => v.id)).toEqual([]);
+			await page.getByRole('button', { name: 'Cancel' }).click();
+			await page.getByRole('button', { name: 'Group mappings for Microsoft' }).click();
+			await page.getByRole('dialog').getByText('Clients and extra permissions').first().click();
+			await expect(page.getByRole('dialog').getByLabel('Group').first()).toHaveValue('0b8d1f64-2e7a-4a53-9c1b-6f1d3a7e9c02');
+			await expect(page).toHaveScreenshot(`${theme}-sso-mappings.png`);
+			r = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa']).analyze();
+			expect(r.violations.filter((v) => v.impact === 'serious' || v.impact === 'critical').map((v) => v.id)).toEqual([]);
 		});
 
 		test('command palette', async ({ page }) => {
