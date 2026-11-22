@@ -16,6 +16,7 @@ mod notify;
 mod paging;
 mod patches;
 mod ratelimit;
+mod rotate;
 mod scheduler;
 mod crypto;
 mod csat;
@@ -76,6 +77,14 @@ enum Cmd {
     Reset2fa {
         #[arg(long)]
         email: String,
+    },
+    /// Replace RMM_DATA_KEY: re-encrypt everything sealed with it under a new key, in one
+    /// transaction. Stop the server first. The keys come from the environment (never the
+    /// command line): RMM_DATA_KEY_NEW, and RMM_DATA_KEY_OLD (default: RMM_DATA_KEY).
+    RotateDataKey {
+        /// Count what would change and check that the old key opens everything; write nothing.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -228,6 +237,17 @@ async fn main() -> Result<()> {
             tx.commit().await?;
             auth::audit(&db, None, "user.mfa_reset", Some(("user", id)), serde_json::json!({ "via": "cli" })).await;
             println!("two-factor auth removed for {email}; they will be asked to set it up again if required");
+            Ok(())
+        }
+        Cmd::RotateDataKey { dry_run } => {
+            let (old, new) = rotate::keys_from_env()?;
+            let report = rotate::rotate(&db, old.as_ref(), &new, dry_run).await?;
+            if dry_run {
+                println!("dry run, nothing written:\n{report}");
+            } else {
+                auth::audit(&db, None, "system.data_key_rotated", None, rotate::audit_details(&report)).await;
+                println!("RMM_DATA_KEY rotated:\n{report}\nSet RMM_DATA_KEY to the new key and start the server.");
+            }
             Ok(())
         }
         Cmd::Serve(args) => serve(db, args).await,

@@ -172,7 +172,7 @@ secret. Password, notes and TOTP secret are sealed. Changing a password moves th
 - Deleting a client deletes its key row, which makes any leftover ciphertext (backups aside) unreadable.
 - Without `RMM_DATA_KEY` every vault endpoint answers 409 "the vault needs RMM_DATA_KEY to be set
   on the server" and the UI says so. At startup, wrapped keys with no `RMM_DATA_KEY` log a warning.
-- Rotating `RMM_DATA_KEY` only needs the wrapped keys rewrapped. Not built here.
+- Rotating `RMM_DATA_KEY` only needs the wrapped keys rewrapped: `rmm-server rotate-data-key` does that (with everything else sealed under the key), in one transaction. No item is touched.
 
 ### Access
 
@@ -282,7 +282,6 @@ ticket page and the docs tab.
 - Ticking task-list boxes while reading (they're read-only; edit the page).
 - Sharing credentials with portal users, browser extensions, autofill, importing from other vaults.
 - An MSP-wide (not per-client) vault.
-- A `RMM_DATA_KEY` rotation command.
 - Full-text search across documents and adding documents or credentials to the command palette.
 - Bulk export of a client's documents.
 
