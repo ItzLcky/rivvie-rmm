@@ -12,21 +12,6 @@ back, restore the backup taken before the upgrade (see
 
 ## [Unreleased]
 
-### Added
-
-- **Network discovery and SNMP monitoring.** Each site chooses a designated agent. It scans its
-  network (private ranges only, bounded) with ICMP where permitted, TCP probes, the neighbour
-  table, reverse DNS, mDNS and SNMP `sysDescr`, and the dashboard lists what it finds under
-  **Network**: hosts matched to agents by MAC or IP, and an unmanaged list with ignore, mark as
-  known, monitor and deploy-an-agent actions. The same agent reads switches, routers, firewalls,
-  printers, UPSes and NAS boxes over SNMP v2c and v3 (our own pure-Rust client: MD5, SHA-1 and
-  SHA-2 authentication, DES and AES privacy): uptime, interface status and traffic, CPU, memory,
-  disks, toner. Charts, hourly rollups, three alert kinds (device down, interface down,
-  threshold) set up in policies, four read operations in the public API under a new `network`
-  scope. SNMP credentials are per client, sealed under `RMM_DATA_KEY` (and resealed by
-  `rotate-data-key`), and never shown again. Migration `0033`. See
-  [docs/design/network.md](docs/design/network.md).
-
 ## [0.2.0] - Unreleased
 
 The first release since agent self-update shipped. Everything below is new since `v0.1.1`.
