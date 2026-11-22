@@ -2626,7 +2626,7 @@ dependencies = [
 
 [[package]]
 name = "rmm-agent"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2664,7 +2664,7 @@ dependencies = [
 
 [[package]]
 name = "rmm-content"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aho-corasick",
  "chrono",
@@ -2680,7 +2680,7 @@ dependencies = [
 
 [[package]]
 name = "rmm-loadgen"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2702,7 +2702,7 @@ dependencies = [
 
 [[package]]
 name = "rmm-proto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "rmp-serde",
@@ -2715,7 +2715,7 @@ dependencies = [
 
 [[package]]
 name = "rmm-scan"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "boreal",
  "bzip2",
@@ -2737,7 +2737,7 @@ dependencies = [
 
 [[package]]
 name = "rmm-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -2787,7 +2787,7 @@ dependencies = [
 
 [[package]]
 name = "rmm-sign"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
