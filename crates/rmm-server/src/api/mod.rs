@@ -47,6 +47,8 @@ mod time;
 mod tools;
 mod totp;
 pub(crate) mod users;
+mod audit;
+mod siem;
 mod vault;
 mod views;
 mod webhooks;
@@ -91,6 +93,9 @@ pub fn router(attachment_max: u64) -> Router<Arc<AppState>> {
         .route("/api-keys/{id}", delete(apikeys::revoke))
         .route("/service-accounts", get(apikeys::service_accounts).post(apikeys::create_service_account))
         .route("/service-accounts/{id}", delete(apikeys::remove_service_account))
+        .route("/siem/destinations", get(siem::list).post(siem::create))
+        .route("/siem/destinations/{id}", axum::routing::put(siem::update).delete(siem::remove))
+        .route("/siem/destinations/{id}/test", post(siem::test))
         .route("/webhooks", get(webhooks::list).post(webhooks::create))
         .route("/webhooks/{id}", axum::routing::put(webhooks::update).delete(webhooks::remove))
         .route("/webhooks/{id}/rotate-secret", post(webhooks::rotate_secret))
@@ -217,7 +222,8 @@ pub fn router(attachment_max: u64) -> Router<Arc<AppState>> {
         .route("/users/{id}/sso-exempt", axum::routing::put(sso::set_exempt))
         .route("/users/{id}/sessions", get(users::sessions).delete(users::revoke_sessions))
         .route("/users/{id}/sessions/{sid}", delete(users::revoke_session))
-        .route("/audit", get(users::audit_log))
+        .route("/audit", get(audit::list))
+        .route("/audit/export", get(audit::export))
         .route("/settings", get(settings::get).put(settings::update))
         .route("/settings/public", get(settings::public))
         .route("/settings/sso", get(sso::settings).put(sso::set_required))

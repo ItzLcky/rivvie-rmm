@@ -1186,6 +1186,11 @@ const webhookDeliveries = [
 	{ id: 6, delivery_id: '91e3f7a2-0c4b-4d18-a6e5-5d2b8c7f1a03', event: 'ticket.created', status: 'sent', attempts: 1, response_status: 204, duration_ms: 87, last_error: null, created_at: ago(60 * 7), sent_at: ago(60 * 7), next_attempt_at: ago(60 * 7) },
 	{ id: 5, delivery_id: '5d6a0f19-3e8c-4c72-9b41-e0a7c2d8b6f5', event: 'ping', status: 'sent', attempts: 1, response_status: 200, duration_ms: 64, last_error: null, created_at: ago(60 * 24), sent_at: ago(60 * 24), next_attempt_at: ago(60 * 24) }
 ];
+const siemDestinations = [
+	{ id: 'sd-1', name: 'Splunk (HEC)', kind: 'https', address: 'https://splunk.northwind.example:8088/services/collector/event', framing: 'octet', https_format: 'splunk_hec', has_token: true, ca_pem: null, facility: 13, send_audit: true, send_detections: true, send_alerts: true, enabled: true, consecutive_failures: 0, next_attempt_at: ago(1), last_attempt_at: ago(1), last_success_at: ago(1), last_error: null, sent_total: 18432, dropped_total: 0, pending: 0, created_at: ago(60 * 24 * 12) },
+	{ id: 'sd-2', name: 'Graylog (TLS)', kind: 'syslog_tls', address: 'logs.northwind.example:6514', framing: 'octet', https_format: 'generic', has_token: false, ca_pem: '-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----', facility: 13, send_audit: true, send_detections: false, send_alerts: false, enabled: true, consecutive_failures: 6, next_attempt_at: ago(-9), last_attempt_at: ago(2), last_success_at: ago(60 * 3), last_error: 'TLS handshake: invalid peer certificate: UnknownIssuer', sent_total: 912, dropped_total: 0, pending: 241, created_at: ago(60 * 24 * 4) },
+	{ id: 'sd-3', name: 'Lab syslog (paused)', kind: 'syslog_udp', address: '10.0.0.40:514', framing: 'octet', https_format: 'generic', has_token: false, ca_pem: null, facility: 16, send_audit: true, send_detections: false, send_alerts: true, enabled: false, consecutive_failures: 0, next_attempt_at: ago(60 * 24), last_attempt_at: null, last_success_at: null, last_error: null, sent_total: 0, dropped_total: 0, pending: 0, created_at: ago(60 * 24 * 2) }
+];
 const openapi = {
 	openapi: '3.1.0',
 	info: { title: 'RMM API', version: '1.0.0', description: 'Authenticate with an API key.' },
@@ -1422,6 +1427,7 @@ export async function mockApi(p: Page, opts: { signedIn?: boolean; ssoRequired?:
 		if (path === '/api-keys') return json(q.get('all') ? allApiKeys : apiKeys);
 		if (path === '/api-keys/options') return json({ groups: [{ id: 'clients', label: 'Clients and sites' }, { id: 'agents', label: 'Agents, inventory and metrics' }, { id: 'jobs', label: 'Jobs and results' }, { id: 'scripts', label: 'Script library' }, { id: 'alerts', label: 'Alerts' }, { id: 'tickets', label: 'Tickets' }, { id: 'security', label: 'Endpoint protection (needs the security.read permission)' }], permissions: admin.permissions, can_write: true, default_rate_limit: 600 });
 		if (path === '/service-accounts') return json(serviceAccounts);
+		if (path === '/siem/destinations') return json({ destinations: siemDestinations, retain_days: 7 });
 		if (path === '/webhooks') return json({ webhooks, events: webhookEvents });
 		if ((m = path.match(/^\/webhooks\/([^/]+)\/deliveries$/))) return json(q.get('status') ? webhookDeliveries.filter((d) => d.status === q.get('status')) : webhookDeliveries);
 		if (path === '/openapi.json') return json(openapi);

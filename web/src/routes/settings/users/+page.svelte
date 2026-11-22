@@ -112,10 +112,11 @@
 		{ value: 'billing.manage', label: 'Manage billing', hint: 'Contracts, products, rates, invoice runs and accounting' },
 		{ value: 'time.approve', label: 'Approve time', hint: 'Approve and reject timesheets' },
 		{ value: 'vault.read', label: 'See passwords', hint: 'Reveal vault passwords and notes, show TOTP codes. Needs two-factor authentication.' },
-		{ value: 'vault.manage', label: 'Manage passwords', hint: 'Add, change and delete vault credentials. Needs two-factor authentication.' }
+		{ value: 'vault.manage', label: 'Manage passwords', hint: 'Add, change and delete vault credentials. Needs two-factor authentication.' },
+		{ value: 'audit.read', label: 'Audit log', hint: 'Read and export the audit log, in the dashboard and through API keys' }
 	];
 	const roleDefaults: Record<string, string[]> = {
-		admin: ['security.read', 'security.respond', 'security.manage', 'billing.read', 'billing.manage', 'time.approve', 'vault.read', 'vault.manage'],
+		admin: ['security.read', 'security.respond', 'security.manage', 'billing.read', 'billing.manage', 'time.approve', 'vault.read', 'vault.manage', 'audit.read'],
 		technician: ['security.read', 'security.respond', 'vault.read', 'vault.manage'],
 		readonly: ['security.read']
 	};

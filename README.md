@@ -759,7 +759,7 @@ Design: [docs/design/api.md](docs/design/api.md).
   also create **service accounts** (users that can't sign in) and their keys under Company settings → API.
   The key is shown once (only a hash is stored). **A key acts as its owner and never with more**: it has
   read or write access, one or more scopes (`clients`, `agents`, `jobs`, `scripts`, `alerts`, `tickets`,
-  `security`), only the named permissions it lists (and its owner holds), optionally a subset of clients,
+  `security`, `audit`), only the named permissions it lists (and its owner holds), optionally a subset of clients,
   an expiry and a rate limit per minute (HTTP 429 over it). The owner's rights are checked on every
   request, so demoting or disabling the owner narrows or kills their keys at once. Keys can't use the
   agent socket, shell or desktop relays, the vault, users, settings, billing or key management, and
@@ -776,6 +776,25 @@ Design: [docs/design/api.md](docs/design/api.md).
   Postgres outbox, written in the transaction that changed the ticket, retried after 1, 5, 30 and 120
   minutes with identical bytes, and logged in the dashboard (HTTP status, duration, error, *Send again*).
   Internal notes are only sent when a subscription asks for them.
+
+### Audit log, export and the SIEM stream
+
+Design: [docs/design/audit-siem.md](docs/design/audit-siem.md).
+
+- **Export:** the Audit log page (admins, or anyone holding the `audit.read` permission) downloads
+  everything matching the current filters as CSV or JSON Lines, streamed (the table is never
+  buffered). Every export is itself audited (`audit.export`). With an API key that has the `audit`
+  scope and the `audit.read` permission: `GET /api/v1/audit/export?format=jsonl&from=…&to=…`.
+- **SIEM stream** (Company settings → SIEM, admins): send the audit log, and optionally security
+  detections and alerts, to syslog over UDP, TCP or TLS (RFC 5424; octet counting per RFC 6587 and
+  RFC 5425) or to an HTTPS endpoint (generic JSON with a bearer token, or Splunk HEC). Events go
+  through a Postgres outbox written in the transaction that wrote them, so nothing is lost across
+  a restart or an outage: a failing destination backs off (5 s doubling to 15 min), its status and
+  last error are on the page, there is a Test button, and events not delivered for 7 days are
+  dropped (and counted). Delivery is at least once; every event carries its audit `id`.
+  Destination tokens are sealed with `RMM_DATA_KEY`.
+- IMAP and SMTP passwords and webhook channel secrets are sealed with `RMM_DATA_KEY` too (they used
+  to be stored in the clear): existing values are sealed at the first start with a key set.
 
 ## Remote desktop
 

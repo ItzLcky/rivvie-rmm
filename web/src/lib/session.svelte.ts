@@ -38,7 +38,8 @@ export type Permission =
 	| 'billing.manage'
 	| 'time.approve'
 	| 'vault.read'
-	| 'vault.manage';
+	| 'vault.manage'
+	| 'audit.read';
 
 /** Holds a named permission (the server sends the effective set; older servers: role defaults). */
 export function allowed(perm: Permission): boolean {

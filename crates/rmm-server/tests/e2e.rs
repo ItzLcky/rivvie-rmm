@@ -1238,6 +1238,8 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
     assert_eq!(limited, Some(20));
 
     observability(&url, dir).await;
+    // After the counters are checked: it restarts the server.
+    audit_export_siem_sealing(server, &admin, &tech, db).await;
     // Last but the drill: it restarts the server, which would reset the counters checked above.
     key_rotation(server, &admin, db, &secret, a_id, all).await;
     if let Ok(path) = std::env::var("RMM_E2E_DRILL") {
@@ -1306,6 +1308,10 @@ const SEALED: &[(&str, &str, &str)] = &[
     ("security_detections", "context", "context_encrypted"),
     ("sso_providers", "client_secret", "secret_sealed"),
     ("webhook_subscriptions", "secret", "secret_sealed"),
+    ("mailboxes", "imap_password_enc", "imap_password_sealed"),
+    ("company_settings", "smtp_password_enc", "smtp_password_sealed"),
+    ("notification_channels", "secret", "secret_sealed"),
+    ("siem_destinations", "token", "token_sealed"),
 ];
 
 async fn sealed_values(db: &sqlx::PgPool) -> Vec<(&'static str, Vec<u8>)> {
@@ -1356,6 +1362,9 @@ async fn key_rotation(server: &mut Server, admin: &Api, db: &sqlx::PgPool, admin
         assert!(tables_before.contains("security_detections"), "detection context to rotate: {tables_before:?}");
     }
     assert!(tables_before.contains("sso_providers") && tables_before.contains("webhook_subscriptions"), "SSO and webhook secrets to rotate: {tables_before:?}");
+    for t in ["mailboxes", "company_settings", "notification_channels", "siem_destinations"] {
+        assert!(tables_before.contains(t), "{t} has a credential to rotate: {tables_before:?}");
+    }
     println!("key rotation: sealed values in {tables_before:?}");
     assert!(before.iter().all(|(_, v)| opens_with(&old_key, v) && !opens_with(&new_key, v)));
     let wrapped_before = wrapped().await;
@@ -1443,6 +1452,532 @@ async fn key_rotation(server: &mut Server, admin: &Api, db: &sqlx::PgPool, admin
     admin.call(reqwest::Method::DELETE, &format!("/vault/{item_id}"), None).await;
     admin.call(reqwest::Method::DELETE, &format!("/vault/{}", fresh["id"].as_str().unwrap()), None).await;
     println!("key rotation: ok");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Audit export, the SIEM stream, and credentials sealed at rest (docs/design/audit-siem.md)
+// ---------------------------------------------------------------------------------------------
+
+type Datagrams = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+/// A syslog UDP listener: every datagram, as text.
+async fn udp_sink() -> (u16, Datagrams) {
+    let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let port = sock.local_addr().unwrap().port();
+    let got: Datagrams = Default::default();
+    let store = got.clone();
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 65536];
+        while let Ok((n, _)) = sock.recv_from(&mut buf).await {
+            store.lock().unwrap().push(String::from_utf8_lossy(&buf[..n]).into_owned());
+        }
+    });
+    (port, got)
+}
+
+/// Messages out of a stream of RFC 6587 octet-counted (`<len> <msg>`) or newline-delimited frames.
+fn syslog_frames(buf: &mut Vec<u8>) -> Vec<String> {
+    let mut out = Vec::new();
+    loop {
+        if buf.first().is_some_and(u8::is_ascii_digit) {
+            let Some(sp) = buf.iter().position(|b| *b == b' ') else { break };
+            let len: usize = String::from_utf8_lossy(&buf[..sp]).parse().expect("an octet count");
+            if buf.len() < sp + 1 + len {
+                break;
+            }
+            out.push(String::from_utf8_lossy(&buf[sp + 1..sp + 1 + len]).into_owned());
+            buf.drain(..sp + 1 + len);
+        } else if let Some(nl) = buf.iter().position(|b| *b == b'\n') {
+            out.push(String::from_utf8_lossy(&buf[..nl]).into_owned());
+            buf.drain(..=nl);
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+/// A syslog TCP listener (on `port`, or a free one): the messages of every connection.
+async fn tcp_sink(port: u16) -> (u16, Datagrams) {
+    use tokio::io::AsyncReadExt;
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let got: Datagrams = Default::default();
+    let store = got.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else { return };
+            let store = store.clone();
+            tokio::spawn(async move {
+                let (mut pending, mut chunk) = (Vec::new(), vec![0u8; 16384]);
+                while let Ok(n) = sock.read(&mut chunk).await {
+                    if n == 0 {
+                        break;
+                    }
+                    pending.extend_from_slice(&chunk[..n]);
+                    store.lock().unwrap().extend(syslog_frames(&mut pending));
+                }
+            });
+        }
+    });
+    (port, got)
+}
+
+/// The JSON part of an RFC 5424 message, after checking the header.
+fn syslog_json(msg: &str) -> (String, Value) {
+    let sd = msg.find(" [rmm@32473 ").unwrap_or_else(|| panic!("no structured data: {msg}"));
+    let header = &msg[..sd];
+    let end = msg[sd..].find("] {").unwrap_or_else(|| panic!("no JSON message: {msg}")) + sd;
+    (header.to_string(), serde_json::from_str(&msg[end + 2..]).unwrap_or_else(|e| panic!("{e}: {msg}")))
+}
+
+async fn wait_syslog(got: &Datagrams, what: &str, pred: impl Fn(&Value) -> bool) -> (String, Value) {
+    eventually(30, what, || async {
+        got.lock().unwrap().iter().filter(|m| m.contains("[rmm@32473 ")).map(|m| syslog_json(m)).find(|(_, v)| pred(v))
+    })
+    .await
+}
+
+async fn siem_destination(admin: &Api, id: &str) -> Value {
+    admin.get("/siem/destinations").await["destinations"].as_array().unwrap().iter().find(|d| d["id"] == id).cloned().unwrap_or_else(|| panic!("destination {id}"))
+}
+
+/// A stand-in IMAP server: greets, records the LOGIN line, refuses it.
+async fn imap_login_sink() -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let logins: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+    let store = logins.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((sock, _)) = listener.accept().await else { return };
+            let store = store.clone();
+            tokio::spawn(async move {
+                let (r, mut w) = sock.into_split();
+                let _ = w.write_all(b"* OK stand-in IMAP ready\r\n").await;
+                let mut lines = BufReader::new(r).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let tag = line.split(' ').next().unwrap_or("a").to_string();
+                    if line.to_ascii_uppercase().contains(" LOGIN ") {
+                        store.lock().unwrap().push(line.clone());
+                        let _ = w.write_all(format!("{tag} NO [AUTHENTICATIONFAILED] refused\r\n").as_bytes()).await;
+                    } else {
+                        let _ = w.write_all(format!("{tag} OK\r\n").as_bytes()).await;
+                    }
+                }
+            });
+        }
+    });
+    (port, logins)
+}
+
+/// An SMTP server that offers AUTH and records the credentials (AUTH PLAIN, or LOGIN's two lines).
+async fn smtp_auth_sink() -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    use data_encoding::BASE64;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let creds: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+    let store = creds.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((sock, _)) = listener.accept().await else { return };
+            let store = store.clone();
+            tokio::spawn(async move {
+                let (r, mut w) = sock.into_split();
+                let mut lines = BufReader::new(r).lines();
+                let _ = w.write_all(b"220 auth-sink ESMTP\r\n").await;
+                let (mut in_data, mut login_step) = (false, 0);
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let decoded = |b: &str| String::from_utf8_lossy(&BASE64.decode(b.trim().as_bytes()).unwrap_or_default()).replace('\0', "|");
+                    let upper = line.to_ascii_uppercase();
+                    let reply: Vec<u8> = if in_data {
+                        if line == "." {
+                            in_data = false;
+                            b"250 queued\r\n".to_vec()
+                        } else {
+                            continue;
+                        }
+                    } else if login_step == 1 {
+                        store.lock().unwrap().push(format!("user:{}", decoded(&line)));
+                        login_step = 2;
+                        b"334 UGFzc3dvcmQ6\r\n".to_vec()
+                    } else if login_step == 2 {
+                        store.lock().unwrap().push(format!("pass:{}", decoded(&line)));
+                        login_step = 0;
+                        b"235 ok\r\n".to_vec()
+                    } else if upper.starts_with("EHLO") {
+                        b"250-auth-sink\r\n250 AUTH PLAIN LOGIN\r\n".to_vec()
+                    } else if upper.starts_with("AUTH PLAIN") {
+                        let initial = line[10..].trim();
+                        store.lock().unwrap().push(format!("plain:{}", decoded(initial)));
+                        b"235 ok\r\n".to_vec()
+                    } else if upper.starts_with("AUTH LOGIN") {
+                        login_step = 1;
+                        b"334 VXNlcm5hbWU6\r\n".to_vec()
+                    } else if upper.starts_with("DATA") {
+                        in_data = true;
+                        b"354 go\r\n".to_vec()
+                    } else if upper.starts_with("QUIT") {
+                        let _ = w.write_all(b"221 bye\r\n").await;
+                        break;
+                    } else {
+                        b"250 ok\r\n".to_vec()
+                    };
+                    if w.write_all(&reply).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    (port, creds)
+}
+
+/// The audit log export (CSV and JSON Lines, filters, streaming, permissions, the public API),
+/// the SIEM stream (syslog over UDP and TCP, HTTPS with a token, outbox across an outage and a
+/// restart, the test button), and the credentials that used to be stored in the clear.
+async fn audit_export_siem_sealing(server: &mut Server, admin: &Api, tech: &Api, db: &sqlx::PgPool) {
+    use reqwest::Method;
+    let url = server.url();
+    let export = |query: String| async move { admin.http.get(format!("{}/audit/export{query}", admin.base)).send().await.unwrap() };
+
+    // --- export: CSV and JSON Lines ------------------------------------------------------------------
+    let client = admin.post("/clients", json!({ "name": "Export, \"Quoted\" Co" })).await;
+    let res = export("?format=csv".into()).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert!(res.headers()["content-type"].to_str().unwrap().starts_with("text/csv"));
+    assert!(res.headers()["content-disposition"].to_str().unwrap().starts_with("attachment; filename=\"audit-"));
+    let csv = res.text().await.unwrap();
+    assert!(csv.starts_with("id,time,user_id,user_email,user_name,action,target_type,target_id,details\r\n"), "{}", &csv[..80.min(csv.len())]);
+    let created = csv.lines().find(|l| l.contains(",client.create,") && l.contains("Quoted")).expect("the client.create row");
+    assert!(created.contains(ADMIN_EMAIL) && created.contains("\"{\"\"name\"\":"), "quoting: {created}");
+    let (total,): (i64,) = sqlx::query_as("SELECT count(*) FROM audit_log").fetch_one(db).await.unwrap();
+    assert!(csv.lines().count() as i64 > total / 2 && csv.lines().count() as i64 <= total + 1, "{} lines, {total} rows", csv.lines().count());
+    let first_id: i64 = csv.lines().nth(1).unwrap().split(',').next().unwrap().parse().unwrap();
+    let (min_id,): (i64,) = sqlx::query_as("SELECT min(id) FROM audit_log").fetch_one(db).await.unwrap();
+    assert_eq!(first_id, min_id, "oldest first");
+
+    let res = export("?format=jsonl&action=client.".into()).await;
+    assert!(res.headers()["content-type"].to_str().unwrap().starts_with("application/x-ndjson"));
+    let rows: Vec<Value> = res.text().await.unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let (clients,): (i64,) = sqlx::query_as("SELECT count(*) FROM audit_log WHERE action LIKE 'client.%'").fetch_one(db).await.unwrap();
+    assert_eq!(rows.len() as i64, clients, "the action prefix filter");
+    assert!(rows.iter().all(|r| r["action"].as_str().unwrap().starts_with("client.")));
+    assert!(rows.iter().any(|r| r["details"]["name"] == "Export, \"Quoted\" Co" && r["user_email"] == ADMIN_EMAIL));
+    let body = export("?format=jsonl&to=2001-01-01T00:00:00Z".into()).await.text().await.unwrap();
+    assert!(body.is_empty(), "nothing before 2001: {body}");
+    let body = export(format!("?format=jsonl&from=2001-01-01T00:00:00Z&target_id={}", client["id"].as_str().unwrap())).await.text().await.unwrap();
+    assert!(body.lines().count() >= 1 && body.lines().all(|l| serde_json::from_str::<Value>(l).unwrap()["target_id"] == client["id"]));
+    assert_eq!(export("?format=xml".into()).await.status(), StatusCode::BAD_REQUEST);
+    // The export is itself audited, with its filters.
+    let exports: Vec<Value> = sqlx::query_scalar("SELECT details FROM audit_log WHERE action = 'audit.export' ORDER BY id").fetch_all(db).await.unwrap();
+    assert!(exports.len() >= 4 && exports.iter().any(|d| d["format"] == "jsonl" && d["action"] == "client." && d["via"] == "session"), "{exports:?}");
+
+    // A big one streams: 25,000 rows come out complete (and in chunks).
+    sqlx::query("INSERT INTO audit_log (action, details) SELECT 'e2e.bulk', jsonb_build_object('n', g, 'pad', repeat('x', 200)) FROM generate_series(1, 25000) g")
+        .execute(db)
+        .await
+        .unwrap();
+    let res = export("?format=csv&action=e2e.bulk".into()).await;
+    let bytes = res.bytes().await.unwrap();
+    assert!(bytes.len() > 5_000_000, "{} bytes", bytes.len());
+    assert_eq!(String::from_utf8_lossy(&bytes).lines().count(), 25_001);
+    sqlx::query("DELETE FROM audit_log WHERE action = 'e2e.bulk'").execute(db).await.unwrap();
+
+    // --- who may export, and the public API ---------------------------------------------------------------
+    assert_eq!(tech.call(Method::GET, "/audit/export", None).await.0, StatusCode::FORBIDDEN, "technicians can't export");
+    assert_eq!(tech.call(Method::GET, "/audit", None).await.0, StatusCode::FORBIDDEN);
+    let v1 = format!("{url}/api/v1");
+    let with_key = |token: String, path: String| {
+        let v1 = v1.clone();
+        async move {
+            let res = reqwest::Client::new().get(format!("{v1}{path}")).bearer_auth(token).send().await.unwrap();
+            (res.status(), res.text().await.unwrap())
+        }
+    };
+    let key = admin.post("/api-keys", json!({ "name": "e2e audit", "access": "read", "scopes": ["audit"], "permissions": ["audit.read"] })).await["token"].as_str().unwrap().to_string();
+    let (s, text) = with_key(key.clone(), "/audit/export?format=jsonl&action=client.".into()).await;
+    assert_eq!(s, StatusCode::OK, "{text}");
+    assert!(text.lines().count() as i64 >= clients && text.lines().all(|l| serde_json::from_str::<Value>(l).is_ok()));
+    let (s, text) = with_key(key.clone(), "/audit?limit=2".into()).await;
+    assert_eq!(s, StatusCode::OK, "{text}");
+    assert_eq!(serde_json::from_str::<Value>(&text).unwrap()["items"].as_array().unwrap().len(), 2);
+    let (s, _) = with_key(key.clone(), "/agents".into()).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "the key holds only the audit scope");
+    let no_perm = admin.post("/api-keys", json!({ "name": "e2e audit, no permission", "access": "read", "scopes": ["audit"] })).await["token"].as_str().unwrap().to_string();
+    assert_eq!(with_key(no_perm, "/audit/export".into()).await.0, StatusCode::FORBIDDEN, "the scope alone isn't enough");
+    let spec: Value = reqwest::get(format!("{url}/api/v1/openapi.json")).await.unwrap().json().await.unwrap();
+    assert_eq!(spec["paths"]["/audit/export"]["get"]["operationId"], "exportAudit");
+    println!("audit export: ok");
+
+    // --- SIEM: validation ---------------------------------------------------------------------------------
+    let (udp_port, udp) = udp_sink().await;
+    let (tcp_port, tcp) = tcp_sink(0).await;
+    let dest = |body: Value| async move { admin.call(Method::POST, "/siem/destinations", Some(body)).await };
+    for (what, body) in [
+        ("unknown kind", json!({ "name": "x", "kind": "carrier_pigeon", "address": "127.0.0.1:1" })),
+        ("no address", json!({ "name": "x", "kind": "syslog_udp", "address": "" })),
+        ("a URL for syslog", json!({ "name": "x", "kind": "syslog_tcp", "address": "http://x/y" })),
+        ("bad URL", json!({ "name": "x", "kind": "https", "address": "ftp://x" })),
+        ("nothing to send", json!({ "name": "x", "kind": "syslog_udp", "address": "127.0.0.1:1", "send_audit": false })),
+        ("a token for syslog", json!({ "name": "x", "kind": "syslog_udp", "address": "127.0.0.1:1", "token": "t" })),
+        ("a CA for UDP", json!({ "name": "x", "kind": "syslog_udp", "address": "127.0.0.1:1", "ca_pem": "-----BEGIN CERTIFICATE-----" })),
+        ("a bad facility", json!({ "name": "x", "kind": "syslog_udp", "address": "127.0.0.1:1", "facility": 99 })),
+    ] {
+        assert_eq!(dest(body).await.0, StatusCode::BAD_REQUEST, "{what}");
+    }
+    assert_eq!(tech.call(Method::GET, "/siem/destinations", None).await.0, StatusCode::FORBIDDEN);
+
+    // --- SIEM: syslog over UDP and TCP ----------------------------------------------------------------------
+    let (s, u) = dest(json!({ "name": "e2e udp", "kind": "syslog_udp", "address": format!("127.0.0.1:{udp_port}"), "send_detections": true, "send_alerts": true })).await;
+    assert_eq!(s, StatusCode::OK, "{u}");
+    let udp_id = u["id"].as_str().unwrap().to_string();
+    let (s, t) = dest(json!({ "name": "e2e tcp", "kind": "syslog_tcp", "address": format!("127.0.0.1:{tcp_port}") })).await;
+    assert_eq!(s, StatusCode::OK, "{t}");
+    let tcp_id = t["id"].as_str().unwrap().to_string();
+    assert_eq!(dest(json!({ "name": "E2E UDP", "kind": "syslog_udp", "address": "127.0.0.1:9" })).await.0, StatusCode::OK, "names are case sensitive");
+    assert_eq!(dest(json!({ "name": "e2e udp", "kind": "syslog_udp", "address": "127.0.0.1:9" })).await.0, StatusCode::CONFLICT);
+    let extra = admin.get("/siem/destinations").await["destinations"].as_array().unwrap().iter().find(|d| d["name"] == "E2E UDP").unwrap()["id"].as_str().unwrap().to_string();
+    admin.call(Method::DELETE, &format!("/siem/destinations/{extra}"), None).await;
+
+    let site = admin.post("/clients", json!({ "name": "SIEM probe" })).await;
+    let site_id = site["id"].as_str().unwrap();
+    let (header, ev) = wait_syslog(&udp, "the client.create event over UDP", |v| v["action"] == "client.create" && v["details"]["name"] == "SIEM probe").await;
+    // <PRI>1 TIMESTAMP HOST APP PROCID MSGID: facility 13 (log audit), informational = 13 * 8 + 6.
+    let parts: Vec<&str> = header.split(' ').collect();
+    assert_eq!((parts[0], parts[3], parts[4], parts[5]), ("<110>1", "rmm-server", "-", "audit.client.create"), "{header}");
+    assert!(chrono::DateTime::parse_from_rfc3339(parts[1]).is_ok(), "an RFC 3339 timestamp: {header}");
+    assert_eq!((ev["kind"].as_str(), ev["user_email"].as_str(), ev["target_id"].as_str()), (Some("audit"), Some(ADMIN_EMAIL), Some(site_id)));
+    let (_, over_tcp) = wait_syslog(&tcp, "the same event over TCP", |v| v["action"] == "client.create" && v["details"]["name"] == "SIEM probe").await;
+    assert_eq!(over_tcp["id"], ev["id"], "the same audit row, with its id for de-duplication");
+    // Octet counting: the sink parsed the lengths, so a wrong count would have broken the frames.
+    assert!(tcp.lock().unwrap().iter().all(|m| m.starts_with('<')), "{:?}", tcp.lock().unwrap());
+    let status = siem_destination(admin, &udp_id).await;
+    assert!(status["sent_total"].as_i64().unwrap() >= 1 && status["last_success_at"].is_string() && status["consecutive_failures"] == 0, "{status}");
+    assert_eq!(status["has_token"], false);
+
+    // A detection and an alert, when the earlier sections left some: status changes and
+    // acknowledgements are events, and the sealed context is never in them.
+    if let Some((id,)) = sqlx::query_as::<_, (uuid::Uuid,)>("SELECT id FROM security_detections WHERE status <> 'blocked' AND context IS NOT NULL LIMIT 1").fetch_optional(db).await.unwrap() {
+        sqlx::query("UPDATE security_detections SET status = 'blocked' WHERE id = $1").bind(id).execute(db).await.unwrap();
+        let (_, d) = wait_syslog(&udp, "a detection event", |v| v["kind"] == "detection" && v["id"] == id.to_string().as_str()).await;
+        assert_eq!(d["event"], "detection.status_changed");
+        assert!(d.get("context").is_none() && d["hostname"].is_string() && d["client"].is_string(), "{d}");
+    }
+    if let Some((id,)) = sqlx::query_as::<_, (uuid::Uuid,)>("SELECT id FROM alerts WHERE acknowledged_at IS NULL AND resolved_at IS NULL LIMIT 1").fetch_optional(db).await.unwrap() {
+        sqlx::query("UPDATE alerts SET acknowledged_at = now() WHERE id = $1").bind(id).execute(db).await.unwrap();
+        let (header, a) = wait_syslog(&udp, "an alert event", |v| v["kind"] == "alert" && v["id"] == id.to_string().as_str()).await;
+        assert_eq!(a["event"], "alert.acknowledged");
+        assert!(header.starts_with("<10>") || header.starts_with("<12>") || header.starts_with("<14>"), "severity maps to syslog: {header}");
+    }
+
+    // The test button sends one event now, and reports a destination it can't reach.
+    let before = udp.lock().unwrap().len();
+    let r = admin.post(&format!("/siem/destinations/{udp_id}/test"), json!({})).await;
+    assert_eq!(r["ok"], true, "{r}");
+    wait_syslog(&udp, "the test event", |v| v["action"] == "siem.test").await;
+    assert!(udp.lock().unwrap().len() > before);
+    let dead_port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let (s, d) = dest(json!({ "name": "e2e down", "kind": "syslog_tcp", "address": format!("127.0.0.1:{dead_port}"), "framing": "newline" })).await;
+    assert_eq!(s, StatusCode::OK, "{d}");
+    let down_id = d["id"].as_str().unwrap().to_string();
+    let r = admin.post(&format!("/siem/destinations/{down_id}/test"), json!({})).await;
+    assert_eq!(r["ok"], false, "{r}");
+    assert!(r["error"].as_str().unwrap().contains("connecting to"), "{r}");
+
+    // --- SIEM: an outage and a restart lose nothing ---------------------------------------------------------
+    let probes = ["outage-1", "outage-2", "outage-3"];
+    for p in &probes[..2] {
+        admin.post("/clients", json!({ "name": p })).await;
+    }
+    let failing = eventually(30, "the unreachable destination to report failures", || async {
+        let d = siem_destination(admin, &down_id).await;
+        (d["consecutive_failures"].as_i64().unwrap() >= 1 && d["pending"].as_i64().unwrap() >= 2).then_some(d)
+    })
+    .await;
+    assert!(failing["last_error"].as_str().unwrap().contains("connecting to") && failing["last_success_at"].is_null(), "{failing}");
+    // Restart the server with events waiting, then bring the collector up.
+    server.restart().await;
+    admin.post("/clients", json!({ "name": probes[2] })).await;
+    let pending: i64 = siem_destination(admin, &down_id).await["pending"].as_i64().unwrap();
+    assert!(pending >= 3, "the outbox survived the restart: {pending}");
+    let (_, newline) = tcp_sink(dead_port).await;
+    // An edit retries at once (otherwise the backoff would have us waiting up to 15 minutes).
+    let edited = admin.put(&format!("/siem/destinations/{down_id}"), json!({ "name": "e2e down", "kind": "syslog_tcp", "address": format!("127.0.0.1:{dead_port}"), "framing": "newline" })).await;
+    assert_eq!(edited["consecutive_failures"], 0);
+    let got = eventually(30, "the waiting events to arrive", || async {
+        let all: Vec<(String, Value)> = newline.lock().unwrap().iter().filter(|m| m.contains("[rmm@32473 ")).map(|m| syslog_json(m)).collect();
+        let names: Vec<String> = all.iter().filter_map(|(_, v)| v["details"]["name"].as_str().map(str::to_string)).collect();
+        probes.iter().all(|p| names.iter().any(|n| n == p)).then_some(names)
+    })
+    .await;
+    let order: Vec<usize> = probes.iter().map(|p| got.iter().position(|n| n == p).unwrap()).collect();
+    assert!(order.windows(2).all(|w| w[0] < w[1]), "in order: {got:?}");
+    let after = eventually(30, "the outbox to drain", || async {
+        let d = siem_destination(admin, &down_id).await;
+        (d["pending"] == 0 && d["sent_total"].as_i64().unwrap() >= 3).then_some(d)
+    })
+    .await;
+    assert!(after["last_error"].is_null() && after["consecutive_failures"] == 0, "{after}");
+    println!("SIEM syslog: ok");
+
+    // --- SIEM: HTTPS with a token, sealed at rest ---------------------------------------------------------
+    type Posts = std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>;
+    let posts: Posts = Default::default();
+    let store = posts.clone();
+    let app = axum::Router::new().route(
+        "/ingest",
+        axum::routing::post(move |headers: axum::http::HeaderMap, body: String| {
+            let store = store.clone();
+            async move {
+                let auth = headers.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
+                store.lock().unwrap().push((auth, body));
+                "ok"
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ingest = format!("http://{}/ingest", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let (s, h) = dest(json!({ "name": "e2e hec", "kind": "https", "address": ingest, "https_format": "splunk_hec", "token": "hec-token-0123" })).await;
+    assert_eq!(s, StatusCode::OK, "{h}");
+    let hec_id = h["id"].as_str().unwrap().to_string();
+    assert_eq!(h["has_token"], true);
+    assert!(!h.to_string().contains("hec-token-0123") && !admin.get("/siem/destinations").await.to_string().contains("hec-token-0123"), "the token is never sent back");
+    let (stored, sealed): (Vec<u8>, bool) = sqlx::query_as("SELECT token, token_sealed FROM siem_destinations WHERE id = $1::uuid").bind(&hec_id).fetch_one(db).await.unwrap();
+    assert!(sealed && !stored.windows(14).any(|w| w == b"hec-token-0123") && opens_with(&server.data_key, &stored), "the token is sealed at rest");
+    admin.post("/clients", json!({ "name": "HEC probe" })).await;
+    let hec = eventually(30, "a Splunk HEC post", || async {
+        posts.lock().unwrap().iter().find(|(_, b)| b.contains("HEC probe")).cloned()
+    })
+    .await;
+    assert_eq!(hec.0, "Splunk hec-token-0123");
+    let events: Vec<Value> = hec.1.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let probe = events.iter().find(|e| e["event"]["details"]["name"] == "HEC probe").unwrap();
+    assert_eq!((probe["sourcetype"].as_str(), probe["source"].as_str()), (Some("rmm:audit"), Some("rmm-server")));
+    assert!(probe["time"].as_f64().unwrap() > 1.7e9);
+    // Same destination as generic JSON with a bearer token, token kept when the edit leaves it out.
+    admin.put(&format!("/siem/destinations/{hec_id}"), json!({ "name": "e2e hec", "kind": "https", "address": ingest, "https_format": "generic" })).await;
+    posts.lock().unwrap().clear();
+    admin.post("/clients", json!({ "name": "Generic probe" })).await;
+    let generic = eventually(30, "a generic JSON post", || async { posts.lock().unwrap().iter().find(|(_, b)| b.contains("Generic probe")).cloned() }).await;
+    assert_eq!(generic.0, "Bearer hec-token-0123", "kept across the edit");
+    let body: Value = serde_json::from_str(&generic.1).unwrap();
+    assert!(body["events"].as_array().unwrap().iter().any(|e| e["details"]["name"] == "Generic probe") && body["source"] == "rmm-server");
+    // Deleting a destination ends the stream and is audited.
+    for id in [&udp_id, &tcp_id, &down_id, &hec_id] {
+        assert!(admin.call(Method::DELETE, &format!("/siem/destinations/{id}"), None).await.0.is_success());
+    }
+    let (left,): (i64,) = sqlx::query_as("SELECT count(*) FROM siem_outbox").fetch_one(db).await.unwrap();
+    assert_eq!(left, 0, "nothing queued for a destination that is gone");
+    let acts: Vec<String> = sqlx::query_scalar("SELECT DISTINCT action FROM audit_log WHERE action LIKE 'siem.%'").fetch_all(db).await.unwrap();
+    for a in ["siem.create", "siem.update", "siem.delete", "siem.test"] {
+        assert!(acts.iter().any(|x| x == a), "{a} audited: {acts:?}");
+    }
+    // One destination stays for the key rotation section (disabled: it needs no collector).
+    admin.post("/siem/destinations", json!({ "name": "rotation", "kind": "https", "address": "https://siem.example.com/ingest", "token": "rotate-me", "enabled": false })).await;
+
+    // --- sealed credentials ------------------------------------------------------------------------------------
+    // The IMAP password: sealed at rest, never returned, used to log in.
+    let (imap_port, logins) = imap_login_sink().await;
+    let boards = admin.get("/tickets/meta").await;
+    let board = boards["boards"][0]["id"].as_str().unwrap().to_string();
+    let mb = admin
+        .post(
+            "/mailboxes",
+            json!({ "name": "Sealed IMAP", "address": "sealed@imap.test", "kind": "imap", "imap_host": "127.0.0.1", "imap_port": imap_port, "imap_security": "none",
+                    "imap_username": "sealed@imap.test", "imap_password": "imap-secret-pw", "board_id": board, "enabled": false }),
+        )
+        .await;
+    let mb_id = mb["id"].as_str().unwrap().to_string();
+    assert_eq!(mb["has_password"], true);
+    assert!(!mb.to_string().contains("imap-secret-pw") && !admin.get("/mailboxes").await.to_string().contains("imap-secret-pw"), "never returned");
+    let (stored, sealed): (Vec<u8>, bool) = sqlx::query_as("SELECT imap_password_enc, imap_password_sealed FROM mailboxes WHERE id = $1::uuid").bind(&mb_id).fetch_one(db).await.unwrap();
+    assert!(sealed && !stored.windows(14).any(|w| w == b"imap-secret-pw") && opens_with(&server.data_key, &stored), "the IMAP password is sealed at rest");
+    let r = admin.post(&format!("/mailboxes/{mb_id}/poll"), json!({})).await;
+    assert_eq!(r["ok"], false, "the stand-in refuses every login");
+    let seen = logins.lock().unwrap().clone();
+    assert!(seen.len() == 1 && seen[0].contains("\"imap-secret-pw\""), "the server logged in with the opened password: {seen:?}");
+    // Editing without a password keeps it; an empty one clears it.
+    let edit = |password: Option<&str>| {
+        let mut body = json!({ "name": "Sealed IMAP", "address": "sealed@imap.test", "kind": "imap", "imap_host": "127.0.0.1", "imap_port": imap_port, "imap_security": "none",
+                               "imap_username": "sealed@imap.test", "board_id": board, "enabled": false });
+        if let Some(p) = password {
+            body["imap_password"] = p.into();
+        }
+        let path = format!("/mailboxes/{mb_id}");
+        async move { admin.put(&path, body).await }
+    };
+    assert_eq!(edit(None).await["has_password"], true);
+    let (kept,): (Vec<u8>,) = sqlx::query_as("SELECT imap_password_enc FROM mailboxes WHERE id = $1::uuid").bind(&mb_id).fetch_one(db).await.unwrap();
+    assert_eq!(kept, stored, "left alone");
+    assert_eq!(edit(Some("imap-new-pw")).await["has_password"], true);
+    let (changed,): (Vec<u8>,) = sqlx::query_as("SELECT imap_password_enc FROM mailboxes WHERE id = $1::uuid").bind(&mb_id).fetch_one(db).await.unwrap();
+    assert_ne!(changed, stored);
+    assert_eq!(edit(Some("")).await["has_password"], false);
+    let (gone,): (Option<Vec<u8>>,) = sqlx::query_as("SELECT imap_password_enc FROM mailboxes WHERE id = $1::uuid").bind(&mb_id).fetch_one(db).await.unwrap();
+    assert!(gone.is_none());
+    edit(Some("imap-rotation-pw")).await;
+
+    // A password stored in the clear (as 0031 leaves what it migrates, and as a server that never
+    // had a key stores it) is sealed at the next start, once the key is there.
+    sqlx::query("UPDATE mailboxes SET imap_password_enc = convert_to('imap-plain-pw', 'UTF8'), imap_password_sealed = false WHERE id = $1::uuid").bind(&mb_id).execute(db).await.unwrap();
+    sqlx::query("UPDATE company_settings SET smtp_password_enc = convert_to('smtp-plain-pw', 'UTF8'), smtp_password_sealed = false").execute(db).await.unwrap();
+    server.restart().await;
+    let (stored, sealed): (Vec<u8>, bool) = sqlx::query_as("SELECT imap_password_enc, imap_password_sealed FROM mailboxes WHERE id = $1::uuid").bind(&mb_id).fetch_one(db).await.unwrap();
+    assert!(sealed && !stored.windows(13).any(|w| w == b"imap-plain-pw"), "sealed at startup");
+    let (stored, sealed): (Vec<u8>, bool) = sqlx::query_as("SELECT smtp_password_enc, smtp_password_sealed FROM company_settings").fetch_one(db).await.unwrap();
+    assert!(sealed && !stored.windows(13).any(|w| w == b"smtp-plain-pw") && opens_with(&server.data_key, &stored), "the SMTP password is sealed at startup");
+
+    // The SMTP password: sealed when set through the API, never returned, used to authenticate.
+    let (smtp_port, creds) = smtp_auth_sink().await;
+    let before = admin.get("/settings/smtp").await;
+    let smtp = admin
+        .put("/settings/smtp", json!({ "host": "127.0.0.1", "port": smtp_port, "security": "none", "username": "mailer@e2e.test", "password": "smtp-secret-pw", "from": "RMM <rmm@e2e.test>" }))
+        .await;
+    assert_eq!(smtp["password_set"], true);
+    assert!(!smtp.to_string().contains("smtp-secret-pw") && !admin.get("/settings/smtp").await.to_string().contains("smtp-secret-pw"));
+    let (stored, sealed): (Vec<u8>, bool) = sqlx::query_as("SELECT smtp_password_enc, smtp_password_sealed FROM company_settings").fetch_one(db).await.unwrap();
+    assert!(sealed && !stored.windows(14).any(|w| w == b"smtp-secret-pw") && opens_with(&server.data_key, &stored));
+    let mail = admin.post("/notification-channels", json!({ "name": "e2e smtp auth", "kind": "email", "config": { "to": ["ops@e2e.test"] } })).await;
+    let mail_id = mail["id"].as_str().unwrap().to_string();
+    let t = admin.post(&format!("/notification-channels/{mail_id}/test"), json!({})).await;
+    assert_eq!(t["ok"], true, "{t}");
+    let seen = creds.lock().unwrap().clone();
+    assert!(
+        seen.iter().any(|c| c == "plain:|mailer@e2e.test|smtp-secret-pw") || (seen.contains(&"user:mailer@e2e.test".into()) && seen.contains(&"pass:smtp-secret-pw".into())),
+        "the mail server was logged in to with the opened password: {seen:?}"
+    );
+    admin.call(Method::DELETE, &format!("/notification-channels/{mail_id}"), None).await;
+    // Back to what the earlier sections left (their sink takes no login, and without a user name
+    // the password isn't used), with a password left in place for the key rotation to find.
+    admin
+        .put(
+            "/settings/smtp",
+            json!({ "host": before["host"], "port": before["port"], "security": before["security"], "username": before["username"], "password": "smtp-rotation-pw", "from": before["from"] }),
+        )
+        .await;
+    assert_eq!(admin.get("/settings/smtp").await["password_set"], true);
+
+    // A webhook channel's signing secret: moved out of `config`, sealed, and the channel list
+    // never shows it (the signed deliveries the earlier sections received prove it still works).
+    let (cfg_leaks, sealed_channels): (i64, i64) = sqlx::query_as(
+        "SELECT count(*) FILTER (WHERE config ? 'secret' OR config::text LIKE '%hook-secret%'), count(*) FILTER (WHERE secret_sealed AND secret IS NOT NULL) FROM notification_channels",
+    )
+    .fetch_one(db)
+    .await
+    .unwrap();
+    assert_eq!(cfg_leaks, 0, "no secret left in config");
+    assert!(sealed_channels >= 1, "a webhook channel with a sealed secret");
+    let channels = admin.get("/notification-channels").await.to_string();
+    assert!(!channels.contains("hook-secret") && channels.contains("\"has_secret\":true"), "{channels}");
+    // The rotation section that follows rotates these along with the rest (one of each is left in place).
+    println!("sealed credentials: ok");
 }
 
 /// Policy management (docs/design/policies.md): the tree, inheritance with per-field overrides
@@ -5212,7 +5747,6 @@ async fn api_keys_and_webhooks(url: &str, admin: &Api, db: &sqlx::PgPool, id1: &
         "/users".to_string(),
         "/auth/me".to_string(),
         "/settings".to_string(),
-        "/audit".to_string(),
         format!("/clients/{a_id}/vault"),
         format!("/agents/{id1}/processes"),
         format!("/agents/{id1}/files"),

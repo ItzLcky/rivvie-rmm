@@ -42,6 +42,8 @@ pub enum Resp {
     Paged(&'static str),
     /// A small ad-hoc object (documented in the summary or note).
     Object,
+    /// A file download (CSV or JSON Lines).
+    Download,
 }
 
 impl Op {
@@ -315,6 +317,36 @@ pub static OPS: &[Op] = &[
         ],
         paged: true, body: None, response: Resp::Paged("Detection"),
     },
+    // ---- audit log (admins, or whoever holds audit.read) ----------------------------------
+    Op {
+        id: "listAudit", method: "GET", path: "/audit", group: "audit", summary: "List audit log events, newest first",
+        note: "Needs the `audit.read` permission on the key, which only a key of an admin (or of a user an admin gave it) can hold.",
+        query: AUDIT_Q, paged: true, body: None, response: Resp::Paged("AuditEvent"),
+    },
+    Op {
+        id: "exportAudit", method: "GET", path: "/audit/export", group: "audit", summary: "Download the audit log as CSV or JSON Lines",
+        note: "Needs the `audit.read` permission on the key. Oldest first, streamed: the whole log can be fetched in one request. \
+               The export is itself audited (`audit.export`). Fields: id, time, user_id, user_email, user_name, action, target_type, target_id, details.",
+        query: &[
+            ("format", "string", "`csv` (default) or `jsonl` (one JSON object per line)."),
+            ("action", "string", "An action, or a prefix ending in `.` (`user.`)."),
+            ("user_id", "uuid", "Only this user's actions."),
+            ("target_type", "string", "Only this kind of target."),
+            ("target_id", "uuid", "Only this target."),
+            ("from", "datetime", "Events at or after this time."),
+            ("to", "datetime", "Events at or before this time."),
+        ],
+        paged: false, body: None, response: Resp::Download,
+    },
+];
+
+const AUDIT_Q: &[(&str, &str, &str)] = &[
+    ("action", "string", "An action, or a prefix ending in `.` (`user.`)."),
+    ("user_id", "uuid", "Only this user's actions."),
+    ("target_type", "string", "Only this kind of target."),
+    ("target_id", "uuid", "Only this target."),
+    ("from", "datetime", "Events at or after this time."),
+    ("to", "datetime", "Events at or before this time."),
 ];
 
 /// The operation for a request: HTTP method and route pattern relative to `/api`.
@@ -567,6 +599,10 @@ fn base_schemas() -> Value {
             ("name", "string"), ("severity", "string"), ("status", "string"), ("resources", "array"), ("first_seen_at", "datetime"),
             ("last_seen_at", "datetime"), ("resolved_at", "datetime?"), ("source", "string"), ("sha256", "string?"),
         ]),
+        "AuditEvent": object("One entry of the audit log.", &[
+            ("id", "integer"), ("ts", "datetime"), ("user_name", "string?"), ("action", "string"), ("target_type", "string?"),
+            ("target_id", "uuid?"), ("details", "object"),
+        ]),
         "Webhook": object("The body of every webhook delivery. `data` depends on the event.", &[
             ("id", "uuid"), ("event", "string"), ("created_at", "datetime"), ("data", "object"),
         ]),
@@ -586,7 +622,7 @@ fn response_schema(r: Resp) -> Option<Value> {
                 "total": { "type": "integer" },
             },
         })),
-        Resp::Object => None,
+        Resp::Object | Resp::Download => None,
     }
 }
 
@@ -615,6 +651,10 @@ fn operation(op: &Op) -> Value {
     description = description.trim().to_string();
     let ok = match response_schema(op.response) {
         Some(s) => json!({ "description": "Success.", "content": { "application/json": { "schema": s } } }),
+        None if matches!(op.response, Resp::Download) => json!({
+            "description": "Success: a download, streamed.",
+            "content": { "text/csv": { "schema": { "type": "string" } }, "application/x-ndjson": { "schema": { "type": "string" } } },
+        }),
         None => json!({ "description": "Success.", "content": { "application/json": { "schema": { "type": "object" } } } }),
     };
     let err = |d: &str| json!({ "description": d, "content": { "application/json": { "schema": reference("Error") } } });

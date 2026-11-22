@@ -22,6 +22,7 @@ mod patches;
 mod software;
 mod ratelimit;
 mod rotate;
+mod siem;
 mod scheduler;
 mod crypto;
 mod csat;
@@ -266,7 +267,6 @@ async fn serve(db: sqlx::PgPool, args: ServeArgs) -> Result<()> {
     // Jobs left `sent` by the previous process aren't lost: agents keep running them and
     // report when they reconnect (and anything they don't hold is marked `lost` then).
     bootstrap_admin(&db).await?;
-    let company = state::Company::load(&db).await.context("loading company settings")?;
     let trusted_proxies = ratelimit::parse_trusted(&args.trusted_proxies).map_err(anyhow::Error::msg)?;
 
     let http = reqwest::Client::builder()
@@ -287,6 +287,9 @@ async fn serve(db: sqlx::PgPool, args: ServeArgs) -> Result<()> {
     };
     api::seal_totp_secrets(&db, data_key.as_ref()).await.context("encrypting two-factor secrets")?;
     api::seal_sso_secrets(&db, data_key.as_ref()).await.context("encrypting single sign-on secrets")?;
+    rotate::seal_plaintext_credentials(&db, data_key.as_ref()).await.context("encrypting mail and notification credentials")?;
+    // After sealing: the company settings in memory hold the mail server password as stored.
+    let company = state::Company::load(&db).await.context("loading company settings")?;
     if data_key.is_none() {
         let (n,): (i64,) = sqlx::query_as("SELECT count(*) FROM vault_keys").fetch_one(&db).await.context("checking vault keys")?;
         if n > 0 {
@@ -340,6 +343,7 @@ async fn serve(db: sqlx::PgPool, args: ServeArgs) -> Result<()> {
     tokio::spawn(accounting::run(state.clone()));
     tokio::spawn(metrics::probe_pool(state.clone()));
     tokio::spawn(updates::run(state.clone()));
+    tokio::spawn(siem::run(state.clone()));
     if state.cfg.metrics_token.is_some() {
         info!("metrics: GET /metrics (bearer token required)");
     }

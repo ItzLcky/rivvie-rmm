@@ -36,6 +36,7 @@ pub const GROUPS: &[(&str, &str)] = &[
     ("tickets", "Tickets"),
     ("software", "Software catalog and deployment"),
     ("security", "Endpoint protection (needs the security.read permission)"),
+    ("audit", "Audit log (needs the audit.read permission)"),
 ];
 
 pub fn is_key(token: &str) -> bool {

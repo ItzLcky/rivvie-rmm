@@ -105,7 +105,7 @@ re-request them (Let's Encrypt rate-limits that). The compose file already sets
 
 | Secret | What it protects | If it leaks | If it's lost |
 |---|---|---|---|
-| `RMM_DATA_KEY` | Two-factor secrets, single sign-on client secrets, webhook signing secrets, the password vault's per-client keys, mailbox and accounting (QuickBooks, Xero) credentials, and detection context, all encrypted at rest | The encryption in the database and in backups is worthless to anyone who also gets the dump. Replacing the key needs the rotation procedure ([below](#rotating-rmm_data_key)) | The vault is gone for good; users with 2FA can't sign in until `rmm-server reset2fa` clears it; the server refuses to start once anything has been encrypted. **Keep it with your backups, in a password manager and a sealed copy off-site.** A backup without its key is half a backup |
+| `RMM_DATA_KEY` | Two-factor secrets, single sign-on client secrets, webhook signing secrets, IMAP and SMTP passwords, SIEM destination tokens, the password vault's per-client keys, mailbox and accounting (QuickBooks, Xero) credentials, and detection context, all encrypted at rest | The encryption in the database and in backups is worthless to anyone who also gets the dump. Replacing the key needs the rotation procedure ([below](#rotating-rmm_data_key)) | The vault is gone for good; users with 2FA can't sign in until `rmm-server reset2fa` clears it; the server refuses to start once anything has been encrypted. **Keep it with your backups, in a password manager and a sealed copy off-site.** A backup without its key is half a backup |
 | `POSTGRES_PASSWORD` | The database | Full read/write of everything. The database isn't published, so this takes access to the host or its Docker network first | Reset it in Postgres (`ALTER USER`) and in `deploy/.env` |
 | Release signing key (`release.key`, from `rmm-sign keygen`) | Every agent self-update and all detection content: agents only run code signed by it | Anyone holding it can push their own binary to every agent. Treat it like a CA key: offline, never on the RMM server or the image, in CI only as the `RMM_UPDATE_SIGNING_KEY` secret | Agents can't be updated again; the public half is compiled into them, so they have to be reinstalled with a new key. Keep two copies off-site |
 | `RMM_METRICS_TOKEN` | `/metrics` | Series names and fleet sizes; low impact. Rotate by changing it and the scraper | Set a new one |
@@ -120,8 +120,8 @@ covered in [RELEASING.md](RELEASING.md) and the README's [Agent updates](../READ
 ### Rotating `RMM_DATA_KEY`
 
 `rmm-server rotate-data-key` re-encrypts everything sealed with the key under a new one, in one
-transaction: two-factor secrets, single sign-on client secrets, webhook signing secrets, mailbox
-and accounting credentials, detection context, and the vault's per-client keys (the vault's items
+transaction: two-factor secrets, single sign-on client secrets, webhook signing secrets, IMAP and
+SMTP passwords, SIEM tokens, mailbox and accounting credentials, detection context, and the vault's per-client keys (the vault's items
 aren't touched). Stop the server first, then:
 
 ```sh

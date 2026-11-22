@@ -45,7 +45,8 @@
 		{ value: 'billing.manage', label: 'Manage billing' },
 		{ value: 'time.approve', label: 'Approve time' },
 		{ value: 'vault.read', label: 'See passwords' },
-		{ value: 'vault.manage', label: 'Manage passwords' }
+		{ value: 'vault.manage', label: 'Manage passwords' },
+		{ value: 'audit.read', label: 'Audit log' }
 	];
 
 	// --- requiring SSO ---------------------------------------------------------------------------------------------
