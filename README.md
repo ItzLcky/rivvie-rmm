@@ -332,6 +332,21 @@ with power-loss protection, not a copy-on-write filesystem such as btrfs), and b
 4.5 MB of database per agent at the default metric retention. `rmm-loadgen` repeats the test
 against your own hardware.
 
+**Stored search and health.** What the dashboard and the agent search need is kept in columns,
+not worked out per request (migration 0026). An agent's addresses and logged-in users are copied
+out of its inventory into `agent_search_terms` when the inventory arrives, and hostname, OS name
+and those terms have `pg_trgm` indexes, so a search is an index lookup rather than a scan of
+every inventory (the extension needs `CREATE EXTENSION` rights on the database, which the
+default container has). An agent's health is stored on its row (`health_rank`, with the counts
+it comes from: open alerts, failed jobs in 24 hours, overdue and failed patches, the fullest
+disk). Triggers on alerts, jobs, patches and the agent row keep it current as they change, and
+the server's housekeeping runs `refresh_agent_health()` every five minutes for what only time
+changes (a job aging past 24 hours, an update missing for a week) and as a safety net. The rules
+are the SQL function `agent_health_rank`; to see what the stored values would be, run
+`SELECT refresh_agent_health()` (it rewrites only what differs). `cargo test -p rmm-server
+stored_columns -- --ignored` (needs `RMM_E2E_DATABASE_URL`, as the e2e suite) checks the stored
+values and the indexed search against the old expressions on a mixed fleet.
+
 ## Policies
 
 **Policies** (Monitoring → Policies) has three tabs.
