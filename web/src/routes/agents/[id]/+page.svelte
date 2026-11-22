@@ -304,6 +304,9 @@
 								<Badge tone={a.update_state === 'failed' || a.update_state === 'rolled_back' ? 'danger' : 'info'} title={a.update_detail ?? ''}>
 									v{a.update_version}: {updateLabels[a.update_state ?? ''] ?? a.update_state}
 								</Badge>
+								{#if (a.update_state === 'failed' || a.update_state === 'rolled_back') && a.update_detail}
+									<p class="text-muted mt-1 text-[13px] break-words">{a.update_detail}</p>
+								{/if}
 							{/if}
 						</dd>
 						<dt>Agent ID</dt><dd class="text-muted font-mono text-[13px] break-all">{a.id}</dd>
