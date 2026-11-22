@@ -35,9 +35,14 @@ restored_db=rmm_drill_restored_$$
 src_db=""
 cleanup() {
   status=$?
-  if [ -n "$src_db" ]; then pgdocker psql -qc "DROP DATABASE IF EXISTS $src_db WITH (FORCE)" -d postgres >/dev/null 2>&1 || true; fi
+  DOCKER_ARGS=()
   pgdocker psql -qc "DROP DATABASE IF EXISTS $restored_db WITH (FORCE)" -d postgres >/dev/null 2>&1 || true
-  if [ $status -eq 0 ]; then rm -rf "$work" "${kept_dir:-}"; else echo "drill failed; working files kept in $work (and ${kept_dir:-})" >&2; fi
+  if [ $status -eq 0 ]; then
+    if [ -n "$src_db" ]; then pgdocker psql -qc "DROP DATABASE IF EXISTS $src_db WITH (FORCE)" -d postgres >/dev/null 2>&1 || true; fi
+    rm -rf "$work" "${kept_dir:-}"
+  else
+    echo "drill failed; kept: $work, ${kept_dir:-} and the database ${src_db:-} (RMM_DRILL_REUSE=$work skips the e2e run next time; drop the database yourself)" >&2
+  fi
 }
 trap cleanup EXIT
 
@@ -68,7 +73,12 @@ fi
 sh -n deploy/backup.sh && sh -n deploy/restore.sh
 
 echo "== 2. e2e run, keeping its database and storage"
+# RMM_DRILL_REUSE=<working directory of a failed run> skips it (while fixing a later step).
+if [ -n "${RMM_DRILL_REUSE:-}" ]; then
+  cp "$RMM_DRILL_REUSE/expect.json" "$RMM_DRILL_REUSE/e2e.log" "$work/"
+else
 RMM_E2E_DRILL="$work/expect.json" RMM_E2E_KEEP=1 cargo test -p rmm-server --test e2e end_to_end -- --ignored --nocapture 2>&1 | tee "$work/e2e.log" | grep -E '^(test |RMM_E2E_KEPT|restore drill)|panicked|FAILED' || true
+fi
 kept=$(grep -E '^RMM_E2E_KEPT ' "$work/e2e.log" | tail -n 1) || { echo "the e2e run failed (see above)" >&2; tail -n 40 "$work/e2e.log"; exit 1; }
 src_db=$(sed -E 's/.*database=([^ ]+).*/\1/' <<<"$kept")
 kept_dir=$(sed -E 's/.* dir=(.*)$/\1/' <<<"$kept")
@@ -82,7 +92,10 @@ DOCKER_ARGS=(-e PGDATABASE="$src_db" -e BACKUP_DIR=/backups -v "$work/backups:/b
 pgdocker sh /backup.sh
 dump=$(ls "$work"/backups/rmm-*.dump); files=$(ls "$work"/backups/rmm-*.files.tar.gz)
 test -s "$dump" && test -s "$files"
-tar -tzf "$files" | grep -q '^\./attachments/' || { echo "the storage backup has no attachments/" >&2; exit 1; }
+tar -tzf "$files" > "$work/files.list"
+for d in attachments invoices triage email; do
+  grep -q "^\./$d/" "$work/files.list" || { echo "the storage backup has no $d/" >&2; exit 1; }
+done
 name=$(basename "$dump" .dump)
 echo "backup: $name ($(du -h "$dump" | cut -f1) dump, $(du -h "$files" | cut -f1) files)"
 

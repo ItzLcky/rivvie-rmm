@@ -112,9 +112,18 @@ async fn restored_backup_serves_everything() {
     }
     let http = reqwest::Client::builder().cookie_store(true).build().unwrap();
     let api = |p: &str| format!("{base}/api{p}");
-    let login = json!({ "email": expect["admin_email"], "password": expect["admin_password"], "code": totp(expect["admin_totp_secret"].as_str().unwrap()) });
-    let res = http.post(api("/auth/login")).json(&login).send().await.unwrap();
-    let me: Value = res.json().await.unwrap();
+    // A 2FA code is accepted once per 30-second step, and the e2e run's last sign-in may have used
+    // this step: on a refusal, wait for the next one.
+    let mut me = Value::Null;
+    for attempt in 0..2 {
+        let login = json!({ "email": expect["admin_email"], "password": expect["admin_password"], "code": totp(expect["admin_totp_secret"].as_str().unwrap()) });
+        me = http.post(api("/auth/login")).json(&login).send().await.unwrap().json().await.unwrap();
+        if me["user"]["totp_enabled"] == true || attempt == 1 {
+            break;
+        }
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        tokio::time::sleep(Duration::from_secs(31 - now % 30)).await;
+    }
     assert_eq!(me["user"]["totp_enabled"], true, "signing in with a 2FA code works on the restored database: {me}");
 
     let ticket_id = expect["ticket_id"].as_str().unwrap();
