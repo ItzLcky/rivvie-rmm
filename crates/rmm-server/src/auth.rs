@@ -108,6 +108,11 @@ pub struct User {
     /// The session this request authenticated with.
     #[serde(skip)]
     pub session_id: Uuid,
+    /// Set when the request authenticated with an API key rather than a session: the key's id.
+    /// The `User` is then already narrowed to what the key allows (see `crate::apikeys`).
+    #[sqlx(skip)]
+    #[serde(skip)]
+    pub api_key: Option<Uuid>,
 }
 
 impl User {
@@ -233,11 +238,16 @@ fn allowed_before_mfa_setup(path: &str) -> bool {
     matches!(path, "/auth/me" | "/auth/logout" | "/auth/totp") || path.starts_with("/auth/totp/")
 }
 
+/// The token of an `Authorization: Bearer` header.
+pub fn bearer(headers: &header::HeaderMap) -> Option<String> {
+    let v = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok())?;
+    v.strip_prefix("Bearer ").map(|t| t.trim().to_string())
+}
+
 pub fn extract_token(headers: &header::HeaderMap) -> Option<String> {
-    if let Some(v) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok())
-        && let Some(t) = v.strip_prefix("Bearer ") {
-            return Some(t.trim().to_string());
-        }
+    if let Some(t) = bearer(headers) {
+        return Some(t);
+    }
     headers
         .get_all(header::COOKIE)
         .iter()
@@ -275,6 +285,10 @@ impl FromRequestParts<Arc<AppState>> for User {
     type Rejection = ApiError;
 
     async fn from_request_parts(parts: &mut Parts, state: &Arc<AppState>) -> Result<Self, ApiError> {
+        // API keys only ever travel in the Authorization header, never in the cookie.
+        if let Some(key) = bearer(&parts.headers).filter(|t| crate::apikeys::is_key(t)) {
+            return crate::apikeys::authenticate(state, parts, &key).await;
+        }
         let token = extract_token(&parts.headers).ok_or(ApiError::Unauthorized)?;
         let user = session_user(state, &token).await?.ok_or(ApiError::Unauthorized)?;
         if user.mfa_setup_required {

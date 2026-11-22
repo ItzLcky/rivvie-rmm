@@ -341,6 +341,7 @@ async fn announce(st: &AppState, ids: &[Uuid], event: &'static str, channels: &[
         if suppressed {
             continue;
         }
+        crate::webhooks::alert_event(st, id, if event == "opened" { "alert.created" } else { "alert.resolved" }).await;
         if notify {
             crate::notify::enqueue(st, id, event, channels).await;
             woke |= !channels.is_empty();

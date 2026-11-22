@@ -76,6 +76,36 @@ impl Limiter {
     }
 }
 
+/// Request budget per API key. Unlike [`Limiter`] every request takes a token, and each key
+/// has its own rate: `per_minute` requests in a burst, refilled evenly over the minute.
+#[derive(Default)]
+pub struct KeyLimiter {
+    buckets: Mutex<HashMap<String, Bucket>>,
+}
+
+impl KeyLimiter {
+    /// `Err(retry_after)` when the key has used up its budget.
+    pub fn take(&self, key: &str, per_minute: u32) -> Result<(), Duration> {
+        let capacity = f64::from(per_minute.max(1));
+        let refill = capacity / 60.0;
+        let now = Instant::now();
+        let mut buckets = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
+        let level = buckets.get(key).map_or(capacity, |b| (b.tokens + now.duration_since(b.at).as_secs_f64() * refill).min(capacity));
+        if level < 1.0 {
+            return Err(Duration::from_secs_f64((1.0 - level) / refill).max(Duration::from_secs(1)));
+        }
+        buckets.insert(key.to_string(), Bucket { tokens: level - 1.0, at: now });
+        Ok(())
+    }
+
+    /// Forget buckets that are full again (a key's limit may have changed: they restart full).
+    pub fn prune(&self) {
+        let now = Instant::now();
+        // A bucket refills within a minute whatever its rate.
+        self.buckets.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, b| now.duration_since(b.at) < Duration::from_secs(60));
+    }
+}
+
 pub struct Limits {
     /// Failed sign-ins (bad password or 2FA code) per client IP.
     pub login_ip: Limiter,
@@ -86,6 +116,8 @@ pub struct Limits {
     /// Vault password reveals and TOTP codes per user. Unlike the others every request takes
     /// a token (see [`Limiter::take`]): a stolen session can't page through a vault quickly.
     pub vault_reveal: Limiter,
+    /// Requests per API key.
+    pub api_keys: KeyLimiter,
 }
 
 impl Default for Limits {
@@ -96,6 +128,7 @@ impl Default for Limits {
             enroll_ip: Limiter::new(20, Duration::from_secs(15)),
             // 60 per 5 minutes.
             vault_reveal: Limiter::new(60, Duration::from_secs(5)),
+            api_keys: KeyLimiter::default(),
         }
     }
 }
@@ -106,6 +139,7 @@ impl Limits {
         self.login_account.prune();
         self.enroll_ip.prune();
         self.vault_reveal.prune();
+        self.api_keys.prune();
     }
 }
 

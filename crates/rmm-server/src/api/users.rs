@@ -28,6 +28,8 @@ pub struct UserRow {
     client_ids: Vec<Uuid>,
     /// Explicit permission set; null = the role's defaults.
     permissions: Option<Vec<String>>,
+    /// Can't sign in; owns API keys (Company settings → API).
+    service_account: bool,
 }
 
 pub async fn list(State(st): State<Arc<AppState>>, u: User) -> ApiResult<Json<Vec<UserRow>>> {
@@ -35,7 +37,7 @@ pub async fn list(State(st): State<Arc<AppState>>, u: User) -> ApiResult<Json<Ve
     Ok(Json(
         sqlx::query_as(
             "SELECT id, email, name, role, disabled, totp_secret IS NOT NULL AS totp_enabled, created_at, last_login_at,
-                    all_clients, ARRAY(SELECT client_id FROM user_clients WHERE user_id = users.id) AS client_ids, permissions
+                    all_clients, ARRAY(SELECT client_id FROM user_clients WHERE user_id = users.id) AS client_ids, permissions, service_account
                FROM users ORDER BY email",
         )
         .fetch_all(&st.db)
@@ -190,7 +192,7 @@ pub async fn reset_password(
     }
     let hash = auth::hash_password_async(&b.password).await?;
     let mut tx = st.db.begin().await?;
-    let n = sqlx::query("UPDATE users SET password_hash = $2 WHERE id = $1")
+    let n = sqlx::query("UPDATE users SET password_hash = $2 WHERE id = $1 AND NOT service_account")
         .bind(id)
         .bind(hash)
         .execute(&mut *tx)

@@ -119,7 +119,14 @@ pub async fn worker(st: Arc<AppState>) {
                 false
             }
         };
-        if full || full_mail {
+        let full_hooks = match crate::webhooks::drain(&st).await {
+            Ok(n) => n as i64 == BATCH,
+            Err(e) => {
+                warn!("webhook worker: {e:#}");
+                false
+            }
+        };
+        if full || full_mail || full_hooks {
             continue;
         }
         tokio::select! {

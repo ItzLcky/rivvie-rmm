@@ -85,6 +85,26 @@ pub async fn list(State(st): State<Arc<AppState>>, u: User) -> ApiResult<Json<Ve
     Ok(Json(load(&st, &u, None).await?))
 }
 
+#[derive(serde::Deserialize)]
+pub struct SitesQuery {
+    client_id: Option<Uuid>,
+}
+
+const SITE_SELECT: &str = "SELECT s.id, s.client_id, s.name, count(a.id) AS agent_count, count(a.id) FILTER (WHERE a.online) AS online_count
+       FROM sites s LEFT JOIN agents a ON a.site_id = s.id
+      WHERE ($1::uuid[] IS NULL OR s.client_id = ANY($1)) AND ($2::uuid IS NULL OR s.client_id = $2) AND ($3::uuid IS NULL OR s.id = $3)
+      GROUP BY s.id ORDER BY lower(s.name)";
+
+/// Every site of the clients the user can see, with agent counts.
+pub async fn list_sites(State(st): State<Arc<AppState>>, u: User, axum::extract::Query(q): axum::extract::Query<SitesQuery>) -> ApiResult<Json<Vec<SiteRow>>> {
+    Ok(Json(sqlx::query_as(SITE_SELECT).bind(u.scope()).bind(q.client_id).bind(None::<Uuid>).fetch_all(&st.db).await?))
+}
+
+pub async fn get_site(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uuid>) -> ApiResult<Json<SiteRow>> {
+    let site: Option<SiteRow> = sqlx::query_as(SITE_SELECT).bind(u.scope()).bind(None::<Uuid>).bind(id).fetch_optional(&st.db).await?;
+    site.map(Json).ok_or(ApiError::NotFound("site"))
+}
+
 pub async fn get(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uuid>) -> ApiResult<Json<ClientOut>> {
     super::access::client(&u, id)?;
     load(&st, &u, Some(id)).await?.pop().map(Json).ok_or(ApiError::NotFound("client"))

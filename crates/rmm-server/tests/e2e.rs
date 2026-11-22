@@ -26,7 +26,7 @@
 //! Prometheus's own tool (CI sets it; without it that check is skipped).
 //!
 //! `RMM_E2E_ONLY=desk` runs only the core and service desk sections (faster while working on
-//! tickets, the portal and billing).
+//! tickets, the portal and billing); `RMM_E2E_ONLY=api` only enrollment and the API keys and webhooks.
 //!
 //! Optional: `RMM_E2E_IMAP=host:imap_port:smtp_port` of a GreenMail container (user
 //! `imap@local.test`, password `secret`) also tests IMAP polling:
@@ -540,6 +540,12 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
 
     a1.run(dir);
     admin.wait_online(&id1, true).await;
+    // RMM_E2E_ONLY=api: just the API keys and webhooks, on the freshly enrolled agent.
+    if std::env::var("RMM_E2E_ONLY").as_deref() == Ok("api") {
+        api_keys_and_webhooks(&url, &admin, db, &id1, a_id, b_id).await;
+        a1.kill();
+        return Ok(());
+    }
 
     // --- a job: output, exit code, status --------------------------------------------------
     let job = admin.run_script(&id1, "echo hello; echo oops >&2; exit 3", 30).await;
@@ -1117,6 +1123,7 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
     billing(&url, &admin, &tech, db, a_id, b_id).await;
     docs_and_vault(&url, &admin, db, a_id, b_id).await;
     ticket_docs(&url, &admin, a_id, b_id).await;
+    api_keys_and_webhooks(&url, &admin, db, &id1, a_id, b_id).await;
 
     // --- rate limits ------------------------------------------------------------------------------
     // Failed sign-ins from one client IP (via the trusted proxy's X-Forwarded-For).
@@ -4776,6 +4783,461 @@ async fn ticket_docs(url: &str, admin: &Api, a_id: &str, b_id: &str) {
     admin.call(Method::DELETE, &format!("/docs/{b_page}"), None).await;
     assert_eq!(admin.get(&format!("/tickets/{t1_id}")).await["docs"], json!([]));
     println!("documentation on tickets: ok");
+}
+
+/// Webhook deliveries seen by a local listener: (receiver number, `X-RMM-Event`,
+/// `X-RMM-Delivery`, `X-RMM-Signature`, raw body).
+type RawHooks = std::sync::Arc<std::sync::Mutex<Vec<(u8, String, String, String, Vec<u8>)>>>;
+
+/// A listener at `/hook/<n>`: records what it is sent, and answers 500 while `fail` is set.
+async fn signed_receiver(fail: std::sync::Arc<std::sync::atomic::AtomicBool>) -> (String, RawHooks) {
+    use axum::http::HeaderMap;
+    use std::sync::atomic::Ordering;
+    let hooks: RawHooks = Default::default();
+    let store = hooks.clone();
+    let app = axum::Router::new().route(
+        "/hook/{n}",
+        axum::routing::post(move |axum::extract::Path(n): axum::extract::Path<u8>, headers: HeaderMap, body: axum::body::Bytes| {
+            let (store, fail) = (store.clone(), fail.clone());
+            async move {
+                let h = |k: &str| headers.get(k).and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
+                store.lock().unwrap().push((n, h("x-rmm-event"), h("x-rmm-delivery"), h("x-rmm-signature"), body.to_vec()));
+                if fail.load(Ordering::SeqCst) {
+                    (StatusCode::INTERNAL_SERVER_ERROR, "receiver is down")
+                } else {
+                    (StatusCode::OK, "ok")
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}/hook", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (base, hooks)
+}
+
+/// `X-RMM-Signature` as a receiver computes it.
+fn hook_signature(secret: &str, body: &[u8]) -> String {
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+    mac.update(body);
+    format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
+}
+
+/// Waits for a delivery to receiver `n` (checking its signature against `secret`) that `pred`
+/// accepts, and returns the envelope.
+async fn wait_signed(hooks: &RawHooks, n: u8, secret: &str, what: &str, pred: impl Fn(&Value) -> bool) -> Value {
+    eventually(30, what, || async {
+        let seen = hooks.lock().unwrap();
+        seen.iter().filter(|h| h.0 == n).find_map(|(_, event, delivery, sig, body)| {
+            let v: Value = serde_json::from_slice(body).unwrap();
+            if !pred(&v) {
+                return None;
+            }
+            // Only the delivery asked for is checked: after a secret is rotated, older ones were signed with the old one.
+            assert_eq!(sig, &hook_signature(secret, body), "signature of {event} (waiting for {what}, receiver {n})");
+            assert_eq!((v["event"].as_str(), v["id"].as_str()), (Some(event.as_str()), Some(delivery.as_str())), "headers match the envelope");
+            Some(v)
+        })
+    })
+    .await
+}
+
+fn deliveries_to(hooks: &RawHooks, n: u8) -> Vec<Value> {
+    hooks.lock().unwrap().iter().filter(|h| h.0 == n).map(|h| serde_json::from_slice(&h.4).unwrap()).collect()
+}
+
+/// A request with an API key (no cookies).
+async fn key_call(token: &str, base: &str, method: reqwest::Method, path: &str, body: Option<Value>) -> (StatusCode, Value, reqwest::header::HeaderMap) {
+    let mut req = reqwest::Client::new().request(method, format!("{base}{path}")).bearer_auth(token);
+    if let Some(b) = body {
+        req = req.json(&b);
+    }
+    let res = req.send().await.unwrap();
+    let (status, headers) = (res.status(), res.headers().clone());
+    (status, res.json::<Value>().await.unwrap_or(Value::Null), headers)
+}
+
+/// API keys, the public API, and outbound webhooks (docs/design/api.md): key creation, calls
+/// with a key, every way a key is refused, scoping to what the owner has, rate limits, service
+/// accounts, the OpenAPI document, and signed webhook deliveries with retries.
+async fn api_keys_and_webhooks(url: &str, admin: &Api, db: &sqlx::PgPool, id1: &str, a_id: &str, b_id: &str) {
+    use reqwest::Method;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let http = reqwest::Client::new();
+    let v1 = format!("{url}/api/v1");
+    let get = |token: String, path: String| {
+        let v1 = v1.clone();
+        async move { key_call(&token, &v1, Method::GET, &path, None).await }
+    };
+    let error_of = |v: &Value| v["error"].as_str().unwrap_or_default().to_string();
+
+    // --- the OpenAPI document needs no credentials ---------------------------------------------------
+    for path in ["/api/openapi.json", "/api/v1/openapi.json"] {
+        let spec: Value = http.get(format!("{url}{path}")).send().await.unwrap().json().await.unwrap();
+        assert_eq!(spec["openapi"], "3.1.0", "{path}");
+        assert!(spec["paths"]["/agents/{id}"]["get"]["operationId"] == "getAgent" && spec["paths"]["/tickets"]["post"].is_object());
+        assert!(spec["paths"].get("/users").is_none() && spec["paths"].get("/vault/{id}/reveal").is_none(), "only the public API is described");
+    }
+
+    // --- creating keys: validated against the owner ---------------------------------------------------
+    let create = |body: Value| async move { admin.call(Method::POST, "/api-keys", Some(body)).await };
+    for (what, body) in [
+        ("no scopes", json!({ "name": "k", "access": "read", "scopes": [] })),
+        ("unknown scope", json!({ "name": "k", "access": "read", "scopes": ["billing"] })),
+        ("unknown access", json!({ "name": "k", "access": "admin", "scopes": ["agents"] })),
+        ("unknown permission", json!({ "name": "k", "access": "read", "scopes": ["agents"], "permissions": ["root"] })),
+        ("no name", json!({ "name": " ", "access": "read", "scopes": ["agents"] })),
+        ("bad expiry", json!({ "name": "k", "access": "read", "scopes": ["agents"], "expires_in_days": 0 })),
+        ("bad rate", json!({ "name": "k", "access": "read", "scopes": ["agents"], "rate_limit_per_min": 0 })),
+    ] {
+        assert_eq!(create(body).await.0, StatusCode::BAD_REQUEST, "{what}");
+    }
+    assert_eq!(create(json!({ "name": "k", "access": "read", "scopes": ["agents"], "client_ids": [uuid::Uuid::nil()] })).await.0, StatusCode::NOT_FOUND);
+
+    let made = admin
+        .post("/api-keys", json!({ "name": "e2e reader", "access": "read", "scopes": ["clients", "agents", "tickets", "alerts"], "client_ids": [a_id] }))
+        .await;
+    let reader = made["token"].as_str().unwrap().to_string();
+    let reader_id = made["key"]["id"].as_str().unwrap().to_string();
+    assert!(reader.starts_with("rmm_k_") && reader.len() == 70, "{reader}");
+    assert_eq!(made["key"]["prefix"], reader[..12]);
+    let listed = admin.get("/api-keys").await;
+    assert!(!listed.to_string().contains(&reader), "the secret is shown once");
+    assert_eq!(listed[0]["status"], "active");
+    let stored: Vec<u8> = sqlx::query_scalar("SELECT token_hash FROM api_keys WHERE id = $1::uuid").bind(&reader_id).fetch_one(db).await.unwrap();
+    assert!(stored.len() == 32 && stored != reader.as_bytes(), "only a hash is stored");
+
+    // --- using a key: Authorization: Bearer, the versioned path and the dashboard's own ---------------
+    let (s, clients, _) = get(reader.clone(), "/clients".into()).await;
+    assert_eq!(s, StatusCode::OK, "{clients}");
+    assert_eq!(clients.as_array().unwrap().iter().map(|c| c["id"].clone()).collect::<Vec<_>>(), [json!(a_id)], "only the key's client");
+    let (s, via_api, _) = key_call(&reader, &format!("{url}/api"), Method::GET, "/clients", None).await;
+    assert!(s.is_success() && via_api == clients, "the same routes under /api");
+    let (s, v, _) = get(reader.clone(), format!("/clients/{b_id}")).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "another client is not found: {v}");
+    let sites = get(reader.clone(), "/sites".into()).await.1;
+    assert!(!sites.as_array().unwrap().is_empty() && sites.as_array().unwrap().iter().all(|s| s["client_id"] == a_id), "{sites}");
+    let agents = get(reader.clone(), "/agents".into()).await.1;
+    assert!(agents["items"].as_array().unwrap().iter().any(|a| a["id"] == id1) && agents["items"].as_array().unwrap().iter().all(|a| a["client_id"] == a_id));
+    let agent = get(reader.clone(), format!("/agents/{id1}")).await.1;
+    assert!(agent.get("inventory").is_some() && agent["hostname"].is_string(), "inventory is part of the agent: {agent}");
+    assert!(get(reader.clone(), format!("/agents/{id1}/metrics?hours=1")).await.0.is_success());
+
+    // Tickets are scoped by client, too.
+    let ticket_a = admin.post("/tickets", json!({ "subject": "API scope A", "client_id": a_id })).await;
+    let ticket_b = admin.post("/tickets", json!({ "subject": "API scope B", "client_id": b_id })).await;
+    let (ta, tb) = (ticket_a["id"].as_str().unwrap().to_string(), ticket_b["id"].as_str().unwrap().to_string());
+    let tickets = get(reader.clone(), "/tickets?view=all".into()).await.1;
+    let seen: Vec<&str> = tickets["items"].as_array().unwrap().iter().map(|t| t["id"].as_str().unwrap()).collect();
+    assert!(seen.contains(&ta.as_str()) && !seen.contains(&tb.as_str()), "{seen:?}");
+    assert_eq!(get(reader.clone(), format!("/tickets/{tb}")).await.0, StatusCode::NOT_FOUND);
+    assert!(get(reader.clone(), format!("/tickets/{ta}")).await.0.is_success());
+
+    // --- refusals ---------------------------------------------------------------------------------------
+    let (s, v, _) = key_call(&reader, &v1, Method::POST, "/tickets", Some(json!({ "subject": "nope", "client_id": a_id }))).await;
+    assert_eq!((s, error_of(&v).as_str()), (StatusCode::FORBIDDEN, "this key is read-only"));
+    let (s, v, _) = get(reader.clone(), "/jobs".into()).await;
+    assert!(s == StatusCode::FORBIDDEN && error_of(&v).contains("no access to jobs"), "a scope the key lacks: {v}");
+    for path in [
+        "/users".to_string(),
+        "/auth/me".to_string(),
+        "/settings".to_string(),
+        "/audit".to_string(),
+        format!("/clients/{a_id}/vault"),
+        format!("/agents/{id1}/processes"),
+        format!("/agents/{id1}/files"),
+        format!("/agents/{id1}/services"),
+        "/api-keys".to_string(),
+        "/webhooks".to_string(),
+    ] {
+        let (s, v, _) = get(reader.clone(), path.clone()).await;
+        assert!(s == StatusCode::FORBIDDEN && error_of(&v).contains("isn't available to API keys"), "{path}: {s} {v}");
+    }
+    let (s, v, _) = key_call(&reader, &v1, Method::POST, "/api-keys", Some(json!({ "name": "x", "access": "read", "scopes": ["agents"] }))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "keys don't mint keys: {v}");
+    assert!(matches!(get(reader.clone(), "/events".into()).await.0, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN), "no live stream for keys");
+    assert_eq!(get(format!("rmm_k_{}", "0".repeat(64)), "/clients".into()).await.0, StatusCode::UNAUTHORIZED, "unknown key");
+    assert_eq!(http.get(format!("{v1}/clients")).send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    // A session token is not an API key, and a key is not a session cookie.
+    let res = http.get(format!("{v1}/clients")).header("cookie", format!("rmm_session={reader}")).send().await.unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+    // --- a write key: tickets and saved scripts ----------------------------------------------------------
+    let made = admin
+        .post("/api-keys", json!({ "name": "e2e writer", "access": "write", "scopes": ["tickets", "jobs"], "client_ids": [a_id] }))
+        .await;
+    let writer = made["token"].as_str().unwrap().to_string();
+    let writer_id = made["key"]["id"].as_str().unwrap().to_string();
+    let (s, t, _) = key_call(&writer, &v1, Method::POST, "/tickets", Some(json!({ "subject": "From the API", "client_id": a_id, "priority": 2 }))).await;
+    assert_eq!(s, StatusCode::OK, "{t}");
+    let tid = t["id"].as_str().unwrap().to_string();
+    let (s, v, _) = key_call(&writer, &v1, Method::POST, "/tickets", Some(json!({ "subject": "Wrong client", "client_id": b_id }))).await;
+    assert!(!s.is_success(), "a key can't create tickets for a client it doesn't have: {v}");
+    let (s, t, _) = key_call(&writer, &v1, Method::PATCH, &format!("/tickets/{tid}"), Some(json!({ "priority": 1 }))).await;
+    assert!(s.is_success() && t["priority"] == 1, "{t}");
+    let (s, v, _) = key_call(&writer, &v1, Method::POST, &format!("/tickets/{tid}/events"), Some(json!({ "kind": "note", "body": "noted via API" }))).await;
+    assert!(s.is_success(), "{v}");
+    assert!(get(writer.clone(), format!("/tickets/{tid}")).await.1["events"].as_array().unwrap().iter().any(|e| e["body"] == "noted via API"));
+    assert_eq!(get(writer.clone(), "/alerts".into()).await.0, StatusCode::FORBIDDEN, "scopes are per resource");
+    let (s, v, _) = key_call(&writer, &v1, Method::POST, "/jobs", Some(json!({ "agent_ids": [id1], "interpreter": "bash", "body": "echo pwned" }))).await;
+    assert!(s == StatusCode::FORBIDDEN && error_of(&v).contains("saved scripts only"), "no ad-hoc code through a key: {v}");
+    let script = admin.post("/scripts", json!({ "name": "api-e2e", "interpreter": "bash", "body": "echo from-key" })).await;
+    let (s, v, _) = key_call(&writer, &v1, Method::POST, "/jobs", Some(json!({ "agent_ids": [id1], "script_id": script["id"] }))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let job = v["jobs"][0]["job_id"].as_str().unwrap().to_string();
+    let (w, j) = (writer.clone(), job.clone());
+    let done = eventually(30, "the job started by the key", || {
+        let (w, j, v1) = (w.clone(), j.clone(), v1.clone());
+        async move {
+            let (_, v, _) = key_call(&w, &v1, Method::GET, &format!("/jobs/{j}"), None).await;
+            (!matches!(v["status"].as_str(), Some("queued" | "sent"))).then_some(v)
+        }
+    })
+    .await;
+    assert_eq!((done["status"].as_str(), done["stdout"].as_str()), (Some("succeeded"), Some("from-key\n")), "{done}");
+    // Writes are audited with the key; reads aren't.
+    let audit = admin.get("/audit?action=api.request&limit=50").await;
+    let paths: Vec<&str> = audit["items"].as_array().unwrap().iter().filter(|r| r["target_id"] == writer_id.as_str()).map(|r| r["details"]["path"].as_str().unwrap()).collect();
+    assert!(paths.contains(&"/api/v1/tickets") && paths.contains(&"/api/v1/jobs"), "{paths:?}");
+    assert!(audit["items"].as_array().unwrap().iter().all(|r| r["details"]["method"] != "GET"));
+    let keys = admin.get("/api-keys").await;
+    let used = keys.as_array().unwrap().iter().find(|k| k["id"] == writer_id.as_str()).unwrap();
+    assert!(used["last_used_at"].is_string(), "{used}");
+
+    // --- a key never has more than its owner ---------------------------------------------------------------
+    let tech_b = signed_in(url, admin, "api-tech-b@e2e.test", "technician", Some(b_id), true).await;
+    let tech_b_id = tech_b.get("/auth/me").await["id"].as_str().unwrap().to_string();
+    let own = |body: Value| {
+        let tech_b = &tech_b;
+        async move { tech_b.call(Method::POST, "/api-keys", Some(body)).await }
+    };
+    assert_eq!(own(json!({ "name": "k", "access": "read", "scopes": ["tickets"], "client_ids": [a_id] })).await.0, StatusCode::BAD_REQUEST, "a client the owner can't see");
+    let (s, v) = own(json!({ "name": "k", "access": "read", "scopes": ["tickets"], "permissions": ["billing.manage"] })).await;
+    assert!(s == StatusCode::BAD_REQUEST && error_of(&v).contains("billing.manage"), "a permission the owner lacks: {v}");
+    assert_eq!(own(json!({ "name": "k", "access": "read", "scopes": ["tickets"], "owner_id": tech_b_id })).await.0, StatusCode::OK, "naming yourself is fine");
+    assert_eq!(own(json!({ "name": "k", "access": "read", "scopes": ["tickets"], "owner_id": uuid::Uuid::nil() })).await.0, StatusCode::FORBIDDEN, "other owners are for admins");
+    assert_eq!(tech_b.call(Method::GET, "/api-keys?all=true", None).await.0, StatusCode::FORBIDDEN);
+    let readonly = signed_in(url, admin, "api-readonly@e2e.test", "readonly", None, true).await;
+    assert_eq!(readonly.call(Method::POST, "/api-keys", Some(json!({ "name": "k", "access": "write", "scopes": ["tickets"] }))).await.0, StatusCode::BAD_REQUEST);
+    let (_, made) = own(json!({ "name": "tech b", "access": "write", "scopes": ["tickets"] })).await;
+    let tech_key = made["token"].as_str().unwrap().to_string();
+    let ids = |v: &Value| v["items"].as_array().unwrap().iter().map(|t| t["id"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+    let seen = ids(&get(tech_key.clone(), "/tickets?view=all".into()).await.1);
+    assert!(seen.contains(&tb) && !seen.contains(&ta), "the owner's clients: {seen:?}");
+    // The owner's access is read on every request: narrowing it narrows the key at once.
+    let (s, _) = admin.call(Method::PUT, &format!("/users/{tech_b_id}/access"), Some(json!({ "all_clients": false, "client_ids": [a_id] }))).await;
+    assert!(s.is_success());
+    let seen = ids(&get(tech_key.clone(), "/tickets?view=all".into()).await.1);
+    assert!(seen.contains(&ta) && !seen.contains(&tb), "{seen:?}");
+    // Named permissions are separate from scopes: the scope opens the route, the permission lets it answer.
+    let sec_plain = admin.post("/api-keys", json!({ "name": "sec", "access": "read", "scopes": ["security"] })).await["token"].as_str().unwrap().to_string();
+    let sec_perm = admin
+        .post("/api-keys", json!({ "name": "sec+", "access": "read", "scopes": ["security"], "permissions": ["security.read"] }))
+        .await["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(get(sec_plain, "/security/summary".into()).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(get(sec_perm.clone(), "/security/summary".into()).await.0, StatusCode::OK);
+    // ...and a permission the owner loses is lost by the key.
+    admin.put(&format!("/users/{tech_b_id}/permissions"), json!({ "permissions": ["security.read"] })).await;
+    let (_, made) = own(json!({ "name": "tech sec", "access": "read", "scopes": ["security"], "permissions": ["security.read"] })).await;
+    let tech_sec = made["token"].as_str().unwrap().to_string();
+    assert_eq!(get(tech_sec.clone(), "/security/summary".into()).await.0, StatusCode::OK);
+    admin.put(&format!("/users/{tech_b_id}/permissions"), json!({ "permissions": [] })).await;
+    assert_eq!(get(tech_sec, "/security/summary".into()).await.0, StatusCode::FORBIDDEN, "the owner no longer holds security.read");
+
+    // --- revoking, expiry, disabled owners, rate limits ---------------------------------------------------------
+    let (s, _) = admin.call(Method::DELETE, &format!("/api-keys/{reader_id}"), None).await;
+    assert!(s.is_success());
+    assert_eq!(get(reader.clone(), "/clients".into()).await.0, StatusCode::UNAUTHORIZED, "revoked");
+    assert_eq!(admin.call(Method::DELETE, &format!("/api-keys/{reader_id}"), None).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(tech_b.call(Method::DELETE, &format!("/api-keys/{writer_id}"), None).await.0, StatusCode::NOT_FOUND, "other people's keys");
+    let (_, made) = create(json!({ "name": "short lived", "access": "read", "scopes": ["clients"], "expires_in_days": 1 })).await;
+    let (short, short_id) = (made["token"].as_str().unwrap().to_string(), made["key"]["id"].as_str().unwrap().to_string());
+    assert!(get(short.clone(), "/clients".into()).await.0.is_success());
+    sqlx::query("UPDATE api_keys SET expires_at = now() - interval '1 minute' WHERE id = $1::uuid").bind(&short_id).execute(db).await.unwrap();
+    assert_eq!(get(short, "/clients".into()).await.0, StatusCode::UNAUTHORIZED, "expired");
+    let (_, made) = create(json!({ "name": "slow lane", "access": "read", "scopes": ["clients"], "rate_limit_per_min": 3 })).await;
+    let slow = made["token"].as_str().unwrap().to_string();
+    for i in 0..3 {
+        assert!(get(slow.clone(), "/clients".into()).await.0.is_success(), "request {i} is within the budget");
+    }
+    let (s, v, h) = get(slow.clone(), "/clients".into()).await;
+    assert!(s == StatusCode::TOO_MANY_REQUESTS && h.contains_key("retry-after"), "the 4th: {s} {v}");
+    assert_eq!(get(sec_perm.clone(), "/security/summary".into()).await.0, StatusCode::OK, "limits are per key");
+
+    // --- service accounts ----------------------------------------------------------------------------------------
+    assert_eq!(
+        admin.call(Method::POST, "/service-accounts", Some(json!({ "name": "root", "role": "admin", "all_clients": true }))).await.0,
+        StatusCode::BAD_REQUEST,
+        "never an admin"
+    );
+    assert_eq!(tech_b.call(Method::POST, "/service-accounts", Some(json!({ "name": "x", "role": "technician", "all_clients": true }))).await.0, StatusCode::FORBIDDEN);
+    let sa = admin.post("/service-accounts", json!({ "name": "CI pipeline", "role": "technician", "client_ids": [a_id] })).await["id"].as_str().unwrap().to_string();
+    let (s, made) = create(json!({ "name": "ci", "access": "read", "scopes": ["agents"], "owner_id": sa })).await;
+    assert_eq!(s, StatusCode::OK, "{made}");
+    let sa_key = made["token"].as_str().unwrap().to_string();
+    assert_eq!(made["key"]["service_account"], true);
+    let seen = get(sa_key.clone(), "/agents".into()).await.1;
+    assert!(seen["items"].as_array().unwrap().iter().any(|a| a["id"] == id1), "{seen}");
+    assert_eq!(create(json!({ "name": "ci", "access": "read", "scopes": ["agents"], "owner_id": tech_b_id })).await.0, StatusCode::BAD_REQUEST, "only service accounts, not people");
+    let email: String = sqlx::query_scalar("SELECT email FROM users WHERE id = $1::uuid").bind(&sa).fetch_one(db).await.unwrap();
+    for password in ["!", "anything-at-all-123"] {
+        let res = http.post(format!("{url}/api/auth/login")).json(&json!({ "email": email, "password": password })).send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "service accounts can't sign in");
+    }
+    assert_eq!(admin.call(Method::POST, &format!("/users/{sa}/password"), Some(json!({ "password": "a-long-enough-password" }))).await.0, StatusCode::NOT_FOUND);
+    assert!(admin.get("/service-accounts").await.as_array().unwrap().iter().any(|a| a["id"] == sa.as_str() && a["keys"] == 1));
+    assert!(admin.call(Method::DELETE, &format!("/service-accounts/{sa}"), None).await.0.is_success());
+    assert_eq!(get(sa_key, "/agents".into()).await.0, StatusCode::UNAUTHORIZED, "removing the account revokes its keys");
+    // A disabled owner's keys stop working, too.
+    admin.call(Method::DELETE, &format!("/users/{tech_b_id}"), None).await;
+    assert_eq!(get(tech_key, "/tickets".into()).await.0, StatusCode::UNAUTHORIZED);
+    println!("API keys: ok");
+
+    // --- webhooks ------------------------------------------------------------------------------------------------------
+    let fail = std::sync::Arc::new(AtomicBool::new(false));
+    let (base, hooks) = signed_receiver(fail.clone()).await;
+    let all = admin.get("/webhooks").await["events"].clone();
+    assert!(all.as_array().unwrap().len() >= 8);
+    let hook = |body: Value| async move { admin.call(Method::POST, "/webhooks", Some(body)).await };
+    for (what, body, want) in [
+        ("a URL without a scheme", json!({ "name": "w", "url": "hooks.example.com", "events": all }), StatusCode::BAD_REQUEST),
+        ("credentials in the URL", json!({ "name": "w", "url": "https://u:p@hooks.example.com/", "events": all }), StatusCode::BAD_REQUEST),
+        ("no events", json!({ "name": "w", "url": format!("{base}/1"), "events": [] }), StatusCode::BAD_REQUEST),
+        ("an unknown event", json!({ "name": "w", "url": format!("{base}/1"), "events": ["ticket.deleted"] }), StatusCode::BAD_REQUEST),
+        ("an unknown client", json!({ "name": "w", "url": format!("{base}/1"), "events": all, "client_id": uuid::Uuid::nil() }), StatusCode::NOT_FOUND),
+    ] {
+        assert_eq!(hook(body).await.0, want, "{what}");
+    }
+    assert_eq!(readonly.call(Method::GET, "/webhooks", None).await.0, StatusCode::FORBIDDEN, "admins only");
+    let created = admin.post("/webhooks", json!({ "name": "e2e all", "url": format!("{base}/1"), "events": all })).await;
+    let (sub, secret) = (created["webhook"]["id"].as_str().unwrap().to_string(), created["secret"].as_str().unwrap().to_string());
+    assert!(secret.starts_with("whsec_"));
+    assert!(!admin.get("/webhooks").await.to_string().contains(&secret), "the secret is shown once");
+    let (stored, sealed): (Vec<u8>, bool) = sqlx::query_as("SELECT secret, secret_sealed FROM webhook_subscriptions WHERE id = $1::uuid").bind(&sub).fetch_one(db).await.unwrap();
+    assert!(sealed && stored != secret.as_bytes(), "sealed at rest");
+    let only_b = admin.post("/webhooks", json!({ "name": "e2e B only", "url": format!("{base}/2"), "events": all, "client_id": b_id })).await;
+    let (sub_b, secret_b) = (only_b["webhook"]["id"].as_str().unwrap().to_string(), only_b["secret"].as_str().unwrap().to_string());
+
+    // A test delivery: signed, with matching headers.
+    admin.post(&format!("/webhooks/{sub}/test"), json!({})).await;
+    let ping = wait_signed(&hooks, 1, &secret, "the ping", |v| v["event"] == "ping").await;
+    assert_eq!(ping["data"]["message"], "Test delivery from RMM");
+
+    // Ticket events, in order.
+    let t = admin.post("/tickets", json!({ "subject": "Webhook ticket", "client_id": a_id })).await;
+    let (wt, number) = (t["id"].as_str().unwrap().to_string(), t["number"].clone());
+    let created = wait_signed(&hooks, 1, &secret, "ticket.created", |v| v["event"] == "ticket.created" && v["data"]["ticket"]["id"] == wt.as_str()).await;
+    assert_eq!(created["data"]["ticket"]["number"], number);
+    assert_eq!((created["data"]["ticket"]["client"]["name"].as_str(), created["data"]["actor"]["type"].as_str()), (Some("Client A"), Some("user")));
+    assert!(created["data"]["ticket"]["url"].as_str().unwrap().ends_with(&format!("/tickets/{wt}")), "{created}");
+    assert_eq!(created["data"]["ticket"]["status"]["category"], "new");
+    let statuses = admin.get(&format!("/tickets/{wt}")).await["statuses"].clone();
+    let status = |cat: &str| statuses.as_array().unwrap().iter().find(|s| s["category"] == cat).unwrap()["id"].clone();
+    admin.call(Method::PATCH, &format!("/tickets/{wt}"), Some(json!({ "priority": 1 }))).await;
+    let updated = wait_signed(&hooks, 1, &secret, "ticket.updated", |v| v["event"] == "ticket.updated" && v["data"]["change"]["field"] == "priority").await;
+    assert_eq!((updated["data"]["change"]["from"].as_i64(), updated["data"]["change"]["to"].as_i64()), (Some(3), Some(1)), "{updated}");
+    admin.call(Method::PATCH, &format!("/tickets/{wt}"), Some(json!({ "status_id": status("resolved") }))).await;
+    let changed = wait_signed(&hooks, 1, &secret, "ticket.status_changed", |v| v["event"] == "ticket.status_changed" && v["data"]["ticket"]["id"] == wt.as_str()).await;
+    assert_eq!(changed["data"]["change"]["category"], "resolved");
+    let resolved = wait_signed(&hooks, 1, &secret, "ticket.resolved", |v| v["event"] == "ticket.resolved" && v["data"]["ticket"]["id"] == wt.as_str()).await;
+    assert_eq!(resolved["data"]["ticket"]["status"]["category"], "resolved");
+    admin.post(&format!("/tickets/{wt}/events"), json!({ "kind": "reply", "body": "All fixed, public." })).await;
+    let reply = wait_signed(&hooks, 1, &secret, "a public comment", |v| v["event"] == "ticket.comment" && v["data"]["comment"]["body"] == "All fixed, public.").await;
+    assert_eq!((reply["data"]["comment"]["public"].as_bool(), reply["data"]["comment"]["kind"].as_str()), (Some(true), Some("reply")));
+    // Internal notes stay inside unless the subscription asks for them.
+    admin.post(&format!("/tickets/{wt}/events"), json!({ "kind": "note", "body": "Secret internal note." })).await;
+    admin.post(&format!("/tickets/{wt}/events"), json!({ "kind": "reply", "body": "Marker after the note." })).await;
+    wait_signed(&hooks, 1, &secret, "the marker", |v| v["data"]["comment"]["body"] == "Marker after the note.").await;
+    assert!(!hooks.lock().unwrap().iter().any(|h| String::from_utf8_lossy(&h.4).contains("Secret internal note")), "internal notes are not sent");
+    admin.put(&format!("/webhooks/{sub}"), json!({ "name": "e2e all", "url": format!("{base}/1"), "events": all, "internal_notes": true })).await;
+    admin.post(&format!("/tickets/{wt}/events"), json!({ "kind": "note", "body": "Second internal note." })).await;
+    let note = wait_signed(&hooks, 1, &secret, "an internal note", |v| v["data"]["comment"]["body"] == "Second internal note.").await;
+    assert_eq!(note["data"]["comment"]["public"], false);
+
+    // A subscription for one client hears about that client only.
+    assert!(deliveries_to(&hooks, 2).is_empty(), "nothing yet for client B");
+    admin.call(Method::PATCH, &format!("/tickets/{tb}"), Some(json!({ "priority": 2 }))).await;
+    let b_update = wait_signed(&hooks, 2, &secret_b, "client B's webhook", |v| v["event"] == "ticket.updated").await;
+    let b_name = admin.get(&format!("/clients/{b_id}")).await["name"].clone();
+    assert_eq!(b_update["data"]["ticket"]["client"]["name"], b_name);
+    wait_signed(&hooks, 1, &secret, "the same change for the MSP-wide webhook", |v| v["data"]["ticket"]["id"] == tb.as_str() && v["event"] == "ticket.updated").await;
+    assert!(deliveries_to(&hooks, 2).iter().all(|v| v["data"]["ticket"]["client"]["name"] == b_name), "B's webhook never sees client A");
+
+    // Alerts: opened by the engine, acknowledged and resolved from the API.
+    let policy = admin
+        .alert_policy(json!({ "name": "API e2e: jobs fail", "kind": "job_failed", "params": {}, "severity": "warning", "client_id": a_id }))
+        .await;
+    let failing = admin.run_script(id1, "exit 9", 30).await;
+    admin.wait_job(&failing, 30).await;
+    let opened = wait_signed(&hooks, 1, &secret, "alert.created", |v| v["event"] == "alert.created" && v["data"]["alert"]["kind"] == "job_failed" && v["data"]["alert"]["details"]["exit_code"] == 9).await;
+    assert_eq!((opened["data"]["agent"]["id"].as_str(), opened["data"]["client"]["name"].as_str()), (Some(id1), Some("Client A")));
+    assert!(opened["data"]["url"].as_str().unwrap().contains(&format!("/agents/{id1}")), "{opened}");
+    let alert_id = opened["data"]["alert"]["id"].as_str().unwrap().to_string();
+    admin.post(&format!("/alerts/{alert_id}/acknowledge"), json!({})).await;
+    let acked = wait_signed(&hooks, 1, &secret, "alert.acknowledged", |v| v["event"] == "alert.acknowledged" && v["data"]["alert"]["id"] == alert_id.as_str()).await;
+    assert_eq!(acked["data"]["alert"]["state"], "acknowledged");
+    admin.post(&format!("/alerts/{alert_id}/resolve"), json!({})).await;
+    let done = wait_signed(&hooks, 1, &secret, "alert.resolved", |v| v["event"] == "alert.resolved" && v["data"]["alert"]["id"] == alert_id.as_str()).await;
+    assert_eq!(done["data"]["alert"]["resolution"], "manual");
+    assert!(deliveries_to(&hooks, 2).iter().all(|v| !v["event"].as_str().unwrap().starts_with("alert.")), "client B has no alerts");
+    admin.call(Method::DELETE, &format!("/policy-items/{}", policy["id"].as_str().unwrap()), None).await;
+
+    // A receiver that is down: the delivery waits and retries, and can be sent again by hand.
+    fail.store(true, Ordering::SeqCst);
+    let t = admin.post("/tickets", json!({ "subject": "Receiver is down", "client_id": a_id })).await;
+    let down = t["id"].as_str().unwrap().to_string();
+    let failed = eventually(30, "a failed attempt in the log", || async {
+        let log = admin.get(&format!("/webhooks/{sub}/deliveries")).await;
+        log.as_array().unwrap().iter().find(|d| d["event"] == "ticket.created" && d["status"] == "pending" && d["attempts"] == 1 && d["last_error"].is_string()).cloned()
+    })
+    .await;
+    assert_eq!(failed["response_status"], 500);
+    assert!(failed["last_error"].as_str().unwrap().contains("HTTP 500"), "{failed}");
+    let first = hooks.lock().unwrap().iter().rev().find(|h| String::from_utf8_lossy(&h.4).contains(&down)).cloned().unwrap();
+    fail.store(false, Ordering::SeqCst);
+    let (s, _) = admin.call(Method::POST, &format!("/webhook-deliveries/{}/redeliver", failed["id"]), None).await;
+    assert!(s.is_success());
+    let sent = eventually(30, "the delivery to be sent again", || async {
+        let log = admin.get(&format!("/webhooks/{sub}/deliveries")).await;
+        log.as_array().unwrap().iter().find(|d| d["id"] == failed["id"] && d["status"] == "sent").cloned()
+    })
+    .await;
+    assert_eq!(sent["response_status"], 200);
+    let again = hooks.lock().unwrap().iter().rev().find(|h| String::from_utf8_lossy(&h.4).contains(&down)).cloned().unwrap();
+    assert_eq!((&first.2, &first.4), (&again.2, &again.4), "a retry carries the same delivery id and the same bytes");
+    assert_eq!(again.3, hook_signature(&secret, &again.4));
+    let detail = admin.get(&format!("/webhook-deliveries/{}", failed["id"])).await;
+    assert_eq!((detail["event"].as_str(), detail["payload"]["ticket"]["id"].as_str()), (Some("ticket.created"), Some(down.as_str())));
+
+    // Disabled subscriptions are skipped; a rotated secret signs from then on.
+    admin.put(&format!("/webhooks/{sub}"), json!({ "name": "e2e all", "url": format!("{base}/1"), "events": all, "enabled": false })).await;
+    let skipped = admin.post("/tickets", json!({ "subject": "While disabled", "client_id": a_id })).await["id"].as_str().unwrap().to_string();
+    admin.put(&format!("/webhooks/{sub}"), json!({ "name": "e2e all", "url": format!("{base}/1"), "events": ["ticket.created"] })).await;
+    let new_secret = admin.post(&format!("/webhooks/{sub}/rotate-secret"), json!({})).await["secret"].as_str().unwrap().to_string();
+    assert_ne!(new_secret, secret);
+    let after = admin.post("/tickets", json!({ "subject": "After rotation", "client_id": a_id })).await["id"].as_str().unwrap().to_string();
+    wait_signed(&hooks, 1, &new_secret, "a delivery signed with the new secret", |v| v["data"]["ticket"]["id"] == after.as_str()).await;
+    assert!(!hooks.lock().unwrap().iter().any(|h| String::from_utf8_lossy(&h.4).contains(&skipped)), "nothing is sent while disabled");
+    // Only the chosen events: a comment no longer goes out.
+    admin.post(&format!("/tickets/{after}/events"), json!({ "kind": "reply", "body": "Not subscribed." })).await;
+    admin.post("/tickets", json!({ "subject": "Barrier", "client_id": a_id })).await;
+    wait_signed(&hooks, 1, &new_secret, "the barrier", |v| v["data"]["ticket"]["subject"] == "Barrier").await;
+    assert!(!hooks.lock().unwrap().iter().any(|h| h.0 == 1 && String::from_utf8_lossy(&h.4).contains("Not subscribed")));
+    let log = admin.get(&format!("/webhooks/{sub}/deliveries?status=sent")).await;
+    assert!(log.as_array().unwrap().len() >= 10 && log.as_array().unwrap().iter().all(|d| d["status"] == "sent"));
+    let audit = admin.get("/audit?action=webhook.&limit=50").await;
+    let actions: Vec<&str> = audit["items"].as_array().unwrap().iter().map(|r| r["action"].as_str().unwrap()).collect();
+    for a in ["webhook.create", "webhook.update", "webhook.test", "webhook.rotate_secret", "webhook.redeliver"] {
+        assert!(actions.contains(&a), "{a} audited: {actions:?}");
+    }
+    for id in [&sub, &sub_b] {
+        assert!(admin.call(Method::DELETE, &format!("/webhooks/{id}"), None).await.0.is_success());
+    }
+    assert_eq!(admin.call(Method::DELETE, &format!("/webhooks/{sub}"), None).await.0, StatusCode::NOT_FOUND);
+    println!("webhooks: ok");
 }
 
 /// The policy migration (0022) on a database with old-model rows in every shape: MSP-wide,

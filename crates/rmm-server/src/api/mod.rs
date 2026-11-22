@@ -9,6 +9,7 @@ pub mod access;
 mod agents;
 mod attachments;
 mod alerts;
+mod apikeys;
 mod billing;
 mod channels;
 mod auth;
@@ -26,6 +27,7 @@ mod patches;
 mod pm;
 pub(crate) mod policies;
 pub(crate) mod portal;
+pub(crate) mod public;
 mod reports;
 mod search;
 mod scripts;
@@ -40,6 +42,7 @@ mod tools;
 mod totp;
 pub(crate) mod users;
 mod vault;
+mod webhooks;
 
 pub use jobs::{FAILED as JOB_FAILED, deliver as deliver_job};
 pub use portal::PORTAL_LINK_MINUTES;
@@ -69,6 +72,19 @@ pub fn router(attachment_max: u64) -> Router<Arc<AppState>> {
         .route("/auth/me", get(auth::me))
         .route("/auth/preferences", axum::routing::put(auth::update_preferences))
         .route("/events", get(crate::events::handler))
+        .route("/openapi.json", get(public::openapi))
+        .route("/api-keys", get(apikeys::list).post(apikeys::create))
+        .route("/api-keys/options", get(apikeys::options))
+        .route("/api-keys/{id}", delete(apikeys::revoke))
+        .route("/service-accounts", get(apikeys::service_accounts).post(apikeys::create_service_account))
+        .route("/service-accounts/{id}", delete(apikeys::remove_service_account))
+        .route("/webhooks", get(webhooks::list).post(webhooks::create))
+        .route("/webhooks/{id}", axum::routing::put(webhooks::update).delete(webhooks::remove))
+        .route("/webhooks/{id}/rotate-secret", post(webhooks::rotate_secret))
+        .route("/webhooks/{id}/test", post(webhooks::test))
+        .route("/webhooks/{id}/deliveries", get(webhooks::deliveries))
+        .route("/webhook-deliveries/{id}", get(webhooks::delivery))
+        .route("/webhook-deliveries/{id}/redeliver", post(webhooks::redeliver))
         .route("/search", get(search::search))
         .route("/auth/password", post(auth::change_password))
         .route("/auth/sessions", get(auth::my_sessions).delete(auth::revoke_other_sessions))
@@ -82,7 +98,8 @@ pub fn router(attachment_max: u64) -> Router<Arc<AppState>> {
         .route("/clients", get(clients::list).post(clients::create))
         .route("/clients/{id}", get(clients::get).put(clients::rename).delete(clients::remove))
         .route("/clients/{id}/sites", post(clients::create_site))
-        .route("/sites/{id}", axum::routing::put(clients::rename_site).delete(clients::remove_site))
+        .route("/sites", get(clients::list_sites))
+        .route("/sites/{id}", get(clients::get_site).put(clients::rename_site).delete(clients::remove_site))
         .route("/sites/{id}/enrollment-tokens", get(clients::list_tokens).post(clients::create_token))
         .route("/enrollment-tokens/{id}", delete(clients::revoke_token))
         .route("/agent-downloads", get(downloads::list))

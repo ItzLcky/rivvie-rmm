@@ -4,6 +4,8 @@ mod billing;
 mod pdf;
 mod policy;
 mod alerts;
+mod apikeys;
+mod webhooks;
 mod desktop_ws;
 mod api;
 mod auth;
@@ -330,6 +332,8 @@ async fn serve(db: sqlx::PgPool, args: ServeArgs) -> Result<()> {
         .route("/healthz", get(|| async { "ok" }))
         .route("/metrics", get(metrics::handler))
         .nest("/api", api::router(state.cfg.attachment_max_bytes()))
+        // The same routes under a version: what API keys and integrations should use.
+        .nest("/api/v1", api::router(state.cfg.attachment_max_bytes()))
         .fallback_service(ServeDir::new(&args.web_dir).fallback(ServeFile::new(index)))
         // (The API sets its own body limit, see `api::router`.)
         .layer(axum::middleware::from_fn(metrics::http_layer));
@@ -487,6 +491,11 @@ async fn housekeeping(state: Arc<AppState>) {
             results.push(sqlx::query("DELETE FROM attachment_links WHERE expires_at < now()").execute(db).await);
             results.push(
                 sqlx::query("DELETE FROM notifications WHERE status <> 'pending' AND created_at < now() - interval '30 days'")
+                    .execute(db)
+                    .await,
+            );
+            results.push(
+                sqlx::query("DELETE FROM webhook_deliveries WHERE status <> 'pending' AND created_at < now() - interval '30 days'")
                     .execute(db)
                     .await,
             );

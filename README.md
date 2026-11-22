@@ -637,6 +637,33 @@ Design: [docs/design/documentation.md](docs/design/documentation.md).
   access. Both also need **two-factor authentication turned on** for the user, and access to the
   client.
 
+## API, keys and webhooks
+
+Design: [docs/design/api.md](docs/design/api.md).
+
+- **API keys** authenticate `Authorization: Bearer rmm_k_…` on the public REST API, mounted at `/api/v1`
+  (the dashboard's own routes, with cookies, stay at `/api`). Create them under Account → API keys; admins
+  also create **service accounts** (users that can't sign in) and their keys under Company settings → API.
+  The key is shown once (only a hash is stored). **A key acts as its owner and never with more**: it has
+  read or write access, one or more scopes (`clients`, `agents`, `jobs`, `scripts`, `alerts`, `tickets`,
+  `security`), only the named permissions it lists (and its owner holds), optionally a subset of clients,
+  an expiry and a rate limit per minute (HTTP 429 over it). The owner's rights are checked on every
+  request, so demoting or disabling the owner narrows or kills their keys at once. Keys can't use the
+  agent socket, shell or desktop relays, the vault, users, settings, billing or key management, and
+  start jobs from saved scripts only. Writes with a key are audited (`api.request`), and lists show each
+  key's last use.
+- **OpenAPI 3.1** at `/api/v1/openapi.json` (no credentials needed), generated from the same registry
+  that decides which routes keys may call (`crates/rmm-server/src/api/public.rs`); the dashboard renders
+  it at **API reference** (`/api-docs`).
+- **Webhooks** (Company settings → Webhooks, admins) post ticket events (`ticket.created`, `.updated`,
+  `.status_changed`, `.resolved`, `.comment`) and alert events (`alert.created`, `.acknowledged`,
+  `.resolved`) as signed JSON to a URL, for all clients or one. The body is signed like the webhook
+  notification channel: `X-RMM-Signature: sha256=<hex HMAC-SHA256 of the raw body>` with a per-webhook secret
+  (shown once, sealed with `RMM_DATA_KEY`), plus `X-RMM-Event` and `X-RMM-Delivery`. Deliveries go through a
+  Postgres outbox, written in the transaction that changed the ticket, retried after 1, 5, 30 and 120
+  minutes with identical bytes, and logged in the dashboard (HTTP status, duration, error, *Send again*).
+  Internal notes are only sent when a subscription asks for them.
+
 ## Remote desktop
 
 Open an agent and choose **Remote desktop** (technicians and admins). The agent starts a helper
