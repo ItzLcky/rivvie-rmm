@@ -484,21 +484,20 @@ for (const theme of ['light', 'dark'] as const) {
 			});
 		});
 
-		// WCAG 2.2 AA checks (contrast, names, roles) on every page, in this theme.
-		test('accessibility', async ({ page }) => {
-			test.setTimeout(420_000);
-			await mockApi(page);
-			const problems: string[] = [];
-			for (const [name, path] of [...pages, ['gallery', '/dev/ui'] as [string, string]]) {
+		// WCAG 2.2 AA checks (contrast, names, roles) on every page, in this theme. One test per page,
+		// so each has its own time budget and a failure names the page.
+		for (const [name, path] of [...pages, ['gallery', '/dev/ui'] as [string, string]]) {
+			test(`accessibility: ${name}`, async ({ page }) => {
+				await mockApi(page);
 				await page.goto(path);
 				await settle(page);
 				const r = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa']).analyze();
-				for (const v of r.violations.filter((v) => v.impact === 'serious' || v.impact === 'critical')) {
-					problems.push(`${name}: ${v.id} (${v.impact}): ${v.nodes.slice(0, 3).map((n) => n.target.join(' ')).join(' | ')}`);
-				}
-			}
-			expect(problems, problems.join('\n')).toEqual([]);
-		});
+				const problems = r.violations
+					.filter((v) => v.impact === 'serious' || v.impact === 'critical')
+					.map((v) => `${name}: ${v.id} (${v.impact}): ${v.nodes.slice(0, 3).map((n) => n.target.join(' ')).join(' | ')}`);
+				expect(problems, problems.join('\n')).toEqual([]);
+			});
+		}
 	});
 }
 
