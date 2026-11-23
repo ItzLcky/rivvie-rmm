@@ -15,10 +15,11 @@ Last reviewed 2026-11-22.
 | 7. PSA | Done: service desk, portal, SLAs, time, contracts, billing, documentation and password vault |
 | 8. Endpoint protection | Milestones 1-7 done, plus our own antivirus engine ([design](design/antivirus.md)) on Linux; Windows real-time collection not built, Windows and macOS sensor untested |
 | 9. Policy management | Done ([design](design/policies.md)) |
+| 10. Platform and reach (blocks 0-4 below) | Built 2026-11-22 on `roadmap-build`, not yet on main: SSO, API, fields, automations, audit/SIEM, software deployment, network/SNMP, data-key rotation, full backups |
 
 Everything built works end to end on Linux and is covered by unit tests, the e2e suite (`crates/rmm-server/tests/e2e.rs`), the Windows e2e on `windows-latest`, the `upgrade` job and the Playwright visual and accessibility tests. The biggest gap is still that **no Windows code path has run on a real Windows host**, and Windows is where most MSP fleets are.
 
-**CI:** main was fully green on `505b405` (2026-11-20, all nine jobs, including `e2e-windows` and `upgrade` for the first time on GitHub). It has been red since `cfd816e` because of the `upgrade` job only; see block 0.
+**CI:** main was fully green on `505b405` (2026-11-20) and red since `cfd816e` because of the `upgrade` job. The fix is on `roadmap-build` (checked locally against the real `v0.1.1` image); that branch has passed every local check but has not run on GitHub, so the new jobs (`restore-drill`, `s3`, the Windows e2e sections) are unproven there.
 
 Design records: [PSA](design/psa.md), [endpoint protection](design/endpoint-protection.md), [antivirus](design/antivirus.md), [production readiness](design/production-readiness.md), [policy management](design/policies.md), [documentation and vault](design/documentation.md), [UI survey](research/rmm-ui-survey.md), [load test](research/load-test-2026-11.md).
 
@@ -28,14 +29,14 @@ In priority order. Block 1 waits on Windows hardware and the security review wai
 
 ### 0. Green main and a release
 
-- [ ] **Fix the `upgrade` job.** `tests/upgrade.rs` now seeds documentation pages with `POST /api/clients/{id}/docs`, but the previous release it runs against (`v0.1.1`, 2026-11-10) predates documentation, so the seed fails with 405. Seed the docs rows only when the old server has the route (or insert them in SQL the way `0023` expects to find them), so the job checks the `0023` migration once a release with docs exists.
-- [ ] **Cut `v0.2.0`.** Nothing has been tagged since `v0.1.1`: blocks 3-6, policy management, the docs and vault and the antivirus engine are only on main. A tag gives the `upgrade` job a newer starting point, gives agents a stable release to update to, and gives operators something other than `main` to pin. Add a CHANGELOG while doing it, and a short release checklist (tag, image, signed agent builds, upgrade job green).
+- [x] **Fix the `upgrade` job.** `tests/upgrade.rs` now seeds documentation pages with `POST /api/clients/{id}/docs`, but the previous release it runs against (`v0.1.1`, 2026-11-10) predates documentation, so the seed fails with 405. Seed the docs rows only when the old server has the route (or insert them in SQL the way `0023` expects to find them), so the job checks the `0023` migration once a release with docs exists.
+- [ ] **Cut `v0.2.0`.** CHANGELOG, [release checklist](RELEASING.md) and the 0.2.0 bump are done; left: merge `roadmap-build`, see CI green, tag. Nothing has been tagged since `v0.1.1`: blocks 3-6, policy management, the docs and vault and the antivirus engine are only on main. A tag gives the `upgrade` job a newer starting point, gives agents a stable release to update to, and gives operators something other than `main` to pin. Add a CHANGELOG while doing it, and a short release checklist (tag, image, signed agent builds, upgrade job green).
 
 ### 1. Windows on real hosts
 
 Every Windows feature is compile-checked (clippy via mingw) and unit-tested against recorded output. The Windows e2e (`crates/rmm-server/tests/e2e_windows.rs`, the `e2e-windows` job) already covers the MSI install, upgrade and uninstall, the service and its recovery actions, the data-directory ACL, PowerShell and cmd jobs, the Job Object tree kill, results across a service restart and the service list. Run the rest on Windows 10/11 and Server 2019/2022, and keep it running:
 
-- [ ] Extend the Windows e2e to self-update, ConPTY shells, Event Log watchers, patches, Defender and the sensor.
+- [x] Extend the Windows e2e to self-update, ConPTY shells, Event Log watchers, patches, Defender and the sensor (sections in `e2e_windows.rs`; first GitHub run will need tuning). The rest is the manual plan in [design/windows-testing.md](design/windows-testing.md).
 - [ ] Install and service on a real host: the `C:\ProgramData\RMM` ACL, the Program Files copy, SCM recovery actions, file logging, reinstall over a running service, MSI upgrade and repair.
 - [ ] Self-update: service stop/start from the detached watchdog, and rollback.
 - [ ] Jobs and shells (ConPTY, Job Objects), service list and control (`Win32_Service`), Event Log watchers (`wevtutil`).
@@ -47,24 +48,24 @@ Every Windows feature is compile-checked (clippy via mingw) and unit-tested agai
 ### 2. Before the first real customer
 
 - [ ] **Security review** by someone outside the project: agent/server protocol, enrollment, the update and content signing chain, session handling, per-client scoping, the shell and desktop relays, the client portal, and the password vault (envelope encryption, reveal auditing, rate limits).
-- [ ] **`RMM_DATA_KEY` rotation**: a CLI command that rewraps the vault's client keys and reseals TOTP secrets, mailbox and accounting secrets and detection context under a new key. Today a leaked key can't be replaced without losing that data.
-- [ ] **Backups cover everything.** The nightly `pg_dump` misses local object storage (attachments, invoice PDFs, triage packages). Back it up beside the dump (or document that S3 must be versioned), and add a restore drill to CI: restore a dump and the storage into an empty stack and read the e2e's rows back.
-- [ ] **Stored columns for search and health** (from the [load test](research/load-test-2026-11.md)): agent search scans every inventory's JSON (~0.8 s at 10,000 agents) and dashboard health is computed per request (~0.3 s, refetched on every alert, job and online change). These are the first things to give at 10,000 agents.
-- [ ] **Try the integrations against the real services**, not stand-ins: AWS S3 and MinIO (multipart uploads and ranges), Microsoft 365 over Graph, QuickBooks Online (sandbox company), Xero (demo organisation), and how real mail clients render our emails.
-- [ ] **Operator guide**: TLS and reverse proxy, sizing from the load test, the environment variables that must be kept safe (`RMM_DATA_KEY`, signing keys), monitoring with `/metrics`. Most of it is in the README already; gather it into one install path an MSP can follow.
+- [x] **`RMM_DATA_KEY` rotation** (`rmm-server rotate-data-key`): a CLI command that rewraps the vault's client keys and reseals TOTP secrets, mailbox and accounting secrets and detection context under a new key. Today a leaked key can't be replaced without losing that data.
+- [x] **Backups cover everything.** The nightly `pg_dump` misses local object storage (attachments, invoice PDFs, triage packages). Back it up beside the dump (or document that S3 must be versioned), and add a restore drill to CI: restore a dump and the storage into an empty stack and read the e2e's rows back.
+- [x] **Stored columns for search and health** (search ~16 ms, dashboard ~50 ms at 10,000 agents) (from the [load test](research/load-test-2026-11.md)): agent search scans every inventory's JSON (~0.8 s at 10,000 agents) and dashboard health is computed per request (~0.3 s, refetched on every alert, job and online change). These are the first things to give at 10,000 agents.
+- [ ] **Try the integrations against the real services**, not stand-ins: AWS S3 (MinIO is done and in CI), Microsoft 365 over Graph, QuickBooks Online (sandbox company), Xero (demo organisation), and how real mail clients render our emails.
+- [x] **Operator guide** ([OPERATOR.md](OPERATOR.md)): TLS and reverse proxy, sizing from the load test, the environment variables that must be kept safe (`RMM_DATA_KEY`, signing keys), monitoring with `/metrics`. Most of it is in the README already; gather it into one install path an MSP can follow.
 
 ### 3. Platform: API, SSO and organisation
 
-- [ ] **API keys and a public REST API** with OpenAPI docs, scoped by permission set and client. Webhooks out for ticket and alert events. Other tools and the PSA integrations below build on it.
-- [ ] **SSO for technicians**: OIDC first (Entra ID and Google cover most MSPs), SAML later. Map groups to roles and clients. Passkeys (WebAuthn) as a second factor.
-- [ ] **Tags, custom fields and agent notes**, then **saved views** built on the existing URL state. Custom fields can be filled by scripts (script output → field), which is how MSPs track things we don't collect.
-- [ ] **Automation policies**, the rest of them: scheduled scripts and an alert's `run_script_id` already live in policy sets. Left: run on enrollment and other event triggers, and a script that runs once per device rather than on a timetable.
-- [ ] Audit log export and a syslog/SIEM stream.
+- [x] **API keys and a public REST API** with OpenAPI docs, scoped by permission set and client. Webhooks out for ticket and alert events. Other tools and the PSA integrations below build on it.
+- [x] **SSO for technicians**: OIDC (tested against a mock provider only; try real Entra ID and Google). SAML later. Map groups to roles and clients. Passkeys (WebAuthn) as a second factor.
+- [x] **Tags, custom fields and agent notes**, then **saved views** built on the existing URL state. Custom fields can be filled by scripts (script output → field), which is how MSPs track things we don't collect.
+- [x] **Automation policies**, the rest of them: scheduled scripts and an alert's `run_script_id` already live in policy sets. Left: run on enrollment and other event triggers, and a script that runs once per device rather than on a timetable.
+- [x] Audit log export and a syslog/SIEM stream.
 
 ### 4. Reach: more devices and platforms
 
-- [ ] **Software deployment**: winget and Chocolatey on Windows, apt/dnf on Linux, MSI push; doubles as third-party patching. Lives in policy sets like patching.
-- [ ] **Network discovery** from an agent (ARP/ping sweep, mDNS, SNMP sysDescr) to find unmanaged devices, and **SNMP monitoring** for switches, firewalls and printers through a designated agent.
+- [x] **Software deployment**: winget and Chocolatey on Windows, apt/dnf on Linux, MSI push; doubles as third-party patching. Lives in policy sets like patching.
+- [x] **Network discovery** from an agent (ARP/ping sweep, mDNS, SNMP sysDescr) to find unmanaged devices, and **SNMP monitoring** for switches, firewalls and printers through a designated agent.
 - [ ] **Windows real-time protection** (antivirus milestone 6): ETW for process starts and file writes instead of polling, scan on write and on start, and an AMSI provider for script content. Two earlier attempts stopped before any code was written; notes are in [design/antivirus.md](design/antivirus.md). Needs block 1's hosts to test on.
 - [ ] **macOS as a supported platform**: launchd install, a signed and notarised `.pkg`, launchd services and the unified log, ScreenCaptureKit + `CGEvent` remote desktop, the Endpoint Security framework for the sensor. Pieces exist (patches, XProtect); the platform as a whole doesn't.
 - [ ] Remote desktop on Wayland (GNOME Mutter RemoteDesktop/ScreenCast, then the portal for KDE/wlroots).
@@ -132,3 +133,14 @@ Frames over the agent WebSocket, relayed by the server. A helper in the user's s
 ### Phase 9: Policy management
 
 One model instead of four ([design](design/policies.md), [API](design/policies-api.md)): device categories, one tree of policy sets with per-field overrides, assignments per client and site, single-device pins. Alert policies, scheduled scripts, patching, security, remote access and agent updates all live in sets; the old per-feature tables are gone, and `0022_policies.sql` migrates them.
+
+### Blocks 0-4 (2026-11-22, branch `roadmap-build`)
+
+Built in parallel tracks and merged with full local checks (clippy incl. Windows, all tests, e2e with SNMP, restore drill, MinIO, 369 visual tests):
+
+- **Release prep:** `upgrade` job fix, CHANGELOG, [release checklist](RELEASING.md), [operator guide](OPERATOR.md), 0.2.0 bump.
+- **Production:** `rotate-data-key`; storage backed up beside the dump, restore script and CI drill; MinIO S3 test; stored search and health columns (`0026`); IMAP/SMTP/webhook secrets sealed (`0031`).
+- **Platform:** OIDC SSO and passkeys (`0028`, [design](design/sso.md)); API keys, `/api/v1`, OpenAPI, webhooks (`0027`, [design](design/api.md)); tags, custom fields, notes, saved views (`0029`, [design](design/fields.md)); automations with event, tag, field and run-once triggers (`0030`, `0035`, [design](design/automations.md)); audit export and SIEM stream (`0031`, `0034`, [design](design/audit-siem.md)).
+- **Reach:** software deployment (`0032`, [design](design/software.md)); network discovery and SNMP (`0033`, [design](design/network.md)); Windows e2e sections and a [real-host test plan](design/windows-testing.md).
+
+Known gaps: no Windows run of any of it; SSO untested against real IdPs; no alerts for failed deployments; SNMP traps, LLDP and IPv6 scans not built; automations whose `field_value` no longer matches a select field's choices never fire.
