@@ -41,7 +41,9 @@ moderate → 4, low → 5). The structured-data id `rmm@32473` uses the enterpri
 for documentation (RFC 5612); we have no IANA number. A message over 8000 bytes is sent without its
 `details`, with `"truncated": true`. The JSON carries the audit row's `id`, `ts`, `action`,
 `user_email`, `target_type`, `target_id` and `details`; detections and alerts carry the host,
-client, severity and state, and a detection never carries its sealed `context`.
+client, severity and state, and a detection never carries its sealed `context`. An alert about an SNMP-monitored network device
+(docs/design/network.md) has the site's designated agent as `agent_id`/`hostname` and adds
+`device_id`, `device_name` and `device_host` (migration 0034).
 
 ### Delivery
 

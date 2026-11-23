@@ -7214,9 +7214,13 @@ async fn software(url: &str, admin: &Api, db: &sqlx::PgPool, dir: &Path, id1: &s
     admin.post("/software/scan", json!({ "agent_ids": [id1] })).await;
     let sw = {
         let this = admin;
+        let want = htop_id.as_str();
         eventually(30, "the first software scan", move || async move {
             let v = this.get(&format!("/agents/{id1}/software?all=true")).await;
-            v["scanned_at"].is_string().then_some(v)
+            // The device scanned when it connected, before the catalog existed: wait for the scan
+            // just asked for, which is the first to have looked for this package.
+            let looked = v["items"].as_array().is_some_and(|a| a.iter().any(|i| i["package_id"] == want && i["checked_at"].is_string()));
+            (v["scanned_at"].is_string() && looked).then_some(v)
         })
         .await
     };
