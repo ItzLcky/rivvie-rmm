@@ -311,20 +311,9 @@ jobs:
         env:
           RMM_E2E_DATABASE_URL: postgres://postgres:root@localhost:5432/postgres
           RMM_E2E_NEW_AGENT_BIN: ${{ github.workspace }}/target/e2e-agent-new.exe
-      # The runner image excludes whole drives from Defender; without that, the test's EICAR
-      # file is never scanned and the detection check is skipped.
-      - name: Remove Defender exclusions
-        shell: pwsh
-        continue-on-error: true
-        run: |
-          try {
-            $pref = Get-MpPreference
-            if ($pref.ExclusionPath) { "Removing paths: $($pref.ExclusionPath -join ', ')"; Remove-MpPreference -ExclusionPath $pref.ExclusionPath }
-            if ($pref.ExclusionExtension) { "Removing extensions: $($pref.ExclusionExtension -join ', ')"; Remove-MpPreference -ExclusionExtension $pref.ExclusionExtension }
-            if ($pref.ExclusionProcess) { "Removing processes: $($pref.ExclusionProcess -join ', ')"; Remove-MpPreference -ExclusionProcess $pref.ExclusionProcess }
-            $after = Get-MpPreference
-            "Left: paths=$($after.ExclusionPath -join ', ') extensions=$($after.ExclusionExtension -join ', ') processes=$($after.ExclusionProcess -join ', ')"
-          } catch { "Could not change Defender exclusions: $_" }
+      # The runner image excludes whole drives from Defender, so the test skips the EICAR
+      # detection check here (the manual plan in docs/design/windows-testing.md covers it).
+      # Removing the exclusions stalled the runner for the whole job timeout.
       - name: End-to-end (Windows)
         timeout-minutes: 30
         run: cargo test -p rmm-server --test e2e_windows -- --ignored --nocapture
