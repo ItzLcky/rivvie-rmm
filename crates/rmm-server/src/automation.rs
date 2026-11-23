@@ -1,7 +1,7 @@
 //! Automation policies (docs/design/automations.md): `automation` items of the policy sets run
 //! a saved script when something happens on a device (it enrolls, comes back after being
-//! offline, an alert of some kind opens, a patch install leaves a restart pending), or once on
-//! every device the item reaches.
+//! offline, an alert of some kind opens, a patch install leaves a restart pending, a tag is put
+//! on it, one of its custom fields changes), or once on every device the item reaches.
 //!
 //! Every run is a row of `automation_runs`, which is both the history on the agent's page and
 //! the state of the once-per-device automations: `enrollment` and `run_once` have a unique row
@@ -83,10 +83,12 @@ pub async fn on_connect(st: &AppState, agent_id: Uuid, first: bool, last_seen: O
     }
 }
 
-/// An alert opened (and wasn't held back by a mute) on an agent.
+/// An alert opened (and wasn't held back by a mute) on an agent. An alert about a network
+/// device (`device_id`; its `agent_id` is only the agent that polls it) is not the agent's own:
+/// no script runs on the poller for it, the same as `run_script_id`.
 pub async fn alert_opened(st: &AppState, alert_id: Uuid) {
     let row: sqlx::Result<Option<(Uuid, String, String)>> =
-        sqlx::query_as("SELECT agent_id, kind, title FROM alerts WHERE id = $1").bind(alert_id).fetch_optional(&st.db).await;
+        sqlx::query_as("SELECT agent_id, kind, title FROM alerts WHERE id = $1 AND device_id IS NULL").bind(alert_id).fetch_optional(&st.db).await;
     match row {
         Ok(Some((agent_id, kind, title))) => {
             fire(st, agent_id, Trigger::AlertOpened, Event { alert_kind: Some(kind.clone()), ..Default::default() }, json!({ "alert_id": alert_id, "alert_kind": kind, "title": title }))
@@ -102,11 +104,52 @@ pub async fn patch_reboot_pending(st: &AppState, agent_id: Uuid, patch_run: Uuid
     fire(st, agent_id, Trigger::PatchRebootPending, Event::default(), json!({ "patch_run_id": patch_run })).await;
 }
 
+/// A tag was put on an agent (it wasn't on it before). `source` is who did it: `user` or `api`.
+pub async fn tag_added(st: &AppState, agent_id: Uuid, tag_id: Uuid, tag: &str, source: &str) {
+    fire(st, agent_id, Trigger::TagAdded, Event { tag_id: Some(tag_id), ..Default::default() }, json!({ "tag_id": tag_id, "tag": tag, "source": source })).await;
+}
+
+/// A custom field of an agent changed.
+#[derive(Debug, Clone)]
+pub struct FieldChange {
+    pub field_id: Uuid,
+    pub name: String,
+    pub kind: String,
+    pub options: Vec<String>,
+    /// The value before and after, as stored (None: no value).
+    pub from: Option<Value>,
+    pub to: Option<Value>,
+}
+
+/// An agent's custom field changed to a new value (callers pass only real changes). `source` is
+/// `user`, `api` or `script`; for a script, `job_id` is the job whose output set it.
+///
+/// **Loop guard.** A field written by the output of an automation's own job doesn't start that
+/// same automation again, however its cooldown is set: a `field_changed` automation whose script
+/// sets the field it watches would otherwise run, set the field, and run again. The event is
+/// recorded as `skipped: own_write`. Other automations still react (a chain of different
+/// automations is a feature), so a chain that loops is bounded by the cooldown and the hourly limit.
+pub async fn field_changed(st: &AppState, agent_id: Uuid, change: FieldChange, source: &str, job_id: Option<Uuid>) {
+    let origin = match job_id {
+        Some(job) => sqlx::query_scalar("SELECT item_id FROM automation_runs WHERE job_id = $1 LIMIT 1").bind(job).fetch_optional(&st.db).await.unwrap_or_else(|e| {
+            warn!(?job_id, "which automation ran the job that set a field: {e}");
+            None
+        }),
+        None => None,
+    };
+    let context = json!({ "field_id": change.field_id, "field": change.name, "from": change.from, "to": change.to, "source": source });
+    fire(st, agent_id, Trigger::FieldChanged, Event { field: Some(change), origin, ..Default::default() }, context).await;
+}
+
 /// What an event says, for the automations that match on it.
 #[derive(Default)]
 pub struct Event {
     offline_minutes: Option<i64>,
     alert_kind: Option<String>,
+    tag_id: Option<Uuid>,
+    field: Option<FieldChange>,
+    /// The automation whose run caused the event (a script of its own set a field).
+    origin: Option<Uuid>,
 }
 
 impl Event {
@@ -114,14 +157,20 @@ impl Event {
         match c.trigger {
             Trigger::AgentOnline => self.offline_minutes.is_some_and(|m| m >= c.offline_minutes.unwrap_or(i32::MAX) as i64),
             Trigger::AlertOpened => self.alert_kind.is_some() && self.alert_kind == c.alert_kind,
+            Trigger::TagAdded => self.tag_id.is_some() && self.tag_id == c.tag_id,
+            Trigger::FieldChanged => self.field.as_ref().is_some_and(|f| {
+                Some(f.field_id) == c.field_id
+                    // The wanted value is text; read it the way the field reads any value.
+                    && c.field_value.as_ref().is_none_or(|want| crate::fields::coerce(&f.kind, &f.options, &Value::String(want.clone())).ok().flatten() == f.to)
+            }),
             _ => true,
         }
     }
 }
 
 /// The one entry point of events: starts every enabled automation of `trigger` that applies to
-/// the agent (its set's items, inside their limits) and matches the event. A trigger on custom
-/// field or tag changes calls this too, with its own [`Trigger`].
+/// the agent (its set's items, inside their limits) and matches the event. Every trigger
+/// (alerts, connects, tags, fields, patches) calls this with its own [`Trigger`].
 pub async fn fire(st: &AppState, agent_id: Uuid, trigger: Trigger, event: Event, context: Value) {
     let items: sqlx::Result<Vec<(Uuid, Value)>> = sqlx::query_as(
         "SELECT item_id, config FROM agent_policy WHERE agent_id = $1 AND module = 'automation' AND enabled AND config ->> 'trigger' = $2",
@@ -139,10 +188,21 @@ pub async fn fire(st: &AppState, agent_id: Uuid, trigger: Trigger, event: Event,
         if !event.matches(&cfg) {
             continue;
         }
-        if let Err(e) = admit(st, item, agent_id, &cfg, trigger, context.clone()).await {
+        let own = event.origin == Some(item);
+        if let Err(e) = admit(st, item, agent_id, &cfg, trigger, context.clone(), own).await {
             warn!(%item, %agent_id, trigger = trigger.as_str(), "automation: {e:#}");
         }
     }
+}
+
+/// The automations that name a tag or custom field (`key`: `tag_id` or `field_id`), for refusing
+/// to delete what they wait on: an item left pointing at nothing would never fire.
+pub async fn named_by(db: &sqlx::PgPool, key: &'static str, id: Uuid) -> sqlx::Result<Vec<String>> {
+    sqlx::query_scalar("SELECT name FROM policy_items WHERE module = 'automation' AND config ->> $1 = $2 ORDER BY name")
+        .bind(key)
+        .bind(id.to_string())
+        .fetch_all(db)
+        .await
 }
 
 /// A job finished (or was given up on): bring its run up to date.
@@ -197,7 +257,8 @@ async fn gate(db: &mut PgConnection, item: Uuid, agent: Uuid, c: &AutomationConf
 }
 
 /// Decides what happens to an event for one device and records it; starts the run if it may.
-async fn admit(st: &AppState, item: Uuid, agent: Uuid, c: &AutomationConfig, trigger: Trigger, context: Value) -> anyhow::Result<()> {
+/// `own`: the event is the effect of this automation's own earlier run (see [`field_changed`]).
+async fn admit(st: &AppState, item: Uuid, agent: Uuid, c: &AutomationConfig, trigger: Trigger, context: Value, own: bool) -> anyhow::Result<()> {
     let mut tx = st.db.begin().await?;
     lock_item(&mut tx, item).await?;
     if trigger.once_per_device() {
@@ -210,7 +271,9 @@ async fn admit(st: &AppState, item: Uuid, agent: Uuid, c: &AutomationConfig, tri
             return Ok(());
         }
     }
-    let verdict = if !trigger.once_per_device()
+    let verdict = if own {
+        Gate::Skip("own_write")
+    } else if !trigger.once_per_device()
         && c.cooldown_minutes > 0
         && sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS (SELECT 1 FROM automation_runs WHERE item_id = $1 AND agent_id = $2 AND status <> 'skipped'
@@ -430,7 +493,7 @@ async fn start_run_once(st: &AppState) -> anyhow::Result<()> {
     .await?;
     for (item, agent, cfg) in due {
         let Some(c) = config(cfg) else { continue };
-        if let Err(e) = admit(st, item, agent, &c, Trigger::RunOnce, json!({})).await {
+        if let Err(e) = admit(st, item, agent, &c, Trigger::RunOnce, json!({}), false).await {
             warn!(%item, %agent, "run-once automation: {e:#}");
         }
     }
@@ -555,5 +618,28 @@ mod tests {
         assert!(kind("disk").matches(&alert));
         assert!(!kind("cpu").matches(&alert) && !Event::default().matches(&alert));
         assert!(Event::default().matches(&cfg(json!({ "trigger": "enrollment" }))));
+
+        let (tag, other) = (Uuid::new_v4(), Uuid::new_v4());
+        let tagged = cfg(json!({ "trigger": "tag_added", "tag_id": tag }));
+        assert!(Event { tag_id: Some(tag), ..Default::default() }.matches(&tagged));
+        assert!(!Event { tag_id: Some(other), ..Default::default() }.matches(&tagged) && !Event::default().matches(&tagged));
+
+        let field = Uuid::new_v4();
+        let change = |kind: &str, options: &[&str], to: Option<Value>| Event {
+            field: Some(FieldChange { field_id: field, name: "tier".into(), kind: kind.into(), options: options.iter().map(|o| o.to_string()).collect(), from: None, to }),
+            ..Default::default()
+        };
+        let any = cfg(json!({ "trigger": "field_changed", "field_id": field }));
+        assert!(change("text", &[], Some(json!("x"))).matches(&any), "any change");
+        assert!(change("text", &[], None).matches(&any), "clearing is a change");
+        assert!(!Event::default().matches(&any));
+        let gold = cfg(json!({ "trigger": "field_changed", "field_id": field, "field_value": "gold" }));
+        assert!(change("select", &["Gold", "Silver"], Some(json!("Gold"))).matches(&gold), "a select's choice is read like any input");
+        assert!(!change("select", &["Gold", "Silver"], Some(json!("Silver"))).matches(&gold));
+        assert!(!change("select", &["Gold", "Silver"], None).matches(&gold), "clearing isn't gold");
+        let yes = cfg(json!({ "trigger": "field_changed", "field_id": field, "field_value": "yes" }));
+        assert!(change("bool", &[], Some(json!(true))).matches(&yes) && !change("bool", &[], Some(json!(false))).matches(&yes));
+        let another = cfg(json!({ "trigger": "field_changed", "field_id": other }));
+        assert!(!change("text", &[], Some(json!("x"))).matches(&another), "another field");
     }
 }

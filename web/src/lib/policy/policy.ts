@@ -231,12 +231,14 @@ export function overriddenAlong(v: Pick<ItemView, 'sources' | 'origin_set_id'>, 
 
 // --- Automations (docs/design/automations.md) ----------------------------------------------------
 
-export type AutomationTrigger = 'enrollment' | 'agent_online' | 'alert_opened' | 'patch_reboot_pending' | 'run_once';
+export type AutomationTrigger = 'enrollment' | 'agent_online' | 'alert_opened' | 'patch_reboot_pending' | 'tag_added' | 'field_changed' | 'run_once';
 export const triggerLabels: Record<AutomationTrigger, string> = {
 	enrollment: 'Device enrolls',
 	agent_online: 'Device comes back online',
 	alert_opened: 'Alert opens',
 	patch_reboot_pending: 'Patch install leaves a restart pending',
+	tag_added: 'Tag added to a device',
+	field_changed: 'Custom field changes',
 	run_once: 'Once per device'
 };
 export const triggerHelp: Record<AutomationTrigger, string> = {
@@ -244,6 +246,8 @@ export const triggerHelp: Record<AutomationTrigger, string> = {
 	agent_online: 'Runs when a device connects again after being offline for at least the time you set.',
 	alert_opened: 'Runs when an alert of the chosen type opens on a device (not while it is muted).',
 	patch_reboot_pending: 'Runs when a patch install has finished and the device still needs a restart.',
+	tag_added: 'Runs when the chosen tag is put on a device that didn’t have it.',
+	field_changed: 'Runs when the chosen custom field of a device is set, changed or cleared, by a person, the API or a script. A script that sets the field it watches doesn’t start itself again.',
 	run_once: 'Runs once on every device using this set, including devices that join later. Each device has its own status; failed ones can retry, and a reset runs it again.'
 };
 /** Triggers that happen once per device ever (a row per device holds the state). */
@@ -255,6 +259,7 @@ export const runReasonLabels: Record<string, string> = {
 	maintenance_window: 'waiting for the maintenance window',
 	rate_limited: 'over the hourly limit',
 	cooldown: 'ran recently on this device',
+	own_write: 'set by this automation’s own script',
 	expired: 'waited too long',
 	no_longer_applies: 'the automation no longer applies',
 	script_missing: 'the script was deleted',
@@ -274,6 +279,9 @@ Object.assign(fieldLabels, {
 	script_id: 'Script',
 	offline_minutes: 'Offline for',
 	alert_kind: 'Alert type',
+	tag_id: 'Tag',
+	field_id: 'Custom field',
+	field_value: 'Field value',
 	retry_failed: 'Retry failures',
 	max_attempts: 'Attempts',
 	retry_minutes: 'Retry after',
@@ -283,10 +291,14 @@ Object.assign(fieldLabels, {
 	retain_days: 'Keep runs'
 });
 
-/** One line for the list: what starts it. */
-export function describeAutomation(c: Config): string {
+/** One line for the list: what starts it. `names` says what the tag and field ids are called. */
+export function describeAutomation(c: Config, names?: { tag?: string; field?: string }): string {
 	const t = c.trigger as AutomationTrigger;
 	switch (t) {
+		case 'tag_added':
+			return `${triggerLabels[t]}: ${names?.tag ?? 'unknown tag'}`;
+		case 'field_changed':
+			return `${triggerLabels[t]}: ${names?.field ?? 'unknown field'}${c.field_value != null ? ` → ${c.field_value}` : ''}`;
 		case 'agent_online':
 			return `${triggerLabels[t]} after ${c.offline_minutes} min offline`;
 		case 'alert_opened':

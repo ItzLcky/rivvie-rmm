@@ -84,7 +84,7 @@ export interface AgentPolicy {
 /** One run of an automation on a device (`GET /agents/{id}/automations`, `/policy-items/{id}/runs`). */
 export interface AutomationRun {
 	id: string; item_id: string; item_name: string; agent_id: string; hostname: string;
-	trigger: 'enrollment' | 'agent_online' | 'alert_opened' | 'patch_reboot_pending' | 'run_once';
+	trigger: 'enrollment' | 'agent_online' | 'alert_opened' | 'patch_reboot_pending' | 'tag_added' | 'field_changed' | 'run_once';
 	status: 'waiting' | 'pending' | 'succeeded' | 'failed' | 'skipped';
 	reason: string | null; context: Record<string, unknown>;
 	job_id: string | null; script_id: string | null; script_name: string | null; exit_code: number | null; attempts: number;

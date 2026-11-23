@@ -292,6 +292,10 @@ pub async fn update_def(State(st): State<Arc<AppState>>, u: User, Path(id): Path
 pub async fn delete_def(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uuid>) -> ApiResult<Json<Value>> {
     u.require(Role::Admin)?;
     let cur = get_def(&st, &u, id).await?;
+    let used = crate::automation::named_by(&st.db, "field_id", id).await?;
+    if !used.is_empty() {
+        return Err(ApiError::Conflict(format!("automations start on this field ({}); change or remove them first", used.join(", "))));
+    }
     sqlx::query("DELETE FROM custom_fields WHERE id = $1").bind(id).execute(&st.db).await?;
     auth::audit(&st.db, Some(u.id), "custom_field.delete", Some(("custom_field", id)), json!({ "name": cur.name, "entity": cur.entity, "values": cur.in_use })).await;
     Ok(Json(json!({ "ok": true })))
@@ -402,6 +406,19 @@ async fn set_values(st: &AppState, u: &User, entity: Entity, id: Uuid, b: SetVal
     }
     tx.commit().await?;
     auth::audit(&st.db, Some(u.id), &format!("{}.fields", entity.as_str()), Some((entity.as_str(), id)), Value::Object(audit)).await;
+    if entity == Entity::Agent {
+        for (f, new) in changes {
+            let change = crate::automation::FieldChange {
+                field_id: f.field_id,
+                name: f.name.clone(),
+                kind: f.kind.clone(),
+                options: f.options.clone(),
+                from: f.value.clone(),
+                to: new,
+            };
+            crate::automation::field_changed(st, id, change, source, None).await;
+        }
+    }
     Ok(Json(load_values(st, entity, id, client).await?))
 }
 

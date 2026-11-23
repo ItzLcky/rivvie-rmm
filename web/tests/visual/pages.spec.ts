@@ -35,6 +35,8 @@ const pages: [string, string][] = [
 	['policy-set-schedules-empty', '/policies/sets/ps-dc?section=schedules'],
 	['policy-set-automations', '/policies/sets/00000000-0000-4000-8001-000000000000?section=automations'],
 	['policy-set-automation-once', '/policies/sets/00000000-0000-4000-8001-000000000000?section=automations&item=au-addon'],
+	['policy-set-automation-tag', '/policies/sets/00000000-0000-4000-8001-000000000000?section=automations&item=au-tag'],
+	['policy-set-automation-field', '/policies/sets/00000000-0000-4000-8001-000000000000?section=automations&item=au-field'],
 	['policy-set-automation-event', '/policies/sets/00000000-0000-4000-8001-000000000002?section=automations&item=au-disk'],
 	['policy-set-automation-overridden', '/policies/sets/00000000-0000-4000-8001-000000000012?section=automations&item=au-addon'],
 	['policy-new-automation', '/policies/sets/00000000-0000-4000-8001-000000000000?section=automations&item=new'],

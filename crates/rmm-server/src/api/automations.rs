@@ -25,14 +25,14 @@ pub struct RunRow {
     item_name: String,
     agent_id: Uuid,
     hostname: String,
-    /// enrollment, agent_online, alert_opened, patch_reboot_pending or run_once.
+    /// enrollment, agent_online, alert_opened, patch_reboot_pending, tag_added, field_changed or run_once.
     trigger: String,
     /// waiting, pending, succeeded, failed or skipped.
     status: String,
     /// Why it waits, was skipped or failed: maintenance_window, rate_limited, cooldown,
-    /// expired, no_longer_applies, script_missing, or the job's own end (timed_out, lost, ...).
+    /// expired, own_write, no_longer_applies, script_missing, or the job's own end (timed_out, lost, ...).
     reason: Option<String>,
-    /// What fired it (the alert, the patch run, how long the agent was offline).
+    /// What fired it (the alert, the patch run, how long the agent was offline, the tag, the field and its old and new value).
     context: Value,
     job_id: Option<Uuid>,
     script_id: Option<Uuid>,

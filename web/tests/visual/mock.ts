@@ -872,6 +872,10 @@ const items: PItem[] = [
 		config: { trigger: 'agent_online', script_id: 's-spool', args: [], timeout_secs: null, offline_minutes: 120, alert_kind: null, retry_failed: false, max_attempts: 3, retry_minutes: 30, cooldown_minutes: 240, max_runs_per_hour: 20, respect_window: false, retain_days: 14 } },
 	{ id: 'au-disk', set: SET.linux, module: 'automation', name: 'Clean up when the disk fills', enabled: true, client_id: null, site_id: null, excluded: [],
 		config: { trigger: 'alert_opened', script_id: 's-disk', args: [], timeout_secs: 120, offline_minutes: null, alert_kind: 'disk', retry_failed: false, max_attempts: 3, retry_minutes: 30, cooldown_minutes: 60, max_runs_per_hour: 100, respect_window: true, retain_days: 30 } },
+	{ id: 'au-tag', set: SET.root, module: 'automation', name: 'Set up pilot machines', enabled: true, client_id: null, site_id: null, excluded: [],
+		config: { trigger: 'tag_added', script_id: 's-upd', args: ['--pilot'], timeout_secs: null, offline_minutes: null, alert_kind: null, tag_id: 'tg-pilot', field_id: null, field_value: null, retry_failed: false, max_attempts: 3, retry_minutes: 30, cooldown_minutes: 60, max_runs_per_hour: 100, respect_window: false, retain_days: 30 } },
+	{ id: 'au-field', set: SET.root, module: 'automation', name: 'Gold support onboarding', enabled: true, client_id: null, site_id: null, excluded: [],
+		config: { trigger: 'field_changed', script_id: 's-disk', args: [], timeout_secs: null, offline_minutes: null, alert_kind: null, tag_id: null, field_id: 'cf-tier', field_value: 'Gold', retry_failed: false, max_attempts: 3, retry_minutes: 30, cooldown_minutes: 60, max_runs_per_hour: 100, respect_window: false, retain_days: 30 } },
 	{ id: PATCH_ITEM, set: SET.root, module: 'patch', name: 'Patching', enabled: true, client_id: null, site_id: null, excluded: [],
 		config: { auto_approve_severities: [], auto_approve_categories: ['security', 'critical', 'definition'], deferral_days: 0, auto_install: false, reboot_policy: 'never', window: null } },
 	{ id: SECURITY_ITEM, set: SET.root, module: 'security', name: 'Security', enabled: true, client_id: null, site_id: null, excluded: [],
@@ -1018,7 +1022,10 @@ const automationRuns = [
 	autoRun('ar-8', 'au-disk', 3, 'alert_opened', 'succeeded', null, 60 * 2, 1, 'j-3', 0),
 	autoRun('ar-9', 'au-disk', 3, 'alert_opened', 'skipped', 'cooldown', 30),
 	autoRun('ar-10', 'au-back', 1, 'agent_online', 'succeeded', null, 60 * 26, 1, 'j-1', 0),
-	autoRun('ar-11', 'au-back', 1, 'agent_online', 'skipped', 'rate_limited', 60 * 8)
+	autoRun('ar-11', 'au-back', 1, 'agent_online', 'skipped', 'rate_limited', 60 * 8),
+	{ ...autoRun('ar-12', 'au-tag', 3, 'tag_added', 'succeeded', null, 60 * 3, 1, 'j-3', 0), context: { tag_id: 'tg-pilot', tag: 'Pilot ring', source: 'user' } },
+	{ ...autoRun('ar-13', 'au-field', 3, 'field_changed', 'succeeded', null, 60 * 9, 1, 'j-3', 0), context: { field: 'support_tier', from: 'Silver', to: 'Gold', source: 'user' } },
+	{ ...autoRun('ar-14', 'au-field', 3, 'field_changed', 'skipped', 'own_write', 60 * 9 - 2), context: { field: 'support_tier', from: 'Gold', to: 'Platinum', source: 'script' } }
 ];
 const runCounts = (rows: typeof automationRuns) =>
 	Object.fromEntries((['waiting', 'pending', 'succeeded', 'failed', 'skipped'] as RunStatus[]).map((st) => [st, rows.filter((r) => r.status === st).length])) as Record<RunStatus, number>;

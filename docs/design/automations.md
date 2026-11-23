@@ -1,6 +1,7 @@
 # Automation policies
 
-Built in roadmap block 3 (Track 7, migration `0030_automations.sql`). The sixth module of the
+Built in roadmap block 3 (Track 7, migration `0030_automations.sql`; the tag and field triggers are
+`0035`). A module of the
 [policy sets](policies.md): an `automation` item runs a saved script when something happens on a
 device, or once on every device. API in [policies-api.md](policies-api.md#automations).
 
@@ -14,11 +15,36 @@ One trigger and one script per item (`config.trigger`):
 | `agent_online` | a device connects after being offline for `offline_minutes` (5 to 30 days) or more | `offline_minutes` |
 | `alert_opened` | an alert of `alert_kind` opens on a device and isn't held back by a mute (an alert that opens muted fires when the mute ends with it still open, like `run_script_id`) | `alert_kind`: `offline`, `cpu`, `memory`, `disk`, `service`, `job_failed`, `log`, `security`, `patch` |
 | `patch_reboot_pending` | a patch install finished and the machine still needs a restart (not when the agent is restarting by itself) | none |
+| `tag_added` | a tag is put on a device that didn't have it ([tags](fields.md#tags): one device's tag list, or the bulk action) | `tag_id` |
+| `field_changed` | a custom field of a device changes: set or cleared by a person, the API or a script's `RMM-FIELD` line, and the value really differs | `field_id` (a field of devices), optional `field_value` |
 | `run_once` | every device that uses the item's set or one below it, inside the item's limit, including devices that join later, once each | none |
 
-A trigger on custom field or tag changes is left out: those models aren't in this build. The hook
-point is [`automation::fire`](../../crates/rmm-server/src/automation.rs), the one entry point events
-call, plus a new variant of `policy::Trigger` and of the `automation_runs.trigger` check.
+Every event reaches the automations through [`automation::fire`](../../crates/rmm-server/src/automation.rs),
+so all triggers share the storm guards below.
+
+**Alerts of network devices.** An alert about a network device ([network.md](network.md); the alert has a
+`device_id` and its `agent_id` is only the agent that polls it) does not fire `alert_opened`: the
+problem isn't on the polling agent, and a script run there would be a script run on the wrong
+machine. It is the same rule as an alert policy's `run_script_id`.
+
+**Tags and fields (migration `0035`).** `tag_added` fires once per (device, tag) that is new:
+saving a tag list that keeps a tag the device already had, or adding a tag it has, does nothing.
+A bulk tag change starts its automations in the background, within each automation's hourly
+limit. `field_changed` fires for each field that changed in one save and never for a write of the
+value the field already had. `field_value` is written as text and read the way the field reads any
+input (`yes` for a bool, a choice ignoring case for a select); without it any change counts,
+clearing included, and with it only a change *to* that value. Both triggers are for devices only
+(not client or site fields), the item's client limit decides which devices it reaches, a client's
+own field can only be used by an item limited to that client, and a tag or a field that an
+automation names can't be deleted until the automation is changed (409).
+
+**Script output → field → the same automation.** A script's `RMM-FIELD` output is applied when its job
+succeeds, and that is a field change like any other. A `field_changed` automation whose script
+sets the field it watches would run itself again forever, so a write made by the output of an
+automation's own job doesn't start that automation again (recorded as `skipped: own_write`, even
+with `cooldown_minutes: 0`). Other automations still react to the write, which is how a chain of
+automations is built; a chain that loops back (A sets the field B watches, B sets the one A
+watches) is bounded only by the cooldown and the hourly limit, so keep the defaults for those.
 
 Like scheduled scripts, an automation can be added to any set, limited to a client or site, with
 devices left out. A set below may override `args`, `timeout_secs`, `retry_failed`, `max_attempts`,
@@ -35,7 +61,7 @@ the automation and the job output retention follows `retain_days`). The row's `s
 - `pending`: its job is queued or running (an offline device collects it when it reconnects)
 - `succeeded` / `failed`: the job's outcome (`reason` for a failure is the job's own end: `failed`,
   `timed_out`, `lost`, `error`, `cancelled`, or `script_missing`, `script_other_client`)
-- `skipped`: not run, `reason` says why (`cooldown`, `rate_limited`, `expired`, `no_longer_applies`)
+- `skipped`: not run, `reason` says why (`cooldown`, `rate_limited`, `expired`, `own_write`, `no_longer_applies`)
 
 `enrollment` and `run_once` have a unique row per (item, agent) (a partial unique index): that row
 is the record that the script ran, so neither can run twice however often the event repeats or the
@@ -55,6 +81,7 @@ the worker starts them again. Moving a device to a set with a different run-once
 All checked in the transaction that records the run, under an advisory lock per item, so two events
 can't take the same slot:
 
+- **Own write** (`field_changed`): see above.
 - **Cooldown** (`cooldown_minutes`, default 60, event triggers): the same device doesn't run the
   automation again within it. The event is recorded as `skipped` (at most one skipped row per
   device, item and reason an hour, so a flapping device doesn't flood the table).
@@ -74,7 +101,8 @@ can't take the same slot:
 
 - Rust: `src/automation.rs` (events, gates, worker), `policy::AutomationConfig`/`Trigger`,
   `api/automations.rs`. Hooks: `agent_ws` (connect, job finished), `alerts::announce` (alert opened),
-  `patches::ingest_result` (reboot pending).
+  `patches::ingest_result` (reboot pending), `api/tags` (tag added), `api/fields` and `fields::apply_job_output`
+  (field changed).
 - Web: *Automations* section of a policy set (`AutomationForm`, `AutomationRuns`), *Automation
   history* on the device's Policy tab (`AutomationHistory`).
 - Public API: `GET /agents/{id}/automations` (group `jobs`).

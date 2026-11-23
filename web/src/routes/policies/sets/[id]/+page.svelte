@@ -8,12 +8,12 @@
 	import { describeCron, describePolicy } from '#lib/monitoring/labels.js';
 	import { paged } from '#lib/paged.svelte.js';
 	import { describeAutomation, moduleLabels, overriddenFields, ownerLabel, reasonLabels, ROOT_SET, sections, setHref } from '#lib/policy/policy.js';
-	import type { Category, ItemView, Module, SetAgent, SetDetail } from '#lib/policy/types.js';
+	import type { Category, Config, ItemView, Module, SetAgent, SetDetail } from '#lib/policy/types.js';
 	import { resource } from '#lib/resource.svelte.js';
 	import { can } from '#lib/session.svelte.js';
 	import { attempt } from '#lib/toast.svelte.js';
 	import { wantLabels, type SoftwarePackage, type Want } from '#lib/software.js';
-	import type { PolicyKind, Script, Severity } from '#lib/types.js';
+	import type { CustomField, PolicyKind, Script, Severity, Tag } from '#lib/types.js';
 	import { param, setParams, sortState } from '#lib/url.svelte.js';
 	import Async from '#lib/ui/Async.svelte';
 	import Badge from '#lib/ui/Badge.svelte';
@@ -39,6 +39,8 @@
 	const categories = resource(() => api.get<Category[]>('/device-categories'));
 	const scripts = resource(() => api.get<Script[]>('/scripts'));
 	const packages = resource(() => api.get<SoftwarePackage[]>('/software/packages'));
+	const tags = resource(() => api.get<Tag[]>('/tags'));
+	const agentFields = resource(() => api.get<CustomField[]>('/custom-fields?entity=agent'));
 	let dialog = $state<'new' | 'edit' | 'duplicate' | null>(null);
 
 	const moduleOf = $derived(sections.find((s) => s.value === section)?.module as Module | undefined);
@@ -70,6 +72,7 @@
 	const catNames = (ids: string[]) => ids.map((c) => categories.data?.find((x) => x.id === c)?.name).filter(Boolean).join(', ');
 	const scriptName = (sid: unknown) => scripts.data?.find((s) => s.id === sid)?.name ?? 'Script';
 	const packageName = (pid: unknown) => packages.data?.find((p) => p.id === pid)?.name ?? 'Package';
+	const describe = (c: Config) => describeAutomation(c, { tag: tags.data?.find((t) => t.id === c.tag_id)?.name, field: agentFields.data?.find((f) => f.id === c.field_id)?.label });
 	/** The sections that list several items, each a module of its own. */
 	const listModules: Record<string, Module> = { alerts: 'alert', schedules: 'schedule', software: 'software', automations: 'automation' };
 	const listModule = $derived(listModules[section]);
@@ -156,7 +159,7 @@
 					{#snippet nameCell(v: ItemView)}
 						<a class="hover:text-accent font-medium" href="?section={section}&item={v.id}">{v.name}</a>
 						<div class="text-muted max-w-md truncate text-xs">
-							{#if v.module === 'alert'}{describePolicy({ kind: v.config.kind as PolicyKind, params: (v.config.params ?? {}) as Record<string, unknown> })}{:else if v.module === 'software'}{packageName(v.config.package_id)} · {wantLabels[v.config.state as Want]}{:else if v.module === 'automation'}{describeAutomation(v.config)} · {scriptName(v.config.script_id)}{:else}{scriptName(v.config.script_id)} · {describeCron(String(v.config.cron))}{/if}
+							{#if v.module === 'alert'}{describePolicy({ kind: v.config.kind as PolicyKind, params: (v.config.params ?? {}) as Record<string, unknown> })}{:else if v.module === 'software'}{packageName(v.config.package_id)} · {wantLabels[v.config.state as Want]}{:else if v.module === 'automation'}{describe(v.config)} · {scriptName(v.config.script_id)}{:else}{scriptName(v.config.script_id)} · {describeCron(String(v.config.cron))}{/if}
 						</div>
 						<div class="mt-1 md:hidden"><PolicyStatus view={v} /></div>
 					{/snippet}

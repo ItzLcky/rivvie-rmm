@@ -128,6 +128,10 @@ pub async fn update(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uui
 
 pub async fn remove(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uuid>) -> ApiResult<Json<Value>> {
     u.require(Role::Admin)?;
+    let used = crate::automation::named_by(&st.db, "tag_id", id).await?;
+    if !used.is_empty() {
+        return Err(ApiError::Conflict(format!("automations start on this tag ({}); change or remove them first", used.join(", "))));
+    }
     let name: Option<String> = sqlx::query_scalar("DELETE FROM tags WHERE id = $1 RETURNING name").bind(id).fetch_optional(&st.db).await?;
     let name = name.ok_or(ApiError::NotFound("tag"))?;
     auth::audit(&st.db, Some(u.id), "tag.delete", Some(("tag", id)), json!({ "name": name })).await;
@@ -179,8 +183,13 @@ pub async fn set_for_agent(State(st): State<Arc<AppState>>, u: User, Path(id): P
     .await?;
     tx.commit().await?;
     if !removed.is_empty() || !added.is_empty() {
-        let added: Vec<&str> = names.iter().filter(|(i, _)| added.contains(i)).map(|(_, n)| n.as_str()).collect();
-        auth::audit(&st.db, Some(u.id), "agent.tags", Some(("agent", id)), json!({ "added": added, "removed": removed })).await;
+        let added: Vec<(Uuid, &str)> = names.iter().filter(|(i, _)| added.contains(i)).map(|(i, n)| (*i, n.as_str())).collect();
+        auth::audit(&st.db, Some(u.id), "agent.tags", Some(("agent", id)), json!({ "added": added.iter().map(|(_, n)| *n).collect::<Vec<_>>(), "removed": removed })).await;
+        // Automations on a tag start for the tags that are new to the agent, not for ones it had.
+        let source = if u.api_key.is_some() { "api" } else { "user" };
+        for (tag_id, name) in added {
+            crate::automation::tag_added(&st, id, tag_id, name, source).await;
+        }
     }
     Ok(Json(json!({ "ok": true })))
 }
@@ -220,16 +229,16 @@ pub async fn bulk(State(st): State<Arc<AppState>>, u: User, Json(b): Json<BulkTa
         return Err(ApiError::NotFound("agent"));
     }
     let all: Vec<Uuid> = add.iter().chain(&remove).copied().collect();
-    known(&st, &all).await?;
+    let names = known(&st, &all).await?;
     let mut tx = st.db.begin().await?;
-    let added = sqlx::query(
-        "INSERT INTO agent_tags (agent_id, tag_id) SELECT a, t FROM unnest($1::uuid[]) a, unnest($2::uuid[]) t ON CONFLICT DO NOTHING",
+    let new: Vec<(Uuid, Uuid)> = sqlx::query_as(
+        "INSERT INTO agent_tags (agent_id, tag_id) SELECT a, t FROM unnest($1::uuid[]) a, unnest($2::uuid[]) t ON CONFLICT DO NOTHING RETURNING agent_id, tag_id",
     )
     .bind(&agents)
     .bind(&add)
-    .execute(&mut *tx)
-    .await?
-    .rows_affected();
+    .fetch_all(&mut *tx)
+    .await?;
+    let added = new.len() as u64;
     let removed = sqlx::query("DELETE FROM agent_tags WHERE agent_id = ANY($1) AND tag_id = ANY($2)")
         .bind(&agents)
         .bind(&remove)
@@ -245,6 +254,17 @@ pub async fn bulk(State(st): State<Arc<AppState>>, u: User, Json(b): Json<BulkTa
         json!({ "agents": agents.len(), "add": add, "remove": remove, "added": added, "removed": removed }),
     )
     .await;
+    // Automations on a tag start for each (agent, tag) that is new, in the background: a bulk
+    // change can name thousands of agents, and each automation has its own hourly limit.
+    if !new.is_empty() {
+        let (st, source) = (st.clone(), if u.api_key.is_some() { "api" } else { "user" });
+        tokio::spawn(async move {
+            for (agent, tag) in new {
+                let name = names.iter().find(|(i, _)| *i == tag).map(|(_, n)| n.as_str()).unwrap_or_default();
+                crate::automation::tag_added(&st, agent, tag, name, source).await;
+            }
+        });
+    }
     Ok(Json(json!({ "agents": agents.len(), "added": added, "removed": removed })))
 }
 

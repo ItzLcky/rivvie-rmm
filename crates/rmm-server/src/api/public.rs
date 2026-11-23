@@ -527,7 +527,7 @@ fn base_schemas() -> Value {
             ("status", "string"), ("exit_code", "integer?"), ("created_by_name", "string?"), ("created_at", "datetime"), ("sent_at", "datetime?"),
             ("finished_at", "datetime?"), ("duration_ms", "integer?"),
         ]),
-        "AutomationRun": object("One run of an automation policy on an agent: a saved script started by an event (enrollment, agent_online, alert_opened, patch_reboot_pending) or once per device (run_once).", &[
+        "AutomationRun": object("One run of an automation policy on an agent: a saved script started by an event (enrollment, agent_online, alert_opened, patch_reboot_pending, tag_added, field_changed) or once per device (run_once).", &[
             ("id", "uuid"), ("item_id", "uuid"), ("item_name", "string"), ("agent_id", "uuid"), ("hostname", "string"), ("trigger", "string"),
             ("status", "string"), ("reason", "string?"), ("context", "object"), ("job_id", "uuid?"), ("script_id", "uuid?"), ("script_name", "string?"),
             ("exit_code", "integer?"), ("attempts", "integer"), ("created_at", "datetime"), ("started_at", "datetime?"), ("finished_at", "datetime?"),

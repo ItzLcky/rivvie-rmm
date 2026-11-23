@@ -788,9 +788,39 @@ async fn check_refs(st: &AppState, u: &User, module: Module, config: &Value, own
                 script_ok(s).await?;
             }
         }
-        Module::Schedule | Module::Automation => {
+        Module::Schedule => {
             if let Some(s) = uuid(config.get("script_id")) {
                 script_ok(s).await?;
+            }
+        }
+        Module::Automation => {
+            if let Some(s) = uuid(config.get("script_id")) {
+                script_ok(s).await?;
+            }
+            if let Some(t) = uuid(config.get("tag_id")) {
+                let exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM tags WHERE id = $1)").bind(t).fetch_one(&st.db).await?;
+                if !exists {
+                    return Err(ApiError::NotFound("tag"));
+                }
+            }
+            if let Some(f) = uuid(config.get("field_id")) {
+                let def: Option<(String, Option<Uuid>, String, Vec<String>)> =
+                    sqlx::query_as("SELECT entity, client_id, kind, options FROM custom_fields WHERE id = $1").bind(f).fetch_optional(&st.db).await?;
+                let Some((entity, field_client, kind, options)) = def else { return Err(ApiError::NotFound("custom field")) };
+                if entity != "agent" {
+                    return Err(bad("an automation can only watch a custom field of devices".into()));
+                }
+                // A client's own field only exists for that client's devices.
+                match field_client {
+                    Some(c) if !u.can_see_client(c) => return Err(ApiError::NotFound("custom field")),
+                    Some(c) if owner != Some(c) => return Err(bad("that field belongs to another client".into())),
+                    _ => {}
+                }
+                if let Some(v) = config.get("field_value").and_then(Value::as_str)
+                    && !matches!(crate::fields::coerce(&kind, &options, &Value::String(v.to_string())), Ok(Some(_)))
+                {
+                    return Err(bad("field_value isn't a value that field can hold".into()));
+                }
             }
         }
         Module::Software => {

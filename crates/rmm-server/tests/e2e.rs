@@ -584,6 +584,7 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
     if std::env::var("RMM_E2E_ONLY").as_deref() == Ok("api") {
         api_keys_and_webhooks(&url, &admin, db, &id1, a_id, b_id).await;
         fields_tags_notes_views(&url, &admin, db, dir, &id1, a_id, b_id).await;
+    automation_tags_and_fields(&url, &admin, db, &id1, &id3, a_id, b_id).await;
         a1.kill();
         return Ok(());
     }
@@ -1522,6 +1523,16 @@ async fn network(url: &str, admin: &Api, db: &sqlx::PgPool, id1: &str, a_id: &st
             let ok = Command::new("docker").args([what, &container]).stdout(Stdio::null()).status().map(|s| s.success()).unwrap_or(false);
             assert!(ok, "docker {what} {container}");
         };
+        // An automation on alerts opening (any agent kind) must not run a script on the designated
+        // agent because of a network device's alert (see docs/design/automations.md).
+        let script = admin.post("/scripts", json!({ "name": "net alert automation (e2e)", "interpreter": "bash", "body": "echo ran" })).await["id"].as_str().unwrap().to_string();
+        let mut watchers = Vec::new();
+        for kind in ["offline", "service"] {
+            let w = admin
+                .post(&format!("/policy-sets/{ROOT_SET}/items"), json!({ "module": "automation", "name": format!("device alerts ({kind}, e2e)"), "config": { "trigger": "alert_opened", "alert_kind": kind, "script_id": script, "cooldown_minutes": 0 } }))
+                .await;
+            watchers.push(w["id"].as_str().unwrap().to_string());
+        }
         docker("pause");
         let alert = eventually(240, "a device-down alert", || async {
             let items = alerts_for(admin, "state=open&kind=net_down").await;
@@ -1530,6 +1541,11 @@ async fn network(url: &str, admin: &Api, db: &sqlx::PgPool, id1: &str, a_id: &st
         .await;
         assert_eq!(alert["agent_id"], id1, "belongs to the designated agent: {alert}");
         assert_eq!(alert["device_name"], "E2E snmpd");
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        for w in &watchers {
+            let n: i64 = sqlx::query_scalar("SELECT count(*) FROM automation_runs WHERE item_id = $1::uuid").bind(w).fetch_one(db).await.unwrap();
+            assert_eq!(n, 0, "a network device's alert starts no agent automation");
+        }
         assert_eq!(admin.get(&format!("/network/devices/{dev}")).await["state"], "down");
         docker("unpause");
         eventually(240, "the device-down alert to clear", || async {
@@ -1538,6 +1554,9 @@ async fn network(url: &str, admin: &Api, db: &sqlx::PgPool, id1: &str, a_id: &st
         })
         .await;
         assert_eq!(admin.get(&format!("/network/devices/{dev}")).await["state"], "up");
+        for w in &watchers {
+            assert!(admin.delete_policy(w).await.is_success());
+        }
     }
     assert!(admin.delete_policy(&item_id).await.is_success());
 
@@ -2835,6 +2854,217 @@ async fn automations(url: &str, admin: &Api, db: &sqlx::PgPool, dir: &Path, id1:
     a4.kill();
     let (s, _) = admin.call(reqwest::Method::DELETE, &format!("/agents/{id4}"), None).await;
     assert!(s.is_success());
+}
+
+/// Automations that start on a tag or a custom-field change (docs/design/automations.md): the
+/// triggers' validation, that only real changes fire (a tag the device had, a value it already
+/// held), the storm guards, bulk tagging, scripts that set fields, the loop guard (a script that sets
+/// the field its own automation watches), and the refusal to delete what an automation waits on.
+#[allow(clippy::too_many_arguments)]
+async fn automation_tags_and_fields(url: &str, admin: &Api, db: &sqlx::PgPool, id1: &str, id3: &str, a_id: &str, b_id: &str) {
+    use reqwest::Method;
+    let tech = signed_in(url, admin, "autotrig-tech@e2e.test", "technician", Some(a_id), false).await;
+    let id_of = |v: &Value| v["id"].as_str().unwrap().to_string();
+    let script = |name: &str, body: &str| {
+        let (name, body) = (name.to_string(), body.to_string());
+        async move { id_of(&admin.post("/scripts", json!({ "name": name, "interpreter": "bash", "body": body })).await) }
+    };
+    let create = |config: Value| async move { admin.call(Method::POST, &format!("/policy-sets/{ROOT_SET}/items"), Some(json!({ "module": "automation", "name": "autotrig item", "config": config }))).await };
+    let new_item = |name: &str, config: Value| {
+        let name = name.to_string();
+        async move {
+            let (s, v) = admin.call(Method::POST, &format!("/policy-sets/{ROOT_SET}/items"), Some(json!({ "module": "automation", "name": name, "config": config }))).await;
+            assert!(s.is_success(), "{name}: {s} {v}");
+            id_of(&v)
+        }
+    };
+    let set_config = |item: &str, config: Value| {
+        let item = item.to_string();
+        async move {
+            let (s, v) = admin.call(Method::PUT, &format!("/policy-items/{item}"), Some(json!({ "config": config }))).await;
+            assert!(s.is_success(), "{v}");
+        }
+    };
+    let runs_of = |item: &str, agent: &str| {
+        let (item, agent) = (item.to_string(), agent.to_string());
+        async move { auto_runs(db, &item, &agent).await }
+    };
+    let count = |item: &str, agent: &str, status: &'static str| {
+        let (item, agent) = (item.to_string(), agent.to_string());
+        async move { auto_runs(db, &item, &agent).await.iter().filter(|r| r.1 == status).count() }
+    };
+    // Waits until `n` runs of the item on the device have this status.
+    let wait_count = |item: &str, agent: &str, status: &'static str, n: usize| {
+        let (item, agent) = (item.to_string(), agent.to_string());
+        async move {
+            eventually(60, &format!("{n} {status} run(s) of {item} on {agent}"), || {
+                let (i, a) = (item.clone(), agent.clone());
+                async move { (auto_runs(db, &i, &a).await.iter().filter(|r| r.1 == status).count() == n).then_some(()) }
+            })
+            .await
+        }
+    };
+    let quiet = || tokio::time::sleep(Duration::from_secs(4));
+
+    // The things a trigger can name.
+    let tag = id_of(&admin.post("/tags", json!({ "name": "autotrig-pilot", "color": "teal" })).await);
+    let other_tag = id_of(&admin.post("/tags", json!({ "name": "autotrig-other" })).await);
+    let field = |name: &str, kind: &str, extra: Value| {
+        let mut b = json!({ "entity": "agent", "name": name, "label": name, "kind": kind });
+        b.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        async move { id_of(&admin.post("/custom-fields", b).await) }
+    };
+    let tier = field("autotrig_tier", "select", json!({ "options": ["Gold", "Silver"] })).await;
+    let note = field("autotrig_note", "text", json!({})).await;
+    let flag = field("autotrig_flag", "text", json!({ "script_writable": true })).await;
+    let looping = field("autotrig_loop", "text", json!({ "script_writable": true })).await;
+    let b_only = field("autotrig_b", "text", json!({ "client_id": b_id })).await;
+    let client_field = id_of(&admin.post("/custom-fields", json!({ "entity": "client", "name": "autotrig_client", "label": "x", "kind": "text" })).await);
+    let hello = script("autotrig hello (e2e)", "echo hello").await;
+
+    // --- validation -------------------------------------------------------------------------------------------------
+    for (what, config, status) in [
+        ("a tag trigger without a tag", json!({ "trigger": "tag_added", "script_id": hello }), StatusCode::BAD_REQUEST),
+        ("a tag that doesn't exist", json!({ "trigger": "tag_added", "script_id": hello, "tag_id": uuid::Uuid::new_v4() }), StatusCode::NOT_FOUND),
+        ("a field trigger without a field", json!({ "trigger": "field_changed", "script_id": hello }), StatusCode::BAD_REQUEST),
+        ("a field that doesn't exist", json!({ "trigger": "field_changed", "script_id": hello, "field_id": uuid::Uuid::new_v4() }), StatusCode::NOT_FOUND),
+        ("a field of clients", json!({ "trigger": "field_changed", "script_id": hello, "field_id": client_field }), StatusCode::BAD_REQUEST),
+        ("a value the select doesn't have", json!({ "trigger": "field_changed", "script_id": hello, "field_id": tier, "field_value": "Platinum" }), StatusCode::BAD_REQUEST),
+        ("a value without a field", json!({ "trigger": "tag_added", "script_id": hello, "tag_id": tag, "field_value": "x" }), StatusCode::BAD_REQUEST),
+        ("a client's field in an automation of every client", json!({ "trigger": "field_changed", "script_id": hello, "field_id": b_only }), StatusCode::BAD_REQUEST),
+        ("an alert kind of network devices", json!({ "trigger": "alert_opened", "script_id": hello, "alert_kind": "net_down" }), StatusCode::BAD_REQUEST),
+    ] {
+        let (s, v) = create(config).await;
+        assert_eq!(s, status, "{what}: {v}");
+    }
+
+    // --- a tag is added -------------------------------------------------------------------------------------------------
+    let tagged_script = script("autotrig tagged (e2e)", "echo tagged").await;
+    let on_tag = new_item("Pilot setup (autotrig e2e)", json!({ "trigger": "tag_added", "tag_id": tag, "script_id": tagged_script })).await;
+    let for_b = new_item("Pilot setup for B (autotrig e2e)", json!({ "trigger": "tag_added", "tag_id": tag, "script_id": tagged_script, "client_id": b_id })).await;
+    // The device keeps the tags earlier sections gave it.
+    let had: Vec<String> = admin.get(&format!("/agents/{id1}")).await["tags"].as_array().unwrap().iter().map(id_of).collect();
+    let tags_with = |extra: &[&str]| json!({ "tag_ids": had.iter().map(String::as_str).chain(extra.iter().copied()).collect::<Vec<_>>() });
+    // Another tag starts nothing.
+    tech.put(&format!("/agents/{id1}/tags"), tags_with(&[&other_tag])).await;
+    quiet().await;
+    assert!(runs_of(&on_tag, id1).await.is_empty(), "another tag");
+    tech.put(&format!("/agents/{id1}/tags"), tags_with(&[&other_tag, &tag])).await;
+    wait_count(&on_tag, id1, "succeeded", 1).await;
+    let run = runs_of(&on_tag, id1).await;
+    assert_eq!(run, vec![("tag_added".to_string(), "succeeded".to_string(), None, 1)], "{run:?}");
+    let ctx: Value = sqlx::query_scalar("SELECT context FROM automation_runs WHERE item_id = $1::uuid AND agent_id = $2::uuid").bind(&on_tag).bind(id1).fetch_one(db).await.unwrap();
+    assert_eq!((ctx["tag"].as_str(), ctx["tag_id"].as_str(), ctx["source"].as_str()), (Some("autotrig-pilot"), Some(tag.as_str()), Some("user")), "{ctx}");
+    assert!(runs_of(&for_b, id1).await.is_empty(), "an automation limited to client B doesn't reach client A's device");
+    // Saving a list that keeps the tag, or adding it again, changes nothing.
+    tech.put(&format!("/agents/{id1}/tags"), tags_with(&[&other_tag, &tag])).await;
+    tech.post("/agents/tags", json!({ "agent_ids": [id1], "add": [tag] })).await;
+    quiet().await;
+    assert_eq!(runs_of(&on_tag, id1).await.len(), 1, "the device already had the tag");
+    // Taken off and put back: inside the cooldown it's recorded as skipped, with the guard's reason...
+    tech.post("/agents/tags", json!({ "agent_ids": [id1], "remove": [tag] })).await;
+    tech.post("/agents/tags", json!({ "agent_ids": [id1], "add": [tag] })).await;
+    wait_count(&on_tag, id1, "skipped", 1).await;
+    assert_eq!(runs_of(&on_tag, id1).await[1].2.as_deref(), Some("cooldown"));
+    assert_eq!(auto_jobs(db, &on_tag, id1).await, 1, "no second job inside the cooldown");
+    // ...and runs again without one.
+    set_config(&on_tag, json!({ "trigger": "tag_added", "tag_id": tag, "script_id": tagged_script, "cooldown_minutes": 0 })).await;
+    tech.post("/agents/tags", json!({ "agent_ids": [id1], "remove": [tag] })).await;
+    tech.post("/agents/tags", json!({ "agent_ids": [id1], "add": [tag] })).await;
+    wait_count(&on_tag, id1, "succeeded", 2).await;
+    // The bulk action: each device that gets the tag runs it (the device that never connected only has its job queued).
+    let r = tech.post("/agents/tags", json!({ "agent_ids": [id1, id3], "remove": [tag] })).await;
+    assert!(r["removed"].as_i64() >= Some(1), "{r}");
+    let r = tech.post("/agents/tags", json!({ "agent_ids": [id1, id3], "add": [tag] })).await;
+    assert_eq!(r["added"].as_i64(), Some(2), "{r}");
+    wait_count(&on_tag, id1, "succeeded", 3).await;
+    eventually(30, "the bulk-tagged device's run", || async { (!runs_of(&on_tag, id3).await.is_empty()).then_some(()) }).await;
+    assert_eq!(runs_of(&on_tag, id3).await[0].0, "tag_added");
+    let history = admin.get(&format!("/agents/{id1}/automations")).await;
+    assert!(history.as_array().unwrap().iter().any(|r| r["trigger"] == "tag_added" && r["context"]["tag"] == "autotrig-pilot"), "{history}");
+
+    // --- a custom field changes ---------------------------------------------------------------------------------------
+    let gold = new_item("Gold onboarding (autotrig e2e)", json!({ "trigger": "field_changed", "field_id": tier, "field_value": "gold", "script_id": hello, "cooldown_minutes": 0 })).await;
+    let any_note = new_item("Note watcher (autotrig e2e)", json!({ "trigger": "field_changed", "field_id": note, "script_id": hello, "cooldown_minutes": 0 })).await;
+    let set_field = |name: &str, value: Value| {
+        let (name, path) = (name.to_string(), format!("/agents/{id1}/fields"));
+        let tech = &tech;
+        async move { tech.put(&path, json!({ "values": { name: value } })).await }
+    };
+    set_field("autotrig_tier", json!("Silver")).await;
+    quiet().await;
+    assert!(runs_of(&gold, id1).await.is_empty(), "Silver isn't Gold");
+    set_field("autotrig_tier", json!("Gold")).await;
+    wait_count(&gold, id1, "succeeded", 1).await;
+    let ctx: Value = sqlx::query_scalar("SELECT context FROM automation_runs WHERE item_id = $1::uuid AND agent_id = $2::uuid").bind(&gold).bind(id1).fetch_one(db).await.unwrap();
+    assert_eq!((ctx["field"].as_str(), ctx["from"].as_str(), ctx["to"].as_str(), ctx["source"].as_str()), (Some("autotrig_tier"), Some("Silver"), Some("Gold"), Some("user")), "{ctx}");
+    set_field("autotrig_tier", json!("gold")).await;
+    quiet().await;
+    assert_eq!(runs_of(&gold, id1).await.len(), 1, "the value it already had isn't a change");
+    set_field("autotrig_tier", Value::Null).await;
+    quiet().await;
+    assert_eq!(runs_of(&gold, id1).await.len(), 1, "clearing isn't Gold");
+    // Without a value, any change counts: setting, changing and clearing.
+    set_field("autotrig_note", json!("first")).await;
+    set_field("autotrig_note", json!("second")).await;
+    set_field("autotrig_note", Value::Null).await;
+    wait_count(&any_note, id1, "succeeded", 3).await;
+    // Fields set by a script fire too, and nothing fires for a value the script left as it was.
+    let flagged = new_item("Flag watcher (autotrig e2e)", json!({ "trigger": "field_changed", "field_id": flag, "script_id": hello, "cooldown_minutes": 0 })).await;
+    let j = admin.run_script(id1, "echo 'RMM-FIELD autotrig_flag=on'", 30).await;
+    assert_eq!(admin.wait_job(&j, 30).await["status"], "succeeded");
+    wait_count(&flagged, id1, "succeeded", 1).await;
+    let ctx: Value = sqlx::query_scalar("SELECT context FROM automation_runs WHERE item_id = $1::uuid AND agent_id = $2::uuid").bind(&flagged).bind(id1).fetch_one(db).await.unwrap();
+    assert_eq!((ctx["to"].as_str(), ctx["source"].as_str()), (Some("on"), Some("script")), "{ctx}");
+    let j = admin.run_script(id1, "echo 'RMM-FIELD autotrig_flag=on'", 30).await;
+    assert_eq!(admin.wait_job(&j, 30).await["status"], "succeeded");
+    quiet().await;
+    assert_eq!(runs_of(&flagged, id1).await.len(), 1, "a script that sets the value the field has changes nothing");
+
+    // --- a script that sets the field its own automation watches ---------------------------------------------------------
+    // Its output changes the field to a new value each time: without a guard this would run forever
+    // (cooldown off). The write of its own job doesn't start it again; another automation still reacts.
+    let setter = script("autotrig loop (e2e)", "echo \"RMM-FIELD autotrig_loop=$RANDOM$RANDOM\"").await;
+    let watcher = new_item("Loop (autotrig e2e)", json!({ "trigger": "field_changed", "field_id": looping, "script_id": setter, "cooldown_minutes": 0, "max_runs_per_hour": 100 })).await;
+    let chained = new_item("Chained (autotrig e2e)", json!({ "trigger": "field_changed", "field_id": looping, "script_id": hello, "cooldown_minutes": 0 })).await;
+    set_field("autotrig_loop", json!("seed")).await;
+    wait_count(&watcher, id1, "succeeded", 1).await;
+    wait_count(&chained, id1, "succeeded", 2).await;
+    quiet().await;
+    let own = runs_of(&watcher, id1).await;
+    assert_eq!(own.iter().map(|r| (r.1.as_str(), r.2.as_deref())).collect::<Vec<_>>(), [("succeeded", None), ("skipped", Some("own_write"))], "{own:?}");
+    assert_eq!(auto_jobs(db, &watcher, id1).await, 1, "one job, not a loop");
+    assert_eq!(count(&chained, id1, "succeeded").await, 2, "the other automation saw the user's write and the script's");
+    let shown = tech.get(&format!("/agents/{id1}/fields")).await;
+    let f = shown.as_array().unwrap().iter().find(|f| f["name"] == "autotrig_loop").unwrap();
+    assert_eq!(f["source"], "script", "the script's value stands: {f}");
+    assert_ne!(f["value"], "seed");
+
+    // --- what an automation waits on can't be deleted ---------------------------------------------------------------------
+    let (s, v) = admin.call(Method::DELETE, &format!("/tags/{tag}"), None).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    assert!(v.to_string().contains("Pilot setup"), "names the automation: {v}");
+    let (s, _) = admin.call(Method::DELETE, &format!("/custom-fields/{tier}"), None).await;
+    assert_eq!(s, StatusCode::CONFLICT);
+
+    // --- clean up: the other sections expect the fleet as it was ---------------------------------------------------------------
+    let items = [&on_tag, &for_b, &gold, &any_note, &flagged, &watcher, &chained];
+    sqlx::query("DELETE FROM jobs WHERE agent_id = $1::uuid AND status IN ('queued', 'sent') AND schedule_id = ANY($2::uuid[])")
+        .bind(id3)
+        .bind(items.iter().map(|s| uuid::Uuid::parse_str(s).unwrap()).collect::<Vec<_>>())
+        .execute(db)
+        .await
+        .unwrap();
+    for i in items {
+        assert_eq!(admin.delete_policy(i).await, StatusCode::OK);
+    }
+    tech.put(&format!("/agents/{id1}/tags"), tags_with(&[])).await;
+    for t in [&tag, &other_tag] {
+        assert_eq!(admin.call(Method::DELETE, &format!("/tags/{t}"), None).await.0, StatusCode::OK);
+    }
+    for f in [&tier, &note, &flag, &looping, &b_only, &client_field] {
+        assert_eq!(admin.call(Method::DELETE, &format!("/custom-fields/{f}"), None).await.0, StatusCode::OK);
+    }
 }
 
 /// Rows written by the previous release (`RMM_E2E_EXPECT`, from `tests/upgrade.rs`) read back

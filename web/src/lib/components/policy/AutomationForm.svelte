@@ -5,7 +5,7 @@
 
 	type Draft = {
 		trigger: AutomationTrigger; script_id: string; args: string; timeout_secs: string;
-		offline_minutes: number; alert_kind: PolicyKind;
+		offline_minutes: number; alert_kind: PolicyKind; tag_id: string; field_id: string; field_value: string;
 		retry_failed: boolean; max_attempts: number; retry_minutes: number;
 		cooldown_minutes: number; max_runs_per_hour: number; respect_window: boolean; retain_days: number;
 	};
@@ -14,6 +14,7 @@
 			trigger: (c.trigger as AutomationTrigger) ?? 'enrollment', script_id: (c.script_id as string) ?? '',
 			args: ((c.args as string[]) ?? []).join('\n'), timeout_secs: c.timeout_secs == null ? '' : String(c.timeout_secs),
 			offline_minutes: Number(c.offline_minutes ?? 30), alert_kind: (c.alert_kind as PolicyKind) ?? 'disk',
+			tag_id: (c.tag_id as string) ?? '', field_id: (c.field_id as string) ?? '', field_value: c.field_value == null ? '' : String(c.field_value),
 			retry_failed: !!c.retry_failed, max_attempts: Number(c.max_attempts ?? 3), retry_minutes: Number(c.retry_minutes ?? 30),
 			cooldown_minutes: Number(c.cooldown_minutes ?? 60), max_runs_per_hour: Number(c.max_runs_per_hour ?? 100),
 			respect_window: !!c.respect_window, retain_days: Number(c.retain_days ?? 30)
@@ -27,6 +28,9 @@
 			timeout_secs: d.timeout_secs.trim() ? Number(d.timeout_secs) : null,
 			offline_minutes: d.trigger === 'agent_online' ? Number(d.offline_minutes) : null,
 			alert_kind: d.trigger === 'alert_opened' ? d.alert_kind : null,
+			tag_id: d.trigger === 'tag_added' ? d.tag_id || null : null,
+			field_id: d.trigger === 'field_changed' ? d.field_id || null : null,
+			field_value: d.trigger === 'field_changed' && d.field_id && d.field_value ? d.field_value : null,
 			retry_failed: once && d.retry_failed, max_attempts: Number(d.max_attempts), retry_minutes: Number(d.retry_minutes),
 			cooldown_minutes: Number(d.cooldown_minutes), max_runs_per_hour: Number(d.max_runs_per_hour),
 			respect_window: d.respect_window, retain_days: Number(d.retain_days)
@@ -42,7 +46,7 @@
 	import { kindLabels } from '#lib/monitoring/labels.js';
 	import { triggerHelp, triggerLabels } from '#lib/policy/policy.js';
 	import { resource } from '#lib/resource.svelte.js';
-	import type { Script } from '#lib/types.js';
+	import type { CustomField, Script, Tag } from '#lib/types.js';
 	import Combobox from '#lib/ui/Combobox.svelte';
 	import Input from '#lib/ui/Input.svelte';
 	import Select from '#lib/ui/Select.svelte';
@@ -84,13 +88,29 @@
 	});
 	$effect(() => {
 		const c = toConfig(draft);
-		const ok = !!c.script_id && !Object.values(errors).some(Boolean);
+		const ok = !!c.script_id && (draft.trigger !== 'tag_added' || !!c.tag_id) && (draft.trigger !== 'field_changed' || !!c.field_id) && !Object.values(errors).some(Boolean);
 		untrack(() => onchange(c, ok));
 	});
 
 	const scripts = resource(() => api.get<Script[]>('/scripts'));
 	const scriptItems = $derived((scripts.data ?? []).filter((s) => !s.client_id || s.client_id === clientId).map((s) => ({ value: s.id, label: s.name, hint: s.client_name ?? undefined })));
 	const script = $derived(scripts.data?.find((s) => s.id === draft.script_id));
+	const tags = resource(() => api.get<Tag[]>('/tags'));
+	const fields = resource(() => api.get<CustomField[]>('/custom-fields?entity=agent'));
+	const tagOptions = $derived([{ value: '', label: 'Pick a tag' }, ...(tags.data ?? []).map((t) => ({ value: t.id, label: t.name }))]);
+	// A client's own field only exists for that client's devices.
+	const fieldOptions = $derived([
+		{ value: '', label: 'Pick a field' },
+		...(fields.data ?? []).filter((f) => !f.client_id || f.client_id === clientId).map((f) => ({ value: f.id, label: f.client_name ? `${f.label} (${f.client_name})` : f.label }))
+	]);
+	const field = $derived(fields.data?.find((f) => f.id === draft.field_id));
+	const valueOptions = $derived(
+		field?.kind === 'select'
+			? [{ value: '', label: 'Any change' }, ...field.options.map((o) => ({ value: o, label: o }))]
+			: field?.kind === 'bool'
+				? [{ value: '', label: 'Any change' }, { value: 'true', label: 'Yes' }, { value: 'false', label: 'No' }]
+				: null
+	);
 	const fixed = $derived(disabled || below);
 	const triggers = (Object.keys(triggerLabels) as (keyof typeof triggerLabels)[]).map((t) => ({ value: t, label: triggerLabels[t] }));
 	const kinds = (Object.keys(kindLabels) as PolicyKind[]).map((k) => ({ value: k, label: kindLabels[k] }));
@@ -114,6 +134,23 @@
 			</PField>
 		{:else if draft.trigger === 'alert_opened'}
 			<PField path="alert_kind" label="Type of alert" id="au-kind"><Select id="au-kind" class="w-full" bind:value={draft.alert_kind} options={kinds} disabled={fixed} /></PField>
+		{:else if draft.trigger === 'tag_added'}
+			<PField path="tag_id" label="Tag" id="au-tag" hint="Runs for a device each time this tag is put on it (a tag it already had doesn’t count). Tags can’t be deleted while an automation waits on them.">
+				{#if tags.data}<Select id="au-tag" class="w-full" bind:value={draft.tag_id} options={tagOptions} disabled={fixed} />{:else}<Skeleton class="h-8 w-full" />{/if}
+			</PField>
+		{:else if draft.trigger === 'field_changed'}
+			<PField path="field_id" label="Custom field" id="au-field" hint="Fields of devices. Runs when a person, the API or a script changes it, not when it is saved with the value it had.">
+				{#if fields.data}<Select id="au-field" class="w-full" bind:value={draft.field_id} options={fieldOptions} disabled={fixed} onchange={() => (draft.field_value = '')} />{:else}<Skeleton class="h-8 w-full" />{/if}
+			</PField>
+			{#if field}
+				<PField path="field_value" label="Only when it becomes" id="au-fvalue" hint="Leave on “Any change” to run for every change, clearing the field included.">
+					{#if valueOptions}
+						<Select id="au-fvalue" class="w-full" bind:value={draft.field_value} options={valueOptions} disabled={fixed} />
+					{:else}
+						<Input id="au-fvalue" bind:value={draft.field_value} maxlength={200} placeholder={field.kind === 'date' ? 'YYYY-MM-DD, or leave empty for any change' : 'Any change'} disabled={fixed} />
+					{/if}
+				</PField>
+			{/if}
 		{/if}
 	</fieldset>
 

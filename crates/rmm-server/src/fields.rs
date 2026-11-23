@@ -181,6 +181,8 @@ async fn apply(st: &AppState, agent_id: Uuid, job_id: Uuid) -> Result<(), sqlx::
     }
     let mut set = Vec::new();
     let mut refused = Vec::new();
+    // What really changed (a script that prints the value the field has changes nothing).
+    let mut changed = Vec::new();
     let mut tx = st.db.begin().await?;
     for (name, raw) in last {
         let Some(def) = defs.iter().find(|d| d.name == name) else {
@@ -191,8 +193,24 @@ async fn apply(st: &AppState, agent_id: Uuid, job_id: Uuid) -> Result<(), sqlx::
             refused.push(json!({ "name": name, "reason": "the field isn't flagged as script-writable" }));
             continue;
         }
+        let old: Option<Value> = sqlx::query_scalar("SELECT value FROM custom_field_values WHERE field_id = $1 AND agent_id = $2")
+            .bind(def.id)
+            .bind(agent_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let change = |to: Option<Value>| crate::automation::FieldChange {
+            field_id: def.id,
+            name: def.name.clone(),
+            kind: def.kind.clone(),
+            options: def.options.clone(),
+            from: old.clone(),
+            to,
+        };
         match coerce(&def.kind, &def.options, &Value::String(raw)) {
             Ok(Some(value)) => {
+                if old.as_ref() != Some(&value) {
+                    changed.push(change(Some(value.clone())));
+                }
                 sqlx::query(
                     "INSERT INTO custom_field_values (field_id, agent_id, value, source, updated_by, job_id, updated_at)
                      VALUES ($1, $2, $3, 'script', NULL, $4, now())
@@ -208,6 +226,9 @@ async fn apply(st: &AppState, agent_id: Uuid, job_id: Uuid) -> Result<(), sqlx::
                 set.push(json!({ "name": name, "value": value }));
             }
             Ok(None) => {
+                if old.is_some() {
+                    changed.push(change(None));
+                }
                 sqlx::query("DELETE FROM custom_field_values WHERE field_id = $1 AND agent_id = $2")
                     .bind(def.id)
                     .bind(agent_id)
@@ -220,6 +241,10 @@ async fn apply(st: &AppState, agent_id: Uuid, job_id: Uuid) -> Result<(), sqlx::
     }
     tx.commit().await?;
     crate::auth::audit(&st.db, None, "agent.field_script", Some(("agent", agent_id)), json!({ "job_id": job_id, "set": set, "refused": refused })).await;
+    // Automations on a field change. Ones whose own job printed this don't start themselves again.
+    for change in changed {
+        crate::automation::field_changed(st, agent_id, change, "script", Some(job_id)).await;
+    }
     Ok(())
 }
 

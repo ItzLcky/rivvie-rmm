@@ -231,8 +231,8 @@ impl ScheduleConfig {
 }
 
 /// What starts an automation (docs/design/automations.md). `run_once` has no event: it runs on
-/// every device the item reaches, once. A trigger on custom field or tag changes belongs here
-/// too once those exist; [`crate::automation::fire`] is the one entry point events use.
+/// every device the item reaches, once. [`crate::automation::fire`] is the one entry point
+/// events use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Trigger {
@@ -245,6 +245,10 @@ pub enum Trigger {
     /// A patch install finished and the machine still needs a restart.
     PatchRebootPending,
     RunOnce,
+    /// A tag (`tag_id`) is put on the agent.
+    TagAdded,
+    /// A custom field (`field_id`) of the agent changes, to `field_value` if one is named.
+    FieldChanged,
 }
 
 impl Trigger {
@@ -255,6 +259,8 @@ impl Trigger {
             Trigger::AlertOpened => "alert_opened",
             Trigger::PatchRebootPending => "patch_reboot_pending",
             Trigger::RunOnce => "run_once",
+            Trigger::TagAdded => "tag_added",
+            Trigger::FieldChanged => "field_changed",
         }
     }
 
@@ -293,6 +299,16 @@ pub struct AutomationConfig {
     /// `alert_opened`: the kind of alert (cpu, disk, offline, ...).
     #[serde(default)]
     pub alert_kind: Option<String>,
+    /// `tag_added`: the tag.
+    #[serde(default)]
+    pub tag_id: Option<Uuid>,
+    /// `field_changed`: the agent custom field.
+    #[serde(default)]
+    pub field_id: Option<Uuid>,
+    /// `field_changed`: only when the field becomes this value (as the field's kind reads it from
+    /// text: `"yes"` for a bool, a choice for a select). None: any change, clearing included.
+    #[serde(default)]
+    pub field_value: Option<String>,
     /// `enrollment` and `run_once`: run again when the script fails, up to `max_attempts`
     /// times in all, `retry_minutes` apart.
     #[serde(default)]
@@ -330,6 +346,25 @@ impl AutomationConfig {
             (Trigger::AlertOpened, Some(k)) if ALERT_KINDS.contains(&k) => {}
             (Trigger::AlertOpened, _) => return Err(format!("alert_kind is one of {}", ALERT_KINDS.join(", "))),
             (_, Some(_)) => return Err("alert_kind belongs to the alert_opened trigger".into()),
+            _ => {}
+        }
+        match (self.trigger, self.tag_id) {
+            (Trigger::TagAdded, Some(_)) => {}
+            (Trigger::TagAdded, None) => return Err("tag_id says which tag starts the automation".into()),
+            (_, Some(_)) => return Err("tag_id belongs to the tag_added trigger".into()),
+            _ => {}
+        }
+        match (self.trigger, self.field_id) {
+            (Trigger::FieldChanged, Some(_)) => {}
+            (Trigger::FieldChanged, None) => return Err("field_id says which custom field starts the automation".into()),
+            (_, Some(_)) => return Err("field_id belongs to the field_changed trigger".into()),
+            _ => {}
+        }
+        match (&self.field_value, self.trigger) {
+            (Some(v), Trigger::FieldChanged) if v.trim().is_empty() || v.chars().count() > crate::fields::TEXT_MAX => {
+                return Err("field_value is a value of the field (leave it out for any change)".into());
+            }
+            (Some(_), t) if t != Trigger::FieldChanged => return Err("field_value belongs to the field_changed trigger".into()),
             _ => {}
         }
         if self.retry_failed && !self.trigger.once_per_device() {
@@ -904,6 +939,18 @@ mod tests {
         assert!(ok(base("patch_reboot_pending", json!({ "alert_kind": "disk" }))).is_err());
         assert!(ok(base("alert_opened", json!({ "alert_kind": "disk", "retry_failed": true }))).is_err(), "events aren't retried");
         assert!(ok(base("volcano", json!({}))).is_err(), "unknown trigger");
+        let (tag, field) = (Uuid::new_v4(), Uuid::new_v4());
+        assert!(ok(base("tag_added", json!({}))).is_err(), "needs tag_id");
+        assert!(ok(base("tag_added", json!({ "tag_id": tag }))).is_ok());
+        assert!(ok(base("tag_added", json!({ "tag_id": tag, "field_id": field }))).is_err());
+        assert!(ok(base("enrollment", json!({ "tag_id": tag }))).is_err(), "tags belong to tag_added");
+        assert!(ok(base("field_changed", json!({}))).is_err(), "needs field_id");
+        assert!(ok(base("field_changed", json!({ "field_id": field }))).is_ok(), "any change");
+        assert!(ok(base("field_changed", json!({ "field_id": field, "field_value": "Gold" }))).is_ok());
+        assert!(ok(base("field_changed", json!({ "field_id": field, "field_value": "  " }))).is_err(), "no blank match; leave it out");
+        assert!(ok(base("field_changed", json!({ "field_id": field, "tag_id": tag }))).is_err());
+        assert!(ok(base("run_once", json!({ "field_value": "x" }))).is_err());
+        assert!(ok(base("tag_added", json!({ "tag_id": tag, "retry_failed": true }))).is_err(), "events aren't retried");
         for bad in [json!({ "max_attempts": 0 }), json!({ "retry_minutes": 1 }), json!({ "cooldown_minutes": -1 }), json!({ "max_runs_per_hour": 0 }), json!({ "timeout_secs": 0 }), json!({ "color": "red" })] {
             assert!(ok(base("enrollment", bad.clone())).is_err(), "{bad}");
         }

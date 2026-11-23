@@ -11,6 +11,14 @@
 	/** What automation policies did on one device, newest first. */
 	let { agentId }: { agentId: string } = $props();
 	const res = resource(() => api.get<AutomationRun[]>(`/agents/${agentId}/automations`));
+	const shown = (v: unknown) => (v == null ? 'no value' : String(v));
+	/** What fired the run, for the triggers that name something. */
+	function cause(r: AutomationRun): string {
+		const c = r.context;
+		if (r.trigger === 'tag_added' && c.tag) return `tag ${c.tag}`;
+		if (r.trigger === 'field_changed' && c.field) return `${c.field}: ${shown(c.from)} → ${shown(c.to)}`;
+		return '';
+	}
 </script>
 
 <section class="card min-w-0 xl:col-span-2" aria-labelledby="ap-automations">
@@ -32,7 +40,7 @@
 									<RunStatus status={r.status} reason={r.reason} />
 								</div>
 								<p class="text-muted text-xs">
-									{triggerLabels[r.trigger]}{r.script_name ? ` · ${r.script_name}` : ''}{r.reason ? ` · ${runReason(r.reason)}` : ''}{r.attempts > 1 ? ` · attempt ${r.attempts}` : ''}
+									{triggerLabels[r.trigger]}{cause(r) ? ` (${cause(r)})` : ''}{r.script_name ? ` · ${r.script_name}` : ''}{r.reason ? ` · ${runReason(r.reason)}` : ''}{r.attempts > 1 ? ` · attempt ${r.attempts}` : ''}
 								</p>
 							</div>
 							<span class="text-muted text-xs whitespace-nowrap" title={datetime(r.created_at)}>{ago(r.created_at)}</span>
