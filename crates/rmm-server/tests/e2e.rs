@@ -5724,9 +5724,11 @@ async fn billing(url: &str, admin: &Api, tech: &Api, db: &sqlx::PgPool, a_id: &s
     let ta_id = ta["id"].as_str().unwrap().to_string();
     let tb = admin.post("/tickets", json!({ "subject": "Billing: server move", "client_id": b_id })).await;
     let tb_id = tb["id"].as_str().unwrap().to_string();
-    admin.post("/time", json!({ "ticket_id": ta_id, "minutes": 90, "work_type_id": remote, "note": "Reinstalled the driver.", "public": true })).await;
-    admin.post("/time", json!({ "ticket_id": ta_id, "minutes": 60, "work_type_id": onsite, "note": "Site visit" })).await;
-    admin.post("/time", json!({ "minutes": 30, "work_type_id": internal, "note": "Team meeting" })).await;
+    // Entries default to starting `minutes` ago, which on a Monday morning (UTC) is last week; start them today.
+    let day_start = today.and_hms_opt(0, 0, 0).unwrap().and_utc();
+    admin.post("/time", json!({ "ticket_id": ta_id, "minutes": 90, "work_type_id": remote, "note": "Reinstalled the driver.", "public": true, "started_at": day_start })).await;
+    admin.post("/time", json!({ "ticket_id": ta_id, "minutes": 60, "work_type_id": onsite, "note": "Site visit", "started_at": day_start })).await;
+    admin.post("/time", json!({ "minutes": 30, "work_type_id": internal, "note": "Team meeting", "started_at": day_start })).await;
     let td = admin.get(&format!("/tickets/{ta_id}")).await;
     assert_eq!(events_of(&td, "time").len(), 2);
     assert!(events_of(&td, "reply").iter().any(|e| e["body"] == "Reinstalled the driver."), "the note went out as a reply too");
@@ -5736,8 +5738,8 @@ async fn billing(url: &str, admin: &Api, tech: &Api, db: &sqlx::PgPool, a_id: &s
     assert_eq!(tech.get("/time/timer").await["id"], started["id"]);
     let stopped = tech.post("/time/timer/stop", json!({ "note": "Quick look" })).await;
     assert_eq!(stopped["minutes"], 1, "at least a minute");
-    tech.post("/time", json!({ "ticket_id": tb_id, "minutes": 540, "work_type_id": remote, "note": "Moved the server" })).await;
-    tech.post("/time", json!({ "ticket_id": tb_id, "minutes": 119, "work_type_id": remote, "note": "Cabling" })).await;
+    tech.post("/time", json!({ "ticket_id": tb_id, "minutes": 540, "work_type_id": remote, "note": "Moved the server", "started_at": day_start })).await;
+    tech.post("/time", json!({ "ticket_id": tb_id, "minutes": 119, "work_type_id": remote, "note": "Cabling", "started_at": day_start })).await;
     let mine = tech.get("/time").await;
     assert_eq!(mine.as_array().unwrap().len(), 3);
     assert!(mine.as_array().unwrap().iter().all(|e| e["rate"].is_null() && e["amount"].is_null()));
