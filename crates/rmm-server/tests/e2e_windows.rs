@@ -724,6 +724,15 @@ async fn wait_security_action(admin: &Api, id: &str, action: &str, secs: u64) ->
     .await
 }
 
+/// Is any of `candidates` (one path in its short and long spelling) at or under one of the
+/// exclusion paths? Case-insensitive, trailing backslashes ignored.
+fn path_excluded(candidates: &[String], exclusions: &[String]) -> bool {
+    let norm = |p: &str| p.trim().trim_end_matches('\\').to_ascii_lowercase();
+    exclusions.iter().map(|e| norm(e)).filter(|e| !e.is_empty()).any(|e| {
+        candidates.iter().map(|c| norm(c)).any(|c| c == e || c.starts_with(&format!("{e}\\")))
+    })
+}
+
 async fn defender(admin: &Api, dir: &Path, id: &str) {
     admin.post(&format!("/agents/{id}/security/refresh"), json!({})).await;
     let s = eventually(120, "Defender's status", || async {
@@ -751,10 +760,28 @@ async fn defender(admin: &Api, dir: &Path, id: &str) {
     let folder = dir.join("eicar");
     std::fs::create_dir_all(&folder).unwrap();
     let file = folder.join("eicar-test.com");
+
+    // Exclusions (GitHub's runner images exclude whole drives) make Defender skip the folder.
+    let (_, paths) = powershell("(Get-MpPreference).ExclusionPath | ForEach-Object { $_ }");
+    let (_, exts) = powershell("(Get-MpPreference).ExclusionExtension | ForEach-Object { $_ }");
+    let paths: Vec<String> = paths.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
+    let exts: Vec<String> = exts.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
+    println!("Defender exclusions: paths {paths:?}, extensions {exts:?}");
+    let mut candidates = vec![folder.display().to_string()];
+    if let Ok(long) = std::fs::canonicalize(&folder) {
+        candidates.push(long.display().to_string().trim_start_matches(r"\\?\").to_string());
+    }
+    if path_excluded(&candidates, &paths) || exts.iter().any(|e| e.trim_start_matches('.').eq_ignore_ascii_case("com")) {
+        println!(
+            "the test folder is excluded from Defender scans (paths {paths:?}, extensions {exts:?}); status and actions work, skipping the detection check"
+        );
+        return;
+    }
+
     let (wrote, out) = powershell(&format!("{EICAR_PS} Set-Content -NoNewline -Encoding ascii -Path '{}' -Value $e", file.display()));
     println!("wrote the test file: {wrote} {}", out.trim());
-    let (_, out) = powershell(&format!("Start-MpScan -ScanType CustomScan -ScanPath '{}'", folder.display()));
-    println!("custom scan: {}", out.trim());
+    let (ok, out) = powershell(&format!("Start-MpScan -ScanType CustomScan -ScanPath '{}'", folder.display()));
+    println!("custom scan: success={ok} output={:?}", out.trim());
     let found = eventually(240, "Defender's detection of the test file", || async {
         admin.post(&format!("/agents/{id}/security/refresh"), json!({})).await;
         tokio::time::sleep(Duration::from_secs(5)).await;
