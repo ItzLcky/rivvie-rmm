@@ -66,7 +66,7 @@ from All devices down.
 
 ```json
 {
-  "id": "uuid", "module": "alert | schedule | software | patch | security | remote_access | agent", "name": "CPU",
+  "id": "uuid", "module": "alert | schedule | software | automation | patch | security | remote_access | agent", "name": "CPU",
   "origin_set_id": "uuid", "origin_set_name": "Linux",
   "status": "defined | inherited | overridden",   // relative to the set being viewed
   "enabled": true, "config": { ... },             // merged, as it applies in this set
@@ -96,6 +96,7 @@ merge key by key, recursively; scalars, arrays and `null` replace.
 | `alert` | `{kind, params, severity, channel_ids: [], notify_resolved: true, renotify_minutes: null, ticket_board_id: null, ticket_priority: 3, ticket_auto_resolve: false, run_script_id: null}` — `kind`/`params` as the old alert policies (`offline`, `cpu`, `memory`, `disk`, `service`, `job_failed`, `log`, `security`, `patch`) | everything but `kind` |
 | `schedule` | `{script_id, cron, timezone: "UTC", args: [], timeout_secs: null, retain_days: 30}` | `args`, `timeout_secs` (and `enabled`) |
 | `software` | `{package_id, state: "present" \| "latest" \| "absent", bootstrap_choco: false, window: null}` (see [software.md](software.md)) | `state`, `bootstrap_choco`, `window` (and `enabled`) |
+| `automation` | `{trigger: "enrollment\|agent_online\|alert_opened\|patch_reboot_pending\|run_once", script_id, args: [], timeout_secs: null, offline_minutes: null, alert_kind: null, retry_failed: false, max_attempts: 3, retry_minutes: 30, cooldown_minutes: 60, max_runs_per_hour: 100, respect_window: false, retain_days: 30}` — `offline_minutes` (5-43200) is required by `agent_online` and refused elsewhere, `alert_kind` likewise for `alert_opened`, `retry_failed` only for `enrollment` and `run_once` | `args`, `timeout_secs`, `retry_failed`, `max_attempts`, `retry_minutes`, `cooldown_minutes`, `max_runs_per_hour`, `respect_window` (and `enabled`) |
 | `patch` | `{auto_approve_severities: [], auto_approve_categories: [], deferral_days, auto_install, reboot_policy, window: null \| {days: [0-6], start: "HH:MM", minutes: 15-1440, tz: "Europe/Berlin" \| "site"}}` | all fields |
 | `security` | `{sensor_enabled, quick_scan_hours, full_scan_days, auto_quarantine, prevention, canaries, telemetry_mb, realtime: "off\|audit\|block", scan_on_write, archive_depth, database_max_age_hours}` | all fields |
 | `remote_access` | `{desktop_enabled, desktop_consent, shell_enabled, files_enabled}` | all fields |
@@ -152,7 +153,7 @@ Paged like `/agents` (`limit`, `after`, `before`, `sort=hostname|client`, `dir`)
 ## Items
 
 ### `POST /policy-sets/{set_id}/items`
-`{module: "alert" | "schedule" | "software", name, enabled?: true, config, client_id?, site_id?}` → `ItemView`
+`{module: "alert" | "schedule" | "software" | "automation", name, enabled?: true, config, client_id?, site_id?}` → `ItemView`
 (at its set). In a client's set the limit is that client (another → 400). `site_id` must belong
 to `client_id` (400). Referenced channels, boards and scripts must exist (404 / 400 "unknown
 notification channel"); a client's own script (`run_script_id`, `params.script_id` of
@@ -279,3 +280,22 @@ Removed: `/alert-policies*`, `/agents/{id}/alert-policies`, `/patch-policies*`,
 `/security/policies*`, `POST /schedules`, `PUT|DELETE /schedules/{id}`,
 `PUT /clients/{id}/desktop`; `desktop_consent` from `/clients` rows; `auto_update_agents` from
 `/settings`.
+
+## Automations
+
+See [automations.md](automations.md). Items are created and edited like alert and schedule items
+(`module: "automation"`; the limit, exclusions and overrides work the same, and the item's
+`ItemView` carries `runs: {waiting, pending, succeeded, failed, skipped}` counts of the devices the
+user can see). Run state:
+
+- `GET /agents/{id}/automations` → the agent's 200 latest runs, newest first: `[{id, item_id,
+  item_name, agent_id, hostname, trigger, status, reason, context, job_id, script_id, script_name,
+  exit_code, attempts, created_at, started_at, finished_at}]`. Also a public API operation
+  (`listAgentAutomations`, scope `jobs`, read).
+- `GET /policy-items/{id}/runs?status=&q=&limit=` (visible items only; 404 unless it is an
+  automation) → `{counts: {waiting, pending, succeeded, failed, skipped}, runs: [...]}`, limited to
+  devices of the clients the user can see. For `enrollment` and `run_once` there is one row per device.
+- `POST /policy-items/{id}/runs/reset` `{agent_ids?: [], failed_only?: false}` → `{reset: n}`.
+  Run-once automations only (400 otherwise). Deletes the run records (not runs in progress) of those
+  devices, or of every device the user can see, so they run again. Same permission as editing the
+  item. Audit: `automation.reset`.

@@ -15,6 +15,7 @@
 	import Field from '#lib/ui/Field.svelte';
 	import Modal from '#lib/ui/Modal.svelte';
 	import Select from '#lib/ui/Select.svelte';
+	import AutomationHistory from './AutomationHistory.svelte';
 	import CategoryChange from './CategoryChange.svelte';
 
 	/** An agent's category, the policy set it uses and why, and every policy that reaches it. */
@@ -94,6 +95,7 @@
 			{ m: 'alert', label: moduleLabels.alert, list: p.policies.filter((x) => x.module === 'alert') },
 			{ m: 'schedule', label: moduleLabels.schedule, list: p.policies.filter((x) => x.module === 'schedule') },
 			{ m: 'software', label: moduleLabels.software, list: p.policies.filter((x) => x.module === 'software') },
+			{ m: 'automation', label: moduleLabels.automation, list: p.policies.filter((x) => x.module === 'automation') },
 			{ m: 'settings', label: 'Settings', list: p.policies.filter((x) => singleModules.includes(x.module)) }
 		].filter((g) => g.list.length);
 	const onlyFor = (v: ItemView) => (v.limit.client_id && v.limit.client_id !== agent.client_id ? v.limit.client_name : v.limit.site_name) ?? 'other devices';
@@ -168,6 +170,7 @@
 					</ul>
 				{/each}
 			</section>
+			<AutomationHistory agentId={agent.id} />
 		</div>
 
 		{#if changing}<CategoryChange agentIds={[agent.id]} current={p.category.manual ? p.category.id : ''} onclose={() => (changing = false)} ondone={() => (res.reload(), onchange?.())} />{/if}

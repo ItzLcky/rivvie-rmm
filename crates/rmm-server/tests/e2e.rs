@@ -134,6 +134,9 @@ impl Server {
             .env("RMM_QBO_API_URL", format!("{}/qbo/api", ACCT_URL.get().map(String::as_str).unwrap_or("http://127.0.0.1:9")))
             .env("RMM_GRAPH_LOGIN_URL", GRAPH_URL.get().map(String::as_str).unwrap_or("http://127.0.0.1:9"))
             .env("RMM_GRAPH_URL", GRAPH_URL.get().map(String::as_str).unwrap_or("http://127.0.0.1:9"))
+            // Offline time counts in full right after the server starts (the restart grace would
+            // hide the hours the automations e2e makes an agent absent for).
+            .env("RMM_AUTOMATION_RESTART_GRACE_MINUTES", "0")
             .env("RUST_LOG", "info,rmm_server=debug")
             .stdout(log.try_clone().unwrap())
             .stderr(log)
@@ -1194,6 +1197,7 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
         day_to_day(&admin, &tech, db, dir, &id1, &id3, a_id).await;
         policies(&url, &admin, db, dir, &id1, &id3, a_id, a_site, b_id).await;
         software(&url, &admin, db, dir, &id1, a_id, b_id).await;
+        automations(&url, &admin, db, dir, &id1, &id3, a_id, a_site, b_id).await;
     }
     portal_and_sla(&url, &admin, db, a_id, b_id).await;
     billing(&url, &admin, &tech, db, a_id, b_id).await;
@@ -2550,6 +2554,287 @@ async fn policies(url: &str, admin: &Api, db: &sqlx::PgPool, dir: &Path, id1: &s
     let audit = admin.get("/audit?action=policy.override").await;
     assert!(!audit["items"].as_array().unwrap().is_empty(), "{audit}");
     println!("policies: ok");
+}
+
+/// The runs of an automation on an agent: (trigger, status, reason, attempts), oldest first.
+async fn auto_runs(db: &sqlx::PgPool, item: &str, agent: &str) -> Vec<(String, String, Option<String>, i32)> {
+    sqlx::query_as("SELECT trigger, status, reason, attempts FROM automation_runs WHERE item_id = $1::uuid AND agent_id = $2::uuid ORDER BY created_at")
+        .bind(item)
+        .bind(agent)
+        .fetch_all(db)
+        .await
+        .unwrap()
+}
+
+async fn auto_jobs(db: &sqlx::PgPool, item: &str, agent: &str) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM jobs WHERE schedule_id = $1::uuid AND agent_id = $2::uuid")
+        .bind(item)
+        .bind(agent)
+        .fetch_one(db)
+        .await
+        .unwrap()
+}
+
+/// Automation policies (docs/design/automations.md): the enrollment trigger and a run-once script
+/// fire exactly once per device (also for a device that joins later, and across reconnects), a
+/// reset and the retry option run it again, alert and offline triggers with their cooldown, hourly
+/// rate limit and maintenance-window guards, and scoping.
+#[allow(clippy::too_many_arguments)]
+async fn automations(url: &str, admin: &Api, db: &sqlx::PgPool, dir: &Path, id1: &str, id3: &str, a_id: &str, a_site: &str, b_id: &str) {
+    // A technician limited to client B (the shared `tech` of the earlier sections was given client A too).
+    admin
+        .post("/users", json!({ "email": "autotech@e2e.test", "name": "Automation tech", "password": "tech-password-123", "role": "technician",
+                                "all_clients": false, "client_ids": [b_id] }))
+        .await;
+    let tech = Api::new(url);
+    tech.post("/auth/login", json!({ "email": "autotech@e2e.test", "password": "tech-password-123" })).await;
+    let item = |v: &Value| v["id"].as_str().unwrap().to_string();
+    let new_item = |name: &str, config: Value| {
+        let name = name.to_string();
+        async move { admin.post(&format!("/policy-sets/{ROOT_SET}/items"), json!({ "module": "automation", "name": name, "config": config })).await }
+    };
+    let script = |name: &str, body: &str| {
+        let (name, body) = (name.to_string(), body.to_string());
+        async move { item(&admin.post("/scripts", json!({ "name": name, "interpreter": "bash", "body": body })).await) }
+    };
+    let run_state = |item_id: String, agent: String| async move {
+        let rows = auto_runs(db, &item_id, &agent).await;
+        rows.last().map(|r| r.1.clone())
+    };
+    let wait_status = |item_id: String, agent: String, want: &'static str| async move {
+        eventually(60, &format!("automation {item_id} on {agent} to be {want}"), || {
+            let (i, a) = (item_id.clone(), agent.clone());
+            async move { (auto_runs(db, &i, &a).await.last().map(|r| r.1.as_str() == want) == Some(true)).then_some(()) }
+        })
+        .await
+    };
+
+    // --- validation -------------------------------------------------------------------------------------------------
+    let hello = script("automation hello (e2e)", "echo enrolled").await;
+    let (s, v) = admin
+        .call(reqwest::Method::POST, &format!("/policy-sets/{ROOT_SET}/items"), Some(json!({ "module": "automation", "name": "x", "config": { "trigger": "agent_online", "script_id": hello } })))
+        .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "agent_online needs offline_minutes: {v}");
+    let (s, _) = admin
+        .call(reqwest::Method::POST, &format!("/policy-sets/{ROOT_SET}/items"), Some(json!({ "module": "automation", "name": "x", "config": { "trigger": "enrollment", "script_id": uuid::Uuid::new_v4() } })))
+        .await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "the script must exist");
+    let (s, _) = tech.call(reqwest::Method::POST, &format!("/policy-sets/{ROOT_SET}/items"), Some(json!({ "module": "automation", "name": "x", "config": { "trigger": "enrollment", "script_id": hello } }))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "MSP-wide automations are for admins");
+
+    // --- enrollment and run-once, on devices that exist and one that joins later -------------------------------------
+    let enroll = item(&new_item("Welcome (automations e2e)", json!({ "trigger": "enrollment", "script_id": hello })).await);
+    let once_script = script("automation once (e2e)", "echo once").await;
+    let once = item(&new_item("Once (automations e2e)", json!({ "trigger": "run_once", "script_id": once_script })).await);
+    assert_eq!(auto_runs(db, &enroll, id1).await.len(), 0, "enrollment automations never run on devices that are already there");
+    wait_status(once.clone(), id1.to_string(), "succeeded").await;
+    assert_eq!(auto_runs(db, &once, id1).await, vec![("run_once".to_string(), "succeeded".to_string(), None, 1)]);
+    let job = sqlx::query_scalar::<_, String>("SELECT j.stdout FROM automation_runs r JOIN jobs j ON j.id = r.job_id WHERE r.item_id = $1::uuid AND r.agent_id = $2::uuid")
+        .bind(&once)
+        .bind(id1)
+        .fetch_one(db)
+        .await
+        .unwrap();
+    assert_eq!(job, "once\n");
+
+    let token = admin.post(&format!("/sites/{a_site}/enrollment-tokens"), json!({ "label": "automations e2e" })).await["token"].as_str().unwrap().to_string();
+    let mut a4 = Agent::new(dir, "a4");
+    let id4 = a4.enroll(url, &token).unwrap();
+    assert_eq!(auto_runs(db, &enroll, &id4).await.len(), 0, "enrolled, not yet connected");
+    a4.run(dir);
+    wait_status(enroll.clone(), id4.clone(), "succeeded").await;
+    wait_status(once.clone(), id4.clone(), "succeeded").await;
+    assert_eq!(auto_runs(db, &enroll, &id4).await, vec![("enrollment".to_string(), "succeeded".to_string(), None, 1)]);
+    assert_eq!(auto_runs(db, &once, &id4).await.len(), 1, "a device that joins later gets the run-once script too");
+    let history = admin.get(&format!("/agents/{id4}/automations")).await;
+    assert_eq!(history.as_array().unwrap().len(), 2, "{history}");
+    assert!(history.as_array().unwrap().iter().all(|r| r["status"] == "succeeded" && r["hostname"].is_string() && r["job_id"].is_string()), "{history}");
+    let shown = admin.get(&format!("/policy-items/{enroll}/runs")).await;
+    assert_eq!((shown["counts"]["succeeded"].as_i64(), shown["runs"].as_array().unwrap().len()), (Some(1), 1), "{shown}");
+    let view = admin.item_in(ROOT_SET, &enroll).await;
+    assert_eq!(view["runs"]["succeeded"], 1, "the policy view carries the counts: {view}");
+
+    // --- coming back after a while away ----------------------------------------------------------------------------------
+    let online = item(&new_item("Back (automations e2e)", json!({ "trigger": "agent_online", "offline_minutes": 30, "script_id": hello })).await);
+    a4.kill();
+    admin.wait_online(&id4, false).await;
+    sqlx::query("UPDATE agents SET last_seen_at = now() - interval '2 hours' WHERE id = $1::uuid").bind(&id4).execute(db).await.unwrap();
+    a4.run(dir);
+    wait_status(online.clone(), id4.clone(), "succeeded").await;
+    let (ctx, n): (Value, i64) = sqlx::query_as("SELECT context, (SELECT count(*) FROM automation_runs WHERE item_id = $1::uuid) FROM automation_runs WHERE item_id = $1::uuid AND agent_id = $2::uuid")
+        .bind(&online)
+        .bind(&id4)
+        .fetch_one(db)
+        .await
+        .unwrap();
+    assert!(ctx["offline_minutes"].as_i64() >= Some(119), "{ctx}");
+    assert_eq!(n, 1);
+    // A short absence doesn't count.
+    a4.kill();
+    admin.wait_online(&id4, false).await;
+    a4.run(dir);
+    admin.wait_online(&id4, true).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(auto_runs(db, &online, &id4).await.len(), 1, "back after seconds: no run");
+    assert_eq!(auto_runs(db, &enroll, &id4).await.len(), 1, "a reconnect isn't an enrollment");
+    assert_eq!(auto_runs(db, &once, &id4).await.len(), 1, "and the run-once script stays done");
+
+    // --- an alert opens: cooldown and the hourly limit -----------------------------------------------------------------
+    let alert_item = admin
+        .alert_policy(json!({ "name": "Jobs fail (automations e2e)", "kind": "job_failed", "params": {}, "severity": "info", "client_id": a_id }))
+        .await;
+    let alert_policy = item(&alert_item);
+    let react = item(&new_item("React (automations e2e)", json!({ "trigger": "alert_opened", "alert_kind": "job_failed", "script_id": hello })).await);
+    let fail_once = || async {
+        let failing = admin.run_script(id1, "exit 9", 30).await;
+        admin.wait_job(&failing, 30).await;
+        let opened = eventually(30, "the job alert", || async {
+            alerts_for(admin, &format!("policy_id={alert_policy}&agent_id={id1}")).await.into_iter().find(|a| a["state"] == "open")
+        })
+        .await;
+        opened["id"].as_str().unwrap().to_string()
+    };
+    let resolve = |alert: String| async move {
+        let (s, v) = admin.call(reqwest::Method::POST, &format!("/alerts/{alert}/resolve"), Some(json!({}))).await;
+        assert!(s.is_success(), "{v}");
+    };
+    let a = fail_once().await;
+    wait_status(react.clone(), id1.to_string(), "succeeded").await;
+    let ctx: Value = sqlx::query_scalar("SELECT context FROM automation_runs WHERE item_id = $1::uuid AND agent_id = $2::uuid")
+        .bind(&react)
+        .bind(id1)
+        .fetch_one(db)
+        .await
+        .unwrap();
+    assert_eq!((ctx["alert_id"].as_str(), ctx["alert_kind"].as_str()), (Some(a.as_str()), Some("job_failed")), "{ctx}");
+    resolve(a).await;
+    let a = fail_once().await;
+    let runs = eventually(10, "the cooldown skip", || async {
+        let r = auto_runs(db, &react, id1).await;
+        (r.len() == 2).then_some(r)
+    })
+    .await;
+    assert_eq!((runs[1].1.as_str(), runs[1].2.as_deref()), ("skipped", Some("cooldown")), "{runs:?}");
+    assert_eq!(auto_jobs(db, &react, id1).await, 1, "no second job inside the cooldown");
+    // No cooldown, but one run an hour: the next is skipped as rate limited.
+    let put = |config: Value| { let react = &react; async move {
+        let (s, v) = admin.call(reqwest::Method::PUT, &format!("/policy-items/{react}"), Some(json!({ "config": config }))).await;
+        assert!(s.is_success(), "{v}");
+    } };
+    put(json!({ "trigger": "alert_opened", "alert_kind": "job_failed", "script_id": hello, "cooldown_minutes": 0, "max_runs_per_hour": 1 })).await;
+    resolve(a).await;
+    let a = fail_once().await;
+    let runs = eventually(10, "the rate limit skip", || async {
+        let r = auto_runs(db, &react, id1).await;
+        (r.len() == 3).then_some(r)
+    })
+    .await;
+    assert_eq!((runs[2].1.as_str(), runs[2].2.as_deref()), ("skipped", Some("rate_limited")), "{runs:?}");
+    // Held back until the site's maintenance window is open.
+    let saved: (Option<Vec<i16>>, Option<chrono::NaiveTime>, Option<i32>, String) =
+        sqlx::query_as("SELECT maint_days, maint_start, maint_minutes, maint_tz FROM sites WHERE id = $1::uuid").bind(a_site).fetch_one(db).await.unwrap();
+    sqlx::query("UPDATE sites SET maint_days = ARRAY[((extract(dow FROM now() AT TIME ZONE 'UTC')::int + 3) % 7)::smallint], maint_start = '03:00', maint_minutes = 60, maint_tz = 'UTC' WHERE id = $1::uuid")
+        .bind(a_site)
+        .execute(db)
+        .await
+        .unwrap();
+    put(json!({ "trigger": "alert_opened", "alert_kind": "job_failed", "script_id": hello, "cooldown_minutes": 0, "max_runs_per_hour": 100, "respect_window": true })).await;
+    resolve(a).await;
+    let a = fail_once().await;
+    let runs = eventually(10, "the held run", || async {
+        let r = auto_runs(db, &react, id1).await;
+        (r.len() == 4).then_some(r)
+    })
+    .await;
+    assert_eq!((runs[3].1.as_str(), runs[3].2.as_deref()), ("waiting", Some("maintenance_window")), "{runs:?}");
+    assert_eq!(auto_jobs(db, &react, id1).await, 1);
+    let shown = admin.get(&format!("/policy-items/{react}/runs?status=waiting")).await;
+    assert_eq!((shown["counts"]["waiting"].as_i64(), shown["runs"].as_array().unwrap().len()), (Some(1), 1), "{shown}");
+    sqlx::query("UPDATE sites SET maint_days = $2, maint_start = $3, maint_minutes = $4, maint_tz = $5 WHERE id = $1::uuid")
+        .bind(a_site)
+        .bind(&saved.0)
+        .bind(saved.1)
+        .bind(saved.2)
+        .bind(&saved.3)
+        .execute(db)
+        .await
+        .unwrap();
+    // The site's own window may be closed or open; open it for the rest of this test.
+    sqlx::query("UPDATE sites SET maint_days = NULL WHERE id = $1::uuid").bind(a_site).execute(db).await.unwrap();
+    eventually(40, "the held run to start when the window opens", || async {
+        (auto_runs(db, &react, id1).await[3].1 == "succeeded").then_some(())
+    })
+    .await;
+    assert_eq!(auto_jobs(db, &react, id1).await, 2);
+    resolve(a).await;
+
+    // --- failed run-once runs retry, a limited number of times ------------------------------------------------------------
+    let bad_script = script("automation flaky (e2e)", "echo nope >&2; exit 1").await;
+    let flaky = item(&new_item("Flaky (automations e2e)", json!({ "trigger": "run_once", "script_id": bad_script, "retry_failed": true, "max_attempts": 2, "retry_minutes": 5 })).await);
+    wait_status(flaky.clone(), id1.to_string(), "failed").await;
+    assert_eq!(auto_runs(db, &flaky, id1).await[0].3, 1);
+    sqlx::query("UPDATE automation_runs SET finished_at = now() - interval '10 minutes' WHERE item_id = $1::uuid AND status = 'failed'").bind(&flaky).execute(db).await.unwrap();
+    eventually(40, "the retry", || async { (auto_runs(db, &flaky, id1).await[0].3 == 2).then_some(()) }).await;
+    wait_status(flaky.clone(), id1.to_string(), "failed").await;
+    sqlx::query("UPDATE automation_runs SET finished_at = now() - interval '10 minutes' WHERE item_id = $1::uuid AND status = 'failed'").bind(&flaky).execute(db).await.unwrap();
+
+    // --- reset: run again where it ran ---------------------------------------------------------------------------------------
+    let (s, v) = admin.call(reqwest::Method::POST, &format!("/policy-items/{enroll}/runs/reset"), Some(json!({}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "only run-once automations reset: {v}");
+    let (s, _) = tech.call(reqwest::Method::POST, &format!("/policy-items/{once}/runs/reset"), Some(json!({}))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "an MSP-wide automation is the admins'");
+    let first = sqlx::query_scalar::<_, uuid::Uuid>("SELECT id FROM automation_runs WHERE item_id = $1::uuid AND agent_id = $2::uuid").bind(&once).bind(id1).fetch_one(db).await.unwrap();
+    let r = admin.post(&format!("/policy-items/{once}/runs/reset"), json!({ "agent_ids": [id1] })).await;
+    assert_eq!(r["reset"], 1, "{r}");
+    eventually(40, "the run-once script to run again", || async {
+        let id = sqlx::query_scalar::<_, uuid::Uuid>("SELECT id FROM automation_runs WHERE item_id = $1::uuid AND agent_id = $2::uuid AND status = 'succeeded'")
+            .bind(&once)
+            .bind(id1)
+            .fetch_optional(db)
+            .await
+            .unwrap();
+        id.filter(|id| *id != first).map(|_| ())
+    })
+    .await;
+    assert_eq!(auto_jobs(db, &once, id1).await, 2, "one job per run");
+    let r = admin.post(&format!("/policy-items/{flaky}/runs/reset"), json!({ "failed_only": true })).await;
+    assert!(r["reset"].as_i64() >= Some(1), "{r}");
+    wait_status(flaky.clone(), id1.to_string(), "failed").await;
+
+    // --- exactly once: nothing ran twice while the worker ticked over all of this ------------------------------------
+    tokio::time::sleep(Duration::from_secs(35)).await;
+    assert_eq!(auto_runs(db, &enroll, &id4).await.len(), 1);
+    assert_eq!(auto_jobs(db, &enroll, &id4).await, 1, "the enrollment script ran once");
+    assert_eq!(auto_jobs(db, &once, &id4).await, 1);
+    assert_eq!(auto_jobs(db, &once, id1).await, 2, "run again once after the reset, not more");
+    assert_eq!(auto_runs(db, &flaky, id1).await[0].3, 1, "the reset gave the flaky script a fresh set of attempts, and it ran once so far: {:?}", auto_runs(db, &flaky, id1).await);
+    assert_eq!(run_state(online.clone(), id4.clone()).await.as_deref(), Some("succeeded"));
+
+    // --- scoping and the API surface --------------------------------------------------------------------------------------
+    let (s, _) = tech.call(reqwest::Method::GET, &format!("/agents/{id4}/automations"), None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "another client's technician doesn't see the device's history");
+    let seen = tech.get(&format!("/policy-items/{once}/runs")).await;
+    assert_eq!((seen["runs"].as_array().unwrap().len(), seen["counts"]["succeeded"].as_i64()), (0, Some(0)), "{seen}");
+    let (s, _) = admin.call(reqwest::Method::GET, &format!("/policy-items/{alert_policy}/runs"), None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "not an automation");
+    let spec = admin.get("/openapi.json").await;
+    assert!(spec["paths"]["/agents/{id}/automations"]["get"].is_object(), "the public API lists the agent history");
+    assert!(audit_count(db, "automation.reset").await >= 2);
+
+    // --- clean up: the other sections expect the fleet as it was -------------------------------------------------------------
+    sqlx::query("DELETE FROM jobs WHERE agent_id = $1::uuid AND status = 'queued' AND schedule_id = ANY($2::uuid[])")
+        .bind(id3)
+        .bind([&enroll, &once, &flaky, &react, &online].iter().map(|s| uuid::Uuid::parse_str(s).unwrap()).collect::<Vec<_>>())
+        .execute(db)
+        .await
+        .unwrap();
+    for i in [&enroll, &once, &flaky, &react, &online] {
+        assert_eq!(admin.delete_policy(i).await, StatusCode::OK);
+    }
+    assert_eq!(admin.delete_policy(&alert_policy).await, StatusCode::OK);
+    a4.kill();
+    let (s, _) = admin.call(reqwest::Method::DELETE, &format!("/agents/{id4}"), None).await;
+    assert!(s.is_success());
 }
 
 /// Rows written by the previous release (`RMM_E2E_EXPECT`, from `tests/upgrade.rs`) read back

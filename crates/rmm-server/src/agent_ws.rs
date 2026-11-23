@@ -226,11 +226,19 @@ async fn run_session(
     if let Some(old) = state.hub.register(agent_id, AgentHandle { conn_id, tx: tx.clone() }) {
         debug!(%agent_id, old = %old.conn_id, "replacing stale connection");
     }
-    sqlx::query("UPDATE agents SET online = true, last_seen_at = now(), connected_at = now(), agent_version = $2 WHERE id = $1")
-        .bind(agent_id)
-        .bind(&agent_version)
-        .execute(&state.db)
-        .await?;
+    // What it was before this connection: automations fire on the first one, and on coming back
+    // after a while away.
+    let (first_connect, last_seen): (bool, Option<chrono::DateTime<chrono::Utc>>) = sqlx::query_as(
+        "UPDATE agents a SET online = true, last_seen_at = now(), connected_at = now(), agent_version = $2,
+                first_connected_at = coalesce(a.first_connected_at, now())
+           FROM (SELECT id, first_connected_at, last_seen_at FROM agents WHERE id = $1) old
+          WHERE a.id = old.id
+      RETURNING old.first_connected_at IS NULL, old.last_seen_at",
+    )
+    .bind(agent_id)
+    .bind(&agent_version)
+    .fetch_one(&state.db)
+    .await?;
     info!(%agent_id, %agent_version, "agent online");
     // Agents don't move between clients, so this holds for the whole connection.
     let client_id: Uuid =
@@ -266,6 +274,10 @@ async fn run_session(
     let _ = tx.send(ServerMsg::RequestInventory).await;
     let _ = tx.send(ServerMsg::Watchers { watchers: crate::alerts::watchers_for(&state, agent_id).await }).await;
     crate::alerts::agent_online(&state, agent_id).await;
+    {
+        let state = state.clone();
+        tokio::spawn(async move { crate::automation::on_connect(&state, agent_id, first_connect, last_seen).await });
+    }
     let dispatched = dispatch_queued(&state, agent_id, &tx).await.unwrap_or_else(|e| {
         warn!(%agent_id, "dispatching queued jobs: {e}");
         0
@@ -450,6 +462,7 @@ async fn on_message(
                 if s == "succeeded" {
                     crate::fields::apply_job_output(state, agent_id, job_id).await;
                 }
+                crate::automation::job_finished(state, job_id).await;
             }
             job_event(job_id, status, false);
             // Stored (or already final from an earlier delivery): the agent can forget it.

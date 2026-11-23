@@ -7,7 +7,7 @@
 	import { datetime, num, osLabels, plural } from '#lib/format.js';
 	import { describeCron, describePolicy } from '#lib/monitoring/labels.js';
 	import { paged } from '#lib/paged.svelte.js';
-	import { moduleLabels, overriddenFields, ownerLabel, reasonLabels, ROOT_SET, sections, setHref } from '#lib/policy/policy.js';
+	import { describeAutomation, moduleLabels, overriddenFields, ownerLabel, reasonLabels, ROOT_SET, sections, setHref } from '#lib/policy/policy.js';
 	import type { Category, ItemView, Module, SetAgent, SetDetail } from '#lib/policy/types.js';
 	import { resource } from '#lib/resource.svelte.js';
 	import { can } from '#lib/session.svelte.js';
@@ -71,7 +71,7 @@
 	const scriptName = (sid: unknown) => scripts.data?.find((s) => s.id === sid)?.name ?? 'Script';
 	const packageName = (pid: unknown) => packages.data?.find((p) => p.id === pid)?.name ?? 'Package';
 	/** The sections that list several items, each a module of its own. */
-	const listModules: Record<string, Module> = { alerts: 'alert', schedules: 'schedule', software: 'software' };
+	const listModules: Record<string, Module> = { alerts: 'alert', schedules: 'schedule', software: 'software', automations: 'automation' };
 	const listModule = $derived(listModules[section]);
 	const limitText = (v: ItemView) => (v.limit.client_name ? `${v.limit.client_name}${v.limit.site_name ? ` › ${v.limit.site_name}` : ''}` : '');
 	const canNewChild = $derived(can('technician'));
@@ -86,7 +86,7 @@
 		<div class="grid gap-4 lg:grid-cols-[11rem_1fr]"><Skeleton class="h-48 w-full" /><div class="card space-y-2 p-4"><Skeleton lines={8} /></div></div>
 	{/snippet}
 	{#snippet children(s)}
-		{@const counts = { alert: items(s, 'alert').length, schedule: items(s, 'schedule').length, software: items(s, 'software').length }}
+		{@const counts = { alert: items(s, 'alert').length, schedule: items(s, 'schedule').length, software: items(s, 'software').length, automation: items(s, 'automation').length }}
 		{@const singleOverride = (m: Module) => items(s, m)[0]?.status === 'overridden'}
 		<PageHeader
 			title={s.name}
@@ -122,6 +122,7 @@
 						{ value: 'alerts', label: 'Alerts', count: counts.alert ? num(counts.alert) : undefined },
 						{ value: 'schedules', label: 'Scheduled scripts', count: counts.schedule ? num(counts.schedule) : undefined },
 						{ value: 'software', label: 'Software', count: counts.software ? num(counts.software) : undefined },
+						{ value: 'automations', label: 'Automations', count: counts.automation ? num(counts.automation) : undefined },
 						{ value: 'patching', label: 'Patching', count: singleOverride('patch') ? 'edited' : undefined, title: singleOverride('patch') ? 'Overridden in this set' : undefined },
 						{ value: 'security', label: 'Security', count: singleOverride('security') ? 'edited' : undefined, title: singleOverride('security') ? 'Overridden in this set' : undefined },
 						{ value: 'remote', label: 'Remote access', count: singleOverride('remote_access') ? 'edited' : undefined, title: singleOverride('remote_access') ? 'Overridden in this set' : undefined },
@@ -155,7 +156,7 @@
 					{#snippet nameCell(v: ItemView)}
 						<a class="hover:text-accent font-medium" href="?section={section}&item={v.id}">{v.name}</a>
 						<div class="text-muted max-w-md truncate text-xs">
-							{#if v.module === 'alert'}{describePolicy({ kind: v.config.kind as PolicyKind, params: (v.config.params ?? {}) as Record<string, unknown> })}{:else if v.module === 'software'}{packageName(v.config.package_id)} · {wantLabels[v.config.state as Want]}{:else}{scriptName(v.config.script_id)} · {describeCron(String(v.config.cron))}{/if}
+							{#if v.module === 'alert'}{describePolicy({ kind: v.config.kind as PolicyKind, params: (v.config.params ?? {}) as Record<string, unknown> })}{:else if v.module === 'software'}{packageName(v.config.package_id)} · {wantLabels[v.config.state as Want]}{:else if v.module === 'automation'}{describeAutomation(v.config)} · {scriptName(v.config.script_id)}{:else}{scriptName(v.config.script_id)} · {describeCron(String(v.config.cron))}{/if}
 						</div>
 						<div class="mt-1 md:hidden"><PolicyStatus view={v} /></div>
 					{/snippet}
@@ -170,6 +171,11 @@
 					{/snippet}
 					{#snippet openCell(v: ItemView)}
 						{#if v.open_alerts}<a class="text-danger font-medium hover:underline" href="/alerts?policy={v.id}">{v.open_alerts}</a>{:else}<span class="text-muted" aria-label="none">–</span>{/if}
+					{/snippet}
+					{#snippet runsCell(v: ItemView)}
+						{#if v.runs}
+							<span class="whitespace-nowrap tabular">{v.runs.succeeded} ok{#if v.runs.failed}, <span class="text-danger font-medium">{v.runs.failed} failed</span>{/if}{#if v.runs.pending + v.runs.waiting}, {v.runs.pending + v.runs.waiting} in progress{/if}</span>
+						{:else}<span class="text-muted">–</span>{/if}
 					{/snippet}
 					{#snippet nextCell(v: ItemView)}<span class="text-muted whitespace-nowrap">{v.enabled && v.schedule?.next_run_at ? datetime(v.schedule.next_run_at) : '–'}</span>{/snippet}
 					{#snippet onCell(v: ItemView)}
@@ -187,7 +193,7 @@
 						rowHref={(v) => `?section=${section}&item=${v.id}`}
 						scroll={false}
 						columns={[
-							{ id: 'name', label: m === 'alert' ? 'Policy' : m === 'software' ? 'Requirement' : 'Scheduled script', cell: nameCell, hideable: false },
+							{ id: 'name', label: m === 'alert' ? 'Policy' : m === 'software' ? 'Requirement' : m === 'automation' ? 'Automation' : 'Scheduled script', cell: nameCell, hideable: false },
 							{ id: 'status', label: 'Where it’s set', cell: statusCell, from: 'md' },
 							...(m === 'alert'
 								? [
@@ -195,6 +201,8 @@
 									]
 								: m === 'software'
 									? []
+									: m === 'automation'
+										? [{ id: 'runs', label: 'Runs', cell: runsCell, from: 'sm' as const }]
 									: [{ id: 'next', label: 'Next run', cell: nextCell, from: 'sm' as const }]),
 							{ id: 'scope', label: 'Limited to', cell: scopeCell, from: 'xl' },
 							...(m === 'alert' ? [{ id: 'open', label: 'Open', cell: openCell, align: 'right' as const }] : []),
@@ -203,15 +211,21 @@
 					>
 						{#snippet toolbar()}
 							<p class="text-muted min-w-0 flex-1 text-xs">
-								{m === 'alert' ? 'Alert policies' : m === 'software' ? 'Software requirements' : 'Scripts'} defined here apply in this set and every set below it. Inherited ones can be changed here, field by field.
+								{m === 'alert' ? 'Alert policies' : m === 'software' ? 'Software requirements' : m === 'automation' ? 'Automations' : 'Scripts'} defined here apply in this set and every set below it. Inherited ones can be changed here, field by field.
 							</p>
-							{#if canAdd}<Button size="sm" variant="primary" icon={Plus} onclick={() => open('new')}>{m === 'alert' ? 'New alert policy' : m === 'software' ? 'New software requirement' : 'New scheduled script'}</Button>{/if}
+							{#if canAdd}<Button size="sm" variant="primary" icon={Plus} onclick={() => open('new')}>{m === 'alert' ? 'New alert policy' : m === 'software' ? 'New software requirement' : m === 'automation' ? 'New automation' : 'New scheduled script'}</Button>{/if}
 						{/snippet}
 						{#snippet empty()}
 							<EmptyState
 								compact
-								title={m === 'alert' ? 'No alert policies reach this set' : m === 'software' ? 'No software is required in this set' : 'No scheduled scripts reach this set'}
-								description={m === 'alert' ? 'A policy watches devices for one problem (offline, high CPU, a stopped service, a failed script…) and opens an alert.' : m === 'software' ? 'Pick a catalog package and say whether devices using this set must have it, keep it current, or not have it. Devices install or remove it on their own, and again when they join the set.' : 'Run a saved script on a timetable on every device using this set: nightly cleanups, weekly reports.'}
+								title={m === 'alert' ? 'No alert policies reach this set' : m === 'software' ? 'No software is required in this set' : m === 'automation' ? 'No automations reach this set' : 'No scheduled scripts reach this set'}
+								description={m === 'alert'
+									? 'A policy watches devices for one problem (offline, high CPU, a stopped service, a failed script…) and opens an alert.'
+									: m === 'software'
+										? 'Pick a catalog package and say whether devices using this set must have it, keep it current, or not have it. Devices install or remove it on their own, and again when they join the set.'
+										: m === 'automation'
+											? 'Run a saved script when something happens on a device (it enrolls, comes back online, an alert opens, a patch install needs a restart), or once on every device.'
+											: 'Run a saved script on a timetable on every device using this set: nightly cleanups, weekly reports.'}
 							/>
 						{/snippet}
 					</DataTable>

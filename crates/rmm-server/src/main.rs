@@ -4,6 +4,7 @@ mod billing;
 mod pdf;
 mod policy;
 mod alerts;
+mod automation;
 mod apikeys;
 mod webhooks;
 mod desktop_ws;
@@ -338,6 +339,7 @@ async fn serve(db: sqlx::PgPool, args: ServeArgs) -> Result<()> {
     tokio::spawn(alerts::run(state.clone()));
     tokio::spawn(notify::worker(state.clone()));
     tokio::spawn(scheduler::run(state.clone()));
+    tokio::spawn(automation::run(state.clone()));
     tokio::spawn(patches::scheduler(state.clone()));
     tokio::spawn(software::scheduler(state.clone()));
     tokio::spawn(security::rollout_loop(state.clone()));
@@ -532,6 +534,9 @@ async fn housekeeping(state: Arc<AppState>) {
                 .execute(db)
                 .await,
             );
+            if let Err(e) = automation::prune(db).await {
+                warn!("housekeeping: pruning automation runs: {e}");
+            }
             results.push(
                 sqlx::query("DELETE FROM alerts WHERE resolved_at < now() - make_interval(days => $1)")
                     .bind(state.cfg.alert_retention_days as i32)

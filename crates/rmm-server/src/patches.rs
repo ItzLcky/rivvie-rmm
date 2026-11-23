@@ -413,6 +413,10 @@ pub async fn ingest_result(st: &AppState, agent_id: Uuid, client_id: Uuid, o: &P
         .await;
         publish(st, agent_id, client_id);
         crate::alerts::patches_changed(st, agent_id).await;
+        // Restarting by itself needs no help; a machine that still waits for one does.
+        if o.reboot_required && !o.rebooting {
+            crate::automation::patch_reboot_pending(st, agent_id, o.run_id).await;
+        }
     }
     Ok(())
 }

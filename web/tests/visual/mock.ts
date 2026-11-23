@@ -864,6 +864,14 @@ const items: PItem[] = [
 		config: { kind: 'service', params: { services: ['VeeamBackupSvc'], auto_only: false, exclude: [] }, severity: 'critical', channel_ids: ['ch-mail'], notify_resolved: true, renotify_minutes: null, ticket_board_id: 'b-alerts', ticket_priority: 2, ticket_auto_resolve: true, run_script_id: null } },
 	...schedules.map((x) => ({ id: x.id, set: x.set_id, module: 'schedule', name: x.name, enabled: x.enabled, client_id: x.client_id, site_id: x.site_id, excluded: [], config: { script_id: x.script_id, cron: x.cron, timezone: x.timezone, args: x.args, timeout_secs: x.timeout_secs, retain_days: x.retain_days } })),
 	{ id: 'sw-req', set: SET.acmeWin, module: 'software', name: 'Firefox on Acme Windows devices', enabled: true, client_id: 'c-acme', site_id: null, excluded: [], config: { package_id: 'sw-ff', state: 'latest', bootstrap_choco: false, window: null } },
+	{ id: 'au-welcome', set: SET.root, module: 'automation', name: 'Welcome new devices', enabled: true, client_id: null, site_id: null, excluded: [],
+		config: { trigger: 'enrollment', script_id: 's-disk', args: [], timeout_secs: null, offline_minutes: null, alert_kind: null, retry_failed: true, max_attempts: 3, retry_minutes: 30, cooldown_minutes: 60, max_runs_per_hour: 100, respect_window: false, retain_days: 30 } },
+	{ id: 'au-addon', set: SET.root, module: 'automation', name: 'Install the monitoring add-on', enabled: true, client_id: null, site_id: null, excluded: [],
+		config: { trigger: 'run_once', script_id: 's-upd', args: ['--quiet'], timeout_secs: 300, offline_minutes: null, alert_kind: null, retry_failed: true, max_attempts: 3, retry_minutes: 30, cooldown_minutes: 60, max_runs_per_hour: 50, respect_window: true, retain_days: 30 } },
+	{ id: 'au-back', set: SET.win, module: 'automation', name: 'Resync after a long absence', enabled: true, client_id: 'c-acme', site_id: null, excluded: [],
+		config: { trigger: 'agent_online', script_id: 's-spool', args: [], timeout_secs: null, offline_minutes: 120, alert_kind: null, retry_failed: false, max_attempts: 3, retry_minutes: 30, cooldown_minutes: 240, max_runs_per_hour: 20, respect_window: false, retain_days: 14 } },
+	{ id: 'au-disk', set: SET.linux, module: 'automation', name: 'Clean up when the disk fills', enabled: true, client_id: null, site_id: null, excluded: [],
+		config: { trigger: 'alert_opened', script_id: 's-disk', args: [], timeout_secs: 120, offline_minutes: null, alert_kind: 'disk', retry_failed: false, max_attempts: 3, retry_minutes: 30, cooldown_minutes: 60, max_runs_per_hour: 100, respect_window: true, retain_days: 30 } },
 	{ id: PATCH_ITEM, set: SET.root, module: 'patch', name: 'Patching', enabled: true, client_id: null, site_id: null, excluded: [],
 		config: { auto_approve_severities: [], auto_approve_categories: ['security', 'critical', 'definition'], deferral_days: 0, auto_install: false, reboot_policy: 'never', window: null } },
 	{ id: SECURITY_ITEM, set: SET.root, module: 'security', name: 'Security', enabled: true, client_id: null, site_id: null, excluded: [],
@@ -879,6 +887,7 @@ const overrides: { item: string; set: string; enabled: boolean | null; config: C
 	{ item: SECURITY_ITEM, set: SET.linSrv, enabled: null, config: { canaries: false, telemetry_mb: 512 } },
 	{ item: SECURITY_ITEM, set: SET.web01, enabled: null, config: { prevention: false, archive_depth: 3 } },
 	{ item: 'p-off', set: SET.dc, enabled: null, config: { renotify_minutes: 30 } },
+	{ item: 'au-addon', set: SET.winSrv, enabled: null, config: { max_runs_per_hour: 10, respect_window: false } },
 	{ item: 'p-svc', set: SET.web01, enabled: false, config: {} },
 	{ item: AGENT_ITEM, set: SET.winSrv, enabled: null, config: { auto_update: false } },
 	{ item: PATCH_ITEM, set: SET.dc, enabled: null, config: { auto_install: false, reboot_policy: 'never' } }
@@ -920,7 +929,7 @@ function chainOf(id: string): PSet[] {
 	for (let s: PSet | undefined = setOf(id); s; s = s.parent_id ? setOf(s.parent_id) : undefined) out.unshift(s);
 	return out;
 }
-const moduleOrder = ['alert', 'schedule', 'software', 'patch', 'security', 'remote_access', 'agent'];
+const moduleOrder = ['alert', 'schedule', 'software', 'automation', 'patch', 'security', 'remote_access', 'agent'];
 function itemView(it: PItem, chain: PSet[], agent?: Agent) {
 	const ids = chain.map((c) => c.id);
 	const at = ids.indexOf(it.set);
@@ -947,6 +956,7 @@ function itemView(it: PItem, chain: PSet[], agent?: Agent) {
 		editable: true, overridable: it.set !== here,
 		open_alerts: alerts.filter((x) => x.policy_id === it.id && x.state !== 'resolved' && (!agent || x.agent_id === agent.id)).length,
 		schedule: sched ? { next_run_at: sched.next_run_at, last_run_at: sched.last_run_at } : null,
+		runs: it.module === 'automation' ? runCounts(automationRuns.filter((r) => r.item_id === it.id && (!agent || r.agent_id === agent.id))) : null,
 		...(agent ? { applies: (!it.client_id || it.client_id === agent.client_id) && (!it.site_id || it.site_id === agent.site_id) && !it.excluded.some((x) => x.id === agent.id), excluded: it.excluded.some((x) => x.id === agent.id) } : {})
 	};
 }
@@ -986,6 +996,32 @@ function agentPatchPolicy(a: Agent, site: { days: number[] | null; start: string
 	const window = eff.window ? { ...eff.window, tz: eff.window.tz === 'site' ? site.tz : eff.window.tz, open_now: false, next_start: '2026-06-21T07:00:00.000Z' } : site;
 	return { ...eff, id: PATCH_ITEM, set_id: set, source: setOf(set).name, own_window: own, window };
 }
+/** Runs of the automations: the device states `/policy-items/{id}/runs` and `/agents/{id}/automations` report. */
+type RunStatus = 'waiting' | 'pending' | 'succeeded' | 'failed' | 'skipped';
+const autoRun = (id: string, item: string, agent: number, trigger: string, status: RunStatus, reason: string | null, mins: number, attempts = 1, job: string | null = null, exit: number | null = null) => {
+	const a = agents[agent - 1];
+	const it = items.find((i) => i.id === item)!;
+	return {
+		id, item_id: item, item_name: it.name, agent_id: a.id, hostname: a.hostname, trigger, status, reason, context: {}, job_id: status === 'waiting' || status === 'skipped' ? null : (job ?? `j-${agent}`),
+		script_id: it.config.script_id as string, script_name: scripts.find((x) => x.id === it.config.script_id)?.name ?? null, exit_code: exit, attempts,
+		created_at: ago(mins + 1), started_at: status === 'waiting' || status === 'skipped' ? null : ago(mins), finished_at: status === 'succeeded' || status === 'failed' || status === 'skipped' ? ago(mins - 0.2) : null
+	};
+};
+const automationRuns = [
+	autoRun('ar-1', 'au-addon', 1, 'run_once', 'succeeded', null, 60 * 5, 1, 'j-1', 0),
+	autoRun('ar-2', 'au-addon', 2, 'run_once', 'failed', 'failed', 60 * 3, 2, 'j-2', 1),
+	autoRun('ar-3', 'au-addon', 3, 'run_once', 'succeeded', null, 60 * 5, 1, 'j-3', 0),
+	autoRun('ar-4', 'au-addon', 4, 'run_once', 'pending', null, 20),
+	autoRun('ar-5', 'au-addon', 5, 'run_once', 'waiting', 'maintenance_window', 90),
+	autoRun('ar-6', 'au-addon', 6, 'run_once', 'succeeded', null, 60 * 4, 1, 'j-6', 0),
+	autoRun('ar-7', 'au-welcome', 7, 'enrollment', 'succeeded', null, 60 * 24 * 2, 1, 'j-7', 0),
+	autoRun('ar-8', 'au-disk', 3, 'alert_opened', 'succeeded', null, 60 * 2, 1, 'j-3', 0),
+	autoRun('ar-9', 'au-disk', 3, 'alert_opened', 'skipped', 'cooldown', 30),
+	autoRun('ar-10', 'au-back', 1, 'agent_online', 'succeeded', null, 60 * 26, 1, 'j-1', 0),
+	autoRun('ar-11', 'au-back', 1, 'agent_online', 'skipped', 'rate_limited', 60 * 8)
+];
+const runCounts = (rows: typeof automationRuns) =>
+	Object.fromEntries((['waiting', 'pending', 'succeeded', 'failed', 'skipped'] as RunStatus[]).map((st) => [st, rows.filter((r) => r.status === st).length])) as Record<RunStatus, number>;
 const scheduleOut = (x: (typeof schedules)[number]) => ({ ...x, set_name: setOf(x.set_id).name });
 /** GET routes of the policy API; undefined when `path` isn't one, null for an unknown set. */
 function policyRoute(path: string, q: URLSearchParams): unknown {
@@ -1007,6 +1043,12 @@ function policyRoute(path: string, q: URLSearchParams): unknown {
 		}));
 		return page(list, Number(q.get('limit') ?? 50));
 	}
+	if ((m = path.match(/^\/policy-items\/([^/]+)\/runs$/))) {
+		const all = automationRuns.filter((r) => r.item_id === m![1]);
+		const only = q.get('status');
+		return { counts: runCounts(all), runs: only ? all.filter((r) => r.status === only) : all };
+	}
+	if ((m = path.match(/^\/agents\/([^/]+)\/automations$/))) return [...automationRuns].filter((r) => r.agent_id === m![1]).reverse();
 	if ((m = path.match(/^\/policy-items\/([^/]+)$/))) {
 		const it = items.find((i) => i.id === m![1]);
 		return it ? itemView(it, chainOf(it.set)) : null;

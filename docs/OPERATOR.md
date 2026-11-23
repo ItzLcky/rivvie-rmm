@@ -208,6 +208,7 @@ that fails to parse falls back to its default.
 | `RMM_INVENTORY_SECS` | `21600` | Agent inventory interval (6 h) |
 | `RMM_PATCH_SCAN_HOURS` | `12` | Online agents scan for OS updates, and for the software catalog's installed versions, when their last scan is older |
 | `RMM_JOB_QUEUE_DAYS` | `7` | Jobs queued for an offline agent expire after this |
+| `RMM_AUTOMATION_RESTART_GRACE_MINUTES` | `10` | After the server starts, an agent's offline time (for the *comes back online* automation trigger) is counted from the start for this long, so a restart doesn't fire every automation |
 | `RMM_ALERT_EVAL_SECS` | `60` | How often polled alert policies (offline, CPU, memory, disk) are evaluated |
 | `RMM_CONTENT_SOAK_MINUTES` | `1440` | How long new detection content stays on canary clients before everyone gets it |
 | `RMM_UPDATE_PUBKEY` | empty | The release public key (hex); when set, uploaded detection content is verified against it too. Build-time for agents (see [RELEASING.md](RELEASING.md)) |

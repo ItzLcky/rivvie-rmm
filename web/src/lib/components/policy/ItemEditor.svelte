@@ -20,6 +20,8 @@
 	import Switch from '#lib/ui/Switch.svelte';
 	import AgentForm, { normalize as agentNorm } from './AgentForm.svelte';
 	import AlertForm, { blankAlert, normalize as alertNorm } from './AlertForm.svelte';
+	import AutomationForm, { blankAutomation, normalize as automationNorm } from './AutomationForm.svelte';
+	import AutomationRuns from './AutomationRuns.svelte';
 	import PatchForm, { normalize as patchNorm } from './PatchForm.svelte';
 	import PField from './PField.svelte';
 	import PolicyStatus from './PolicyStatus.svelte';
@@ -57,6 +59,7 @@
 	const norms: Record<Module, (c: Config) => Config> = {
 		alert: alertNorm,
 		schedule: scheduleNorm,
+		automation: automationNorm,
 		patch: patchNorm,
 		security: securityNorm,
 		remote_access: remoteNorm,
@@ -82,7 +85,7 @@
 	});
 
 	// What the form mounts with, and what it reports back.
-	const initial = untrack(() => (view ? norm(view.config) : module === 'alert' ? blankAlert(kind) : module === 'software' ? blankSoftware() : blankSchedule()));
+	const initial = untrack(() => (view ? norm(view.config) : module === 'alert' ? blankAlert(kind) : module === 'software' ? blankSoftware() : module === 'automation' ? blankAutomation() : blankSchedule()));
 	let formConfig = $state<Config>(initial);
 	let formKey = $state(0);
 	let edited = $state<Config>(initial);
@@ -223,7 +226,7 @@
 		const v = current!;
 		const ok = await confirmAction({
 			title: `Delete ${v.name}?`,
-			message: v.open_alerts ? `Its ${plural(v.open_alerts, 'open alert')} will be closed without notifications.` : module === 'schedule' ? 'Past runs stay in Jobs.' : 'Past alerts are kept.',
+			message: v.open_alerts ? `Its ${plural(v.open_alerts, 'open alert')} will be closed without notifications.` : module === 'schedule' ? 'Past runs stay in Jobs.' : module === 'automation' ? 'Its run history goes with it; the jobs it started stay in Jobs.' : 'Past alerts are kept.',
 			confirmLabel: `Delete ${moduleNoun[module]}`,
 			danger: true
 		});
@@ -302,10 +305,10 @@
 	{#if !single}
 		{#if !below}
 			<fieldset class="card space-y-4 p-4" disabled={!canEdit}>
-				<legend class="float-left w-full pb-3 text-sm font-semibold">{module === 'alert' ? 'Policy' : module === 'software' ? 'Requirement' : 'Scheduled script'}</legend>
+				<legend class="float-left w-full pb-3 text-sm font-semibold">{module === 'alert' ? 'Policy' : module === 'software' ? 'Requirement' : module === 'automation' ? 'Automation' : 'Scheduled script'}</legend>
 				<div class="clear-both grid gap-4 md:grid-cols-[minmax(0,1fr)_auto]">
 					<Field label="Name" id="it-name" required>
-						<Input id="it-name" bind:value={name} required maxlength={200} placeholder={module === 'alert' ? 'e.g. Servers offline' : module === 'software' ? 'e.g. Firefox on workstations' : 'e.g. Nightly temp cleanup'} />
+						<Input id="it-name" bind:value={name} required maxlength={200} placeholder={module === 'alert' ? 'e.g. Servers offline' : module === 'software' ? 'e.g. Firefox on workstations' : module === 'automation' ? 'e.g. Install the monitoring add-on' : 'e.g. Nightly temp cleanup'} />
 					</Field>
 					<div class="md:pt-7"><Switch bind:checked={enabled} disabled={!canEdit}>Enabled</Switch></div>
 				</div>
@@ -362,10 +365,14 @@
 			<SoftwareForm config={formConfig} onchange={(c, ok) => ((edited = c), (valid = ok))} disabled={!canEdit} {below} clientId={current?.limit.client_id ?? limitClient} {onpackage} />
 		{:else if module === 'schedule'}
 			<ScheduleForm config={formConfig} onchange={(c, ok) => ((edited = c), (valid = ok))} disabled={!canEdit} {below} clientId={current?.limit.client_id ?? limitClient} {onscript} />
+		{:else if module === 'automation'}
+			<AutomationForm config={formConfig} onchange={(c, ok) => ((edited = c), (valid = ok))} disabled={!canEdit} {below} clientId={current?.limit.client_id ?? limitClient} {onscript} />
 		{:else if Form}
 			<Form config={formConfig} onchange={(c, ok) => ((edited = c), (valid = ok))} disabled={!canEdit} />
 		{/if}
 	{/key}
+
+	{#if module === 'automation' && current}<AutomationRuns view={current} canReset={current.editable} />{/if}
 
 	{#if canEdit && dirty}
 		<!-- Unsaved edits stay in view while scrolling; a new policy just ends with its button. -->
@@ -381,7 +388,7 @@
 			</p>
 			<div class="flex gap-2">
 				{#if current}<Button variant="ghost" onclick={discard}>Discard</Button>{/if}
-				<Button variant="primary" icon={Save} type="submit" loading={busy} disabled={!valid || (!single && !below && !name.trim()) || (module === 'schedule' && !edited.script_id) || (module === 'software' && !edited.package_id)}>{current ? 'Save' : `Create ${moduleNoun[module]}`}</Button>
+				<Button variant="primary" icon={Save} type="submit" loading={busy} disabled={!valid || (!single && !below && !name.trim()) || ((module === 'schedule' || module === 'automation') && !edited.script_id) || (module === 'software' && !edited.package_id)}>{current ? 'Save' : `Create ${moduleNoun[module]}`}</Button>
 			</div>
 		</div>
 	{/if}
