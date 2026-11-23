@@ -15,11 +15,11 @@ Last reviewed 2026-11-22.
 | 7. PSA | Done: service desk, portal, SLAs, time, contracts, billing, documentation and password vault |
 | 8. Endpoint protection | Milestones 1-7 done, plus our own antivirus engine ([design](design/antivirus.md)) on Linux; Windows real-time collection not built, Windows and macOS sensor untested |
 | 9. Policy management | Done ([design](design/policies.md)) |
-| 10. Platform and reach (blocks 0-4 below) | Built 2026-11-22 on `roadmap-build`, not yet on main: SSO, API, fields, automations, audit/SIEM, software deployment, network/SNMP, data-key rotation, full backups |
+| 10. Platform and reach (blocks 0-4 below) | Released in `v0.2.0` (2026-11-23): SSO, API, fields, automations, audit/SIEM, software deployment, network/SNMP, data-key rotation, full backups |
 
 Everything built works end to end on Linux and is covered by unit tests, the e2e suite (`crates/rmm-server/tests/e2e.rs`), the Windows e2e on `windows-latest`, the `upgrade` job and the Playwright visual and accessibility tests. The biggest gap is still that **no Windows code path has run on a real Windows host**, and Windows is where most MSP fleets are.
 
-**CI:** main was fully green on `505b405` (2026-11-20) and red since `cfd816e` because of the `upgrade` job. The fix is on `roadmap-build` (checked locally against the real `v0.1.1` image); that branch has passed every local check but has not run on GitHub, so the new jobs (`restore-drill`, `s3`, the Windows e2e sections) are unproven there.
+**CI:** every job is green on the `v0.2.0` merge (PR #1), including `upgrade` from `v0.1.1`, `restore-drill`, `s3` and the full Windows e2e on `windows-latest`. On the runner the Defender section skips the EICAR detection (the image excludes every drive from Defender scans, and removing the exclusions stalls the runner); the [manual plan](design/windows-testing.md) covers it.
 
 Design records: [PSA](design/psa.md), [endpoint protection](design/endpoint-protection.md), [antivirus](design/antivirus.md), [production readiness](design/production-readiness.md), [policy management](design/policies.md), [documentation and vault](design/documentation.md), [UI survey](research/rmm-ui-survey.md), [load test](research/load-test-2026-11.md).
 
@@ -30,13 +30,13 @@ In priority order. Block 1 waits on Windows hardware and the security review wai
 ### 0. Green main and a release
 
 - [x] **Fix the `upgrade` job.** `tests/upgrade.rs` now seeds documentation pages with `POST /api/clients/{id}/docs`, but the previous release it runs against (`v0.1.1`, 2026-11-10) predates documentation, so the seed fails with 405. Seed the docs rows only when the old server has the route (or insert them in SQL the way `0023` expects to find them), so the job checks the `0023` migration once a release with docs exists.
-- [ ] **Cut `v0.2.0`.** CHANGELOG, [release checklist](RELEASING.md) and the 0.2.0 bump are done; left: merge `roadmap-build`, see CI green, tag. Nothing has been tagged since `v0.1.1`: blocks 3-6, policy management, the docs and vault and the antivirus engine are only on main. A tag gives the `upgrade` job a newer starting point, gives agents a stable release to update to, and gives operators something other than `main` to pin. Add a CHANGELOG while doing it, and a short release checklist (tag, image, signed agent builds, upgrade job green).
+- [x] **Cut `v0.2.0`.** Tagged 2026-11-23 after PR #1 went green. It gives the `upgrade` job a newer starting point, agents a stable release to update to, and operators a tag to pin.
 
 ### 1. Windows on real hosts
 
 Every Windows feature is compile-checked (clippy via mingw) and unit-tested against recorded output. The Windows e2e (`crates/rmm-server/tests/e2e_windows.rs`, the `e2e-windows` job) already covers the MSI install, upgrade and uninstall, the service and its recovery actions, the data-directory ACL, PowerShell and cmd jobs, the Job Object tree kill, results across a service restart and the service list. Run the rest on Windows 10/11 and Server 2019/2022, and keep it running:
 
-- [x] Extend the Windows e2e to self-update, ConPTY shells, Event Log watchers, patches, Defender and the sensor (sections in `e2e_windows.rs`; first GitHub run will need tuning). The rest is the manual plan in [design/windows-testing.md](design/windows-testing.md).
+- [x] Extend the Windows e2e to self-update, ConPTY shells, Event Log watchers, patches, Defender and the sensor (sections in `e2e_windows.rs`; green on `windows-latest` since PR #1, the EICAR detection excepted). The rest is the manual plan in [design/windows-testing.md](design/windows-testing.md).
 - [ ] Install and service on a real host: the `C:\ProgramData\RMM` ACL, the Program Files copy, SCM recovery actions, file logging, reinstall over a running service, MSI upgrade and repair.
 - [ ] Self-update: service stop/start from the detached watchdog, and rollback.
 - [ ] Jobs and shells (ConPTY, Job Objects), service list and control (`Win32_Service`), Event Log watchers (`wevtutil`).
@@ -134,7 +134,7 @@ Frames over the agent WebSocket, relayed by the server. A helper in the user's s
 
 One model instead of four ([design](design/policies.md), [API](design/policies-api.md)): device categories, one tree of policy sets with per-field overrides, assignments per client and site, single-device pins. Alert policies, scheduled scripts, patching, security, remote access and agent updates all live in sets; the old per-feature tables are gone, and `0022_policies.sql` migrates them.
 
-### Blocks 0-4 (2026-11-22, branch `roadmap-build`)
+### Blocks 0-4 (2026-11-22, released in `v0.2.0` on 2026-11-23)
 
 Built in parallel tracks and merged with full local checks (clippy incl. Windows, all tests, e2e with SNMP, restore drill, MinIO, 369 visual tests):
 

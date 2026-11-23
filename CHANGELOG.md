@@ -12,7 +12,7 @@ back, restore the backup taken before the upgrade (see
 
 ## [Unreleased]
 
-## [0.2.0] - Unreleased
+## [0.2.0] - 2026-11-23
 
 The first release since agent self-update shipped. Everything below is new since `v0.1.1`.
 Migrations `0014` to `0035` are new (there is no `0025`) (the upgrade job migrates a `v0.1.1` database through them).
