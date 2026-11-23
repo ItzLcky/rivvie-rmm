@@ -524,7 +524,13 @@ impl Term {
             let left = deadline.checked_duration_since(Instant::now()).unwrap_or_default();
             assert!(!left.is_zero(), "timed out waiting for: {what}\nterminal output so far: {:?}\nclosed: {:?}", self.out, self.closed);
             match tokio::time::timeout(left, self.ws.next()).await {
-                Ok(Some(Ok(Message::Binary(b)))) => self.out.push_str(&String::from_utf8_lossy(&b)),
+                Ok(Some(Ok(Message::Binary(b)))) => {
+                    self.out.push_str(&String::from_utf8_lossy(&b));
+                    // ConPTY asks for the cursor position (ESC[6n) and prints nothing until answered; xterm.js does this in the browser.
+                    if String::from_utf8_lossy(&b).contains("\x1b[6n") {
+                        self.send("\x1b[1;1R").await;
+                    }
+                }
                 Ok(Some(Ok(Message::Text(t)))) => {
                     let v: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
                     match v["type"].as_str() {
