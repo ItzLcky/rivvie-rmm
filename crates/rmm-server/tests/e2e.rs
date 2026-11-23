@@ -22,11 +22,31 @@
 //! must read back through the API before the suite runs. That database's admin must be the
 //! e2e admin with two-factor auth cleared (`rmm-server reset2fa`).
 //!
+//! The single sign-on and passkey section starts a second server on the same database, because
+//! WebAuthn needs a host name (`http://localhost:<port>`) where the main one is reached by
+//! 127.0.0.1, and a stand-in OIDC provider (an axum issuer with a generated ES256 key).
+//!
 //! `RMM_E2E_PROMTOOL=<path to promtool>` also parses and lints the `/metrics` output with
 //! Prometheus's own tool (CI sets it; without it that check is skipped).
 //!
+//! `RMM_E2E_ONLY=sso` runs only the sign-in and the single sign-on and passkey section.
+//!
+//! `RMM_E2E_DRILL=<file>` makes the run end by writing down what a restored backup must give
+//! back (a ticket with a 3 MiB attachment, a vault item, row counts, the key and the admin's
+//! 2FA secret) to that file, and `RMM_E2E_KEEP=1` keeps the database and storage directory
+//! afterwards (their names are printed as `RMM_E2E_KEPT database=... dir=...`). The CI
+//! restore drill (`scripts/restore-drill.sh`) backs them up with the compose stack's scripts,
+//! restores into an empty database and directory, and checks them with `tests/drill.rs`.
+//!
+//! `RMM_E2E_SNMP=<ip>[:<docker container>]` is a net-snmp `snmpd` (the recipe is in
+//! `crates/rmm-snmp/tests/netsnmp.rs`; it needs the users and community that file creates, on a
+//! private address such as the Docker bridge's) for the network section: scan, monitor, rates,
+//! device-down alerts. The container name, if given, is paused and unpaused to make it go
+//! quiet. Without it that section checks everything that doesn't need a device.
+//! `RMM_E2E_ONLY=network` runs only that section (after the enrollment it needs).
+//!
 //! `RMM_E2E_ONLY=desk` runs only the core and service desk sections (faster while working on
-//! tickets, the portal and billing).
+//! tickets, the portal and billing); `RMM_E2E_ONLY=api` only enrollment and the API keys and webhooks.
 //!
 //! Optional: `RMM_E2E_IMAP=host:imap_port:smtp_port` of a GreenMail container (user
 //! `imap@local.test`, password `secret`) also tests IMAP polling:
@@ -70,6 +90,8 @@ struct Server {
     /// RMM_METRICS_TOKEN and JSON logs: off for the first start (`/metrics` must 404), on
     /// from the first restart.
     observability: bool,
+    /// RMM_DATA_KEY: changes when the key rotation section replaces it.
+    data_key: String,
 }
 
 /// RMM_METRICS_TOKEN once `observability` is on.
@@ -80,7 +102,7 @@ impl Server {
         format!("http://127.0.0.1:{}", self.port)
     }
 
-    fn start(db_url: &str, dir: &Path, port: u16, observability: bool) -> Child {
+    fn start(db_url: &str, dir: &Path, port: u16, observability: bool, data_key: &str) -> Child {
         let log = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("server.log")).unwrap();
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_rmm-server"));
         if observability {
@@ -100,7 +122,7 @@ impl Server {
             .env("RMM_ADMIN_PASSWORD", ADMIN_PASSWORD)
             .env("RMM_UPDATE_PUBKEY", content_pubkey())
             .env("RMM_CONTENT_SOAK_MINUTES", "0")
-            .env("RMM_DATA_KEY", "ab".repeat(32))
+            .env("RMM_DATA_KEY", data_key)
             .env("RMM_SLA_SWEEP_SECS", "2")
             // Small enough to test the limit quickly, over the 8 MB that other requests get.
             .env("RMM_ATTACHMENT_MAX_MB", ATTACHMENT_MAX_MB.to_string())
@@ -112,6 +134,9 @@ impl Server {
             .env("RMM_QBO_API_URL", format!("{}/qbo/api", ACCT_URL.get().map(String::as_str).unwrap_or("http://127.0.0.1:9")))
             .env("RMM_GRAPH_LOGIN_URL", GRAPH_URL.get().map(String::as_str).unwrap_or("http://127.0.0.1:9"))
             .env("RMM_GRAPH_URL", GRAPH_URL.get().map(String::as_str).unwrap_or("http://127.0.0.1:9"))
+            // Offline time counts in full right after the server starts (the restart grace would
+            // hide the hours the automations e2e makes an agent absent for).
+            .env("RMM_AUTOMATION_RESTART_GRACE_MINUTES", "0")
             .env("RUST_LOG", "info,rmm_server=debug")
             .stdout(log.try_clone().unwrap())
             .stderr(log)
@@ -130,7 +155,7 @@ impl Server {
     }
 
     async fn start_again(&mut self) {
-        self.child = Self::start(&self.db_url, &self.dir, self.port, self.observability);
+        self.child = Self::start(&self.db_url, &self.dir, self.port, self.observability, &self.data_key);
         wait_healthy(&self.url()).await;
     }
 }
@@ -178,6 +203,8 @@ impl Agent {
                 .env("RUST_LOG", "info")
                 // Debug agents read updates from this file instead of the real package manager.
                 .env("RMM_PATCH_FAKE", log_dir.join(format!("{name}-patches.json")))
+                // And software providers from this one.
+                .env("RMM_SOFTWARE_FAKE", log_dir.join(format!("{name}-software.json")))
                 // And capture a synthetic screen, logging input here.
                 .env("RMM_DESKTOP_FAKE", log_dir.join(format!("{name}-desktop.jsonl")))
                 // And report antivirus state from this file.
@@ -464,13 +491,18 @@ async fn end_to_end() {
     let _ = ACCT.set(acct);
     let result = {
         let port = free_port();
+        let data_key = "ab".repeat(32);
         let mut server =
-            Server { child: Server::start(&db_url, &dir, port, false), port, db_url: db_url.clone(), dir: dir.clone(), observability: false };
+            Server { child: Server::start(&db_url, &dir, port, false, &data_key), port, db_url: db_url.clone(), dir: dir.clone(), observability: false, data_key };
         wait_healthy(&server.url()).await;
         let db = sqlx::PgPool::connect(&db_url).await.unwrap();
         run(&mut server, &db, &dir).await
     };
 
+    if std::env::var("RMM_E2E_KEEP").as_deref() == Ok("1") && result.is_ok() {
+        println!("RMM_E2E_KEPT database={db_name} dir={}", dir.display());
+        return;
+    }
     sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE IF EXISTS {db_name} WITH (FORCE)")))
         .execute(&mut admin_conn)
         .await
@@ -518,6 +550,14 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
         previous_release_rows(&admin, &path).await;
     }
 
+    // RMM_E2E_ONLY=sso runs just the single sign-on and passkey section (and the sign-in above).
+    if std::env::var("RMM_E2E_ONLY").as_deref() == Ok("sso") {
+        // The setup above used this step's code.
+        LAST_TOTP_STEP.store(totp_step(), std::sync::atomic::Ordering::SeqCst);
+        sso_and_passkeys(server, db, dir, &secret).await;
+        return Ok(());
+    }
+
     // --- tenancy -------------------------------------------------------------------------
     let client_a = admin.post("/clients", json!({ "name": "Client A" })).await;
     let client_b = admin.post("/clients", json!({ "name": "Client B" })).await;
@@ -540,6 +580,20 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
 
     a1.run(dir);
     admin.wait_online(&id1, true).await;
+    // RMM_E2E_ONLY=api: just the API keys and webhooks, on the freshly enrolled agent.
+    if std::env::var("RMM_E2E_ONLY").as_deref() == Ok("api") {
+        api_keys_and_webhooks(&url, &admin, db, &id1, a_id, b_id).await;
+        fields_tags_notes_views(&url, &admin, db, dir, &id1, a_id, b_id).await;
+    automation_tags_and_fields(&url, &admin, db, &id1, &id3, a_id, b_id).await;
+        a1.kill();
+        return Ok(());
+    }
+
+    if std::env::var("RMM_E2E_ONLY").as_deref() == Ok("network") {
+        network(&url, &admin, db, &id1, a_id, a_site, b_id).await;
+        a1.kill();
+        return Ok(());
+    }
 
     // --- a job: output, exit code, status --------------------------------------------------
     let job = admin.run_script(&id1, "echo hello; echo oops >&2; exit 3", 30).await;
@@ -604,6 +658,37 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
     assert_eq!(dash["offline"][0]["id"], id3.as_str());
     assert!(dash["failed_jobs"].as_array().unwrap().iter().any(|j| j["id"] == job.as_str()));
     assert_eq!(dash["client_health"][0]["id"], a_id, "the client with problems sorts first: {dash}");
+    // Stored columns (migration 0026): the dashboard counts the stored health, and the agent's
+    // addresses and users are in the search table, found by prefix through the API.
+    let by_rank: Vec<(i16, i64)> = sqlx::query_as("SELECT health_rank, count(*) FROM agents GROUP BY 1").fetch_all(db).await.unwrap();
+    assert!(by_rank.len() >= 2, "{by_rank:?}");
+    for (rank, n) in by_rank {
+        let name = ["healthy", "unknown", "attention", "unhealthy"][rank as usize];
+        assert_eq!(dash["health"][name].as_i64(), Some(n), "dashboard health counts the stored rank: {dash}");
+    }
+    let by_health: Value = admin.get("/agents?health=attention,unhealthy").await;
+    assert!(by_health["items"].as_array().unwrap().iter().any(|a| a["id"] == id1.as_str()), "{by_health}");
+    let ip = a1_info["inventory"]["network"].as_array().and_then(|n| n.iter().find_map(|i| i["addrs"][0].as_str().map(str::to_string)));
+    if let Some(ip) = ip {
+        let terms: i64 = sqlx::query_scalar("SELECT count(*) FROM agent_search_terms WHERE agent_id = $1::text::uuid AND kind = 'ip' AND term = $2")
+            .bind(&id1)
+            .bind(&ip)
+            .fetch_one(db)
+            .await
+            .unwrap();
+        assert_eq!(terms, 1, "inventory addresses are stored for search");
+        let prefix = &ip[..ip.len().min(6)];
+        let hits = admin.get(&format!("/agents?q={}", url_escape(prefix))).await;
+        assert!(hits["items"].as_array().unwrap().iter().any(|a| a["id"] == id1.as_str()), "address prefix {prefix}: {hits}");
+        let hits = admin.get(&format!("/search?q={}", url_escape(&ip))).await;
+        assert!(hits["agents"].as_array().unwrap().iter().any(|a| a["id"] == id1.as_str()), "address {ip}: {hits}");
+        let miss = admin.get(&format!("/agents?q={}", url_escape(&format!("9{ip}")))).await;
+        assert!(!miss["items"].as_array().unwrap().iter().any(|a| a["id"] == id1.as_str()), "an address matches from its start only: {miss}");
+    }
+    if let Some(user) = a1_info["inventory"]["logged_in_users"][0].as_str() {
+        let hits = admin.get(&format!("/agents?q={}", url_escape(&user.to_uppercase()))).await;
+        assert!(hits["items"].as_array().unwrap().iter().any(|a| a["id"] == id1.as_str()), "logged-in user {user}, any case: {hits}");
+    }
     assert_eq!(admin.get(&format!("/dashboard?client_id={b_id}")).await["agents_total"], 0);
     let detail = admin.get(&format!("/clients/{a_id}")).await;
     assert_eq!((detail["name"].as_str(), detail["sites"][0]["agent_count"].as_i64()), (Some("Client A"), Some(2)));
@@ -1112,11 +1197,17 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
         monitoring(server, &admin, db, dir, &id1, &id3, a_id).await;
         day_to_day(&admin, &tech, db, dir, &id1, &id3, a_id).await;
         policies(&url, &admin, db, dir, &id1, &id3, a_id, a_site, b_id).await;
+        software(&url, &admin, db, dir, &id1, a_id, b_id).await;
+        automations(&url, &admin, db, dir, &id1, &id3, a_id, a_site, b_id).await;
     }
     portal_and_sla(&url, &admin, db, a_id, b_id).await;
     billing(&url, &admin, &tech, db, a_id, b_id).await;
     docs_and_vault(&url, &admin, db, a_id, b_id).await;
     ticket_docs(&url, &admin, a_id, b_id).await;
+    api_keys_and_webhooks(&url, &admin, db, &id1, a_id, b_id).await;
+    fields_tags_notes_views(&url, &admin, db, dir, &id1, a_id, b_id).await;
+    network(&url, &admin, db, &id1, a_id, a_site, b_id).await;
+    sso_and_passkeys(server, db, dir, &secret).await;
 
     // --- rate limits ------------------------------------------------------------------------------
     // Failed sign-ins from one client IP (via the trusted proxy's X-Forwarded-For).
@@ -1166,8 +1257,974 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
     assert_eq!(limited, Some(20));
 
     observability(&url, dir).await;
+    // After the counters are checked: it restarts the server.
+    audit_export_siem_sealing(server, &admin, &tech, db).await;
+    // Last but the drill: it restarts the server, which would reset the counters checked above.
+    key_rotation(server, &admin, db, &secret, a_id, all).await;
+    if let Ok(path) = std::env::var("RMM_E2E_DRILL") {
+        drill_expectations(server, &admin, db, &secret, a_id, &path).await;
+    }
     a1.kill();
     Ok(())
+}
+
+/// Rows a restored backup has to give back (see the module docs, `RMM_E2E_DRILL`).
+async fn drill_expectations(server: &Server, admin: &Api, db: &sqlx::PgPool, admin_secret: &str, a_id: &str, path: &str) {
+    const VAULT_PW: &str = "drill-vault-password";
+    let ticket = admin.post("/tickets", json!({ "subject": "Restore drill", "description": "Must survive a restore.", "client_id": a_id })).await;
+    let ticket_id = ticket["id"].as_str().unwrap().to_string();
+    let bytes = pattern(3 << 20, 42);
+    let form = reqwest::multipart::Form::new().part("file", reqwest::multipart::Part::bytes(bytes.clone()).file_name("drill.bin"));
+    let up: Value = admin.http.post(format!("{}/tickets/{ticket_id}/attachments", admin.base)).multipart(form).send().await.unwrap().json().await.unwrap();
+    let attachment_id = up[0]["id"].as_str().unwrap().to_string();
+    let item = admin.post(&format!("/clients/{a_id}/vault"), json!({ "name": "Drill item", "password": VAULT_PW })).await;
+    // Tables that don't change once the server and agents are stopped.
+    let mut counts = serde_json::Map::new();
+    for t in ["users", "clients", "tickets", "ticket_attachments", "ticket_events", "invoices", "vault_items", "vault_keys", "contacts", "client_docs", "mailboxes"] {
+        let (n,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!("SELECT count(*) FROM {t}"))).fetch_one(db).await.unwrap();
+        counts.insert(t.into(), n.into());
+    }
+    let expect = json!({
+        "data_key": server.data_key, "admin_email": ADMIN_EMAIL, "admin_password": ADMIN_PASSWORD, "admin_totp_secret": admin_secret,
+        "ticket_id": ticket_id, "attachment_id": attachment_id, "attachment_sha256": sha256(&bytes), "attachment_size": bytes.len(),
+        "vault_item_id": item["id"], "vault_password": VAULT_PW, "counts": counts,
+    });
+    std::fs::write(path, serde_json::to_vec_pretty(&expect).unwrap()).unwrap();
+    println!("restore drill expectations written to {path}");
+}
+
+/// True when `bytes` (nonce || ciphertext, as `crypto.rs` stores them) opens with this hex key.
+fn opens_with(key_hex: &str, bytes: &[u8]) -> bool {
+    use chacha20poly1305::aead::{Aead, KeyInit};
+    use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+    let key: [u8; 32] = hex::decode(key_hex).unwrap().try_into().unwrap();
+    let Some(nonce) = bytes.get(..12).and_then(|n| <[u8; 12]>::try_from(n).ok()) else { return false };
+    ChaCha20Poly1305::new(&Key::from(key)).decrypt(&Nonce::from(nonce), &bytes[12..]).is_ok()
+}
+
+/// A value sealed with this hex key, as `crypto.rs` stores it (nonce || ciphertext).
+fn seal_with(key_hex: &str, plain: &[u8]) -> Vec<u8> {
+    use chacha20poly1305::aead::{Aead, KeyInit};
+    use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+    let key: [u8; 32] = hex::decode(key_hex).unwrap().try_into().unwrap();
+    let nonce = [9u8; 12];
+    let mut out = nonce.to_vec();
+    out.extend(ChaCha20Poly1305::new(&Key::from(key)).encrypt(&Nonce::from(nonce), plain).unwrap());
+    out
+}
+
+/// Every value sealed without associated data, by table and column (the vault's wrapped keys
+/// carry AAD and are checked through the API).
+const SEALED: &[(&str, &str, &str)] = &[
+    ("users", "totp_secret", "totp_sealed"),
+    ("users", "totp_pending", "totp_sealed"),
+    ("contact_credentials", "totp_secret", "totp_sealed"),
+    ("contact_credentials", "totp_pending", "totp_sealed"),
+    ("mailboxes", "graph_secret", "graph_secret_sealed"),
+    ("accounting_connections", "client_secret", "sealed"),
+    ("accounting_connections", "access_token", "sealed"),
+    ("accounting_connections", "refresh_token", "sealed"),
+    ("security_detections", "context", "context_encrypted"),
+    ("sso_providers", "client_secret", "secret_sealed"),
+    ("webhook_subscriptions", "secret", "secret_sealed"),
+    ("mailboxes", "imap_password_enc", "imap_password_sealed"),
+    ("company_settings", "smtp_password_enc", "smtp_password_sealed"),
+    ("notification_channels", "secret", "secret_sealed"),
+    ("siem_destinations", "token", "token_sealed"),
+    ("net_credentials", "secret", "secret_sealed"),
+];
+
+async fn sealed_values(db: &sqlx::PgPool) -> Vec<(&'static str, Vec<u8>)> {
+    let mut all = Vec::new();
+    for (table, col, flag) in SEALED {
+        let rows: Vec<(Vec<u8>,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!("SELECT {col} FROM {table} WHERE {flag} AND {col} IS NOT NULL")))
+            .fetch_all(db)
+            .await
+            .unwrap();
+        all.extend(rows.into_iter().map(|(v,)| (*table, v)));
+    }
+    all
+}
+
+/// Network discovery and SNMP monitoring: the designated agent, credentials sealed at rest, what
+/// a site may be told to scan, and, with `RMM_E2E_SNMP`, a real scan and reading of a net-snmp
+/// device, its counters and alerts, and the public API.
+async fn network(url: &str, admin: &Api, db: &sqlx::PgPool, id1: &str, a_id: &str, a_site: &str, b_id: &str) {
+    use reqwest::Method;
+    let snmp = std::env::var("RMM_E2E_SNMP").ok().filter(|s| !s.is_empty());
+    let (snmp_ip, snmp_container) = match snmp.as_deref().map(|s| s.split_once(':').map_or((s, None), |(a, b)| (a, Some(b)))) {
+        Some((ip, c)) => (Some(ip.to_string()), c.map(str::to_string)),
+        None => (None, None),
+    };
+
+    // --- the site starts with nothing, and the agent says it can do this -------------------------------
+    let site = admin.get(&format!("/sites/{a_site}/network")).await;
+    assert!(site["agent_id"].is_null() && site["subnets"].as_array().unwrap().is_empty() && site["devices"] == 0, "{site}");
+    let candidate = eventually(30, "the agent lists the network capability", || async {
+        let s = admin.get(&format!("/sites/{a_site}/network")).await;
+        s["candidates"].as_array().unwrap().iter().find(|c| c["id"] == id1 && c["capable"] == true).cloned()
+    })
+    .await;
+    assert_eq!(candidate["online"], true);
+    let summary = admin.get("/network/summary").await;
+    assert_eq!((summary["devices"].as_i64(), summary["unmanaged"].as_i64(), summary["down"].as_i64()), (Some(0), Some(0), Some(0)), "{summary}");
+
+    // --- credentials: sealed, never returned, and checked ---------------------------------------------
+    let bad = |body: Value| async move { admin.call(Method::POST, &format!("/clients/{a_id}/network-credentials"), Some(body)).await.0 };
+    assert_eq!(bad(json!({ "name": "no community", "version": "v2c" })).await, StatusCode::BAD_REQUEST);
+    assert_eq!(bad(json!({ "name": "no user", "version": "v3" })).await, StatusCode::BAD_REQUEST);
+    assert_eq!(bad(json!({ "name": "short", "version": "v3", "username": "u", "auth_proto": "sha1", "auth_secret": "short" })).await, StatusCode::BAD_REQUEST);
+    assert_eq!(bad(json!({ "name": "priv alone", "version": "v3", "username": "u", "priv_proto": "aes128", "priv_secret": "longenough1" })).await, StatusCode::BAD_REQUEST);
+    assert_eq!(bad(json!({ "name": "v1", "version": "v1", "community": "x" })).await, StatusCode::BAD_REQUEST);
+    let v2c = admin.post(&format!("/clients/{a_id}/network-credentials"), json!({ "name": "E2E v2c", "version": "v2c", "community": "e2ecomm" })).await;
+    let v3 = admin
+        .post(
+            &format!("/clients/{a_id}/network-credentials"),
+            json!({ "name": "E2E v3", "version": "v3", "username": "e2ev3", "auth_proto": "sha1", "auth_secret": "e2eauthpass", "priv_proto": "aes128", "priv_secret": "e2eprivpass" }),
+        )
+        .await;
+    let (v2c_id, v3_id) = (v2c["id"].as_str().unwrap().to_string(), v3["id"].as_str().unwrap().to_string());
+    let listed = admin.get(&format!("/clients/{a_id}/network-credentials")).await;
+    assert_eq!(listed.as_array().unwrap().len(), 2, "{listed}");
+    let text = listed.to_string();
+    assert!(!text.contains("e2ecomm") && !text.contains("e2eauthpass") && !text.contains("e2eprivpass") && !text.contains("secret"), "secrets are write-only: {text}");
+    assert!(admin.get(&format!("/clients/{b_id}/network-credentials")).await.as_array().unwrap().is_empty());
+    let (stored, sealed): (Vec<u8>, bool) = sqlx::query_as("SELECT secret, secret_sealed FROM net_credentials WHERE id = $1::uuid").bind(&v2c_id).fetch_one(db).await.unwrap();
+    assert!(sealed && !String::from_utf8_lossy(&stored).contains("e2ecomm"), "the community is sealed at rest");
+    // An edit keeps the secret it wasn't given.
+    admin.put(&format!("/network-credentials/{v2c_id}"), json!({ "name": "E2E v2c (read-only)" })).await;
+    let (stored_after, _): (Vec<u8>, bool) = sqlx::query_as("SELECT secret, secret_sealed FROM net_credentials WHERE id = $1::uuid").bind(&v2c_id).fetch_one(db).await.unwrap();
+    assert!(!stored_after.is_empty());
+
+    // --- what a site may be told ---------------------------------------------------------------------
+    let put = |body: Value| async move { admin.call(Method::PUT, &format!("/sites/{a_site}/network"), Some(body)).await };
+    for (what, body) in [
+        ("a public block", json!({ "agent_id": id1, "subnets": ["8.8.8.0/24"] })),
+        ("a block that is too large", json!({ "agent_id": id1, "subnets": ["10.0.0.0/16"] })),
+        ("not a block", json!({ "agent_id": id1, "subnets": ["nope"] })),
+        ("an agent that isn't in the site", json!({ "agent_id": uuid::Uuid::new_v4() })),
+        ("another client's credentials", json!({ "agent_id": id1, "credential_ids": [uuid::Uuid::new_v4()] })),
+        ("an interval that's too short", json!({ "agent_id": id1, "poll_secs": 5 })),
+    ] {
+        let (s, v) = put(body).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{what}: {v}");
+    }
+    let (s, _) = admin.call(Method::POST, &format!("/sites/{a_site}/network/scan"), None).await;
+    assert!(s.is_client_error(), "no scan without a designated agent ({s})");
+    let (s, v) = admin
+        .call(Method::POST, "/network/devices", Some(json!({ "site_id": a_site, "name": "public", "host": "8.8.8.8", "credential_id": v2c_id })))
+        .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "devices are read on private addresses only: {v}");
+
+    // --- no SNMP device: the rest ends here ------------------------------------------------------------
+    let Some(ip) = snmp_ip else {
+        println!("network: RMM_E2E_SNMP not set, skipping the scan and the device");
+        return;
+    };
+    let parts: Vec<&str> = ip.split('.').collect();
+    let block = format!("{}.{}.{}.0/24", parts[0], parts[1], parts[2]);
+
+    // --- a scan finds the device, tries the credentials and says what it is -------------------------------
+    admin
+        .put(&format!("/sites/{a_site}/network"), json!({ "agent_id": id1, "subnets": [block], "discovery_hours": 0, "credential_ids": [v3_id, v2c_id], "poll_secs": 60 }))
+        .await;
+    let started = admin.post(&format!("/sites/{a_site}/network/scan"), json!({})).await;
+    assert!(started["id"].is_string(), "{started}");
+    let (s, v) = admin.call(Method::POST, &format!("/sites/{a_site}/network/scan"), None).await;
+    assert!(s == StatusCode::CONFLICT || s.is_success(), "a second scan while one runs is refused, or it was already over: {s} {v}");
+    let found = eventually(120, "the scan to find the snmpd", || async {
+        let all = admin.get(&format!("/network/discovered?site_id={a_site}&state=all")).await;
+        all.as_array().unwrap().iter().find(|d| d["ip"] == ip.as_str() && d["sys_name"] == "e2e-snmpd").cloned()
+    })
+    .await;
+    assert_eq!(found["state"], "unmanaged", "{found}");
+    assert!(found["credential_id"].is_string(), "a credential set answered: {found}");
+    assert!(found["methods"].as_array().unwrap().iter().any(|m| m == "snmp"), "{found}");
+    assert!(found["sys_descr"].as_str().unwrap().contains("Linux"), "{found}");
+    let scans = admin.get(&format!("/sites/{a_site}/network/scans")).await;
+    assert_eq!(scans[0]["status"], "done", "{scans}");
+    assert!(scans[0]["found"].as_i64() >= Some(1) && scans[0]["scanned"].as_i64() >= Some(1), "{scans}");
+    // The agent's own machine is in the list too, and matched to the agent by IP or MAC (managed), or at least listed.
+    let unmanaged = admin.get("/network/discovered").await;
+    assert!(unmanaged.as_array().unwrap().iter().any(|d| d["id"] == found["id"]), "the unmanaged list is the default");
+    let summary = admin.get("/network/summary").await;
+    assert!(summary["unmanaged"].as_i64() >= Some(1), "{summary}");
+
+    // --- ignore, mark as known, put back -----------------------------------------------------------------
+    let fid = found["id"].as_str().unwrap().to_string();
+    admin.post("/network/discovered/bulk", json!({ "ids": [fid], "status": "ignored" })).await;
+    assert!(!admin.get("/network/discovered").await.to_string().contains(&fid), "ignored hosts leave the list");
+    assert!(admin.get("/network/discovered?state=ignored").await.to_string().contains(&fid));
+    admin.post("/network/discovered/bulk", json!({ "ids": [fid], "status": "known", "note": "e2e snmpd" })).await;
+    let known = admin.get("/network/discovered?state=known").await;
+    assert_eq!(known[0]["note"], "e2e snmpd", "{known}");
+    admin.post("/network/discovered/bulk", json!({ "ids": [fid], "status": "unmanaged" })).await;
+    let hint = admin.get(&format!("/network/discovered/{fid}/deploy")).await;
+    assert!(hint["os"].is_string() && hint["ways"].is_array() && hint["site_id"] == a_site, "{hint}");
+
+    // --- monitor it -----------------------------------------------------------------------------------------
+    let (s, _) = admin.call(Method::POST, &format!("/network/discovered/{fid}/monitor"), Some(json!({ "name": "E2E snmpd", "credential_id": uuid::Uuid::new_v4() }))).await;
+    assert!(s.is_client_error());
+    let mon = admin.post(&format!("/network/discovered/{fid}/monitor"), json!({ "name": "E2E snmpd", "kind": "server", "credential_id": v2c_id })).await;
+    let dev = mon["id"].as_str().unwrap().to_string();
+    let (s, _) = admin.call(Method::POST, &format!("/network/discovered/{fid}/monitor"), Some(json!({ "name": "again", "credential_id": v2c_id }))).await;
+    assert_eq!(s, StatusCode::CONFLICT, "one device per host");
+    let d = eventually(90, "the first reading", || async {
+        let d = admin.get(&format!("/network/devices/{dev}")).await;
+        (d["state"] == "up" && !d["interfaces"].as_array().unwrap().is_empty()).then_some(d)
+    })
+    .await;
+    assert_eq!(d["sys_name"], "e2e-snmpd", "{d}");
+    assert!(d["uptime_secs"].as_i64() >= Some(0) && d["agent_id"] == id1, "{d}");
+    assert_eq!(d["kind"], "server");
+    assert!(d["interfaces"].as_array().unwrap().iter().any(|i| i["oper_status"] == 1), "{d}");
+    assert_eq!(admin.get("/network/discovered?state=monitored").await[0]["net_device_id"], dev.as_str());
+    // Counters turn into rates from the second reading on, and the history keeps the readings.
+    admin.post(&format!("/network/devices/{dev}/poll"), json!({})).await;
+    let metrics = eventually(120, "device history", || async {
+        let m = admin.get(&format!("/network/devices/{dev}/metrics?hours=1")).await;
+        (!m.as_array().unwrap().is_empty() && m[0]["reachable_pct"].as_f64() == Some(100.0)).then_some(m)
+    })
+    .await;
+    assert!(metrics[0]["rtt_ms"].is_number(), "{metrics}");
+    let list = admin.get(&format!("/network/devices?site_id={a_site}&state=up&q=snmpd")).await;
+    assert_eq!(list.as_array().unwrap().len(), 1, "{list}");
+    assert_eq!(admin.get("/network/devices?kind=switch").await.as_array().unwrap().len(), 0);
+    let eth = d["interfaces"].as_array().unwrap().iter().find(|i| i["oper_status"] == 1 && i["name"].as_str().is_some_and(|n| n.starts_with("eth"))).cloned();
+    if let Some(i) = eth {
+        let idx = i["if_index"].as_i64().unwrap();
+        admin.put(&format!("/network/devices/{dev}/interfaces/{idx}"), json!({ "monitored": true })).await;
+        let (s, _) = admin.call(Method::GET, &format!("/network/devices/{dev}/interfaces/{idx}/metrics?hours=1"), None).await;
+        assert!(s.is_success());
+    }
+
+    // --- the public API: the network scope, and client scoping -----------------------------------------------
+    let made = admin.post("/api-keys", json!({ "name": "e2e network", "access": "read", "scopes": ["network"], "client_ids": [a_id] })).await;
+    let key = made["token"].as_str().unwrap().to_string();
+    let v1 = format!("{url}/api/v1");
+    let (s, devs, _) = key_call(&key, &v1, Method::GET, "/network/devices", None).await;
+    assert!(s.is_success() && devs.as_array().unwrap().iter().any(|x| x["id"] == dev.as_str()), "{s} {devs}");
+    assert!(!devs.to_string().contains("e2ecomm") && !devs.to_string().contains("credential_id\":\"\""), "no secrets in the public API");
+    assert!(key_call(&key, &v1, Method::GET, &format!("/network/devices/{dev}"), None).await.0.is_success());
+    assert!(key_call(&key, &v1, Method::GET, "/network/discovered?state=all", None).await.0.is_success());
+    assert_eq!(key_call(&key, &v1, Method::POST, "/network/devices", Some(json!({}))).await.0, StatusCode::FORBIDDEN, "a key can't change the network");
+    assert!(!key_call(&key, &v1, Method::POST, &format!("/sites/{a_site}/network/scan"), None).await.0.is_success(), "nor start scans");
+    assert!(!key_call(&key, &v1, Method::GET, &format!("/clients/{a_id}/network-credentials"), None).await.0.is_success(), "nor reach credentials");
+    let spec: Value = reqwest::get(format!("{url}/api/v1/openapi.json")).await.unwrap().json().await.unwrap();
+    assert!(spec["paths"]["/network/devices"]["get"]["operationId"] == "listNetworkDevices", "documented");
+
+    // --- alerts: a device that stops answering, then comes back --------------------------------------------------
+    let item = admin.alert_policy(json!({ "name": "E2E network down", "kind": "net_down", "params": { "minutes": 1 }, "severity": "critical" })).await;
+    let item_id = item["id"].as_str().unwrap().to_string();
+    let (s, v) = admin.alert_policy_call(json!({ "name": "bad", "kind": "net_threshold", "params": { "metric": "bogus", "threshold": 5 }, "severity": "info" })).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    if let Some(container) = snmp_container {
+        let docker = |what: &str| {
+            let ok = Command::new("docker").args([what, &container]).stdout(Stdio::null()).status().map(|s| s.success()).unwrap_or(false);
+            assert!(ok, "docker {what} {container}");
+        };
+        // An automation on alerts opening (any agent kind) must not run a script on the designated
+        // agent because of a network device's alert (see docs/design/automations.md).
+        let script = admin.post("/scripts", json!({ "name": "net alert automation (e2e)", "interpreter": "bash", "body": "echo ran" })).await["id"].as_str().unwrap().to_string();
+        let mut watchers = Vec::new();
+        for kind in ["offline", "service"] {
+            let w = admin
+                .post(&format!("/policy-sets/{ROOT_SET}/items"), json!({ "module": "automation", "name": format!("device alerts ({kind}, e2e)"), "config": { "trigger": "alert_opened", "alert_kind": kind, "script_id": script, "cooldown_minutes": 0 } }))
+                .await;
+            watchers.push(w["id"].as_str().unwrap().to_string());
+        }
+        docker("pause");
+        let alert = eventually(240, "a device-down alert", || async {
+            let items = alerts_for(admin, "state=open&kind=net_down").await;
+            items.into_iter().find(|a| a["device_id"] == dev.as_str())
+        })
+        .await;
+        assert_eq!(alert["agent_id"], id1, "belongs to the designated agent: {alert}");
+        assert_eq!(alert["device_name"], "E2E snmpd");
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        for w in &watchers {
+            let n: i64 = sqlx::query_scalar("SELECT count(*) FROM automation_runs WHERE item_id = $1::uuid").bind(w).fetch_one(db).await.unwrap();
+            assert_eq!(n, 0, "a network device's alert starts no agent automation");
+        }
+        assert_eq!(admin.get(&format!("/network/devices/{dev}")).await["state"], "down");
+        docker("unpause");
+        eventually(240, "the device-down alert to clear", || async {
+            let items = alerts_for(admin, "state=open&kind=net_down").await;
+            (!items.iter().any(|a| a["device_id"] == dev.as_str())).then_some(())
+        })
+        .await;
+        assert_eq!(admin.get(&format!("/network/devices/{dev}")).await["state"], "up");
+        for w in &watchers {
+            assert!(admin.delete_policy(w).await.is_success());
+        }
+    }
+    assert!(admin.delete_policy(&item_id).await.is_success());
+
+    // --- pausing and deleting ----------------------------------------------------------------------------------
+    admin.put(&format!("/network/devices/{dev}"), json!({ "enabled": false })).await;
+    assert_eq!(admin.get(&format!("/network/devices/{dev}")).await["enabled"], false);
+    let (s, _) = admin.call(Method::DELETE, &format!("/network-credentials/{v2c_id}"), None).await;
+    assert!(s.is_client_error(), "credentials in use can't be deleted ({s})");
+    let (s, _) = admin.call(Method::DELETE, &format!("/network/devices/{dev}"), None).await;
+    assert!(s.is_success());
+    let after = admin.get(&format!("/network/discovered?state=unmanaged&site_id={a_site}")).await;
+    assert!(after.to_string().contains(&fid), "a deleted device is an unmanaged host again: {after}");
+    admin.put(&format!("/sites/{a_site}/network"), json!({ "agent_id": null })).await;
+    assert!(admin.get(&format!("/sites/{a_site}/network")).await["agent_id"].is_null());
+}
+
+/// `rmm-server rotate-data-key`: dry run, a wrong old key, the real run, a second run that
+/// finds nothing to do, and then the server on the new key reading everything back: vault
+/// secrets and TOTP codes, and signing in with a TOTP code.
+async fn key_rotation(server: &mut Server, admin: &Api, db: &sqlx::PgPool, admin_secret: &str, a_id: &str, all: bool) {
+    const PW: &str = "rotation-vault-password";
+    const NOTE: &str = "rotation vault note";
+    const SECRET: &str = "JBSWY3DPEHPK3PXP";
+    let old_key = server.data_key.clone();
+    let new_key = "cd".repeat(32);
+    let item = admin
+        .post(
+            &format!("/clients/{a_id}/vault"),
+            json!({ "name": "Rotation test", "password": PW, "notes": NOTE, "totp": SECRET }),
+        )
+        .await;
+    let item_id = item["id"].as_str().unwrap().to_string();
+    // The other sealed secrets the later features added: a webhook's signing secret (through the
+    // API) and a single sign-on provider's client secret (a row of its own, disabled, so no
+    // identity provider needs to answer).
+    let events = admin.get("/webhooks").await["events"].clone();
+    let hook = admin.post("/webhooks", json!({ "name": "rotation", "url": "https://hooks.example.com/rotation", "events": events })).await;
+    let hook_id = hook["webhook"]["id"].as_str().unwrap().to_string();
+    sqlx::query("INSERT INTO sso_providers (name, issuer, client_id, client_secret, secret_sealed, enabled) VALUES ('Rotation IdP', 'https://idp.example.com', 'c', $1, true, false)")
+        .bind(seal_with(&server.data_key, b"idp-client-secret"))
+        .execute(db)
+        .await
+        .unwrap();
+    let wrapped = || async { sqlx::query_scalar::<_, Vec<u8>>("SELECT wrapped_key FROM vault_keys WHERE client_id = $1::uuid").bind(a_id).fetch_one(db).await.unwrap() };
+
+    let before = sealed_values(db).await;
+    let tables_before: std::collections::BTreeSet<_> = before.iter().map(|(t, _)| *t).collect();
+    assert!(tables_before.contains("users") && tables_before.contains("contact_credentials"), "TOTP secrets to rotate: {tables_before:?}");
+    if all {
+        assert!(tables_before.contains("security_detections"), "detection context to rotate: {tables_before:?}");
+    }
+    assert!(tables_before.contains("sso_providers") && tables_before.contains("webhook_subscriptions"), "SSO and webhook secrets to rotate: {tables_before:?}");
+    for t in ["mailboxes", "company_settings", "notification_channels", "siem_destinations"] {
+        assert!(tables_before.contains(t), "{t} has a credential to rotate: {tables_before:?}");
+    }
+    println!("key rotation: sealed values in {tables_before:?}");
+    assert!(before.iter().all(|(_, v)| opens_with(&old_key, v) && !opens_with(&new_key, v)));
+    let wrapped_before = wrapped().await;
+
+    server.stop();
+    let rotate = |old: &str, args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_rmm-server"))
+            .arg("rotate-data-key")
+            .args(args)
+            .env("DATABASE_URL", &server.db_url)
+            .env("RMM_DATA_KEY", old)
+            .env("RMM_DATA_KEY_NEW", &new_key)
+            .output()
+            .expect("running rmm-server rotate-data-key")
+    };
+    let (sealed_ref, wrapped_ref) = (&before, &wrapped_before);
+    let unchanged = |what: &'static str| async move {
+        assert_eq!(sealed_values(db).await, *sealed_ref, "{what}: nothing was written");
+        assert_eq!(wrapped().await, *wrapped_ref, "{what}: the vault keys weren't touched");
+    };
+
+    let out = rotate(&old_key, &["--dry-run"]);
+    assert!(out.status.success(), "dry run: {}", String::from_utf8_lossy(&out.stderr));
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(text.contains("dry run") && text.contains("vault_keys") && text.contains("1 to rotate"), "{text}");
+    unchanged("dry run").await;
+
+    let out = rotate(&"ef".repeat(32), &[]);
+    assert!(!out.status.success(), "a wrong old key must fail");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("opens with neither the old nor the new key") && err.contains("Nothing was changed"), "{err}");
+    unchanged("wrong old key").await;
+    let out = rotate(&new_key, &[]);
+    assert!(!out.status.success() && String::from_utf8_lossy(&out.stderr).contains("the same"), "old = new is refused");
+
+    let out = rotate(&old_key, &[]);
+    assert!(out.status.success(), "rotation: {}", String::from_utf8_lossy(&out.stderr));
+    let after = sealed_values(db).await;
+    assert_eq!(after.len(), before.len());
+    assert!(after.iter().all(|(_, v)| opens_with(&new_key, v) && !opens_with(&old_key, v)), "every sealed value is under the new key now");
+    let wrapped_after = wrapped().await;
+    assert_ne!(wrapped_after, wrapped_before, "the vault's client key was rewrapped");
+    // Again: nothing left to rotate, nothing written, still succeeds.
+    let out = rotate(&old_key, &[]);
+    assert!(out.status.success(), "second run: {}", String::from_utf8_lossy(&out.stderr));
+    for line in String::from_utf8_lossy(&out.stdout).lines().filter(|l| l.contains("to rotate")) {
+        assert!(line.split_whitespace().nth(1) == Some("0") && line.contains("0 stored in the clear"), "second run found work: {line}");
+    }
+    assert_eq!(sealed_values(db).await, after, "a second run writes nothing");
+    assert_eq!(wrapped().await, wrapped_after);
+    let (audited,): (i64,) = sqlx::query_as("SELECT count(*) FROM audit_log WHERE action = 'system.data_key_rotated'").fetch_one(db).await.unwrap();
+    assert_eq!(audited, 2, "both real runs are in the audit log");
+
+    // The server on the old key can't read the new rows; on the new key everything works.
+    server.data_key = new_key.clone();
+    server.start_again().await;
+    let url = server.url();
+    let reveal = |field: &str| {
+        let body = json!({ "field": field });
+        let path = format!("/vault/{item_id}/reveal");
+        async move { admin.post(&path, body).await["value"].clone() }
+    };
+    assert_eq!(reveal("password").await, PW);
+    assert_eq!(reveal("notes").await, NOTE);
+    let code = admin.post(&format!("/vault/{item_id}/totp"), json!({})).await;
+    let (c1, c2) = (totp(SECRET), totp(SECRET));
+    assert!(code["code"] == c1.as_str() || code["code"] == c2.as_str(), "the vault TOTP still computes: {code}");
+    let other = admin.get(&format!("/clients/{a_id}/vault")).await;
+    assert!(other.as_array().unwrap().iter().any(|i| i["id"] == item_id.as_str()));
+    // A new item sealed after the rotation, read back through the same client key.
+    let fresh = admin.post(&format!("/clients/{a_id}/vault"), json!({ "name": "After rotation", "password": "after-rot" })).await;
+    assert_eq!(admin.post(&format!("/vault/{}/reveal", fresh["id"].as_str().unwrap()), json!({ "field": "password" })).await["value"], "after-rot");
+    // Signing in needs the TOTP secret (sealed with the new key now).
+    sqlx::query("UPDATE users SET totp_last_step = NULL WHERE email = $1").bind(ADMIN_EMAIL).execute(db).await.unwrap();
+    let again = Api::new(&url);
+    let me = again.post("/auth/login", json!({ "email": ADMIN_EMAIL, "password": ADMIN_PASSWORD, "code": totp(admin_secret) })).await;
+    assert_eq!(me["user"]["totp_enabled"], true, "{me}");
+    // The provider list reads on the new key (the secret itself is never shown); the webhook's
+    // secret can be rotated again; then both are removed.
+    let listing = admin.get("/settings/sso").await;
+    assert!(listing["providers"].as_array().unwrap().iter().any(|p| p["name"] == "Rotation IdP" && p["has_secret"] == true), "{listing}");
+    assert!(admin.post(&format!("/webhooks/{hook_id}/rotate-secret"), json!({})).await["secret"].as_str().unwrap().starts_with("whsec_"));
+    sqlx::query("DELETE FROM sso_providers WHERE name = 'Rotation IdP'").execute(db).await.unwrap();
+    assert!(admin.call(reqwest::Method::DELETE, &format!("/webhooks/{hook_id}"), None).await.0.is_success());
+    admin.call(reqwest::Method::DELETE, &format!("/vault/{item_id}"), None).await;
+    admin.call(reqwest::Method::DELETE, &format!("/vault/{}", fresh["id"].as_str().unwrap()), None).await;
+    println!("key rotation: ok");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Audit export, the SIEM stream, and credentials sealed at rest (docs/design/audit-siem.md)
+// ---------------------------------------------------------------------------------------------
+
+type Datagrams = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+/// A syslog UDP listener: every datagram, as text.
+async fn udp_sink() -> (u16, Datagrams) {
+    let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let port = sock.local_addr().unwrap().port();
+    let got: Datagrams = Default::default();
+    let store = got.clone();
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 65536];
+        while let Ok((n, _)) = sock.recv_from(&mut buf).await {
+            store.lock().unwrap().push(String::from_utf8_lossy(&buf[..n]).into_owned());
+        }
+    });
+    (port, got)
+}
+
+/// Messages out of a stream of RFC 6587 octet-counted (`<len> <msg>`) or newline-delimited frames.
+fn syslog_frames(buf: &mut Vec<u8>) -> Vec<String> {
+    let mut out = Vec::new();
+    loop {
+        if buf.first().is_some_and(u8::is_ascii_digit) {
+            let Some(sp) = buf.iter().position(|b| *b == b' ') else { break };
+            let len: usize = String::from_utf8_lossy(&buf[..sp]).parse().expect("an octet count");
+            if buf.len() < sp + 1 + len {
+                break;
+            }
+            out.push(String::from_utf8_lossy(&buf[sp + 1..sp + 1 + len]).into_owned());
+            buf.drain(..sp + 1 + len);
+        } else if let Some(nl) = buf.iter().position(|b| *b == b'\n') {
+            out.push(String::from_utf8_lossy(&buf[..nl]).into_owned());
+            buf.drain(..=nl);
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+/// A syslog TCP listener (on `port`, or a free one): the messages of every connection.
+async fn tcp_sink(port: u16) -> (u16, Datagrams) {
+    use tokio::io::AsyncReadExt;
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let got: Datagrams = Default::default();
+    let store = got.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else { return };
+            let store = store.clone();
+            tokio::spawn(async move {
+                let (mut pending, mut chunk) = (Vec::new(), vec![0u8; 16384]);
+                while let Ok(n) = sock.read(&mut chunk).await {
+                    if n == 0 {
+                        break;
+                    }
+                    pending.extend_from_slice(&chunk[..n]);
+                    store.lock().unwrap().extend(syslog_frames(&mut pending));
+                }
+            });
+        }
+    });
+    (port, got)
+}
+
+/// The JSON part of an RFC 5424 message, after checking the header.
+fn syslog_json(msg: &str) -> (String, Value) {
+    let sd = msg.find(" [rmm@32473 ").unwrap_or_else(|| panic!("no structured data: {msg}"));
+    let header = &msg[..sd];
+    let end = msg[sd..].find("] {").unwrap_or_else(|| panic!("no JSON message: {msg}")) + sd;
+    (header.to_string(), serde_json::from_str(&msg[end + 2..]).unwrap_or_else(|e| panic!("{e}: {msg}")))
+}
+
+async fn wait_syslog(got: &Datagrams, what: &str, pred: impl Fn(&Value) -> bool) -> (String, Value) {
+    eventually(30, what, || async {
+        got.lock().unwrap().iter().filter(|m| m.contains("[rmm@32473 ")).map(|m| syslog_json(m)).find(|(_, v)| pred(v))
+    })
+    .await
+}
+
+async fn siem_destination(admin: &Api, id: &str) -> Value {
+    admin.get("/siem/destinations").await["destinations"].as_array().unwrap().iter().find(|d| d["id"] == id).cloned().unwrap_or_else(|| panic!("destination {id}"))
+}
+
+/// A stand-in IMAP server: greets, records the LOGIN line, refuses it.
+async fn imap_login_sink() -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let logins: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+    let store = logins.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((sock, _)) = listener.accept().await else { return };
+            let store = store.clone();
+            tokio::spawn(async move {
+                let (r, mut w) = sock.into_split();
+                let _ = w.write_all(b"* OK stand-in IMAP ready\r\n").await;
+                let mut lines = BufReader::new(r).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let tag = line.split(' ').next().unwrap_or("a").to_string();
+                    if line.to_ascii_uppercase().contains(" LOGIN ") {
+                        store.lock().unwrap().push(line.clone());
+                        let _ = w.write_all(format!("{tag} NO [AUTHENTICATIONFAILED] refused\r\n").as_bytes()).await;
+                    } else {
+                        let _ = w.write_all(format!("{tag} OK\r\n").as_bytes()).await;
+                    }
+                }
+            });
+        }
+    });
+    (port, logins)
+}
+
+/// An SMTP server that offers AUTH and records the credentials (AUTH PLAIN, or LOGIN's two lines).
+async fn smtp_auth_sink() -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    use data_encoding::BASE64;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let creds: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+    let store = creds.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((sock, _)) = listener.accept().await else { return };
+            let store = store.clone();
+            tokio::spawn(async move {
+                let (r, mut w) = sock.into_split();
+                let mut lines = BufReader::new(r).lines();
+                let _ = w.write_all(b"220 auth-sink ESMTP\r\n").await;
+                let (mut in_data, mut login_step) = (false, 0);
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let decoded = |b: &str| String::from_utf8_lossy(&BASE64.decode(b.trim().as_bytes()).unwrap_or_default()).replace('\0', "|");
+                    let upper = line.to_ascii_uppercase();
+                    let reply: Vec<u8> = if in_data {
+                        if line == "." {
+                            in_data = false;
+                            b"250 queued\r\n".to_vec()
+                        } else {
+                            continue;
+                        }
+                    } else if login_step == 1 {
+                        store.lock().unwrap().push(format!("user:{}", decoded(&line)));
+                        login_step = 2;
+                        b"334 UGFzc3dvcmQ6\r\n".to_vec()
+                    } else if login_step == 2 {
+                        store.lock().unwrap().push(format!("pass:{}", decoded(&line)));
+                        login_step = 0;
+                        b"235 ok\r\n".to_vec()
+                    } else if upper.starts_with("EHLO") {
+                        b"250-auth-sink\r\n250 AUTH PLAIN LOGIN\r\n".to_vec()
+                    } else if upper.starts_with("AUTH PLAIN") {
+                        let initial = line[10..].trim();
+                        store.lock().unwrap().push(format!("plain:{}", decoded(initial)));
+                        b"235 ok\r\n".to_vec()
+                    } else if upper.starts_with("AUTH LOGIN") {
+                        login_step = 1;
+                        b"334 VXNlcm5hbWU6\r\n".to_vec()
+                    } else if upper.starts_with("DATA") {
+                        in_data = true;
+                        b"354 go\r\n".to_vec()
+                    } else if upper.starts_with("QUIT") {
+                        let _ = w.write_all(b"221 bye\r\n").await;
+                        break;
+                    } else {
+                        b"250 ok\r\n".to_vec()
+                    };
+                    if w.write_all(&reply).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    (port, creds)
+}
+
+/// The audit log export (CSV and JSON Lines, filters, streaming, permissions, the public API),
+/// the SIEM stream (syslog over UDP and TCP, HTTPS with a token, outbox across an outage and a
+/// restart, the test button), and the credentials that used to be stored in the clear.
+async fn audit_export_siem_sealing(server: &mut Server, admin: &Api, tech: &Api, db: &sqlx::PgPool) {
+    use reqwest::Method;
+    let url = server.url();
+    let export = |query: String| async move { admin.http.get(format!("{}/audit/export{query}", admin.base)).send().await.unwrap() };
+
+    // --- export: CSV and JSON Lines ------------------------------------------------------------------
+    let client = admin.post("/clients", json!({ "name": "Export, \"Quoted\" Co" })).await;
+    let res = export("?format=csv".into()).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert!(res.headers()["content-type"].to_str().unwrap().starts_with("text/csv"));
+    assert!(res.headers()["content-disposition"].to_str().unwrap().starts_with("attachment; filename=\"audit-"));
+    let csv = res.text().await.unwrap();
+    assert!(csv.starts_with("id,time,user_id,user_email,user_name,action,target_type,target_id,details\r\n"), "{}", &csv[..80.min(csv.len())]);
+    let created = csv.lines().find(|l| l.contains(",client.create,") && l.contains("Quoted")).expect("the client.create row");
+    assert!(created.contains(ADMIN_EMAIL) && created.contains("\"{\"\"name\"\":"), "quoting: {created}");
+    let (total,): (i64,) = sqlx::query_as("SELECT count(*) FROM audit_log").fetch_one(db).await.unwrap();
+    assert!(csv.lines().count() as i64 > total / 2 && csv.lines().count() as i64 <= total + 1, "{} lines, {total} rows", csv.lines().count());
+    let first_id: i64 = csv.lines().nth(1).unwrap().split(',').next().unwrap().parse().unwrap();
+    let (min_id,): (i64,) = sqlx::query_as("SELECT min(id) FROM audit_log").fetch_one(db).await.unwrap();
+    assert_eq!(first_id, min_id, "oldest first");
+
+    let res = export("?format=jsonl&action=client.".into()).await;
+    assert!(res.headers()["content-type"].to_str().unwrap().starts_with("application/x-ndjson"));
+    let rows: Vec<Value> = res.text().await.unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let (clients,): (i64,) = sqlx::query_as("SELECT count(*) FROM audit_log WHERE action LIKE 'client.%'").fetch_one(db).await.unwrap();
+    assert_eq!(rows.len() as i64, clients, "the action prefix filter");
+    assert!(rows.iter().all(|r| r["action"].as_str().unwrap().starts_with("client.")));
+    assert!(rows.iter().any(|r| r["details"]["name"] == "Export, \"Quoted\" Co" && r["user_email"] == ADMIN_EMAIL));
+    let body = export("?format=jsonl&to=2001-01-01T00:00:00Z".into()).await.text().await.unwrap();
+    assert!(body.is_empty(), "nothing before 2001: {body}");
+    let body = export(format!("?format=jsonl&from=2001-01-01T00:00:00Z&target_id={}", client["id"].as_str().unwrap())).await.text().await.unwrap();
+    assert!(body.lines().count() >= 1 && body.lines().all(|l| serde_json::from_str::<Value>(l).unwrap()["target_id"] == client["id"]));
+    assert_eq!(export("?format=xml".into()).await.status(), StatusCode::BAD_REQUEST);
+    // The export is itself audited, with its filters.
+    let exports: Vec<Value> = sqlx::query_scalar("SELECT details FROM audit_log WHERE action = 'audit.export' ORDER BY id").fetch_all(db).await.unwrap();
+    assert!(exports.len() >= 4 && exports.iter().any(|d| d["format"] == "jsonl" && d["action"] == "client." && d["via"] == "session"), "{exports:?}");
+
+    // A big one streams: 25,000 rows come out complete (and in chunks).
+    sqlx::query("INSERT INTO audit_log (action, details) SELECT 'e2e.bulk', jsonb_build_object('n', g, 'pad', repeat('x', 200)) FROM generate_series(1, 25000) g")
+        .execute(db)
+        .await
+        .unwrap();
+    let res = export("?format=csv&action=e2e.bulk".into()).await;
+    let bytes = res.bytes().await.unwrap();
+    assert!(bytes.len() > 5_000_000, "{} bytes", bytes.len());
+    assert_eq!(String::from_utf8_lossy(&bytes).lines().count(), 25_001);
+    sqlx::query("DELETE FROM audit_log WHERE action = 'e2e.bulk'").execute(db).await.unwrap();
+
+    // --- who may export, and the public API ---------------------------------------------------------------
+    assert_eq!(tech.call(Method::GET, "/audit/export", None).await.0, StatusCode::FORBIDDEN, "technicians can't export");
+    assert_eq!(tech.call(Method::GET, "/audit", None).await.0, StatusCode::FORBIDDEN);
+    let v1 = format!("{url}/api/v1");
+    let with_key = |token: String, path: String| {
+        let v1 = v1.clone();
+        async move {
+            let res = reqwest::Client::new().get(format!("{v1}{path}")).bearer_auth(token).send().await.unwrap();
+            (res.status(), res.text().await.unwrap())
+        }
+    };
+    let key = admin.post("/api-keys", json!({ "name": "e2e audit", "access": "read", "scopes": ["audit"], "permissions": ["audit.read"] })).await["token"].as_str().unwrap().to_string();
+    let (s, text) = with_key(key.clone(), "/audit/export?format=jsonl&action=client.".into()).await;
+    assert_eq!(s, StatusCode::OK, "{text}");
+    assert!(text.lines().count() as i64 >= clients && text.lines().all(|l| serde_json::from_str::<Value>(l).is_ok()));
+    let (s, text) = with_key(key.clone(), "/audit?limit=2".into()).await;
+    assert_eq!(s, StatusCode::OK, "{text}");
+    assert_eq!(serde_json::from_str::<Value>(&text).unwrap()["items"].as_array().unwrap().len(), 2);
+    let (s, _) = with_key(key.clone(), "/agents".into()).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "the key holds only the audit scope");
+    let no_perm = admin.post("/api-keys", json!({ "name": "e2e audit, no permission", "access": "read", "scopes": ["audit"] })).await["token"].as_str().unwrap().to_string();
+    assert_eq!(with_key(no_perm, "/audit/export".into()).await.0, StatusCode::FORBIDDEN, "the scope alone isn't enough");
+    let spec: Value = reqwest::get(format!("{url}/api/v1/openapi.json")).await.unwrap().json().await.unwrap();
+    assert_eq!(spec["paths"]["/audit/export"]["get"]["operationId"], "exportAudit");
+    println!("audit export: ok");
+
+    // --- SIEM: validation ---------------------------------------------------------------------------------
+    let (udp_port, udp) = udp_sink().await;
+    let (tcp_port, tcp) = tcp_sink(0).await;
+    let dest = |body: Value| async move { admin.call(Method::POST, "/siem/destinations", Some(body)).await };
+    for (what, body) in [
+        ("unknown kind", json!({ "name": "x", "kind": "carrier_pigeon", "address": "127.0.0.1:1" })),
+        ("no address", json!({ "name": "x", "kind": "syslog_udp", "address": "" })),
+        ("a URL for syslog", json!({ "name": "x", "kind": "syslog_tcp", "address": "http://x/y" })),
+        ("bad URL", json!({ "name": "x", "kind": "https", "address": "ftp://x" })),
+        ("nothing to send", json!({ "name": "x", "kind": "syslog_udp", "address": "127.0.0.1:1", "send_audit": false })),
+        ("a token for syslog", json!({ "name": "x", "kind": "syslog_udp", "address": "127.0.0.1:1", "token": "t" })),
+        ("a CA for UDP", json!({ "name": "x", "kind": "syslog_udp", "address": "127.0.0.1:1", "ca_pem": "-----BEGIN CERTIFICATE-----" })),
+        ("a bad facility", json!({ "name": "x", "kind": "syslog_udp", "address": "127.0.0.1:1", "facility": 99 })),
+    ] {
+        assert_eq!(dest(body).await.0, StatusCode::BAD_REQUEST, "{what}");
+    }
+    assert_eq!(tech.call(Method::GET, "/siem/destinations", None).await.0, StatusCode::FORBIDDEN);
+
+    // --- SIEM: syslog over UDP and TCP ----------------------------------------------------------------------
+    let (s, u) = dest(json!({ "name": "e2e udp", "kind": "syslog_udp", "address": format!("127.0.0.1:{udp_port}"), "send_detections": true, "send_alerts": true })).await;
+    assert_eq!(s, StatusCode::OK, "{u}");
+    let udp_id = u["id"].as_str().unwrap().to_string();
+    let (s, t) = dest(json!({ "name": "e2e tcp", "kind": "syslog_tcp", "address": format!("127.0.0.1:{tcp_port}") })).await;
+    assert_eq!(s, StatusCode::OK, "{t}");
+    let tcp_id = t["id"].as_str().unwrap().to_string();
+    assert_eq!(dest(json!({ "name": "E2E UDP", "kind": "syslog_udp", "address": "127.0.0.1:9" })).await.0, StatusCode::OK, "names are case sensitive");
+    assert_eq!(dest(json!({ "name": "e2e udp", "kind": "syslog_udp", "address": "127.0.0.1:9" })).await.0, StatusCode::CONFLICT);
+    let extra = admin.get("/siem/destinations").await["destinations"].as_array().unwrap().iter().find(|d| d["name"] == "E2E UDP").unwrap()["id"].as_str().unwrap().to_string();
+    admin.call(Method::DELETE, &format!("/siem/destinations/{extra}"), None).await;
+
+    let site = admin.post("/clients", json!({ "name": "SIEM probe" })).await;
+    let site_id = site["id"].as_str().unwrap();
+    let (header, ev) = wait_syslog(&udp, "the client.create event over UDP", |v| v["action"] == "client.create" && v["details"]["name"] == "SIEM probe").await;
+    // <PRI>1 TIMESTAMP HOST APP PROCID MSGID: facility 13 (log audit), informational = 13 * 8 + 6.
+    let parts: Vec<&str> = header.split(' ').collect();
+    assert_eq!((parts[0], parts[3], parts[4], parts[5]), ("<110>1", "rmm-server", "-", "audit.client.create"), "{header}");
+    assert!(chrono::DateTime::parse_from_rfc3339(parts[1]).is_ok(), "an RFC 3339 timestamp: {header}");
+    assert_eq!((ev["kind"].as_str(), ev["user_email"].as_str(), ev["target_id"].as_str()), (Some("audit"), Some(ADMIN_EMAIL), Some(site_id)));
+    let (_, over_tcp) = wait_syslog(&tcp, "the same event over TCP", |v| v["action"] == "client.create" && v["details"]["name"] == "SIEM probe").await;
+    assert_eq!(over_tcp["id"], ev["id"], "the same audit row, with its id for de-duplication");
+    // Octet counting: the sink parsed the lengths, so a wrong count would have broken the frames.
+    assert!(tcp.lock().unwrap().iter().all(|m| m.starts_with('<')), "{:?}", tcp.lock().unwrap());
+    let status = siem_destination(admin, &udp_id).await;
+    assert!(status["sent_total"].as_i64().unwrap() >= 1 && status["last_success_at"].is_string() && status["consecutive_failures"] == 0, "{status}");
+    assert_eq!(status["has_token"], false);
+
+    // A detection and an alert, when the earlier sections left some: status changes and
+    // acknowledgements are events, and the sealed context is never in them.
+    if let Some((id,)) = sqlx::query_as::<_, (uuid::Uuid,)>("SELECT id FROM security_detections WHERE status <> 'blocked' AND context IS NOT NULL LIMIT 1").fetch_optional(db).await.unwrap() {
+        sqlx::query("UPDATE security_detections SET status = 'blocked' WHERE id = $1").bind(id).execute(db).await.unwrap();
+        let (_, d) = wait_syslog(&udp, "a detection event", |v| v["kind"] == "detection" && v["id"] == id.to_string().as_str()).await;
+        assert_eq!(d["event"], "detection.status_changed");
+        assert!(d.get("context").is_none() && d["hostname"].is_string() && d["client"].is_string(), "{d}");
+    }
+    if let Some((id,)) = sqlx::query_as::<_, (uuid::Uuid,)>("SELECT id FROM alerts WHERE acknowledged_at IS NULL AND resolved_at IS NULL LIMIT 1").fetch_optional(db).await.unwrap() {
+        sqlx::query("UPDATE alerts SET acknowledged_at = now() WHERE id = $1").bind(id).execute(db).await.unwrap();
+        let (header, a) = wait_syslog(&udp, "an alert event", |v| v["kind"] == "alert" && v["id"] == id.to_string().as_str()).await;
+        assert_eq!(a["event"], "alert.acknowledged");
+        assert!(header.starts_with("<10>") || header.starts_with("<12>") || header.starts_with("<14>"), "severity maps to syslog: {header}");
+    }
+
+    // The test button sends one event now, and reports a destination it can't reach.
+    let before = udp.lock().unwrap().len();
+    let r = admin.post(&format!("/siem/destinations/{udp_id}/test"), json!({})).await;
+    assert_eq!(r["ok"], true, "{r}");
+    wait_syslog(&udp, "the test event", |v| v["action"] == "siem.test").await;
+    assert!(udp.lock().unwrap().len() > before);
+    let dead_port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let (s, d) = dest(json!({ "name": "e2e down", "kind": "syslog_tcp", "address": format!("127.0.0.1:{dead_port}"), "framing": "newline" })).await;
+    assert_eq!(s, StatusCode::OK, "{d}");
+    let down_id = d["id"].as_str().unwrap().to_string();
+    let r = admin.post(&format!("/siem/destinations/{down_id}/test"), json!({})).await;
+    assert_eq!(r["ok"], false, "{r}");
+    assert!(r["error"].as_str().unwrap().contains("connecting to"), "{r}");
+
+    // --- SIEM: an outage and a restart lose nothing ---------------------------------------------------------
+    let probes = ["outage-1", "outage-2", "outage-3"];
+    for p in &probes[..2] {
+        admin.post("/clients", json!({ "name": p })).await;
+    }
+    let failing = eventually(30, "the unreachable destination to report failures", || async {
+        let d = siem_destination(admin, &down_id).await;
+        (d["consecutive_failures"].as_i64().unwrap() >= 1 && d["pending"].as_i64().unwrap() >= 2).then_some(d)
+    })
+    .await;
+    assert!(failing["last_error"].as_str().unwrap().contains("connecting to") && failing["last_success_at"].is_null(), "{failing}");
+    // Restart the server with events waiting, then bring the collector up.
+    server.restart().await;
+    admin.post("/clients", json!({ "name": probes[2] })).await;
+    let pending: i64 = siem_destination(admin, &down_id).await["pending"].as_i64().unwrap();
+    assert!(pending >= 3, "the outbox survived the restart: {pending}");
+    let (_, newline) = tcp_sink(dead_port).await;
+    // An edit retries at once (otherwise the backoff would have us waiting up to 15 minutes).
+    let edited = admin.put(&format!("/siem/destinations/{down_id}"), json!({ "name": "e2e down", "kind": "syslog_tcp", "address": format!("127.0.0.1:{dead_port}"), "framing": "newline" })).await;
+    assert_eq!(edited["consecutive_failures"], 0);
+    let got = eventually(30, "the waiting events to arrive", || async {
+        let all: Vec<(String, Value)> = newline.lock().unwrap().iter().filter(|m| m.contains("[rmm@32473 ")).map(|m| syslog_json(m)).collect();
+        let names: Vec<String> = all.iter().filter_map(|(_, v)| v["details"]["name"].as_str().map(str::to_string)).collect();
+        probes.iter().all(|p| names.iter().any(|n| n == p)).then_some(names)
+    })
+    .await;
+    let order: Vec<usize> = probes.iter().map(|p| got.iter().position(|n| n == p).unwrap()).collect();
+    assert!(order.windows(2).all(|w| w[0] < w[1]), "in order: {got:?}");
+    let after = eventually(30, "the outbox to drain", || async {
+        let d = siem_destination(admin, &down_id).await;
+        (d["pending"] == 0 && d["sent_total"].as_i64().unwrap() >= 3).then_some(d)
+    })
+    .await;
+    assert!(after["last_error"].is_null() && after["consecutive_failures"] == 0, "{after}");
+    println!("SIEM syslog: ok");
+
+    // --- SIEM: HTTPS with a token, sealed at rest ---------------------------------------------------------
+    type Posts = std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>;
+    let posts: Posts = Default::default();
+    let store = posts.clone();
+    let app = axum::Router::new().route(
+        "/ingest",
+        axum::routing::post(move |headers: axum::http::HeaderMap, body: String| {
+            let store = store.clone();
+            async move {
+                let auth = headers.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
+                store.lock().unwrap().push((auth, body));
+                "ok"
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ingest = format!("http://{}/ingest", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let (s, h) = dest(json!({ "name": "e2e hec", "kind": "https", "address": ingest, "https_format": "splunk_hec", "token": "hec-token-0123" })).await;
+    assert_eq!(s, StatusCode::OK, "{h}");
+    let hec_id = h["id"].as_str().unwrap().to_string();
+    assert_eq!(h["has_token"], true);
+    assert!(!h.to_string().contains("hec-token-0123") && !admin.get("/siem/destinations").await.to_string().contains("hec-token-0123"), "the token is never sent back");
+    let (stored, sealed): (Vec<u8>, bool) = sqlx::query_as("SELECT token, token_sealed FROM siem_destinations WHERE id = $1::uuid").bind(&hec_id).fetch_one(db).await.unwrap();
+    assert!(sealed && !stored.windows(14).any(|w| w == b"hec-token-0123") && opens_with(&server.data_key, &stored), "the token is sealed at rest");
+    admin.post("/clients", json!({ "name": "HEC probe" })).await;
+    let hec = eventually(30, "a Splunk HEC post", || async {
+        posts.lock().unwrap().iter().find(|(_, b)| b.contains("HEC probe")).cloned()
+    })
+    .await;
+    assert_eq!(hec.0, "Splunk hec-token-0123");
+    let events: Vec<Value> = hec.1.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let probe = events.iter().find(|e| e["event"]["details"]["name"] == "HEC probe").unwrap();
+    assert_eq!((probe["sourcetype"].as_str(), probe["source"].as_str()), (Some("rmm:audit"), Some("rmm-server")));
+    assert!(probe["time"].as_f64().unwrap() > 1.7e9);
+    // Same destination as generic JSON with a bearer token, token kept when the edit leaves it out.
+    admin.put(&format!("/siem/destinations/{hec_id}"), json!({ "name": "e2e hec", "kind": "https", "address": ingest, "https_format": "generic" })).await;
+    posts.lock().unwrap().clear();
+    admin.post("/clients", json!({ "name": "Generic probe" })).await;
+    let generic = eventually(30, "a generic JSON post", || async { posts.lock().unwrap().iter().find(|(_, b)| b.contains("Generic probe")).cloned() }).await;
+    assert_eq!(generic.0, "Bearer hec-token-0123", "kept across the edit");
+    let body: Value = serde_json::from_str(&generic.1).unwrap();
+    assert!(body["events"].as_array().unwrap().iter().any(|e| e["details"]["name"] == "Generic probe") && body["source"] == "rmm-server");
+    // Deleting a destination ends the stream and is audited.
+    for id in [&udp_id, &tcp_id, &down_id, &hec_id] {
+        assert!(admin.call(Method::DELETE, &format!("/siem/destinations/{id}"), None).await.0.is_success());
+    }
+    let (left,): (i64,) = sqlx::query_as("SELECT count(*) FROM siem_outbox").fetch_one(db).await.unwrap();
+    assert_eq!(left, 0, "nothing queued for a destination that is gone");
+    let acts: Vec<String> = sqlx::query_scalar("SELECT DISTINCT action FROM audit_log WHERE action LIKE 'siem.%'").fetch_all(db).await.unwrap();
+    for a in ["siem.create", "siem.update", "siem.delete", "siem.test"] {
+        assert!(acts.iter().any(|x| x == a), "{a} audited: {acts:?}");
+    }
+    // One destination stays for the key rotation section (disabled: it needs no collector).
+    admin.post("/siem/destinations", json!({ "name": "rotation", "kind": "https", "address": "https://siem.example.com/ingest", "token": "rotate-me", "enabled": false })).await;
+
+    // --- sealed credentials ------------------------------------------------------------------------------------
+    // The IMAP password: sealed at rest, never returned, used to log in.
+    let (imap_port, logins) = imap_login_sink().await;
+    let boards = admin.get("/tickets/meta").await;
+    let board = boards["boards"][0]["id"].as_str().unwrap().to_string();
+    let mb = admin
+        .post(
+            "/mailboxes",
+            json!({ "name": "Sealed IMAP", "address": "sealed@imap.test", "kind": "imap", "imap_host": "127.0.0.1", "imap_port": imap_port, "imap_security": "none",
+                    "imap_username": "sealed@imap.test", "imap_password": "imap-secret-pw", "board_id": board, "enabled": false }),
+        )
+        .await;
+    let mb_id = mb["id"].as_str().unwrap().to_string();
+    assert_eq!(mb["has_password"], true);
+    assert!(!mb.to_string().contains("imap-secret-pw") && !admin.get("/mailboxes").await.to_string().contains("imap-secret-pw"), "never returned");
+    let (stored, sealed): (Vec<u8>, bool) = sqlx::query_as("SELECT imap_password_enc, imap_password_sealed FROM mailboxes WHERE id = $1::uuid").bind(&mb_id).fetch_one(db).await.unwrap();
+    assert!(sealed && !stored.windows(14).any(|w| w == b"imap-secret-pw") && opens_with(&server.data_key, &stored), "the IMAP password is sealed at rest");
+    let r = admin.post(&format!("/mailboxes/{mb_id}/poll"), json!({})).await;
+    assert_eq!(r["ok"], false, "the stand-in refuses every login");
+    let seen = logins.lock().unwrap().clone();
+    assert!(seen.len() == 1 && seen[0].contains("\"imap-secret-pw\""), "the server logged in with the opened password: {seen:?}");
+    // Editing without a password keeps it; an empty one clears it.
+    let edit = |password: Option<&str>| {
+        let mut body = json!({ "name": "Sealed IMAP", "address": "sealed@imap.test", "kind": "imap", "imap_host": "127.0.0.1", "imap_port": imap_port, "imap_security": "none",
+                               "imap_username": "sealed@imap.test", "board_id": board, "enabled": false });
+        if let Some(p) = password {
+            body["imap_password"] = p.into();
+        }
+        let path = format!("/mailboxes/{mb_id}");
+        async move { admin.put(&path, body).await }
+    };
+    assert_eq!(edit(None).await["has_password"], true);
+    let (kept,): (Vec<u8>,) = sqlx::query_as("SELECT imap_password_enc FROM mailboxes WHERE id = $1::uuid").bind(&mb_id).fetch_one(db).await.unwrap();
+    assert_eq!(kept, stored, "left alone");
+    assert_eq!(edit(Some("imap-new-pw")).await["has_password"], true);
+    let (changed,): (Vec<u8>,) = sqlx::query_as("SELECT imap_password_enc FROM mailboxes WHERE id = $1::uuid").bind(&mb_id).fetch_one(db).await.unwrap();
+    assert_ne!(changed, stored);
+    assert_eq!(edit(Some("")).await["has_password"], false);
+    let (gone,): (Option<Vec<u8>>,) = sqlx::query_as("SELECT imap_password_enc FROM mailboxes WHERE id = $1::uuid").bind(&mb_id).fetch_one(db).await.unwrap();
+    assert!(gone.is_none());
+    edit(Some("imap-rotation-pw")).await;
+
+    // A password stored in the clear (as 0031 leaves what it migrates, and as a server that never
+    // had a key stores it) is sealed at the next start, once the key is there.
+    sqlx::query("UPDATE mailboxes SET imap_password_enc = convert_to('imap-plain-pw', 'UTF8'), imap_password_sealed = false WHERE id = $1::uuid").bind(&mb_id).execute(db).await.unwrap();
+    sqlx::query("UPDATE company_settings SET smtp_password_enc = convert_to('smtp-plain-pw', 'UTF8'), smtp_password_sealed = false").execute(db).await.unwrap();
+    server.restart().await;
+    let (stored, sealed): (Vec<u8>, bool) = sqlx::query_as("SELECT imap_password_enc, imap_password_sealed FROM mailboxes WHERE id = $1::uuid").bind(&mb_id).fetch_one(db).await.unwrap();
+    assert!(sealed && !stored.windows(13).any(|w| w == b"imap-plain-pw"), "sealed at startup");
+    let (stored, sealed): (Vec<u8>, bool) = sqlx::query_as("SELECT smtp_password_enc, smtp_password_sealed FROM company_settings").fetch_one(db).await.unwrap();
+    assert!(sealed && !stored.windows(13).any(|w| w == b"smtp-plain-pw") && opens_with(&server.data_key, &stored), "the SMTP password is sealed at startup");
+
+    // The SMTP password: sealed when set through the API, never returned, used to authenticate.
+    let (smtp_port, creds) = smtp_auth_sink().await;
+    let before = admin.get("/settings/smtp").await;
+    let smtp = admin
+        .put("/settings/smtp", json!({ "host": "127.0.0.1", "port": smtp_port, "security": "none", "username": "mailer@e2e.test", "password": "smtp-secret-pw", "from": "RMM <rmm@e2e.test>" }))
+        .await;
+    assert_eq!(smtp["password_set"], true);
+    assert!(!smtp.to_string().contains("smtp-secret-pw") && !admin.get("/settings/smtp").await.to_string().contains("smtp-secret-pw"));
+    let (stored, sealed): (Vec<u8>, bool) = sqlx::query_as("SELECT smtp_password_enc, smtp_password_sealed FROM company_settings").fetch_one(db).await.unwrap();
+    assert!(sealed && !stored.windows(14).any(|w| w == b"smtp-secret-pw") && opens_with(&server.data_key, &stored));
+    let mail = admin.post("/notification-channels", json!({ "name": "e2e smtp auth", "kind": "email", "config": { "to": ["ops@e2e.test"] } })).await;
+    let mail_id = mail["id"].as_str().unwrap().to_string();
+    let t = admin.post(&format!("/notification-channels/{mail_id}/test"), json!({})).await;
+    assert_eq!(t["ok"], true, "{t}");
+    let seen = creds.lock().unwrap().clone();
+    assert!(
+        seen.iter().any(|c| c == "plain:|mailer@e2e.test|smtp-secret-pw") || (seen.contains(&"user:mailer@e2e.test".into()) && seen.contains(&"pass:smtp-secret-pw".into())),
+        "the mail server was logged in to with the opened password: {seen:?}"
+    );
+    admin.call(Method::DELETE, &format!("/notification-channels/{mail_id}"), None).await;
+    // Back to what the earlier sections left (their sink takes no login, and without a user name
+    // the password isn't used), with a password left in place for the key rotation to find.
+    admin
+        .put(
+            "/settings/smtp",
+            json!({ "host": before["host"], "port": before["port"], "security": before["security"], "username": before["username"], "password": "smtp-rotation-pw", "from": before["from"] }),
+        )
+        .await;
+    assert_eq!(admin.get("/settings/smtp").await["password_set"], true);
+
+    // A webhook channel's signing secret: moved out of `config`, sealed, and the channel list
+    // never shows it (the signed deliveries the earlier sections received prove it still works).
+    let (cfg_leaks, sealed_channels): (i64, i64) = sqlx::query_as(
+        "SELECT count(*) FILTER (WHERE config ? 'secret' OR config::text LIKE '%hook-secret%'), count(*) FILTER (WHERE secret_sealed AND secret IS NOT NULL) FROM notification_channels",
+    )
+    .fetch_one(db)
+    .await
+    .unwrap();
+    assert_eq!(cfg_leaks, 0, "no secret left in config");
+    assert!(sealed_channels >= 1, "a webhook channel with a sealed secret");
+    let channels = admin.get("/notification-channels").await.to_string();
+    assert!(!channels.contains("hook-secret") && channels.contains("\"has_secret\":true"), "{channels}");
+    // The rotation section that follows rotates these along with the rest (one of each is left in place).
+    println!("sealed credentials: ok");
 }
 
 /// Policy management (docs/design/policies.md): the tree, inheritance with per-field overrides
@@ -1518,6 +2575,498 @@ async fn policies(url: &str, admin: &Api, db: &sqlx::PgPool, dir: &Path, id1: &s
     println!("policies: ok");
 }
 
+/// The runs of an automation on an agent: (trigger, status, reason, attempts), oldest first.
+async fn auto_runs(db: &sqlx::PgPool, item: &str, agent: &str) -> Vec<(String, String, Option<String>, i32)> {
+    sqlx::query_as("SELECT trigger, status, reason, attempts FROM automation_runs WHERE item_id = $1::uuid AND agent_id = $2::uuid ORDER BY created_at")
+        .bind(item)
+        .bind(agent)
+        .fetch_all(db)
+        .await
+        .unwrap()
+}
+
+async fn auto_jobs(db: &sqlx::PgPool, item: &str, agent: &str) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM jobs WHERE schedule_id = $1::uuid AND agent_id = $2::uuid")
+        .bind(item)
+        .bind(agent)
+        .fetch_one(db)
+        .await
+        .unwrap()
+}
+
+/// Automation policies (docs/design/automations.md): the enrollment trigger and a run-once script
+/// fire exactly once per device (also for a device that joins later, and across reconnects), a
+/// reset and the retry option run it again, alert and offline triggers with their cooldown, hourly
+/// rate limit and maintenance-window guards, and scoping.
+#[allow(clippy::too_many_arguments)]
+async fn automations(url: &str, admin: &Api, db: &sqlx::PgPool, dir: &Path, id1: &str, id3: &str, a_id: &str, a_site: &str, b_id: &str) {
+    // A technician limited to client B (the shared `tech` of the earlier sections was given client A too).
+    admin
+        .post("/users", json!({ "email": "autotech@e2e.test", "name": "Automation tech", "password": "tech-password-123", "role": "technician",
+                                "all_clients": false, "client_ids": [b_id] }))
+        .await;
+    let tech = Api::new(url);
+    tech.post("/auth/login", json!({ "email": "autotech@e2e.test", "password": "tech-password-123" })).await;
+    let item = |v: &Value| v["id"].as_str().unwrap().to_string();
+    let new_item = |name: &str, config: Value| {
+        let name = name.to_string();
+        async move { admin.post(&format!("/policy-sets/{ROOT_SET}/items"), json!({ "module": "automation", "name": name, "config": config })).await }
+    };
+    let script = |name: &str, body: &str| {
+        let (name, body) = (name.to_string(), body.to_string());
+        async move { item(&admin.post("/scripts", json!({ "name": name, "interpreter": "bash", "body": body })).await) }
+    };
+    let run_state = |item_id: String, agent: String| async move {
+        let rows = auto_runs(db, &item_id, &agent).await;
+        rows.last().map(|r| r.1.clone())
+    };
+    let wait_status = |item_id: String, agent: String, want: &'static str| async move {
+        eventually(60, &format!("automation {item_id} on {agent} to be {want}"), || {
+            let (i, a) = (item_id.clone(), agent.clone());
+            async move { (auto_runs(db, &i, &a).await.last().map(|r| r.1.as_str() == want) == Some(true)).then_some(()) }
+        })
+        .await
+    };
+
+    // --- validation -------------------------------------------------------------------------------------------------
+    let hello = script("automation hello (e2e)", "echo enrolled").await;
+    let (s, v) = admin
+        .call(reqwest::Method::POST, &format!("/policy-sets/{ROOT_SET}/items"), Some(json!({ "module": "automation", "name": "x", "config": { "trigger": "agent_online", "script_id": hello } })))
+        .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "agent_online needs offline_minutes: {v}");
+    let (s, _) = admin
+        .call(reqwest::Method::POST, &format!("/policy-sets/{ROOT_SET}/items"), Some(json!({ "module": "automation", "name": "x", "config": { "trigger": "enrollment", "script_id": uuid::Uuid::new_v4() } })))
+        .await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "the script must exist");
+    let (s, _) = tech.call(reqwest::Method::POST, &format!("/policy-sets/{ROOT_SET}/items"), Some(json!({ "module": "automation", "name": "x", "config": { "trigger": "enrollment", "script_id": hello } }))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "MSP-wide automations are for admins");
+
+    // --- enrollment and run-once, on devices that exist and one that joins later -------------------------------------
+    let enroll = item(&new_item("Welcome (automations e2e)", json!({ "trigger": "enrollment", "script_id": hello })).await);
+    let once_script = script("automation once (e2e)", "echo once").await;
+    let once = item(&new_item("Once (automations e2e)", json!({ "trigger": "run_once", "script_id": once_script })).await);
+    assert_eq!(auto_runs(db, &enroll, id1).await.len(), 0, "enrollment automations never run on devices that are already there");
+    wait_status(once.clone(), id1.to_string(), "succeeded").await;
+    assert_eq!(auto_runs(db, &once, id1).await, vec![("run_once".to_string(), "succeeded".to_string(), None, 1)]);
+    let job = sqlx::query_scalar::<_, String>("SELECT j.stdout FROM automation_runs r JOIN jobs j ON j.id = r.job_id WHERE r.item_id = $1::uuid AND r.agent_id = $2::uuid")
+        .bind(&once)
+        .bind(id1)
+        .fetch_one(db)
+        .await
+        .unwrap();
+    assert_eq!(job, "once\n");
+
+    let token = admin.post(&format!("/sites/{a_site}/enrollment-tokens"), json!({ "label": "automations e2e" })).await["token"].as_str().unwrap().to_string();
+    let mut a4 = Agent::new(dir, "a4");
+    let id4 = a4.enroll(url, &token).unwrap();
+    assert_eq!(auto_runs(db, &enroll, &id4).await.len(), 0, "enrolled, not yet connected");
+    a4.run(dir);
+    wait_status(enroll.clone(), id4.clone(), "succeeded").await;
+    wait_status(once.clone(), id4.clone(), "succeeded").await;
+    assert_eq!(auto_runs(db, &enroll, &id4).await, vec![("enrollment".to_string(), "succeeded".to_string(), None, 1)]);
+    assert_eq!(auto_runs(db, &once, &id4).await.len(), 1, "a device that joins later gets the run-once script too");
+    let history = admin.get(&format!("/agents/{id4}/automations")).await;
+    assert_eq!(history.as_array().unwrap().len(), 2, "{history}");
+    assert!(history.as_array().unwrap().iter().all(|r| r["status"] == "succeeded" && r["hostname"].is_string() && r["job_id"].is_string()), "{history}");
+    let shown = admin.get(&format!("/policy-items/{enroll}/runs")).await;
+    assert_eq!((shown["counts"]["succeeded"].as_i64(), shown["runs"].as_array().unwrap().len()), (Some(1), 1), "{shown}");
+    let view = admin.item_in(ROOT_SET, &enroll).await;
+    assert_eq!(view["runs"]["succeeded"], 1, "the policy view carries the counts: {view}");
+
+    // --- coming back after a while away ----------------------------------------------------------------------------------
+    let online = item(&new_item("Back (automations e2e)", json!({ "trigger": "agent_online", "offline_minutes": 30, "script_id": hello })).await);
+    a4.kill();
+    admin.wait_online(&id4, false).await;
+    sqlx::query("UPDATE agents SET last_seen_at = now() - interval '2 hours' WHERE id = $1::uuid").bind(&id4).execute(db).await.unwrap();
+    a4.run(dir);
+    wait_status(online.clone(), id4.clone(), "succeeded").await;
+    let (ctx, n): (Value, i64) = sqlx::query_as("SELECT context, (SELECT count(*) FROM automation_runs WHERE item_id = $1::uuid) FROM automation_runs WHERE item_id = $1::uuid AND agent_id = $2::uuid")
+        .bind(&online)
+        .bind(&id4)
+        .fetch_one(db)
+        .await
+        .unwrap();
+    assert!(ctx["offline_minutes"].as_i64() >= Some(119), "{ctx}");
+    assert_eq!(n, 1);
+    // A short absence doesn't count.
+    a4.kill();
+    admin.wait_online(&id4, false).await;
+    a4.run(dir);
+    admin.wait_online(&id4, true).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(auto_runs(db, &online, &id4).await.len(), 1, "back after seconds: no run");
+    assert_eq!(auto_runs(db, &enroll, &id4).await.len(), 1, "a reconnect isn't an enrollment");
+    assert_eq!(auto_runs(db, &once, &id4).await.len(), 1, "and the run-once script stays done");
+
+    // --- an alert opens: cooldown and the hourly limit -----------------------------------------------------------------
+    let alert_item = admin
+        .alert_policy(json!({ "name": "Jobs fail (automations e2e)", "kind": "job_failed", "params": {}, "severity": "info", "client_id": a_id }))
+        .await;
+    let alert_policy = item(&alert_item);
+    let react = item(&new_item("React (automations e2e)", json!({ "trigger": "alert_opened", "alert_kind": "job_failed", "script_id": hello })).await);
+    let fail_once = || async {
+        let failing = admin.run_script(id1, "exit 9", 30).await;
+        admin.wait_job(&failing, 30).await;
+        let opened = eventually(30, "the job alert", || async {
+            alerts_for(admin, &format!("policy_id={alert_policy}&agent_id={id1}")).await.into_iter().find(|a| a["state"] == "open")
+        })
+        .await;
+        opened["id"].as_str().unwrap().to_string()
+    };
+    let resolve = |alert: String| async move {
+        let (s, v) = admin.call(reqwest::Method::POST, &format!("/alerts/{alert}/resolve"), Some(json!({}))).await;
+        assert!(s.is_success(), "{v}");
+    };
+    let a = fail_once().await;
+    wait_status(react.clone(), id1.to_string(), "succeeded").await;
+    let ctx: Value = sqlx::query_scalar("SELECT context FROM automation_runs WHERE item_id = $1::uuid AND agent_id = $2::uuid")
+        .bind(&react)
+        .bind(id1)
+        .fetch_one(db)
+        .await
+        .unwrap();
+    assert_eq!((ctx["alert_id"].as_str(), ctx["alert_kind"].as_str()), (Some(a.as_str()), Some("job_failed")), "{ctx}");
+    resolve(a).await;
+    let a = fail_once().await;
+    let runs = eventually(10, "the cooldown skip", || async {
+        let r = auto_runs(db, &react, id1).await;
+        (r.len() == 2).then_some(r)
+    })
+    .await;
+    assert_eq!((runs[1].1.as_str(), runs[1].2.as_deref()), ("skipped", Some("cooldown")), "{runs:?}");
+    assert_eq!(auto_jobs(db, &react, id1).await, 1, "no second job inside the cooldown");
+    // No cooldown, but one run an hour: the next is skipped as rate limited.
+    let put = |config: Value| { let react = &react; async move {
+        let (s, v) = admin.call(reqwest::Method::PUT, &format!("/policy-items/{react}"), Some(json!({ "config": config }))).await;
+        assert!(s.is_success(), "{v}");
+    } };
+    put(json!({ "trigger": "alert_opened", "alert_kind": "job_failed", "script_id": hello, "cooldown_minutes": 0, "max_runs_per_hour": 1 })).await;
+    resolve(a).await;
+    let a = fail_once().await;
+    let runs = eventually(10, "the rate limit skip", || async {
+        let r = auto_runs(db, &react, id1).await;
+        (r.len() == 3).then_some(r)
+    })
+    .await;
+    assert_eq!((runs[2].1.as_str(), runs[2].2.as_deref()), ("skipped", Some("rate_limited")), "{runs:?}");
+    // Held back until the site's maintenance window is open.
+    let saved: (Option<Vec<i16>>, Option<chrono::NaiveTime>, Option<i32>, String) =
+        sqlx::query_as("SELECT maint_days, maint_start, maint_minutes, maint_tz FROM sites WHERE id = $1::uuid").bind(a_site).fetch_one(db).await.unwrap();
+    sqlx::query("UPDATE sites SET maint_days = ARRAY[((extract(dow FROM now() AT TIME ZONE 'UTC')::int + 3) % 7)::smallint], maint_start = '03:00', maint_minutes = 60, maint_tz = 'UTC' WHERE id = $1::uuid")
+        .bind(a_site)
+        .execute(db)
+        .await
+        .unwrap();
+    put(json!({ "trigger": "alert_opened", "alert_kind": "job_failed", "script_id": hello, "cooldown_minutes": 0, "max_runs_per_hour": 100, "respect_window": true })).await;
+    resolve(a).await;
+    let a = fail_once().await;
+    let runs = eventually(10, "the held run", || async {
+        let r = auto_runs(db, &react, id1).await;
+        (r.len() == 4).then_some(r)
+    })
+    .await;
+    assert_eq!((runs[3].1.as_str(), runs[3].2.as_deref()), ("waiting", Some("maintenance_window")), "{runs:?}");
+    assert_eq!(auto_jobs(db, &react, id1).await, 1);
+    let shown = admin.get(&format!("/policy-items/{react}/runs?status=waiting")).await;
+    assert_eq!((shown["counts"]["waiting"].as_i64(), shown["runs"].as_array().unwrap().len()), (Some(1), 1), "{shown}");
+    sqlx::query("UPDATE sites SET maint_days = $2, maint_start = $3, maint_minutes = $4, maint_tz = $5 WHERE id = $1::uuid")
+        .bind(a_site)
+        .bind(&saved.0)
+        .bind(saved.1)
+        .bind(saved.2)
+        .bind(&saved.3)
+        .execute(db)
+        .await
+        .unwrap();
+    // The site's own window may be closed or open; open it for the rest of this test.
+    sqlx::query("UPDATE sites SET maint_days = NULL WHERE id = $1::uuid").bind(a_site).execute(db).await.unwrap();
+    eventually(40, "the held run to start when the window opens", || async {
+        (auto_runs(db, &react, id1).await[3].1 == "succeeded").then_some(())
+    })
+    .await;
+    assert_eq!(auto_jobs(db, &react, id1).await, 2);
+    resolve(a).await;
+
+    // --- failed run-once runs retry, a limited number of times ------------------------------------------------------------
+    let bad_script = script("automation flaky (e2e)", "echo nope >&2; exit 1").await;
+    let flaky = item(&new_item("Flaky (automations e2e)", json!({ "trigger": "run_once", "script_id": bad_script, "retry_failed": true, "max_attempts": 2, "retry_minutes": 5 })).await);
+    wait_status(flaky.clone(), id1.to_string(), "failed").await;
+    assert_eq!(auto_runs(db, &flaky, id1).await[0].3, 1);
+    sqlx::query("UPDATE automation_runs SET finished_at = now() - interval '10 minutes' WHERE item_id = $1::uuid AND status = 'failed'").bind(&flaky).execute(db).await.unwrap();
+    eventually(40, "the retry", || async { (auto_runs(db, &flaky, id1).await[0].3 == 2).then_some(()) }).await;
+    wait_status(flaky.clone(), id1.to_string(), "failed").await;
+    sqlx::query("UPDATE automation_runs SET finished_at = now() - interval '10 minutes' WHERE item_id = $1::uuid AND status = 'failed'").bind(&flaky).execute(db).await.unwrap();
+
+    // --- reset: run again where it ran ---------------------------------------------------------------------------------------
+    let (s, v) = admin.call(reqwest::Method::POST, &format!("/policy-items/{enroll}/runs/reset"), Some(json!({}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "only run-once automations reset: {v}");
+    let (s, _) = tech.call(reqwest::Method::POST, &format!("/policy-items/{once}/runs/reset"), Some(json!({}))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "an MSP-wide automation is the admins'");
+    let first = sqlx::query_scalar::<_, uuid::Uuid>("SELECT id FROM automation_runs WHERE item_id = $1::uuid AND agent_id = $2::uuid").bind(&once).bind(id1).fetch_one(db).await.unwrap();
+    let r = admin.post(&format!("/policy-items/{once}/runs/reset"), json!({ "agent_ids": [id1] })).await;
+    assert_eq!(r["reset"], 1, "{r}");
+    eventually(40, "the run-once script to run again", || async {
+        let id = sqlx::query_scalar::<_, uuid::Uuid>("SELECT id FROM automation_runs WHERE item_id = $1::uuid AND agent_id = $2::uuid AND status = 'succeeded'")
+            .bind(&once)
+            .bind(id1)
+            .fetch_optional(db)
+            .await
+            .unwrap();
+        id.filter(|id| *id != first).map(|_| ())
+    })
+    .await;
+    assert_eq!(auto_jobs(db, &once, id1).await, 2, "one job per run");
+    let r = admin.post(&format!("/policy-items/{flaky}/runs/reset"), json!({ "failed_only": true })).await;
+    assert!(r["reset"].as_i64() >= Some(1), "{r}");
+    wait_status(flaky.clone(), id1.to_string(), "failed").await;
+
+    // --- exactly once: nothing ran twice while the worker ticked over all of this ------------------------------------
+    tokio::time::sleep(Duration::from_secs(35)).await;
+    assert_eq!(auto_runs(db, &enroll, &id4).await.len(), 1);
+    assert_eq!(auto_jobs(db, &enroll, &id4).await, 1, "the enrollment script ran once");
+    assert_eq!(auto_jobs(db, &once, &id4).await, 1);
+    assert_eq!(auto_jobs(db, &once, id1).await, 2, "run again once after the reset, not more");
+    assert_eq!(auto_runs(db, &flaky, id1).await[0].3, 1, "the reset gave the flaky script a fresh set of attempts, and it ran once so far: {:?}", auto_runs(db, &flaky, id1).await);
+    assert_eq!(run_state(online.clone(), id4.clone()).await.as_deref(), Some("succeeded"));
+
+    // --- scoping and the API surface --------------------------------------------------------------------------------------
+    let (s, _) = tech.call(reqwest::Method::GET, &format!("/agents/{id4}/automations"), None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "another client's technician doesn't see the device's history");
+    let seen = tech.get(&format!("/policy-items/{once}/runs")).await;
+    assert_eq!((seen["runs"].as_array().unwrap().len(), seen["counts"]["succeeded"].as_i64()), (0, Some(0)), "{seen}");
+    let (s, _) = admin.call(reqwest::Method::GET, &format!("/policy-items/{alert_policy}/runs"), None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "not an automation");
+    let spec = admin.get("/openapi.json").await;
+    assert!(spec["paths"]["/agents/{id}/automations"]["get"].is_object(), "the public API lists the agent history");
+    assert!(audit_count(db, "automation.reset").await >= 2);
+
+    // --- clean up: the other sections expect the fleet as it was -------------------------------------------------------------
+    sqlx::query("DELETE FROM jobs WHERE agent_id = $1::uuid AND status = 'queued' AND schedule_id = ANY($2::uuid[])")
+        .bind(id3)
+        .bind([&enroll, &once, &flaky, &react, &online].iter().map(|s| uuid::Uuid::parse_str(s).unwrap()).collect::<Vec<_>>())
+        .execute(db)
+        .await
+        .unwrap();
+    for i in [&enroll, &once, &flaky, &react, &online] {
+        assert_eq!(admin.delete_policy(i).await, StatusCode::OK);
+    }
+    assert_eq!(admin.delete_policy(&alert_policy).await, StatusCode::OK);
+    a4.kill();
+    let (s, _) = admin.call(reqwest::Method::DELETE, &format!("/agents/{id4}"), None).await;
+    assert!(s.is_success());
+}
+
+/// Automations that start on a tag or a custom-field change (docs/design/automations.md): the
+/// triggers' validation, that only real changes fire (a tag the device had, a value it already
+/// held), the storm guards, bulk tagging, scripts that set fields, the loop guard (a script that sets
+/// the field its own automation watches), and the refusal to delete what an automation waits on.
+#[allow(clippy::too_many_arguments)]
+async fn automation_tags_and_fields(url: &str, admin: &Api, db: &sqlx::PgPool, id1: &str, id3: &str, a_id: &str, b_id: &str) {
+    use reqwest::Method;
+    let tech = signed_in(url, admin, "autotrig-tech@e2e.test", "technician", Some(a_id), false).await;
+    let id_of = |v: &Value| v["id"].as_str().unwrap().to_string();
+    let script = |name: &str, body: &str| {
+        let (name, body) = (name.to_string(), body.to_string());
+        async move { id_of(&admin.post("/scripts", json!({ "name": name, "interpreter": "bash", "body": body })).await) }
+    };
+    let create = |config: Value| async move { admin.call(Method::POST, &format!("/policy-sets/{ROOT_SET}/items"), Some(json!({ "module": "automation", "name": "autotrig item", "config": config }))).await };
+    let new_item = |name: &str, config: Value| {
+        let name = name.to_string();
+        async move {
+            let (s, v) = admin.call(Method::POST, &format!("/policy-sets/{ROOT_SET}/items"), Some(json!({ "module": "automation", "name": name, "config": config }))).await;
+            assert!(s.is_success(), "{name}: {s} {v}");
+            id_of(&v)
+        }
+    };
+    let set_config = |item: &str, config: Value| {
+        let item = item.to_string();
+        async move {
+            let (s, v) = admin.call(Method::PUT, &format!("/policy-items/{item}"), Some(json!({ "config": config }))).await;
+            assert!(s.is_success(), "{v}");
+        }
+    };
+    let runs_of = |item: &str, agent: &str| {
+        let (item, agent) = (item.to_string(), agent.to_string());
+        async move { auto_runs(db, &item, &agent).await }
+    };
+    let count = |item: &str, agent: &str, status: &'static str| {
+        let (item, agent) = (item.to_string(), agent.to_string());
+        async move { auto_runs(db, &item, &agent).await.iter().filter(|r| r.1 == status).count() }
+    };
+    // Waits until `n` runs of the item on the device have this status.
+    let wait_count = |item: &str, agent: &str, status: &'static str, n: usize| {
+        let (item, agent) = (item.to_string(), agent.to_string());
+        async move {
+            eventually(60, &format!("{n} {status} run(s) of {item} on {agent}"), || {
+                let (i, a) = (item.clone(), agent.clone());
+                async move { (auto_runs(db, &i, &a).await.iter().filter(|r| r.1 == status).count() == n).then_some(()) }
+            })
+            .await
+        }
+    };
+    let quiet = || tokio::time::sleep(Duration::from_secs(4));
+
+    // The things a trigger can name.
+    let tag = id_of(&admin.post("/tags", json!({ "name": "autotrig-pilot", "color": "teal" })).await);
+    let other_tag = id_of(&admin.post("/tags", json!({ "name": "autotrig-other" })).await);
+    let field = |name: &str, kind: &str, extra: Value| {
+        let mut b = json!({ "entity": "agent", "name": name, "label": name, "kind": kind });
+        b.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        async move { id_of(&admin.post("/custom-fields", b).await) }
+    };
+    let tier = field("autotrig_tier", "select", json!({ "options": ["Gold", "Silver"] })).await;
+    let note = field("autotrig_note", "text", json!({})).await;
+    let flag = field("autotrig_flag", "text", json!({ "script_writable": true })).await;
+    let looping = field("autotrig_loop", "text", json!({ "script_writable": true })).await;
+    let b_only = field("autotrig_b", "text", json!({ "client_id": b_id })).await;
+    let client_field = id_of(&admin.post("/custom-fields", json!({ "entity": "client", "name": "autotrig_client", "label": "x", "kind": "text" })).await);
+    let hello = script("autotrig hello (e2e)", "echo hello").await;
+
+    // --- validation -------------------------------------------------------------------------------------------------
+    for (what, config, status) in [
+        ("a tag trigger without a tag", json!({ "trigger": "tag_added", "script_id": hello }), StatusCode::BAD_REQUEST),
+        ("a tag that doesn't exist", json!({ "trigger": "tag_added", "script_id": hello, "tag_id": uuid::Uuid::new_v4() }), StatusCode::NOT_FOUND),
+        ("a field trigger without a field", json!({ "trigger": "field_changed", "script_id": hello }), StatusCode::BAD_REQUEST),
+        ("a field that doesn't exist", json!({ "trigger": "field_changed", "script_id": hello, "field_id": uuid::Uuid::new_v4() }), StatusCode::NOT_FOUND),
+        ("a field of clients", json!({ "trigger": "field_changed", "script_id": hello, "field_id": client_field }), StatusCode::BAD_REQUEST),
+        ("a value the select doesn't have", json!({ "trigger": "field_changed", "script_id": hello, "field_id": tier, "field_value": "Platinum" }), StatusCode::BAD_REQUEST),
+        ("a value without a field", json!({ "trigger": "tag_added", "script_id": hello, "tag_id": tag, "field_value": "x" }), StatusCode::BAD_REQUEST),
+        ("a client's field in an automation of every client", json!({ "trigger": "field_changed", "script_id": hello, "field_id": b_only }), StatusCode::BAD_REQUEST),
+        ("an alert kind of network devices", json!({ "trigger": "alert_opened", "script_id": hello, "alert_kind": "net_down" }), StatusCode::BAD_REQUEST),
+    ] {
+        let (s, v) = create(config).await;
+        assert_eq!(s, status, "{what}: {v}");
+    }
+
+    // --- a tag is added -------------------------------------------------------------------------------------------------
+    let tagged_script = script("autotrig tagged (e2e)", "echo tagged").await;
+    let on_tag = new_item("Pilot setup (autotrig e2e)", json!({ "trigger": "tag_added", "tag_id": tag, "script_id": tagged_script })).await;
+    let for_b = new_item("Pilot setup for B (autotrig e2e)", json!({ "trigger": "tag_added", "tag_id": tag, "script_id": tagged_script, "client_id": b_id })).await;
+    // The device keeps the tags earlier sections gave it.
+    let had: Vec<String> = admin.get(&format!("/agents/{id1}")).await["tags"].as_array().unwrap().iter().map(id_of).collect();
+    let tags_with = |extra: &[&str]| json!({ "tag_ids": had.iter().map(String::as_str).chain(extra.iter().copied()).collect::<Vec<_>>() });
+    // Another tag starts nothing.
+    tech.put(&format!("/agents/{id1}/tags"), tags_with(&[&other_tag])).await;
+    quiet().await;
+    assert!(runs_of(&on_tag, id1).await.is_empty(), "another tag");
+    tech.put(&format!("/agents/{id1}/tags"), tags_with(&[&other_tag, &tag])).await;
+    wait_count(&on_tag, id1, "succeeded", 1).await;
+    let run = runs_of(&on_tag, id1).await;
+    assert_eq!(run, vec![("tag_added".to_string(), "succeeded".to_string(), None, 1)], "{run:?}");
+    let ctx: Value = sqlx::query_scalar("SELECT context FROM automation_runs WHERE item_id = $1::uuid AND agent_id = $2::uuid").bind(&on_tag).bind(id1).fetch_one(db).await.unwrap();
+    assert_eq!((ctx["tag"].as_str(), ctx["tag_id"].as_str(), ctx["source"].as_str()), (Some("autotrig-pilot"), Some(tag.as_str()), Some("user")), "{ctx}");
+    assert!(runs_of(&for_b, id1).await.is_empty(), "an automation limited to client B doesn't reach client A's device");
+    // Saving a list that keeps the tag, or adding it again, changes nothing.
+    tech.put(&format!("/agents/{id1}/tags"), tags_with(&[&other_tag, &tag])).await;
+    tech.post("/agents/tags", json!({ "agent_ids": [id1], "add": [tag] })).await;
+    quiet().await;
+    assert_eq!(runs_of(&on_tag, id1).await.len(), 1, "the device already had the tag");
+    // Taken off and put back: inside the cooldown it's recorded as skipped, with the guard's reason...
+    tech.post("/agents/tags", json!({ "agent_ids": [id1], "remove": [tag] })).await;
+    tech.post("/agents/tags", json!({ "agent_ids": [id1], "add": [tag] })).await;
+    wait_count(&on_tag, id1, "skipped", 1).await;
+    assert_eq!(runs_of(&on_tag, id1).await[1].2.as_deref(), Some("cooldown"));
+    assert_eq!(auto_jobs(db, &on_tag, id1).await, 1, "no second job inside the cooldown");
+    // ...and runs again without one.
+    set_config(&on_tag, json!({ "trigger": "tag_added", "tag_id": tag, "script_id": tagged_script, "cooldown_minutes": 0 })).await;
+    tech.post("/agents/tags", json!({ "agent_ids": [id1], "remove": [tag] })).await;
+    tech.post("/agents/tags", json!({ "agent_ids": [id1], "add": [tag] })).await;
+    wait_count(&on_tag, id1, "succeeded", 2).await;
+    // The bulk action: each device that gets the tag runs it (the device that never connected only has its job queued).
+    let r = tech.post("/agents/tags", json!({ "agent_ids": [id1, id3], "remove": [tag] })).await;
+    assert!(r["removed"].as_i64() >= Some(1), "{r}");
+    let r = tech.post("/agents/tags", json!({ "agent_ids": [id1, id3], "add": [tag] })).await;
+    assert_eq!(r["added"].as_i64(), Some(2), "{r}");
+    wait_count(&on_tag, id1, "succeeded", 3).await;
+    eventually(30, "the bulk-tagged device's run", || async { (!runs_of(&on_tag, id3).await.is_empty()).then_some(()) }).await;
+    assert_eq!(runs_of(&on_tag, id3).await[0].0, "tag_added");
+    let history = admin.get(&format!("/agents/{id1}/automations")).await;
+    assert!(history.as_array().unwrap().iter().any(|r| r["trigger"] == "tag_added" && r["context"]["tag"] == "autotrig-pilot"), "{history}");
+
+    // --- a custom field changes ---------------------------------------------------------------------------------------
+    let gold = new_item("Gold onboarding (autotrig e2e)", json!({ "trigger": "field_changed", "field_id": tier, "field_value": "gold", "script_id": hello, "cooldown_minutes": 0 })).await;
+    let any_note = new_item("Note watcher (autotrig e2e)", json!({ "trigger": "field_changed", "field_id": note, "script_id": hello, "cooldown_minutes": 0 })).await;
+    let set_field = |name: &str, value: Value| {
+        let (name, path) = (name.to_string(), format!("/agents/{id1}/fields"));
+        let tech = &tech;
+        async move { tech.put(&path, json!({ "values": { name: value } })).await }
+    };
+    set_field("autotrig_tier", json!("Silver")).await;
+    quiet().await;
+    assert!(runs_of(&gold, id1).await.is_empty(), "Silver isn't Gold");
+    set_field("autotrig_tier", json!("Gold")).await;
+    wait_count(&gold, id1, "succeeded", 1).await;
+    let ctx: Value = sqlx::query_scalar("SELECT context FROM automation_runs WHERE item_id = $1::uuid AND agent_id = $2::uuid").bind(&gold).bind(id1).fetch_one(db).await.unwrap();
+    assert_eq!((ctx["field"].as_str(), ctx["from"].as_str(), ctx["to"].as_str(), ctx["source"].as_str()), (Some("autotrig_tier"), Some("Silver"), Some("Gold"), Some("user")), "{ctx}");
+    set_field("autotrig_tier", json!("gold")).await;
+    quiet().await;
+    assert_eq!(runs_of(&gold, id1).await.len(), 1, "the value it already had isn't a change");
+    set_field("autotrig_tier", Value::Null).await;
+    quiet().await;
+    assert_eq!(runs_of(&gold, id1).await.len(), 1, "clearing isn't Gold");
+    // Without a value, any change counts: setting, changing and clearing.
+    set_field("autotrig_note", json!("first")).await;
+    set_field("autotrig_note", json!("second")).await;
+    set_field("autotrig_note", Value::Null).await;
+    wait_count(&any_note, id1, "succeeded", 3).await;
+    // Fields set by a script fire too, and nothing fires for a value the script left as it was.
+    let flagged = new_item("Flag watcher (autotrig e2e)", json!({ "trigger": "field_changed", "field_id": flag, "script_id": hello, "cooldown_minutes": 0 })).await;
+    let j = admin.run_script(id1, "echo 'RMM-FIELD autotrig_flag=on'", 30).await;
+    assert_eq!(admin.wait_job(&j, 30).await["status"], "succeeded");
+    wait_count(&flagged, id1, "succeeded", 1).await;
+    let ctx: Value = sqlx::query_scalar("SELECT context FROM automation_runs WHERE item_id = $1::uuid AND agent_id = $2::uuid").bind(&flagged).bind(id1).fetch_one(db).await.unwrap();
+    assert_eq!((ctx["to"].as_str(), ctx["source"].as_str()), (Some("on"), Some("script")), "{ctx}");
+    let j = admin.run_script(id1, "echo 'RMM-FIELD autotrig_flag=on'", 30).await;
+    assert_eq!(admin.wait_job(&j, 30).await["status"], "succeeded");
+    quiet().await;
+    assert_eq!(runs_of(&flagged, id1).await.len(), 1, "a script that sets the value the field has changes nothing");
+
+    // --- a script that sets the field its own automation watches ---------------------------------------------------------
+    // Its output changes the field to a new value each time: without a guard this would run forever
+    // (cooldown off). The write of its own job doesn't start it again; another automation still reacts.
+    let setter = script("autotrig loop (e2e)", "echo \"RMM-FIELD autotrig_loop=$RANDOM$RANDOM\"").await;
+    let watcher = new_item("Loop (autotrig e2e)", json!({ "trigger": "field_changed", "field_id": looping, "script_id": setter, "cooldown_minutes": 0, "max_runs_per_hour": 100 })).await;
+    let chained = new_item("Chained (autotrig e2e)", json!({ "trigger": "field_changed", "field_id": looping, "script_id": hello, "cooldown_minutes": 0 })).await;
+    set_field("autotrig_loop", json!("seed")).await;
+    wait_count(&watcher, id1, "succeeded", 1).await;
+    wait_count(&chained, id1, "succeeded", 2).await;
+    quiet().await;
+    let own = runs_of(&watcher, id1).await;
+    assert_eq!(own.iter().map(|r| (r.1.as_str(), r.2.as_deref())).collect::<Vec<_>>(), [("succeeded", None), ("skipped", Some("own_write"))], "{own:?}");
+    assert_eq!(auto_jobs(db, &watcher, id1).await, 1, "one job, not a loop");
+    assert_eq!(count(&chained, id1, "succeeded").await, 2, "the other automation saw the user's write and the script's");
+    let shown = tech.get(&format!("/agents/{id1}/fields")).await;
+    let f = shown.as_array().unwrap().iter().find(|f| f["name"] == "autotrig_loop").unwrap();
+    assert_eq!(f["source"], "script", "the script's value stands: {f}");
+    assert_ne!(f["value"], "seed");
+
+    // --- what an automation waits on can't be deleted ---------------------------------------------------------------------
+    let (s, v) = admin.call(Method::DELETE, &format!("/tags/{tag}"), None).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    assert!(v.to_string().contains("Pilot setup"), "names the automation: {v}");
+    let (s, _) = admin.call(Method::DELETE, &format!("/custom-fields/{tier}"), None).await;
+    assert_eq!(s, StatusCode::CONFLICT);
+
+    // --- clean up: the other sections expect the fleet as it was ---------------------------------------------------------------
+    let items = [&on_tag, &for_b, &gold, &any_note, &flagged, &watcher, &chained];
+    sqlx::query("DELETE FROM jobs WHERE agent_id = $1::uuid AND status IN ('queued', 'sent') AND schedule_id = ANY($2::uuid[])")
+        .bind(id3)
+        .bind(items.iter().map(|s| uuid::Uuid::parse_str(s).unwrap()).collect::<Vec<_>>())
+        .execute(db)
+        .await
+        .unwrap();
+    for i in items {
+        assert_eq!(admin.delete_policy(i).await, StatusCode::OK);
+    }
+    tech.put(&format!("/agents/{id1}/tags"), tags_with(&[])).await;
+    for t in [&tag, &other_tag] {
+        assert_eq!(admin.call(Method::DELETE, &format!("/tags/{t}"), None).await.0, StatusCode::OK);
+    }
+    for f in [&tier, &note, &flag, &looping, &b_only, &client_field] {
+        assert_eq!(admin.call(Method::DELETE, &format!("/custom-fields/{f}"), None).await.0, StatusCode::OK);
+    }
+}
+
 /// Rows written by the previous release (`RMM_E2E_EXPECT`, from `tests/upgrade.rs`) read back
 /// through this release's API after the migrations ran on them.
 async fn previous_release_rows(admin: &Api, path: &str) {
@@ -1559,7 +3108,9 @@ async fn previous_release_rows(admin: &Api, path: &str) {
         println!("previous release's policies: ok");
     }
     // Its documentation pages: free-text categories became category rows (see tests/upgrade.rs).
-    if let (Some(doc), Some(seeded)) = (e["doc_id"].as_str(), e["doc_seeded_id"].as_str()) {
+    // Only when the previous release had documentation to seed (`docs_seeded`, see tests/upgrade.rs).
+    if e["docs_seeded"] == true {
+        let (doc, seeded) = (e["doc_id"].as_str().expect("doc_id"), e["doc_seeded_id"].as_str().expect("doc_seeded_id"));
         let d = admin.get(&format!("/docs/{doc}")).await;
         assert_eq!((d["title"].as_str(), d["category"].as_str(), d["body"].as_str()), (Some("Alarm panel"), Some("Alarm codes"), Some("Code changes monthly.")), "{d}");
         let cats = admin.get("/doc-categories").await;
@@ -4173,9 +5724,11 @@ async fn billing(url: &str, admin: &Api, tech: &Api, db: &sqlx::PgPool, a_id: &s
     let ta_id = ta["id"].as_str().unwrap().to_string();
     let tb = admin.post("/tickets", json!({ "subject": "Billing: server move", "client_id": b_id })).await;
     let tb_id = tb["id"].as_str().unwrap().to_string();
-    admin.post("/time", json!({ "ticket_id": ta_id, "minutes": 90, "work_type_id": remote, "note": "Reinstalled the driver.", "public": true })).await;
-    admin.post("/time", json!({ "ticket_id": ta_id, "minutes": 60, "work_type_id": onsite, "note": "Site visit" })).await;
-    admin.post("/time", json!({ "minutes": 30, "work_type_id": internal, "note": "Team meeting" })).await;
+    // Entries default to starting `minutes` ago, which on a Monday morning (UTC) is last week; start them today.
+    let day_start = today.and_hms_opt(0, 0, 0).unwrap().and_utc();
+    admin.post("/time", json!({ "ticket_id": ta_id, "minutes": 90, "work_type_id": remote, "note": "Reinstalled the driver.", "public": true, "started_at": day_start })).await;
+    admin.post("/time", json!({ "ticket_id": ta_id, "minutes": 60, "work_type_id": onsite, "note": "Site visit", "started_at": day_start })).await;
+    admin.post("/time", json!({ "minutes": 30, "work_type_id": internal, "note": "Team meeting", "started_at": day_start })).await;
     let td = admin.get(&format!("/tickets/{ta_id}")).await;
     assert_eq!(events_of(&td, "time").len(), 2);
     assert!(events_of(&td, "reply").iter().any(|e| e["body"] == "Reinstalled the driver."), "the note went out as a reply too");
@@ -4185,8 +5738,8 @@ async fn billing(url: &str, admin: &Api, tech: &Api, db: &sqlx::PgPool, a_id: &s
     assert_eq!(tech.get("/time/timer").await["id"], started["id"]);
     let stopped = tech.post("/time/timer/stop", json!({ "note": "Quick look" })).await;
     assert_eq!(stopped["minutes"], 1, "at least a minute");
-    tech.post("/time", json!({ "ticket_id": tb_id, "minutes": 540, "work_type_id": remote, "note": "Moved the server" })).await;
-    tech.post("/time", json!({ "ticket_id": tb_id, "minutes": 119, "work_type_id": remote, "note": "Cabling" })).await;
+    tech.post("/time", json!({ "ticket_id": tb_id, "minutes": 540, "work_type_id": remote, "note": "Moved the server", "started_at": day_start })).await;
+    tech.post("/time", json!({ "ticket_id": tb_id, "minutes": 119, "work_type_id": remote, "note": "Cabling", "started_at": day_start })).await;
     let mine = tech.get("/time").await;
     assert_eq!(mine.as_array().unwrap().len(), 3);
     assert!(mine.as_array().unwrap().iter().all(|e| e["rate"].is_null() && e["amount"].is_null()));
@@ -4778,6 +6331,465 @@ async fn ticket_docs(url: &str, admin: &Api, a_id: &str, b_id: &str) {
     println!("documentation on tickets: ok");
 }
 
+/// Webhook deliveries seen by a local listener: (receiver number, `X-RMM-Event`,
+/// `X-RMM-Delivery`, `X-RMM-Signature`, raw body).
+type RawHooks = std::sync::Arc<std::sync::Mutex<Vec<(u8, String, String, String, Vec<u8>)>>>;
+
+/// A listener at `/hook/<n>`: records what it is sent, and answers 500 while `fail` is set.
+async fn signed_receiver(fail: std::sync::Arc<std::sync::atomic::AtomicBool>) -> (String, RawHooks) {
+    use axum::http::HeaderMap;
+    use std::sync::atomic::Ordering;
+    let hooks: RawHooks = Default::default();
+    let store = hooks.clone();
+    let app = axum::Router::new().route(
+        "/hook/{n}",
+        axum::routing::post(move |axum::extract::Path(n): axum::extract::Path<u8>, headers: HeaderMap, body: axum::body::Bytes| {
+            let (store, fail) = (store.clone(), fail.clone());
+            async move {
+                let h = |k: &str| headers.get(k).and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
+                store.lock().unwrap().push((n, h("x-rmm-event"), h("x-rmm-delivery"), h("x-rmm-signature"), body.to_vec()));
+                if fail.load(Ordering::SeqCst) {
+                    (StatusCode::INTERNAL_SERVER_ERROR, "receiver is down")
+                } else {
+                    (StatusCode::OK, "ok")
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}/hook", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (base, hooks)
+}
+
+/// `X-RMM-Signature` as a receiver computes it.
+fn hook_signature(secret: &str, body: &[u8]) -> String {
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+    mac.update(body);
+    format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
+}
+
+/// Waits for a delivery to receiver `n` (checking its signature against `secret`) that `pred`
+/// accepts, and returns the envelope.
+async fn wait_signed(hooks: &RawHooks, n: u8, secret: &str, what: &str, pred: impl Fn(&Value) -> bool) -> Value {
+    eventually(30, what, || async {
+        let seen = hooks.lock().unwrap();
+        seen.iter().filter(|h| h.0 == n).find_map(|(_, event, delivery, sig, body)| {
+            let v: Value = serde_json::from_slice(body).unwrap();
+            if !pred(&v) {
+                return None;
+            }
+            // Only the delivery asked for is checked: after a secret is rotated, older ones were signed with the old one.
+            assert_eq!(sig, &hook_signature(secret, body), "signature of {event} (waiting for {what}, receiver {n})");
+            assert_eq!((v["event"].as_str(), v["id"].as_str()), (Some(event.as_str()), Some(delivery.as_str())), "headers match the envelope");
+            Some(v)
+        })
+    })
+    .await
+}
+
+fn deliveries_to(hooks: &RawHooks, n: u8) -> Vec<Value> {
+    hooks.lock().unwrap().iter().filter(|h| h.0 == n).map(|h| serde_json::from_slice(&h.4).unwrap()).collect()
+}
+
+/// A request with an API key (no cookies).
+async fn key_call(token: &str, base: &str, method: reqwest::Method, path: &str, body: Option<Value>) -> (StatusCode, Value, reqwest::header::HeaderMap) {
+    let mut req = reqwest::Client::new().request(method, format!("{base}{path}")).bearer_auth(token);
+    if let Some(b) = body {
+        req = req.json(&b);
+    }
+    let res = req.send().await.unwrap();
+    let (status, headers) = (res.status(), res.headers().clone());
+    (status, res.json::<Value>().await.unwrap_or(Value::Null), headers)
+}
+
+/// API keys, the public API, and outbound webhooks (docs/design/api.md): key creation, calls
+/// with a key, every way a key is refused, scoping to what the owner has, rate limits, service
+/// accounts, the OpenAPI document, and signed webhook deliveries with retries.
+async fn api_keys_and_webhooks(url: &str, admin: &Api, db: &sqlx::PgPool, id1: &str, a_id: &str, b_id: &str) {
+    use reqwest::Method;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let http = reqwest::Client::new();
+    let v1 = format!("{url}/api/v1");
+    let get = |token: String, path: String| {
+        let v1 = v1.clone();
+        async move { key_call(&token, &v1, Method::GET, &path, None).await }
+    };
+    let error_of = |v: &Value| v["error"].as_str().unwrap_or_default().to_string();
+
+    // --- the OpenAPI document needs no credentials ---------------------------------------------------
+    for path in ["/api/openapi.json", "/api/v1/openapi.json"] {
+        let spec: Value = http.get(format!("{url}{path}")).send().await.unwrap().json().await.unwrap();
+        assert_eq!(spec["openapi"], "3.1.0", "{path}");
+        assert!(spec["paths"]["/agents/{id}"]["get"]["operationId"] == "getAgent" && spec["paths"]["/tickets"]["post"].is_object());
+        assert!(spec["paths"].get("/users").is_none() && spec["paths"].get("/vault/{id}/reveal").is_none(), "only the public API is described");
+    }
+
+    // --- creating keys: validated against the owner ---------------------------------------------------
+    let create = |body: Value| async move { admin.call(Method::POST, "/api-keys", Some(body)).await };
+    for (what, body) in [
+        ("no scopes", json!({ "name": "k", "access": "read", "scopes": [] })),
+        ("unknown scope", json!({ "name": "k", "access": "read", "scopes": ["billing"] })),
+        ("unknown access", json!({ "name": "k", "access": "admin", "scopes": ["agents"] })),
+        ("unknown permission", json!({ "name": "k", "access": "read", "scopes": ["agents"], "permissions": ["root"] })),
+        ("no name", json!({ "name": " ", "access": "read", "scopes": ["agents"] })),
+        ("bad expiry", json!({ "name": "k", "access": "read", "scopes": ["agents"], "expires_in_days": 0 })),
+        ("bad rate", json!({ "name": "k", "access": "read", "scopes": ["agents"], "rate_limit_per_min": 0 })),
+    ] {
+        assert_eq!(create(body).await.0, StatusCode::BAD_REQUEST, "{what}");
+    }
+    assert_eq!(create(json!({ "name": "k", "access": "read", "scopes": ["agents"], "client_ids": [uuid::Uuid::nil()] })).await.0, StatusCode::NOT_FOUND);
+
+    let made = admin
+        .post("/api-keys", json!({ "name": "e2e reader", "access": "read", "scopes": ["clients", "agents", "tickets", "alerts"], "client_ids": [a_id] }))
+        .await;
+    let reader = made["token"].as_str().unwrap().to_string();
+    let reader_id = made["key"]["id"].as_str().unwrap().to_string();
+    assert!(reader.starts_with("rmm_k_") && reader.len() == 70, "{reader}");
+    assert_eq!(made["key"]["prefix"], reader[..12]);
+    let listed = admin.get("/api-keys").await;
+    assert!(!listed.to_string().contains(&reader), "the secret is shown once");
+    assert_eq!(listed[0]["status"], "active");
+    let stored: Vec<u8> = sqlx::query_scalar("SELECT token_hash FROM api_keys WHERE id = $1::uuid").bind(&reader_id).fetch_one(db).await.unwrap();
+    assert!(stored.len() == 32 && stored != reader.as_bytes(), "only a hash is stored");
+
+    // --- using a key: Authorization: Bearer, the versioned path and the dashboard's own ---------------
+    let (s, clients, _) = get(reader.clone(), "/clients".into()).await;
+    assert_eq!(s, StatusCode::OK, "{clients}");
+    assert_eq!(clients.as_array().unwrap().iter().map(|c| c["id"].clone()).collect::<Vec<_>>(), [json!(a_id)], "only the key's client");
+    let (s, via_api, _) = key_call(&reader, &format!("{url}/api"), Method::GET, "/clients", None).await;
+    assert!(s.is_success() && via_api == clients, "the same routes under /api");
+    let (s, v, _) = get(reader.clone(), format!("/clients/{b_id}")).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "another client is not found: {v}");
+    let sites = get(reader.clone(), "/sites".into()).await.1;
+    assert!(!sites.as_array().unwrap().is_empty() && sites.as_array().unwrap().iter().all(|s| s["client_id"] == a_id), "{sites}");
+    let agents = get(reader.clone(), "/agents".into()).await.1;
+    assert!(agents["items"].as_array().unwrap().iter().any(|a| a["id"] == id1) && agents["items"].as_array().unwrap().iter().all(|a| a["client_id"] == a_id));
+    let agent = get(reader.clone(), format!("/agents/{id1}")).await.1;
+    assert!(agent.get("inventory").is_some() && agent["hostname"].is_string(), "inventory is part of the agent: {agent}");
+    assert!(get(reader.clone(), format!("/agents/{id1}/metrics?hours=1")).await.0.is_success());
+
+    // Tickets are scoped by client, too.
+    let ticket_a = admin.post("/tickets", json!({ "subject": "API scope A", "client_id": a_id })).await;
+    let ticket_b = admin.post("/tickets", json!({ "subject": "API scope B", "client_id": b_id })).await;
+    let (ta, tb) = (ticket_a["id"].as_str().unwrap().to_string(), ticket_b["id"].as_str().unwrap().to_string());
+    let tickets = get(reader.clone(), "/tickets?view=all".into()).await.1;
+    let seen: Vec<&str> = tickets["items"].as_array().unwrap().iter().map(|t| t["id"].as_str().unwrap()).collect();
+    assert!(seen.contains(&ta.as_str()) && !seen.contains(&tb.as_str()), "{seen:?}");
+    assert_eq!(get(reader.clone(), format!("/tickets/{tb}")).await.0, StatusCode::NOT_FOUND);
+    assert!(get(reader.clone(), format!("/tickets/{ta}")).await.0.is_success());
+
+    // --- refusals ---------------------------------------------------------------------------------------
+    let (s, v, _) = key_call(&reader, &v1, Method::POST, "/tickets", Some(json!({ "subject": "nope", "client_id": a_id }))).await;
+    assert_eq!((s, error_of(&v).as_str()), (StatusCode::FORBIDDEN, "this key is read-only"));
+    let (s, v, _) = get(reader.clone(), "/jobs".into()).await;
+    assert!(s == StatusCode::FORBIDDEN && error_of(&v).contains("no access to jobs"), "a scope the key lacks: {v}");
+    for path in [
+        "/users".to_string(),
+        "/auth/me".to_string(),
+        "/settings".to_string(),
+        format!("/clients/{a_id}/vault"),
+        format!("/agents/{id1}/processes"),
+        format!("/agents/{id1}/files"),
+        format!("/agents/{id1}/services"),
+        "/api-keys".to_string(),
+        "/webhooks".to_string(),
+    ] {
+        let (s, v, _) = get(reader.clone(), path.clone()).await;
+        assert!(s == StatusCode::FORBIDDEN && error_of(&v).contains("isn't available to API keys"), "{path}: {s} {v}");
+    }
+    let (s, v, _) = key_call(&reader, &v1, Method::POST, "/api-keys", Some(json!({ "name": "x", "access": "read", "scopes": ["agents"] }))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "keys don't mint keys: {v}");
+    assert!(matches!(get(reader.clone(), "/events".into()).await.0, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN), "no live stream for keys");
+    assert_eq!(get(format!("rmm_k_{}", "0".repeat(64)), "/clients".into()).await.0, StatusCode::UNAUTHORIZED, "unknown key");
+    assert_eq!(http.get(format!("{v1}/clients")).send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    // A session token is not an API key, and a key is not a session cookie.
+    let res = http.get(format!("{v1}/clients")).header("cookie", format!("rmm_session={reader}")).send().await.unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+    // --- a write key: tickets and saved scripts ----------------------------------------------------------
+    let made = admin
+        .post("/api-keys", json!({ "name": "e2e writer", "access": "write", "scopes": ["tickets", "jobs"], "client_ids": [a_id] }))
+        .await;
+    let writer = made["token"].as_str().unwrap().to_string();
+    let writer_id = made["key"]["id"].as_str().unwrap().to_string();
+    let (s, t, _) = key_call(&writer, &v1, Method::POST, "/tickets", Some(json!({ "subject": "From the API", "client_id": a_id, "priority": 2 }))).await;
+    assert_eq!(s, StatusCode::OK, "{t}");
+    let tid = t["id"].as_str().unwrap().to_string();
+    let (s, v, _) = key_call(&writer, &v1, Method::POST, "/tickets", Some(json!({ "subject": "Wrong client", "client_id": b_id }))).await;
+    assert!(!s.is_success(), "a key can't create tickets for a client it doesn't have: {v}");
+    let (s, t, _) = key_call(&writer, &v1, Method::PATCH, &format!("/tickets/{tid}"), Some(json!({ "priority": 1 }))).await;
+    assert!(s.is_success() && t["priority"] == 1, "{t}");
+    let (s, v, _) = key_call(&writer, &v1, Method::POST, &format!("/tickets/{tid}/events"), Some(json!({ "kind": "note", "body": "noted via API" }))).await;
+    assert!(s.is_success(), "{v}");
+    assert!(get(writer.clone(), format!("/tickets/{tid}")).await.1["events"].as_array().unwrap().iter().any(|e| e["body"] == "noted via API"));
+    assert_eq!(get(writer.clone(), "/alerts".into()).await.0, StatusCode::FORBIDDEN, "scopes are per resource");
+    let (s, v, _) = key_call(&writer, &v1, Method::POST, "/jobs", Some(json!({ "agent_ids": [id1], "interpreter": "bash", "body": "echo pwned" }))).await;
+    assert!(s == StatusCode::FORBIDDEN && error_of(&v).contains("saved scripts only"), "no ad-hoc code through a key: {v}");
+    let script = admin.post("/scripts", json!({ "name": "api-e2e", "interpreter": "bash", "body": "echo from-key" })).await;
+    let (s, v, _) = key_call(&writer, &v1, Method::POST, "/jobs", Some(json!({ "agent_ids": [id1], "script_id": script["id"] }))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let job = v["jobs"][0]["job_id"].as_str().unwrap().to_string();
+    let (w, j) = (writer.clone(), job.clone());
+    let done = eventually(30, "the job started by the key", || {
+        let (w, j, v1) = (w.clone(), j.clone(), v1.clone());
+        async move {
+            let (_, v, _) = key_call(&w, &v1, Method::GET, &format!("/jobs/{j}"), None).await;
+            (!matches!(v["status"].as_str(), Some("queued" | "sent"))).then_some(v)
+        }
+    })
+    .await;
+    assert_eq!((done["status"].as_str(), done["stdout"].as_str()), (Some("succeeded"), Some("from-key\n")), "{done}");
+    // Writes are audited with the key; reads aren't.
+    let audit = admin.get("/audit?action=api.request&limit=50").await;
+    let paths: Vec<&str> = audit["items"].as_array().unwrap().iter().filter(|r| r["target_id"] == writer_id.as_str()).map(|r| r["details"]["path"].as_str().unwrap()).collect();
+    assert!(paths.contains(&"/api/v1/tickets") && paths.contains(&"/api/v1/jobs"), "{paths:?}");
+    assert!(audit["items"].as_array().unwrap().iter().all(|r| r["details"]["method"] != "GET"));
+    let keys = admin.get("/api-keys").await;
+    let used = keys.as_array().unwrap().iter().find(|k| k["id"] == writer_id.as_str()).unwrap();
+    assert!(used["last_used_at"].is_string(), "{used}");
+
+    // --- a key never has more than its owner ---------------------------------------------------------------
+    let tech_b = signed_in(url, admin, "api-tech-b@e2e.test", "technician", Some(b_id), true).await;
+    let tech_b_id = tech_b.get("/auth/me").await["id"].as_str().unwrap().to_string();
+    let own = |body: Value| {
+        let tech_b = &tech_b;
+        async move { tech_b.call(Method::POST, "/api-keys", Some(body)).await }
+    };
+    assert_eq!(own(json!({ "name": "k", "access": "read", "scopes": ["tickets"], "client_ids": [a_id] })).await.0, StatusCode::BAD_REQUEST, "a client the owner can't see");
+    let (s, v) = own(json!({ "name": "k", "access": "read", "scopes": ["tickets"], "permissions": ["billing.manage"] })).await;
+    assert!(s == StatusCode::BAD_REQUEST && error_of(&v).contains("billing.manage"), "a permission the owner lacks: {v}");
+    assert_eq!(own(json!({ "name": "k", "access": "read", "scopes": ["tickets"], "owner_id": tech_b_id })).await.0, StatusCode::OK, "naming yourself is fine");
+    assert_eq!(own(json!({ "name": "k", "access": "read", "scopes": ["tickets"], "owner_id": uuid::Uuid::nil() })).await.0, StatusCode::FORBIDDEN, "other owners are for admins");
+    assert_eq!(tech_b.call(Method::GET, "/api-keys?all=true", None).await.0, StatusCode::FORBIDDEN);
+    let readonly = signed_in(url, admin, "api-readonly@e2e.test", "readonly", None, true).await;
+    assert_eq!(readonly.call(Method::POST, "/api-keys", Some(json!({ "name": "k", "access": "write", "scopes": ["tickets"] }))).await.0, StatusCode::BAD_REQUEST);
+    let (_, made) = own(json!({ "name": "tech b", "access": "write", "scopes": ["tickets"] })).await;
+    let tech_key = made["token"].as_str().unwrap().to_string();
+    let ids = |v: &Value| v["items"].as_array().unwrap().iter().map(|t| t["id"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+    let seen = ids(&get(tech_key.clone(), "/tickets?view=all".into()).await.1);
+    assert!(seen.contains(&tb) && !seen.contains(&ta), "the owner's clients: {seen:?}");
+    // The owner's access is read on every request: narrowing it narrows the key at once.
+    let (s, _) = admin.call(Method::PUT, &format!("/users/{tech_b_id}/access"), Some(json!({ "all_clients": false, "client_ids": [a_id] }))).await;
+    assert!(s.is_success());
+    let seen = ids(&get(tech_key.clone(), "/tickets?view=all".into()).await.1);
+    assert!(seen.contains(&ta) && !seen.contains(&tb), "{seen:?}");
+    // Named permissions are separate from scopes: the scope opens the route, the permission lets it answer.
+    let sec_plain = admin.post("/api-keys", json!({ "name": "sec", "access": "read", "scopes": ["security"] })).await["token"].as_str().unwrap().to_string();
+    let sec_perm = admin
+        .post("/api-keys", json!({ "name": "sec+", "access": "read", "scopes": ["security"], "permissions": ["security.read"] }))
+        .await["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(get(sec_plain, "/security/summary".into()).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(get(sec_perm.clone(), "/security/summary".into()).await.0, StatusCode::OK);
+    // ...and a permission the owner loses is lost by the key.
+    admin.put(&format!("/users/{tech_b_id}/permissions"), json!({ "permissions": ["security.read"] })).await;
+    let (_, made) = own(json!({ "name": "tech sec", "access": "read", "scopes": ["security"], "permissions": ["security.read"] })).await;
+    let tech_sec = made["token"].as_str().unwrap().to_string();
+    assert_eq!(get(tech_sec.clone(), "/security/summary".into()).await.0, StatusCode::OK);
+    admin.put(&format!("/users/{tech_b_id}/permissions"), json!({ "permissions": [] })).await;
+    assert_eq!(get(tech_sec, "/security/summary".into()).await.0, StatusCode::FORBIDDEN, "the owner no longer holds security.read");
+
+    // --- revoking, expiry, disabled owners, rate limits ---------------------------------------------------------
+    let (s, _) = admin.call(Method::DELETE, &format!("/api-keys/{reader_id}"), None).await;
+    assert!(s.is_success());
+    assert_eq!(get(reader.clone(), "/clients".into()).await.0, StatusCode::UNAUTHORIZED, "revoked");
+    assert_eq!(admin.call(Method::DELETE, &format!("/api-keys/{reader_id}"), None).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(tech_b.call(Method::DELETE, &format!("/api-keys/{writer_id}"), None).await.0, StatusCode::NOT_FOUND, "other people's keys");
+    let (_, made) = create(json!({ "name": "short lived", "access": "read", "scopes": ["clients"], "expires_in_days": 1 })).await;
+    let (short, short_id) = (made["token"].as_str().unwrap().to_string(), made["key"]["id"].as_str().unwrap().to_string());
+    assert!(get(short.clone(), "/clients".into()).await.0.is_success());
+    sqlx::query("UPDATE api_keys SET expires_at = now() - interval '1 minute' WHERE id = $1::uuid").bind(&short_id).execute(db).await.unwrap();
+    assert_eq!(get(short, "/clients".into()).await.0, StatusCode::UNAUTHORIZED, "expired");
+    let (_, made) = create(json!({ "name": "slow lane", "access": "read", "scopes": ["clients"], "rate_limit_per_min": 3 })).await;
+    let slow = made["token"].as_str().unwrap().to_string();
+    for i in 0..3 {
+        assert!(get(slow.clone(), "/clients".into()).await.0.is_success(), "request {i} is within the budget");
+    }
+    let (s, v, h) = get(slow.clone(), "/clients".into()).await;
+    assert!(s == StatusCode::TOO_MANY_REQUESTS && h.contains_key("retry-after"), "the 4th: {s} {v}");
+    assert_eq!(get(sec_perm.clone(), "/security/summary".into()).await.0, StatusCode::OK, "limits are per key");
+
+    // --- service accounts ----------------------------------------------------------------------------------------
+    assert_eq!(
+        admin.call(Method::POST, "/service-accounts", Some(json!({ "name": "root", "role": "admin", "all_clients": true }))).await.0,
+        StatusCode::BAD_REQUEST,
+        "never an admin"
+    );
+    assert_eq!(tech_b.call(Method::POST, "/service-accounts", Some(json!({ "name": "x", "role": "technician", "all_clients": true }))).await.0, StatusCode::FORBIDDEN);
+    let sa = admin.post("/service-accounts", json!({ "name": "CI pipeline", "role": "technician", "client_ids": [a_id] })).await["id"].as_str().unwrap().to_string();
+    let (s, made) = create(json!({ "name": "ci", "access": "read", "scopes": ["agents"], "owner_id": sa })).await;
+    assert_eq!(s, StatusCode::OK, "{made}");
+    let sa_key = made["token"].as_str().unwrap().to_string();
+    assert_eq!(made["key"]["service_account"], true);
+    let seen = get(sa_key.clone(), "/agents".into()).await.1;
+    assert!(seen["items"].as_array().unwrap().iter().any(|a| a["id"] == id1), "{seen}");
+    assert_eq!(create(json!({ "name": "ci", "access": "read", "scopes": ["agents"], "owner_id": tech_b_id })).await.0, StatusCode::BAD_REQUEST, "only service accounts, not people");
+    let email: String = sqlx::query_scalar("SELECT email FROM users WHERE id = $1::uuid").bind(&sa).fetch_one(db).await.unwrap();
+    for password in ["!", "anything-at-all-123"] {
+        let res = http.post(format!("{url}/api/auth/login")).json(&json!({ "email": email, "password": password })).send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "service accounts can't sign in");
+    }
+    assert_eq!(admin.call(Method::POST, &format!("/users/{sa}/password"), Some(json!({ "password": "a-long-enough-password" }))).await.0, StatusCode::NOT_FOUND);
+    // With single sign-on: a service account is never a break-glass account, and the users list says what it is.
+    assert_eq!(admin.call(Method::PUT, &format!("/users/{sa}/sso-exempt"), Some(json!({ "exempt": true }))).await.0, StatusCode::NOT_FOUND);
+    let listed = admin.get("/users").await;
+    let listed = listed.as_array().unwrap().iter().find(|u| u["id"] == sa.as_str()).unwrap().clone();
+    assert_eq!((&listed["service_account"], &listed["sso_exempt"], &listed["sso_only"]), (&json!(true), &json!(false), &json!(false)), "{listed}");
+    assert!(admin.get("/service-accounts").await.as_array().unwrap().iter().any(|a| a["id"] == sa.as_str() && a["keys"] == 1));
+    assert!(admin.call(Method::DELETE, &format!("/service-accounts/{sa}"), None).await.0.is_success());
+    assert_eq!(get(sa_key, "/agents".into()).await.0, StatusCode::UNAUTHORIZED, "removing the account revokes its keys");
+    // A disabled owner's keys stop working, too.
+    admin.call(Method::DELETE, &format!("/users/{tech_b_id}"), None).await;
+    assert_eq!(get(tech_key, "/tickets".into()).await.0, StatusCode::UNAUTHORIZED);
+    println!("API keys: ok");
+
+    // --- webhooks ------------------------------------------------------------------------------------------------------
+    let fail = std::sync::Arc::new(AtomicBool::new(false));
+    let (base, hooks) = signed_receiver(fail.clone()).await;
+    let all = admin.get("/webhooks").await["events"].clone();
+    assert!(all.as_array().unwrap().len() >= 8);
+    let hook = |body: Value| async move { admin.call(Method::POST, "/webhooks", Some(body)).await };
+    for (what, body, want) in [
+        ("a URL without a scheme", json!({ "name": "w", "url": "hooks.example.com", "events": all }), StatusCode::BAD_REQUEST),
+        ("credentials in the URL", json!({ "name": "w", "url": "https://u:p@hooks.example.com/", "events": all }), StatusCode::BAD_REQUEST),
+        ("no events", json!({ "name": "w", "url": format!("{base}/1"), "events": [] }), StatusCode::BAD_REQUEST),
+        ("an unknown event", json!({ "name": "w", "url": format!("{base}/1"), "events": ["ticket.deleted"] }), StatusCode::BAD_REQUEST),
+        ("an unknown client", json!({ "name": "w", "url": format!("{base}/1"), "events": all, "client_id": uuid::Uuid::nil() }), StatusCode::NOT_FOUND),
+    ] {
+        assert_eq!(hook(body).await.0, want, "{what}");
+    }
+    assert_eq!(readonly.call(Method::GET, "/webhooks", None).await.0, StatusCode::FORBIDDEN, "admins only");
+    let created = admin.post("/webhooks", json!({ "name": "e2e all", "url": format!("{base}/1"), "events": all })).await;
+    let (sub, secret) = (created["webhook"]["id"].as_str().unwrap().to_string(), created["secret"].as_str().unwrap().to_string());
+    assert!(secret.starts_with("whsec_"));
+    assert!(!admin.get("/webhooks").await.to_string().contains(&secret), "the secret is shown once");
+    let (stored, sealed): (Vec<u8>, bool) = sqlx::query_as("SELECT secret, secret_sealed FROM webhook_subscriptions WHERE id = $1::uuid").bind(&sub).fetch_one(db).await.unwrap();
+    assert!(sealed && stored != secret.as_bytes(), "sealed at rest");
+    let only_b = admin.post("/webhooks", json!({ "name": "e2e B only", "url": format!("{base}/2"), "events": all, "client_id": b_id })).await;
+    let (sub_b, secret_b) = (only_b["webhook"]["id"].as_str().unwrap().to_string(), only_b["secret"].as_str().unwrap().to_string());
+
+    // A test delivery: signed, with matching headers.
+    admin.post(&format!("/webhooks/{sub}/test"), json!({})).await;
+    let ping = wait_signed(&hooks, 1, &secret, "the ping", |v| v["event"] == "ping").await;
+    assert_eq!(ping["data"]["message"], "Test delivery from RMM");
+
+    // Ticket events, in order.
+    let t = admin.post("/tickets", json!({ "subject": "Webhook ticket", "client_id": a_id })).await;
+    let (wt, number) = (t["id"].as_str().unwrap().to_string(), t["number"].clone());
+    let created = wait_signed(&hooks, 1, &secret, "ticket.created", |v| v["event"] == "ticket.created" && v["data"]["ticket"]["id"] == wt.as_str()).await;
+    assert_eq!(created["data"]["ticket"]["number"], number);
+    assert_eq!((created["data"]["ticket"]["client"]["name"].as_str(), created["data"]["actor"]["type"].as_str()), (Some("Client A"), Some("user")));
+    assert!(created["data"]["ticket"]["url"].as_str().unwrap().ends_with(&format!("/tickets/{wt}")), "{created}");
+    assert_eq!(created["data"]["ticket"]["status"]["category"], "new");
+    let statuses = admin.get(&format!("/tickets/{wt}")).await["statuses"].clone();
+    let status = |cat: &str| statuses.as_array().unwrap().iter().find(|s| s["category"] == cat).unwrap()["id"].clone();
+    admin.call(Method::PATCH, &format!("/tickets/{wt}"), Some(json!({ "priority": 1 }))).await;
+    let updated = wait_signed(&hooks, 1, &secret, "ticket.updated", |v| v["event"] == "ticket.updated" && v["data"]["change"]["field"] == "priority").await;
+    assert_eq!((updated["data"]["change"]["from"].as_i64(), updated["data"]["change"]["to"].as_i64()), (Some(3), Some(1)), "{updated}");
+    admin.call(Method::PATCH, &format!("/tickets/{wt}"), Some(json!({ "status_id": status("resolved") }))).await;
+    let changed = wait_signed(&hooks, 1, &secret, "ticket.status_changed", |v| v["event"] == "ticket.status_changed" && v["data"]["ticket"]["id"] == wt.as_str()).await;
+    assert_eq!(changed["data"]["change"]["category"], "resolved");
+    let resolved = wait_signed(&hooks, 1, &secret, "ticket.resolved", |v| v["event"] == "ticket.resolved" && v["data"]["ticket"]["id"] == wt.as_str()).await;
+    assert_eq!(resolved["data"]["ticket"]["status"]["category"], "resolved");
+    admin.post(&format!("/tickets/{wt}/events"), json!({ "kind": "reply", "body": "All fixed, public." })).await;
+    let reply = wait_signed(&hooks, 1, &secret, "a public comment", |v| v["event"] == "ticket.comment" && v["data"]["comment"]["body"] == "All fixed, public.").await;
+    assert_eq!((reply["data"]["comment"]["public"].as_bool(), reply["data"]["comment"]["kind"].as_str()), (Some(true), Some("reply")));
+    // Internal notes stay inside unless the subscription asks for them.
+    admin.post(&format!("/tickets/{wt}/events"), json!({ "kind": "note", "body": "Secret internal note." })).await;
+    admin.post(&format!("/tickets/{wt}/events"), json!({ "kind": "reply", "body": "Marker after the note." })).await;
+    wait_signed(&hooks, 1, &secret, "the marker", |v| v["data"]["comment"]["body"] == "Marker after the note.").await;
+    assert!(!hooks.lock().unwrap().iter().any(|h| String::from_utf8_lossy(&h.4).contains("Secret internal note")), "internal notes are not sent");
+    admin.put(&format!("/webhooks/{sub}"), json!({ "name": "e2e all", "url": format!("{base}/1"), "events": all, "internal_notes": true })).await;
+    admin.post(&format!("/tickets/{wt}/events"), json!({ "kind": "note", "body": "Second internal note." })).await;
+    let note = wait_signed(&hooks, 1, &secret, "an internal note", |v| v["data"]["comment"]["body"] == "Second internal note.").await;
+    assert_eq!(note["data"]["comment"]["public"], false);
+
+    // A subscription for one client hears about that client only.
+    assert!(deliveries_to(&hooks, 2).is_empty(), "nothing yet for client B");
+    admin.call(Method::PATCH, &format!("/tickets/{tb}"), Some(json!({ "priority": 2 }))).await;
+    let b_update = wait_signed(&hooks, 2, &secret_b, "client B's webhook", |v| v["event"] == "ticket.updated").await;
+    let b_name = admin.get(&format!("/clients/{b_id}")).await["name"].clone();
+    assert_eq!(b_update["data"]["ticket"]["client"]["name"], b_name);
+    wait_signed(&hooks, 1, &secret, "the same change for the MSP-wide webhook", |v| v["data"]["ticket"]["id"] == tb.as_str() && v["event"] == "ticket.updated").await;
+    assert!(deliveries_to(&hooks, 2).iter().all(|v| v["data"]["ticket"]["client"]["name"] == b_name), "B's webhook never sees client A");
+
+    // Alerts: opened by the engine, acknowledged and resolved from the API.
+    let policy = admin
+        .alert_policy(json!({ "name": "API e2e: jobs fail", "kind": "job_failed", "params": {}, "severity": "warning", "client_id": a_id }))
+        .await;
+    let failing = admin.run_script(id1, "exit 9", 30).await;
+    admin.wait_job(&failing, 30).await;
+    let opened = wait_signed(&hooks, 1, &secret, "alert.created", |v| v["event"] == "alert.created" && v["data"]["alert"]["kind"] == "job_failed" && v["data"]["alert"]["details"]["exit_code"] == 9).await;
+    assert_eq!((opened["data"]["agent"]["id"].as_str(), opened["data"]["client"]["name"].as_str()), (Some(id1), Some("Client A")));
+    assert!(opened["data"]["url"].as_str().unwrap().contains(&format!("/agents/{id1}")), "{opened}");
+    let alert_id = opened["data"]["alert"]["id"].as_str().unwrap().to_string();
+    admin.post(&format!("/alerts/{alert_id}/acknowledge"), json!({})).await;
+    let acked = wait_signed(&hooks, 1, &secret, "alert.acknowledged", |v| v["event"] == "alert.acknowledged" && v["data"]["alert"]["id"] == alert_id.as_str()).await;
+    assert_eq!(acked["data"]["alert"]["state"], "acknowledged");
+    admin.post(&format!("/alerts/{alert_id}/resolve"), json!({})).await;
+    let done = wait_signed(&hooks, 1, &secret, "alert.resolved", |v| v["event"] == "alert.resolved" && v["data"]["alert"]["id"] == alert_id.as_str()).await;
+    assert_eq!(done["data"]["alert"]["resolution"], "manual");
+    assert!(deliveries_to(&hooks, 2).iter().all(|v| !v["event"].as_str().unwrap().starts_with("alert.")), "client B has no alerts");
+    admin.call(Method::DELETE, &format!("/policy-items/{}", policy["id"].as_str().unwrap()), None).await;
+
+    // A receiver that is down: the delivery waits and retries, and can be sent again by hand.
+    fail.store(true, Ordering::SeqCst);
+    let t = admin.post("/tickets", json!({ "subject": "Receiver is down", "client_id": a_id })).await;
+    let down = t["id"].as_str().unwrap().to_string();
+    let failed = eventually(30, "a failed attempt in the log", || async {
+        let log = admin.get(&format!("/webhooks/{sub}/deliveries")).await;
+        log.as_array().unwrap().iter().find(|d| d["event"] == "ticket.created" && d["status"] == "pending" && d["attempts"] == 1 && d["last_error"].is_string()).cloned()
+    })
+    .await;
+    assert_eq!(failed["response_status"], 500);
+    assert!(failed["last_error"].as_str().unwrap().contains("HTTP 500"), "{failed}");
+    let first = hooks.lock().unwrap().iter().rev().find(|h| String::from_utf8_lossy(&h.4).contains(&down)).cloned().unwrap();
+    fail.store(false, Ordering::SeqCst);
+    let (s, _) = admin.call(Method::POST, &format!("/webhook-deliveries/{}/redeliver", failed["id"]), None).await;
+    assert!(s.is_success());
+    let sent = eventually(30, "the delivery to be sent again", || async {
+        let log = admin.get(&format!("/webhooks/{sub}/deliveries")).await;
+        log.as_array().unwrap().iter().find(|d| d["id"] == failed["id"] && d["status"] == "sent").cloned()
+    })
+    .await;
+    assert_eq!(sent["response_status"], 200);
+    let again = hooks.lock().unwrap().iter().rev().find(|h| String::from_utf8_lossy(&h.4).contains(&down)).cloned().unwrap();
+    assert_eq!((&first.2, &first.4), (&again.2, &again.4), "a retry carries the same delivery id and the same bytes");
+    assert_eq!(again.3, hook_signature(&secret, &again.4));
+    let detail = admin.get(&format!("/webhook-deliveries/{}", failed["id"])).await;
+    assert_eq!((detail["event"].as_str(), detail["payload"]["ticket"]["id"].as_str()), (Some("ticket.created"), Some(down.as_str())));
+
+    // Disabled subscriptions are skipped; a rotated secret signs from then on.
+    admin.put(&format!("/webhooks/{sub}"), json!({ "name": "e2e all", "url": format!("{base}/1"), "events": all, "enabled": false })).await;
+    let skipped = admin.post("/tickets", json!({ "subject": "While disabled", "client_id": a_id })).await["id"].as_str().unwrap().to_string();
+    admin.put(&format!("/webhooks/{sub}"), json!({ "name": "e2e all", "url": format!("{base}/1"), "events": ["ticket.created"] })).await;
+    let new_secret = admin.post(&format!("/webhooks/{sub}/rotate-secret"), json!({})).await["secret"].as_str().unwrap().to_string();
+    assert_ne!(new_secret, secret);
+    let after = admin.post("/tickets", json!({ "subject": "After rotation", "client_id": a_id })).await["id"].as_str().unwrap().to_string();
+    wait_signed(&hooks, 1, &new_secret, "a delivery signed with the new secret", |v| v["data"]["ticket"]["id"] == after.as_str()).await;
+    assert!(!hooks.lock().unwrap().iter().any(|h| String::from_utf8_lossy(&h.4).contains(&skipped)), "nothing is sent while disabled");
+    // Only the chosen events: a comment no longer goes out.
+    admin.post(&format!("/tickets/{after}/events"), json!({ "kind": "reply", "body": "Not subscribed." })).await;
+    admin.post("/tickets", json!({ "subject": "Barrier", "client_id": a_id })).await;
+    wait_signed(&hooks, 1, &new_secret, "the barrier", |v| v["data"]["ticket"]["subject"] == "Barrier").await;
+    assert!(!hooks.lock().unwrap().iter().any(|h| h.0 == 1 && String::from_utf8_lossy(&h.4).contains("Not subscribed")));
+    let log = admin.get(&format!("/webhooks/{sub}/deliveries?status=sent")).await;
+    assert!(log.as_array().unwrap().len() >= 10 && log.as_array().unwrap().iter().all(|d| d["status"] == "sent"));
+    let audit = admin.get("/audit?action=webhook.&limit=50").await;
+    let actions: Vec<&str> = audit["items"].as_array().unwrap().iter().map(|r| r["action"].as_str().unwrap()).collect();
+    for a in ["webhook.create", "webhook.update", "webhook.test", "webhook.rotate_secret", "webhook.redeliver"] {
+        assert!(actions.contains(&a), "{a} audited: {actions:?}");
+    }
+    for id in [&sub, &sub_b] {
+        assert!(admin.call(Method::DELETE, &format!("/webhooks/{id}"), None).await.0.is_success());
+    }
+    assert_eq!(admin.call(Method::DELETE, &format!("/webhooks/{sub}"), None).await.0, StatusCode::NOT_FOUND);
+    println!("webhooks: ok");
+}
+
 /// The policy migration (0022) on a database with old-model rows in every shape: MSP-wide,
 /// client and site policies, OS limits, excluded agents, desktop consent, schedules with run
 /// state, open alerts. What applied to each agent before must apply after.
@@ -4997,4 +7009,1282 @@ async fn policy_migration() {
     db.close().await;
     sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE IF EXISTS {db_name} WITH (FORCE)"))).execute(&mut admin_conn).await.unwrap();
     println!("policy migration: ok");
+}
+
+
+// ---------------------------------------------------------------------------------------------
+// Single sign-on (OIDC) and passkeys
+// ---------------------------------------------------------------------------------------------
+
+/// What the stand-in identity provider puts in the next ID token it issues.
+#[derive(Clone)]
+struct Scenario {
+    sub: String,
+    email: Option<String>,
+    email_verified: bool,
+    name: String,
+    groups: Vec<String>,
+    aud: Option<String>,
+    nonce: Option<String>,
+    iss: Option<String>,
+    /// Sign with a key that isn't in the JWKS.
+    wrong_key: bool,
+    expired: bool,
+}
+
+impl Scenario {
+    fn user(sub: &str, email: &str, groups: &[&str]) -> Scenario {
+        Scenario {
+            sub: sub.into(),
+            email: Some(email.into()),
+            email_verified: true,
+            name: "Sso Person".into(),
+            groups: groups.iter().map(|g| g.to_string()).collect(),
+            aud: None,
+            nonce: None,
+            iss: None,
+            wrong_key: false,
+            expired: false,
+        }
+    }
+}
+
+struct Issued {
+    scenario: Scenario,
+    nonce: String,
+    challenge: String,
+}
+
+struct IdpInner {
+    base: String,
+    key: ring::signature::EcdsaKeyPair,
+    other: ring::signature::EcdsaKeyPair,
+    jwks: Value,
+    scenario: std::sync::Mutex<Scenario>,
+    codes: std::sync::Mutex<std::collections::HashMap<String, Issued>>,
+}
+
+type Idp = std::sync::Arc<IdpInner>;
+
+const IDP_CLIENT: &str = "rmm-e2e";
+const IDP_SECRET: &str = "s3cret-e2e-client-secret";
+
+fn b64url(b: &[u8]) -> String {
+    data_encoding::BASE64URL_NOPAD.encode(b)
+}
+
+fn ec_key() -> ring::signature::EcdsaKeyPair {
+    use ring::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair};
+    let rng = ring::rand::SystemRandom::new();
+    let pk8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).unwrap();
+    EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pk8.as_ref(), &rng).unwrap()
+}
+
+impl IdpInner {
+    fn sign(&self, claims: &Value, wrong_key: bool) -> String {
+        use ring::signature::KeyPair;
+        let _ = KeyPair::public_key(&self.key);
+        let input = format!("{}.{}", b64url(json!({ "alg": "ES256", "kid": "e2e-1", "typ": "JWT" }).to_string().as_bytes()), b64url(claims.to_string().as_bytes()));
+        let key = if wrong_key { &self.other } else { &self.key };
+        let sig = key.sign(&ring::rand::SystemRandom::new(), input.as_bytes()).unwrap();
+        format!("{input}.{}", b64url(sig.as_ref()))
+    }
+}
+
+/// An OIDC provider on a free port: discovery, JWKS, authorize (which approves at once) and token.
+async fn idp_mock() -> Idp {
+    use axum::extract::{Query as Q, State as S};
+    use axum::http::{HeaderMap, StatusCode as Code};
+    use axum::routing::{get, post};
+    use ring::signature::KeyPair;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let key = ec_key();
+    let point = key.public_key().as_ref().to_vec();
+    let jwks = json!({ "keys": [{ "kty": "EC", "crv": "P-256", "kid": "e2e-1", "use": "sig", "alg": "ES256", "x": b64url(&point[1..33]), "y": b64url(&point[33..]) }] });
+    let idp: Idp = std::sync::Arc::new(IdpInner {
+        base: base.clone(),
+        key,
+        other: ec_key(),
+        jwks,
+        scenario: std::sync::Mutex::new(Scenario::user("sub-0", "nobody@e2e.test", &[])),
+        codes: Default::default(),
+    });
+    let app = axum::Router::new()
+        .route(
+            "/.well-known/openid-configuration",
+            get(|S(i): S<Idp>| async move {
+                axum::Json(json!({
+                    "issuer": i.base, "authorization_endpoint": format!("{}/authorize", i.base), "token_endpoint": format!("{}/token", i.base),
+                    "jwks_uri": format!("{}/jwks", i.base), "token_endpoint_auth_methods_supported": ["client_secret_basic"],
+                    "id_token_signing_alg_values_supported": ["ES256"], "response_types_supported": ["code"], "subject_types_supported": ["public"],
+                }))
+            }),
+        )
+        .route("/jwks", get(|S(i): S<Idp>| async move { axum::Json(i.jwks.clone()) }))
+        .route(
+            "/authorize",
+            get(|S(i): S<Idp>, Q(q): Q<std::collections::HashMap<String, String>>| async move {
+                assert_eq!(q["response_type"], "code");
+                assert_eq!(q["client_id"], IDP_CLIENT);
+                assert_eq!(q["code_challenge_method"], "S256", "PKCE is mandatory");
+                assert!(q["scope"].split(' ').any(|s| s == "openid"));
+                assert!(!q["nonce"].is_empty() && !q["state"].is_empty());
+                let code = hex::encode(rand_bytes());
+                i.codes.lock().unwrap().insert(
+                    code.clone(),
+                    Issued { scenario: i.scenario.lock().unwrap().clone(), nonce: q["nonce"].clone(), challenge: q["code_challenge"].clone() },
+                );
+                axum::response::Redirect::to(&format!("{}?code={code}&state={}", q["redirect_uri"], q["state"]))
+            }),
+        )
+        .route(
+            "/token",
+            post(|S(i): S<Idp>, h: HeaderMap, axum::Form(f): axum::Form<std::collections::HashMap<String, String>>| async move {
+                let basic = h.get("authorization").and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Basic ")).and_then(|v| data_encoding::BASE64.decode(v.as_bytes()).ok());
+                if basic.as_deref() != Some(format!("{IDP_CLIENT}:{IDP_SECRET}").as_bytes()) {
+                    return (Code::UNAUTHORIZED, axum::Json(json!({ "error": "invalid_client" })));
+                }
+                let Some(issued) = i.codes.lock().unwrap().remove(f.get("code").map(String::as_str).unwrap_or("")) else {
+                    return (Code::BAD_REQUEST, axum::Json(json!({ "error": "invalid_grant" })));
+                };
+                if b64url(&sha256_raw(f.get("code_verifier").map(String::as_str).unwrap_or("").as_bytes())) != issued.challenge {
+                    return (Code::BAD_REQUEST, axum::Json(json!({ "error": "invalid_grant", "error_description": "PKCE verification failed" })));
+                }
+                let sc = issued.scenario;
+                let now = chrono::Utc::now().timestamp();
+                let mut claims = json!({
+                    "iss": sc.iss.clone().unwrap_or_else(|| i.base.clone()),
+                    "aud": sc.aud.clone().unwrap_or_else(|| IDP_CLIENT.to_string()),
+                    "sub": sc.sub, "iat": now, "exp": if sc.expired { now - 3600 } else { now + 300 },
+                    "nonce": sc.nonce.clone().unwrap_or(issued.nonce), "name": sc.name, "groups": sc.groups,
+                });
+                if let Some(e) = &sc.email {
+                    claims["email"] = json!(e);
+                    claims["email_verified"] = json!(sc.email_verified);
+                }
+                (Code::OK, axum::Json(json!({ "access_token": "unused", "token_type": "Bearer", "id_token": i.sign(&claims, sc.wrong_key) })))
+            }),
+        )
+        .with_state(idp.clone());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    idp
+}
+
+fn rand_bytes() -> [u8; 16] {
+    let mut b = [0u8; 16];
+    getrandom::fill(&mut b).unwrap();
+    b
+}
+
+fn sha256_raw(b: &[u8]) -> Vec<u8> {
+    use sha2::Digest;
+    sha2::Sha256::digest(b).to_vec()
+}
+
+/// A browser: keeps cookies, follows no redirects by itself.
+fn browser() -> reqwest::Client {
+    reqwest::Client::builder().cookie_store(true).redirect(reqwest::redirect::Policy::none()).build().unwrap()
+}
+
+fn location(r: &reqwest::Response) -> String {
+    assert!(r.status().is_redirection(), "expected a redirect, got {} from {}", r.status(), r.url());
+    r.headers()["location"].to_str().unwrap().to_string()
+}
+
+/// The redirects of one SSO sign-in. Returns (the callback URL the provider sent the browser back
+/// to, where the server then sent it).
+async fn sso_walk(b: &reqwest::Client, public: &str, provider: &str) -> (String, String) {
+    let to_idp = location(&b.get(format!("{public}/api/auth/sso/{provider}/start?next=/agents")).send().await.unwrap());
+    let back = location(&b.get(&to_idp).send().await.unwrap());
+    let end = location(&b.get(&back).send().await.unwrap());
+    (back, end)
+}
+
+/// The server, started a second time on the e2e database with a public URL of `localhost`.
+struct SsoServer(Child);
+
+impl Drop for SsoServer {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+async fn audit_detail(db: &sqlx::PgPool, action: &str) -> Value {
+    sqlx::query_scalar("SELECT details FROM audit_log WHERE action = $1 ORDER BY id DESC LIMIT 1").bind(action).fetch_one(db).await.unwrap_or(Value::Null)
+}
+
+async fn audit_count(db: &sqlx::PgPool, action: &str) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM audit_log WHERE action = $1").bind(action).fetch_one(db).await.unwrap()
+}
+
+async fn sso_and_passkeys(server: &Server, db: &sqlx::PgPool, dir: &Path, admin_totp_secret: &str) {
+    use reqwest::Method;
+    use webauthn_authenticator_rs::WebauthnAuthenticator;
+    use webauthn_authenticator_rs::softpasskey::SoftPasskey;
+    use webauthn_rs::prelude::{CreationChallengeResponse, RequestChallengeResponse, Url};
+
+    let port = free_port();
+    let public = format!("http://localhost:{port}");
+    let log = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("server-sso.log")).unwrap();
+    let _guard = SsoServer(
+        Command::new(env!("CARGO_BIN_EXE_rmm-server"))
+            .env("DATABASE_URL", &server.db_url)
+            .env("RMM_BIND", format!("127.0.0.1:{port}"))
+            .env("RMM_PUBLIC_URL", &public)
+            .env("RMM_WEB_DIR", dir.join("web"))
+            .env("RMM_AGENT_DIR", dir.join("agents"))
+            .env("RMM_STORAGE_DIR", dir.join("storage"))
+            .env("RMM_DATA_KEY", "ab".repeat(32))
+            .env("RMM_UPDATE_PUBKEY", content_pubkey())
+            .env("RUST_LOG", "info,rmm_server=debug")
+            .stdout(log.try_clone().unwrap())
+            .stderr(log)
+            .spawn()
+            .expect("starting the second rmm-server"),
+    );
+    wait_healthy(&format!("http://127.0.0.1:{port}")).await;
+    let api = |b: reqwest::Client| Api { http: b, base: format!("{public}/api") };
+
+    // The built-in admin signs in here with its authenticator app.
+    let admin = api(browser());
+    sign_in_with_totp(&admin, admin_totp_secret).await;
+    let client_x = admin.post("/clients", json!({ "name": "SSO Client X" })).await["id"].as_str().unwrap().to_string();
+    let client_y = admin.post("/clients", json!({ "name": "SSO Client Y" })).await["id"].as_str().unwrap().to_string();
+
+    // --- a provider: validated against the stand-in, secret sealed, never read back -------------------
+    let idp = idp_mock().await;
+    let provider = |name: &str| {
+        json!({ "name": name, "preset": "custom", "issuer": idp.base, "client_id": IDP_CLIENT, "client_secret": IDP_SECRET,
+                "jit": true, "group_sync": true, "groups_claim": "groups", "allowed_domains": ["e2e.test"] })
+    };
+    let (s, v) = admin.call(Method::POST, "/settings/sso/providers", Some(json!({ "name": "Dead", "issuer": "http://127.0.0.1:9", "client_id": "c", "client_secret": "s" }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "an issuer that doesn't answer is refused: {v}");
+    let (s, _) = admin.call(Method::POST, "/settings/sso/providers", Some(json!({ "name": "Plain", "issuer": "http://idp.example.com", "client_id": "c", "client_secret": "s" }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "plain http only for localhost");
+    let created = admin.post("/settings/sso/providers", provider("Mock IdP")).await;
+    let pid = created["id"].as_str().unwrap().to_string();
+    let (blob, sealed): (Vec<u8>, bool) = sqlx::query_as("SELECT client_secret, secret_sealed FROM sso_providers WHERE id = $1::uuid").bind(&pid).fetch_one(db).await.unwrap();
+    assert!(sealed && !blob.windows(IDP_SECRET.len()).any(|w| w == IDP_SECRET.as_bytes()), "client secrets are encrypted at rest");
+    let listing = admin.get("/settings/sso").await;
+    assert!(!listing.to_string().contains(IDP_SECRET), "the secret is never returned");
+    assert_eq!(listing["providers"][0]["has_secret"], true);
+    assert_eq!(listing["redirect_uri"], format!("{public}/api/auth/sso/callback"));
+    let test = admin.post(&format!("/settings/sso/providers/{pid}/test"), json!({})).await;
+    assert_eq!((test["ok"].clone(), test["keys"].clone()), (json!(true), json!(1)), "{test}");
+    admin
+        .put(
+            &format!("/settings/sso/providers/{pid}/maps"),
+            json!([
+                { "group_value": "RMM-Admins", "role": "admin" },
+                { "group_value": "rmm-techs", "role": "technician", "client_ids": [client_x] },
+                { "group_value": "rmm-lead", "role": "technician", "extra_permissions": ["billing.read"], "client_ids": [client_y] },
+            ]),
+        )
+        .await;
+    let (s, _) = admin.call(Method::PUT, &format!("/settings/sso/providers/{pid}/maps"), Some(json!([{ "group_value": "x", "role": "technician", "extra_permissions": ["nope"] }]))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let buttons = reqwest::get(format!("{public}/api/auth/sso/providers")).await.unwrap().json::<Value>().await.unwrap();
+    assert_eq!(buttons["providers"][0]["name"], "Mock IdP", "the sign-in page lists providers without a session: {buttons}");
+    assert!(!buttons.to_string().contains("issuer"), "and only what a button needs");
+
+    // --- JIT sign-in: the account, role and clients come from the groups ---------------------------------
+    *idp.scenario.lock().unwrap() = Scenario::user("sub-new", "Newhire@e2e.test", &["rmm-techs", "unrelated"]);
+    let b = browser();
+    let (_, end) = sso_walk(&b, &public, &pid).await;
+    assert_eq!(end, "/agents", "back to where the sign-in began");
+    let tech = api(b);
+    let me = tech.get("/auth/me").await;
+    assert_eq!((me["email"].as_str(), me["role"].as_str(), me["sso_session"].clone(), me["mfa_setup_required"].clone()), (Some("newhire@e2e.test"), Some("technician"), json!(true), json!(false)), "{me}");
+    assert_eq!(me["client_ids"], json!([client_x]));
+    assert!(tech.get("/agents").await.is_array() || tech.get("/agents").await.is_object());
+    let (s, v) = tech.call(Method::GET, &format!("/clients/{client_x}/vault"), None).await;
+    assert!(s.is_success(), "the vault wants a second factor, which the identity provider did: {s} {v}");
+    let user_id = me["id"].as_str().unwrap().to_string();
+    let (only, hash): (bool, String) = sqlx::query_as("SELECT sso_only, password_hash FROM users WHERE id = $1::uuid").bind(&user_id).fetch_one(db).await.unwrap();
+    assert!(only && hash.starts_with("$argon2"), "an unusable random password");
+    let pw = api(browser());
+    let (s, _) = pw.call(Method::POST, "/auth/login", Some(json!({ "email": "newhire@e2e.test", "password": "" }))).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    assert_eq!(audit_detail(db, "auth.login").await["via"], "sso");
+    assert_eq!(audit_count(db, "auth.sso_access_sync").await, 1);
+
+    // --- the next sign-in follows the groups: more clients, a permission, then none at all ------------------
+    *idp.scenario.lock().unwrap() = Scenario::user("sub-new", "newhire@e2e.test", &["rmm-techs", "RMM-LEAD"]);
+    let b = browser();
+    sso_walk(&b, &public, &pid).await;
+    let tech = api(b);
+    let me = tech.get("/auth/me").await;
+    let mut clients: Vec<String> = me["client_ids"].as_array().unwrap().iter().map(|c| c.as_str().unwrap().to_string()).collect();
+    clients.sort();
+    let mut want = vec![client_x.clone(), client_y.clone()];
+    want.sort();
+    assert_eq!(clients, want);
+    assert!(me["permissions"].as_array().unwrap().iter().any(|p| p == "billing.read"), "{me}");
+    assert!(!me["permissions"].as_array().unwrap().iter().any(|p| p == "billing.manage"));
+    *idp.scenario.lock().unwrap() = Scenario::user("sub-new", "newhire@e2e.test", &["rmm-admins"]);
+    let b = browser();
+    sso_walk(&b, &public, &pid).await;
+    let me = api(b).get("/auth/me").await;
+    assert_eq!((me["role"].as_str(), me["mfa_setup_required"].clone()), (Some("admin"), json!(false)), "an admin from an SSO session doesn't have to set up TOTP here: {me}");
+    *idp.scenario.lock().unwrap() = Scenario::user("sub-new", "newhire@e2e.test", &["somebody-else"]);
+    let b = browser();
+    let (_, end) = sso_walk(&b, &public, &pid).await;
+    assert_eq!(end, "/login?sso_error=not_allowed", "no mapping, no default role");
+    let (s, _) = api(b).call(Method::GET, "/auth/me", None).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "and no session");
+    assert_eq!(audit_detail(db, "auth.sso_failed").await["reason"], "no group mapping matches");
+    // Someone who used SSO before and is in none of the groups now loses their access.
+    let (role, all, n): (String, bool, i64) =
+        sqlx::query_as("SELECT role, all_clients, (SELECT count(*) FROM user_clients WHERE user_id = $1::uuid) FROM users WHERE id = $1::uuid").bind(&user_id).fetch_one(db).await.unwrap();
+    assert_eq!((role.as_str(), all, n), ("readonly", false, 0), "removed from every group");
+    // A first sign-in that matches nothing changes nothing: trying SSO once doesn't demote an account.
+    let keep = admin.post("/users", json!({ "email": "keepme@e2e.test", "name": "Keep", "password": "user-password-123", "role": "admin" })).await;
+    *idp.scenario.lock().unwrap() = Scenario::user("sub-keep", "keepme@e2e.test", &[]);
+    assert_eq!(sso_walk(&browser(), &public, &pid).await.1, "/login?sso_error=not_allowed");
+    let (role, links): (String, i64) =
+        sqlx::query_as("SELECT role, (SELECT count(*) FROM user_identities WHERE user_id = $1::uuid) FROM users WHERE id = $1::uuid").bind(keep["id"].as_str().unwrap()).fetch_one(db).await.unwrap();
+    assert_eq!((role.as_str(), links), ("admin", 0), "still an admin, and not linked");
+
+    // --- linking: only by a verified address, and never over another identity ---------------------------------
+    let linked = admin.post("/users", json!({ "email": "linked@e2e.test", "name": "Linked", "password": "user-password-123", "role": "readonly", "all_clients": false, "client_ids": [] })).await;
+    let linked_id = linked["id"].as_str().unwrap().to_string();
+    let mut sc = Scenario::user("sub-linked", "linked@e2e.test", &["rmm-techs"]);
+    sc.email_verified = false;
+    *idp.scenario.lock().unwrap() = sc.clone();
+    let (_, end) = sso_walk(&browser(), &public, &pid).await;
+    assert_eq!(end, "/login?sso_error=not_allowed", "an unverified address links nothing");
+    sc.email = None;
+    *idp.scenario.lock().unwrap() = sc.clone();
+    assert_eq!(sso_walk(&browser(), &public, &pid).await.1, "/login?sso_error=not_allowed", "no address at all");
+    sc.email = Some("linked@e2e.test".into());
+    sc.email_verified = true;
+    *idp.scenario.lock().unwrap() = sc.clone();
+    let b = browser();
+    assert_eq!(sso_walk(&b, &public, &pid).await.1, "/agents");
+    let me = api(b).get("/auth/me").await;
+    assert_eq!(me["id"], linked_id.as_str(), "the existing account, not a new one");
+    assert_eq!(me["role"], "technician", "group sync applies to linked accounts");
+    assert_eq!(audit_count(db, "auth.sso_link").await, 1);
+    // The same person again, now by subject alone: a changed address doesn't matter.
+    sc.email = Some("renamed@e2e.test".into());
+    *idp.scenario.lock().unwrap() = sc.clone();
+    let b = browser();
+    assert_eq!(sso_walk(&b, &public, &pid).await.1, "/agents");
+    assert_eq!(api(b).get("/auth/me").await["id"], linked_id.as_str());
+    // A different identity claiming that address can't take the account over.
+    let other = Scenario::user("sub-impostor", "linked@e2e.test", &["rmm-admins"]);
+    *idp.scenario.lock().unwrap() = other;
+    assert_eq!(sso_walk(&browser(), &public, &pid).await.1, "/login?sso_error=not_allowed");
+    assert_eq!(audit_detail(db, "auth.sso_failed").await["reason"], "the account is linked to a different identity at this provider");
+    // Domains are restricted per provider.
+    *idp.scenario.lock().unwrap() = Scenario::user("sub-outsider", "visitor@other.example", &["rmm-admins"]);
+    assert_eq!(sso_walk(&browser(), &public, &pid).await.1, "/login?sso_error=not_allowed");
+    assert_eq!(audit_detail(db, "auth.sso_failed").await["reason"], "email domain not allowed");
+    // A disabled account stays out.
+    admin.call(Method::DELETE, &format!("/users/{linked_id}"), None).await;
+    *idp.scenario.lock().unwrap() = Scenario::user("sub-linked", "linked@e2e.test", &["rmm-techs"]);
+    assert_eq!(sso_walk(&browser(), &public, &pid).await.1, "/login?sso_error=not_allowed");
+    assert_eq!(audit_detail(db, "auth.sso_failed").await["reason"], "the account is disabled");
+
+    // --- tokens that must not be accepted ------------------------------------------------------------------
+    let base_sc = Scenario::user("sub-new", "newhire@e2e.test", &["rmm-techs"]);
+    type Tweak = Box<dyn Fn(&mut Scenario)>;
+    let attempts: Vec<(&str, Tweak, &str)> = vec![
+        ("bad_nonce", Box::new(|s| s.nonce = Some("replayed-nonce".into())), "bad_nonce"),
+        ("bad_audience", Box::new(|s| s.aud = Some("someone-elses-client".into())), "bad_audience"),
+        ("bad_issuer", Box::new(|s| s.iss = Some("https://evil.example.com".into())), "bad_issuer"),
+        ("expired", Box::new(|s| s.expired = true), "expired"),
+        ("bad_signature", Box::new(|s| s.wrong_key = true), "bad_signature"),
+    ];
+    for (name, tweak, code) in attempts {
+        let mut sc = base_sc.clone();
+        tweak(&mut sc);
+        *idp.scenario.lock().unwrap() = sc;
+        let b = browser();
+        let (_, end) = sso_walk(&b, &public, &pid).await;
+        assert_eq!(end, "/login?sso_error=failed", "{name}");
+        let (s, _) = api(b).call(Method::GET, "/auth/me", None).await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED, "{name}: no session");
+        let reason = audit_detail(db, "auth.sso_failed").await["reason"].as_str().unwrap().to_string();
+        assert!(reason.starts_with(code), "{name}: {reason}");
+    }
+    // A callback is single use, and only for the browser that began it.
+    *idp.scenario.lock().unwrap() = base_sc.clone();
+    let b = browser();
+    let (back, end) = sso_walk(&b, &public, &pid).await;
+    assert_eq!(end, "/agents");
+    assert_eq!(location(&b.get(&back).send().await.unwrap()), "/login?sso_error=expired", "replayed callback");
+    let to_idp = location(&browser().get(format!("{public}/api/auth/sso/{pid}/start")).send().await.unwrap());
+    let back = location(&browser().get(&to_idp).send().await.unwrap());
+    assert_eq!(location(&browser().get(&back).send().await.unwrap()), "/login?sso_error=failed", "another browser has no binding cookie");
+    assert_eq!(audit_detail(db, "auth.sso_failed").await["reason"], "the state cookie doesn't match");
+    assert_eq!(location(&browser().get(format!("{public}/api/auth/sso/callback?code=x&state=forged")).send().await.unwrap()), "/login?sso_error=expired");
+    // Redirect targets stay on the site.
+    let to_idp = location(&b.get(format!("{public}/api/auth/sso/{pid}/start?next=//evil.example.com")).send().await.unwrap());
+    let back = location(&b.get(&to_idp).send().await.unwrap());
+    assert_eq!(location(&b.get(&back).send().await.unwrap()), "/");
+
+    // --- requiring SSO, with a break-glass admin ------------------------------------------------------------------
+    let (s, v) = admin.call(Method::PUT, "/settings/sso", Some(json!({ "required": true }))).await;
+    assert_eq!(s, StatusCode::CONFLICT, "nobody could sign in with a password afterwards: {v}");
+    let me = admin.get("/auth/me").await;
+    admin.post("/users", json!({ "email": "plain@e2e.test", "name": "Plain", "password": "user-password-123", "role": "technician" })).await;
+    let bg2 = admin.post("/users", json!({ "email": "bg2@e2e.test", "name": "Second break-glass", "password": "user-password-123", "role": "admin" })).await["id"].as_str().unwrap().to_string();
+    admin.put(&format!("/users/{}/sso-exempt", me["id"].as_str().unwrap()), json!({ "exempt": true })).await;
+    // A claim from the provider never reaches a break-glass account.
+    *idp.scenario.lock().unwrap() = Scenario::user("sub-bg", ADMIN_EMAIL, &["rmm-admins"]);
+    assert_eq!(sso_walk(&browser(), &public, &pid).await.1, "/login?sso_error=not_allowed");
+    assert_eq!(audit_detail(db, "auth.sso_failed").await["reason"], "break-glass accounts aren't linked by email");
+    admin.put("/settings/sso", json!({ "required": true })).await;
+    let plain = api(browser());
+    let (s, v) = plain.call(Method::POST, "/auth/login", Some(json!({ "email": "plain@e2e.test", "password": "user-password-123" }))).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "refused, and in the same words as a wrong password: {v}");
+    assert_eq!(v["error"], "not authenticated");
+    assert_eq!(audit_detail(db, "auth.login_denied_sso_required").await["ip"], "127.0.0.1");
+    let breakglass = api(browser());
+    let (s, v) = breakglass.call(Method::POST, "/auth/login", Some(json!({ "email": ADMIN_EMAIL, "password": ADMIN_PASSWORD }))).await;
+    assert_eq!((s, v["mfa_required"].clone()), (StatusCode::UNAUTHORIZED, json!(true)), "the password is accepted for a break-glass account, which then asks for its second factor: {v}");
+    let me2 = sign_in_with_totp(&breakglass, admin_totp_secret).await;
+    assert_eq!(me2["user"]["email"], ADMIN_EMAIL, "the break-glass admin still signs in with a password");
+    let (s, _) = admin.call(Method::PUT, &format!("/users/{}/sso-exempt", me["id"].as_str().unwrap()), Some(json!({ "exempt": false }))).await;
+    assert_eq!(s, StatusCode::CONFLICT, "the last break-glass admin stays");
+    let (s, _) = admin.call(Method::DELETE, &format!("/settings/sso/providers/{pid}"), None).await;
+    assert_eq!(s, StatusCode::CONFLICT, "and the last provider");
+    // Disabling the last break-glass admin is refused too (the first one may stand down while a second holds).
+    admin.put(&format!("/users/{bg2}/sso-exempt"), json!({ "exempt": true })).await;
+    admin.put(&format!("/users/{}/sso-exempt", me["id"].as_str().unwrap()), json!({ "exempt": false })).await;
+    let (s, v) = admin.call(Method::DELETE, &format!("/users/{bg2}"), None).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    admin.put(&format!("/users/{}/sso-exempt", me["id"].as_str().unwrap()), json!({ "exempt": true })).await;
+    admin.put("/settings/sso", json!({ "required": false })).await;
+    // Switching the provider off ends the sessions it vouched for.
+    *idp.scenario.lock().unwrap() = base_sc.clone();
+    let b = browser();
+    sso_walk(&b, &public, &pid).await;
+    let held = api(b);
+    held.get("/auth/me").await;
+    let mut off = provider("Mock IdP");
+    off["enabled"] = json!(false);
+    admin.put(&format!("/settings/sso/providers/{pid}"), off).await;
+    let (s, _) = held.call(Method::GET, "/auth/me", None).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    assert_eq!(sso_walk_start_only(&public, &pid).await, "/login?sso_error=provider_error");
+    admin.put(&format!("/settings/sso/providers/{pid}"), provider("Mock IdP")).await;
+    // A new client id means the subjects it issued mean nothing: links and sessions go.
+    let (links,): (i64,) = sqlx::query_as("SELECT count(*) FROM user_identities WHERE provider_id = $1::uuid").bind(&pid).fetch_one(db).await.unwrap();
+    assert!(links > 0);
+    let mut moved = provider("Mock IdP");
+    moved["client_id"] = json!("another-client");
+    admin.put(&format!("/settings/sso/providers/{pid}"), moved).await;
+    let (links,): (i64,) = sqlx::query_as("SELECT count(*) FROM user_identities WHERE provider_id = $1::uuid").bind(&pid).fetch_one(db).await.unwrap();
+    assert_eq!(links, 0);
+    let mut moved = provider("Mock IdP");
+    moved["issuer"] = json!(format!("{}/another", idp.base));
+    moved.as_object_mut().unwrap().remove("client_secret");
+    let (s, v) = admin.call(Method::PUT, &format!("/settings/sso/providers/{pid}"), Some(moved)).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "a new issuer needs the secret entered again: {v}");
+    assert!(v["error"].as_str().unwrap().contains("secret"), "{v}");
+    admin.put(&format!("/settings/sso/providers/{pid}"), provider("Mock IdP")).await;
+
+    // --- passkeys ----------------------------------------------------------------------------------------------------
+    let origin = Url::parse(&public).unwrap();
+    let pk_pw = "user-password-123";
+    let mut device = SoftPasskey::new(true);
+    let pk = signed_in_at(&public, &admin, "pk@e2e.test", "technician").await;
+    // 2FA isn't required for a technician, so nothing changes at sign-in yet.
+    let start = pk.post("/auth/passkeys/register/start", json!({ "password": pk_pw })).await;
+    let (s, _) = pk.call(Method::POST, "/auth/passkeys/register/start", Some(json!({ "password": "wrong-password-1" }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "registering asks for the password");
+    let ccr: CreationChallengeResponse = serde_json::from_value(start["options"].clone()).unwrap();
+    let cred = device.do_registration(origin.clone(), ccr).unwrap();
+    let vault = format!("/clients/{client_x}/vault");
+    assert_eq!(pk.call(Method::GET, &vault, None).await.0, StatusCode::FORBIDDEN, "no second factor yet, no vault");
+    let fin = pk.post("/auth/passkeys/register/finish", json!({ "ceremony_id": start["ceremony_id"], "name": "Laptop key", "credential": cred })).await;
+    let recovery: Vec<String> = fin["recovery_codes"].as_array().expect("a first factor with no TOTP creates recovery codes").iter().map(|c| c.as_str().unwrap().to_string()).collect();
+    assert_eq!(recovery.len(), 10);
+    let (s, _) = pk.call(Method::POST, "/auth/passkeys/register/finish", Some(json!({ "ceremony_id": start["ceremony_id"], "name": "again", "credential": cred }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "a ceremony finishes once");
+    assert!(pk.call(Method::GET, &vault, None).await.0.is_success(), "a passkey is a second factor for the vault");
+    let list = pk.get("/auth/passkeys").await;
+    assert_eq!(list["passkeys"][0]["name"], "Laptop key");
+    assert_eq!(list["recovery_codes_left"], 10);
+    let (stored, ): (Value,) = sqlx::query_as("SELECT passkey FROM user_passkeys WHERE user_id = (SELECT id FROM users WHERE email = 'pk@e2e.test')").fetch_one(db).await.unwrap();
+    assert!(!stored.to_string().to_lowercase().contains("private"), "only the public credential is stored");
+    let passkey_id = list["passkeys"][0]["id"].as_str().unwrap().to_string();
+    pk.call(Method::PATCH, &format!("/auth/passkeys/{passkey_id}"), Some(json!({ "name": "Work laptop" }))).await;
+    assert_eq!(pk.get("/auth/passkeys").await["passkeys"][0]["name"], "Work laptop");
+
+    // Signing in now asks for a second factor, and offers the passkey.
+    let login = |body: Value| async {
+        let b = api(browser());
+        let (s, v) = b.call(Method::POST, "/auth/login", Some(body)).await;
+        (b, s, v)
+    };
+    let creds = json!({ "email": "pk@e2e.test", "password": pk_pw });
+    let (_, s, v) = login(creds.clone()).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    assert_eq!((v["mfa_required"].clone(), v["methods"].clone()), (json!(true), json!({ "totp": false, "passkey": true })), "{v}");
+    let challenge = |email: &str, password: &str| {
+        let api = api(browser());
+        let (email, password) = (email.to_string(), password.to_string());
+        async move { api.call(Method::POST, "/auth/login/passkey", Some(json!({ "email": email, "password": password }))).await }
+    };
+    assert_eq!(challenge("pk@e2e.test", "wrong").await.0, StatusCode::UNAUTHORIZED, "the challenge is for someone who knows the password");
+    let (s, ch) = challenge("pk@e2e.test", pk_pw).await;
+    assert!(s.is_success(), "{ch}");
+    let rcr: RequestChallengeResponse = serde_json::from_value(ch["options"].clone()).unwrap();
+    let assertion = device.do_authentication(origin.clone(), rcr).unwrap();
+    let body = json!({ "email": "pk@e2e.test", "password": pk_pw, "passkey": { "ceremony_id": ch["ceremony_id"], "credential": assertion } });
+    let (b, s, v) = login(body.clone()).await;
+    assert!(s.is_success(), "{v}");
+    assert_eq!(b.get("/auth/me").await["email"], "pk@e2e.test");
+    let (_, s, _) = login(body).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "an answer can't be replayed");
+    let used: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar("SELECT last_used_at FROM user_passkeys WHERE id = $1::uuid").bind(&passkey_id).fetch_one(db).await.unwrap();
+    assert!(used.is_some());
+    // A challenge answered for another account's ceremony, a wrong password at the last step and a TOTP-shaped code all fail.
+    let (_, ch2) = challenge("pk@e2e.test", pk_pw).await;
+    let rcr: RequestChallengeResponse = serde_json::from_value(ch2["options"].clone()).unwrap();
+    let assertion = device.do_authentication(origin.clone(), rcr).unwrap();
+    let (_, s, _) = login(json!({ "email": "pk@e2e.test", "password": "wrong-password", "passkey": { "ceremony_id": ch2["ceremony_id"], "credential": assertion } })).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    let (_, s, _) = login(json!({ "email": "pk@e2e.test", "password": pk_pw, "code": "123456" })).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "there is no authenticator app to check a code against");
+    // Recovery codes still work, once.
+    let (b, s, v) = login(json!({ "email": "pk@e2e.test", "password": pk_pw, "code": recovery[0] })).await;
+    assert!(s.is_success(), "{v}");
+    assert_eq!(b.get("/auth/me").await["email"], "pk@e2e.test");
+    let (_, s, _) = login(json!({ "email": "pk@e2e.test", "password": pk_pw, "code": recovery[0] })).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "recovery codes are single use");
+    // TOTP beside the passkey; removing TOTP keeps the passkey (and the codes).
+    let setup = pk.post("/auth/totp/setup", json!({ "password": pk_pw })).await;
+    let secret = setup["secret"].as_str().unwrap().to_string();
+    pk.post("/auth/totp/enable", json!({ "code": totp(&secret) })).await;
+    let (_, s, v) = login(json!({ "email": "pk@e2e.test", "password": pk_pw })).await;
+    assert_eq!((s, v["methods"].clone()), (StatusCode::UNAUTHORIZED, json!({ "totp": true, "passkey": true })));
+    // Remove the passkey (password needed): TOTP remains.
+    let (s, _) = pk.call(Method::POST, &format!("/auth/passkeys/{passkey_id}/remove"), Some(json!({ "password": "wrong-password-1" }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    pk.post(&format!("/auth/passkeys/{passkey_id}/remove"), json!({ "password": pk_pw })).await;
+    assert_eq!(pk.get("/auth/passkeys").await["passkeys"], json!([]));
+    let (_, s, v) = login(json!({ "email": "pk@e2e.test", "password": pk_pw })).await;
+    assert_eq!((s, v["methods"].clone()), (StatusCode::UNAUTHORIZED, json!({ "totp": true, "passkey": false })));
+    let (b, s, _) = login(json!({ "email": "pk@e2e.test", "password": pk_pw, "code": "000000" })).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    drop(b);
+
+    // A required second factor can be a passkey: an admin has nothing but the setup endpoints until one is registered.
+    let boss = signed_in_at(&public, &admin, "pk-admin@e2e.test", "admin").await;
+    assert_eq!(boss.get("/auth/me").await["mfa_setup_required"], true);
+    let (s, _) = boss.call(Method::GET, "/agents", None).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    let mut boss_device = SoftPasskey::new(true);
+    let start = boss.post("/auth/passkeys/register/start", json!({ "password": pk_pw })).await;
+    let ccr: CreationChallengeResponse = serde_json::from_value(start["options"].clone()).unwrap();
+    let cred = boss_device.do_registration(origin.clone(), ccr).unwrap();
+    boss.post("/auth/passkeys/register/finish", json!({ "ceremony_id": start["ceremony_id"], "name": "Key", "credential": cred })).await;
+    assert_eq!(boss.get("/auth/me").await["mfa_setup_required"], false, "a passkey satisfies the requirement");
+    boss.get("/agents").await;
+    // The admin's reset (lost key) removes passkeys and codes.
+    let boss_id = boss.get("/auth/me").await["id"].as_str().unwrap().to_string();
+    let (s, _) = admin.call(Method::DELETE, &format!("/users/{boss_id}/totp"), None).await;
+    assert!(s.is_success());
+    let (n,): (i64,) = sqlx::query_as("SELECT count(*) FROM user_passkeys WHERE user_id = $1::uuid").bind(&boss_id).fetch_one(db).await.unwrap();
+    assert_eq!(n, 0);
+    // SSO-only accounts have no password to confirm with, so no passkeys.
+    let (s, v) = tech.call(Method::POST, "/auth/passkeys/register/start", Some(json!({ "password": "anything-at-all-1" }))).await;
+    assert!(s == StatusCode::UNAUTHORIZED || s == StatusCode::BAD_REQUEST, "{s} {v}");
+}
+
+/// The 30-second step of the current time, which a TOTP code is good for once.
+fn totp_step() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() / 30
+}
+
+static LAST_TOTP_STEP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The built-in admin's password and authenticator code. A code is accepted once per step, so
+/// this waits for a step it hasn't used (a wrong code would also count against the sign-in limit).
+async fn sign_in_with_totp(api: &Api, secret: &str) -> Value {
+    while totp_step() <= LAST_TOTP_STEP.load(std::sync::atomic::Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    LAST_TOTP_STEP.store(totp_step(), std::sync::atomic::Ordering::SeqCst);
+    let (s, v) = api.call(reqwest::Method::POST, "/auth/login", Some(json!({ "email": ADMIN_EMAIL, "password": ADMIN_PASSWORD, "code": totp(secret) }))).await;
+    assert!(s.is_success(), "the admin's sign-in with a TOTP code: {s} {v}");
+    v
+}
+
+/// A user the admin creates, signed in on the second server.
+async fn signed_in_at(public: &str, admin: &Api, email: &str, role: &str) -> Api {
+    admin.post("/users", json!({ "email": email, "name": email, "password": "user-password-123", "role": role, "all_clients": true })).await;
+    let api = Api { http: browser(), base: format!("{public}/api") };
+    api.post("/auth/login", json!({ "email": email, "password": "user-password-123" })).await;
+    api
+}
+
+/// `/start` for a provider that is switched off.
+async fn sso_walk_start_only(public: &str, provider: &str) -> String {
+    location(&browser().get(format!("{public}/api/auth/sso/{provider}/start")).send().await.unwrap())
+}
+
+// ---------------------------------------------------------------------------------------------
+// Software deployment (docs/design/software.md): the catalog, uploaded installers, deploying to
+// a device, the third-party updates view, and desired state in policy sets (enforced when a
+// scan arrives, when a device joins a set, with back-off after failures).
+// The agent's providers are replaced by a JSON file (RMM_SOFTWARE_FAKE, debug builds).
+// ---------------------------------------------------------------------------------------------
+async fn software(url: &str, admin: &Api, db: &sqlx::PgPool, dir: &Path, id1: &str, a_id: &str, b_id: &str) {
+    use reqwest::Method;
+    let fake = dir.join("a1-software.json");
+    let fake_state = || -> Value { serde_json::from_str(&std::fs::read_to_string(&fake).unwrap_or_default()).unwrap_or(json!({})) };
+    let set_fake = |v: Value| std::fs::write(&fake, v.to_string()).unwrap();
+    set_fake(json!({ "installed": {}, "available": {} }));
+    let item = |v: &Value| v["id"].as_str().unwrap().to_string();
+
+    // --- the catalog -------------------------------------------------------------------------------
+    for (what, body) in [
+        ("an option as a package id", json!({ "name": "Bad", "apt_name": "--force-yes" })),
+        ("a space in an id", json!({ "name": "Bad", "winget_id": "Some App" })),
+        ("a shell in a version", json!({ "name": "Bad", "apt_name": "ok", "version": "1.0; rm -rf /" })),
+        ("no name", json!({ "name": "  ", "apt_name": "ok" })),
+        ("a bad product code", json!({ "name": "Bad", "apt_name": "ok", "product_code": "nope" })),
+        ("an unclosed quote", json!({ "name": "Bad", "apt_name": "ok", "silent_args": "/S \"x" })),
+    ] {
+        assert_eq!(admin.call(Method::POST, "/software/packages", Some(body)).await.0, StatusCode::BAD_REQUEST, "{what}");
+    }
+    let htop = admin.post("/software/packages", json!({ "name": "Htop (e2e)", "apt_name": "htop-e2e", "winget_id": "Htop.Htop", "publisher": "e2e" })).await;
+    let htop_id = item(&htop);
+    assert_eq!((htop["platforms"].clone(), htop["version"].clone()), (json!(["windows", "linux"]), Value::Null), "{htop}");
+    let (s, v) = admin.call(Method::POST, "/software/packages", Some(json!({ "name": "htop (E2E)", "apt_name": "x" }))).await;
+    assert_eq!(s, StatusCode::CONFLICT, "names are unique, whatever the case: {v}");
+    let b_only = admin.post("/software/packages", json!({ "name": "B only (e2e)", "client_id": b_id, "apt_name": "b-only-e2e" })).await;
+    let b_only_id = item(&b_only);
+    let a_only = admin.post("/software/packages", json!({ "name": "A only (e2e)", "client_id": a_id, "apt_name": "a-only-e2e" })).await;
+    let a_only_id = item(&a_only);
+    let acme = admin.post("/software/packages", json!({ "name": "Acme Tool (e2e)", "version": "2.0.0", "silent_args": "/qn" })).await;
+    assert_eq!(acme["platforms"], json!([]), "no source yet: it can't be deployed");
+    let acme_id = item(&acme);
+
+    // Scoping: a technician limited to client B sees MSP-wide packages and B's, never A's, and can't touch MSP-wide ones.
+    let tech_b = signed_in(url, admin, "swtech-b@e2e.test", "technician", Some(b_id), false).await;
+    let names = |v: &Value| v.as_array().unwrap().iter().map(|p| p["name"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+    let seen = names(&tech_b.get("/software/packages").await);
+    assert!(seen.contains(&"Htop (e2e)".to_string()) && seen.contains(&"B only (e2e)".to_string()) && !seen.contains(&"A only (e2e)".to_string()), "{seen:?}");
+    assert_eq!(tech_b.call(Method::GET, &format!("/software/packages/{a_only_id}"), None).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(tech_b.call(Method::POST, "/software/packages", Some(json!({ "name": "MSP-wide by a tech", "apt_name": "x" }))).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(tech_b.call(Method::PUT, &format!("/software/packages/{htop_id}"), Some(json!({ "name": "Htop (e2e)", "apt_name": "htop-e2e" }))).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(tech_b.call(Method::GET, &format!("/agents/{id1}/software"), None).await.0, StatusCode::NOT_FOUND, "a device of another client");
+    let (s, v) = tech_b.call(Method::POST, "/software/deploy", Some(json!({ "package_id": htop_id, "op": "install", "agent_ids": [id1] }))).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "deploying to another client's device: {v}");
+    let own = tech_b.post("/software/packages", json!({ "name": "Tech's own (e2e)", "client_id": b_id, "apt_name": "tech-own" })).await;
+    assert!(own["client_name"].is_string());
+    assert_eq!(tech_b.call(Method::DELETE, &format!("/software/packages/{}", item(&own)), None).await.0, StatusCode::OK);
+
+    // --- uploaded installers: stored, hashed, served to the agent that may use them -----------------------
+    let msi = {
+        let mut b = vec![0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
+        b.extend(pattern(4096, 7));
+        b
+    };
+    let upload = |id: String, name: &'static str, bytes: Vec<u8>| async move {
+        let form = reqwest::multipart::Form::new().part("file", reqwest::multipart::Part::bytes(bytes).file_name(name));
+        let res = admin.http.post(format!("{}/software/packages/{id}/installer", admin.base)).multipart(form).send().await.unwrap();
+        let s = res.status();
+        (s, res.json::<Value>().await.unwrap_or(Value::Null))
+    };
+    assert_eq!(upload(acme_id.clone(), "acme.msi", b"MZ not an msi".to_vec()).await.0, StatusCode::BAD_REQUEST, "the name and the bytes must agree");
+    assert_eq!(upload(acme_id.clone(), "acme.zip", msi.clone()).await.0, StatusCode::BAD_REQUEST);
+    let (s, up) = upload(acme_id.clone(), "acme.msi", msi.clone()).await;
+    assert_eq!(s, StatusCode::OK, "{up}");
+    assert_eq!((up["installer"]["kind"].as_str(), up["installer"]["sha256"].as_str(), up["platforms"].clone()), (Some("msi"), Some(sha256(&msi).as_str()), json!(["windows"])), "{up}");
+    assert!(!up.to_string().contains("attachments/"), "the storage key isn't exposed");
+    let cfg = std::fs::read_to_string(dir.join("a1.toml")).unwrap();
+    let secret = cfg.lines().find_map(|l| l.strip_prefix("secret = ")).unwrap().trim_matches('"').to_string();
+    let http = reqwest::Client::new();
+    let link = format!("{url}/api/agent/software/{acme_id}/installer");
+    assert_eq!(http.get(&link).send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(http.get(&link).header("X-Rmm-Agent", id1).header("Authorization", "Bearer wrong").send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    let res = http.get(&link).header("X-Rmm-Agent", id1).header("Authorization", format!("Bearer {secret}")).send().await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.bytes().await.unwrap(), msi, "the file comes back byte for byte");
+    let res = http.get(&link).header("X-Rmm-Agent", id1).header("Authorization", format!("Bearer {secret}")).header("Range", "bytes=10-19").send().await.unwrap();
+    assert_eq!((res.status(), res.bytes().await.unwrap().to_vec()), (StatusCode::PARTIAL_CONTENT, msi[10..20].to_vec()));
+    // Another client's installer isn't for this device.
+    assert_eq!(upload(b_only_id.clone(), "b.msi", msi.clone()).await.0, StatusCode::OK);
+    let res = http.get(format!("{url}/api/agent/software/{b_only_id}/installer")).header("X-Rmm-Agent", id1).header("Authorization", format!("Bearer {secret}")).send().await.unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    // An EXE package needs its arguments and the version; a replaced upload removes the old file.
+    let (s, v) = admin.call(Method::PUT, &format!("/software/packages/{acme_id}"), Some(json!({ "name": "Acme Tool (e2e)", "silent_args": "" }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "an uploaded installer needs the version it installs: {v}");
+    admin.put(&format!("/software/packages/{acme_id}"), json!({ "name": "Acme Tool (e2e)", "version": "2.0.0", "silent_args": "/qn", "product_code": "{11111111-2222-3333-4444-555555555555}" })).await;
+    let gone = admin.call(Method::DELETE, &format!("/software/packages/{acme_id}/installer"), None).await;
+    assert_eq!(gone.0, StatusCode::OK);
+    assert_eq!(http.get(&link).header("X-Rmm-Agent", id1).header("Authorization", format!("Bearer {secret}")).send().await.unwrap().status(), StatusCode::NOT_FOUND);
+
+    // --- a device scans the catalog and reports what it has ------------------------------------------------
+    let (s, v) = admin.call(Method::GET, &format!("/agents/{id1}/software"), None).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["capable"], true, "the agent announces the software capability: {v}");
+    admin.post("/software/scan", json!({ "agent_ids": [id1] })).await;
+    let sw = {
+        let this = admin;
+        let want = htop_id.as_str();
+        eventually(30, "the first software scan", move || async move {
+            let v = this.get(&format!("/agents/{id1}/software?all=true")).await;
+            // The device scanned when it connected, before the catalog existed: wait for the scan
+            // just asked for, which is the first to have looked for this package.
+            let looked = v["items"].as_array().is_some_and(|a| a.iter().any(|i| i["package_id"] == want && i["checked_at"].is_string()));
+            (v["scanned_at"].is_string() && looked).then_some(v)
+        })
+        .await
+    };
+    assert_eq!(sw["providers"], json!(["fake"]), "{sw}");
+    let htop_row = |v: &Value| v["items"].as_array().unwrap().iter().find(|i| i["package_id"] == htop_id.as_str()).cloned();
+    let row = htop_row(&sw).expect("the catalog package is listed");
+    assert_eq!((row["installed"].clone(), row["provider"].as_str(), row["desired"].clone()), (Value::Null, Some("fake"), Value::Null), "{row}");
+    assert!(sw["items"].as_array().unwrap().iter().all(|i| i["package_id"] != b_only_id.as_str()), "another client's package isn't offered to this device");
+
+    // --- deploying by hand -----------------------------------------------------------------------------
+    let (s, v) = admin.call(Method::POST, "/software/deploy", Some(json!({ "package_id": htop_id, "op": "sideways", "agent_ids": [id1] }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    let r = admin.post("/software/deploy", json!({ "package_id": b_only_id, "op": "install", "agent_ids": [id1] })).await;
+    assert!(r["runs"].as_array().unwrap().is_empty() && r["skipped"][0]["reason"].as_str().unwrap().contains("another client"), "{r}");
+    let r = admin.post("/software/deploy", json!({ "package_id": acme_id, "op": "install", "agent_ids": [id1] })).await;
+    assert!(r["runs"].as_array().unwrap().is_empty() && r["skipped"][0]["reason"].as_str().unwrap().contains("no id or installer"), "{r}");
+    let wait_run = |rid: String| async move {
+        let rid = rid.as_str();
+        eventually(40, "the software run to finish", move || async move {
+            let r = admin.get(&format!("/software/runs/{rid}")).await;
+            (!matches!(r["status"].as_str(), Some("queued" | "sent"))).then_some(r)
+        })
+        .await
+    };
+    let r = admin.post("/software/deploy", json!({ "package_id": htop_id, "op": "install", "agent_ids": [id1] })).await;
+    assert_eq!(r["runs"].as_array().unwrap().len(), 1, "{r}");
+    let run = wait_run(r["runs"][0]["run_id"].as_str().unwrap().to_string()).await;
+    assert_eq!((run["status"].as_str(), run["provider"].as_str(), run["to_version"].as_str(), run["trigger"].as_str()), (Some("succeeded"), Some("fake"), Some("1.0.0"), Some("manual")), "{run}");
+    assert!(run["output"].as_str().unwrap().contains("install htop-e2e"), "the agent's log is kept: {run}");
+    assert_eq!(fake_state()["installed"]["htop-e2e"], "1.0.0", "the provider really ran");
+    let v = admin.get(&format!("/agents/{id1}/software")).await;
+    assert_eq!(htop_row(&v).unwrap()["installed"], "1.0.0", "{v}");
+    assert!(v["runs"].as_array().unwrap().iter().any(|r| r["package_name"] == "Htop (e2e)" && r["status"] == "succeeded"));
+    let devices = admin.get(&format!("/software/packages/{htop_id}/devices")).await;
+    assert!(devices["items"].as_array().unwrap().iter().any(|d| d["agent_id"] == id1 && d["installed"] == "1.0.0"), "{devices}");
+    assert!(audit_count(db, "software.deploy").await >= 1 && audit_count(db, "agent.software_result").await >= 1);
+    let listed = admin.get("/software/packages?q=htop").await;
+    assert_eq!((listed[0]["installed_on"].as_i64(), listed[0]["updates"].as_i64()), (Some(1), Some(0)), "{listed}");
+
+    // --- updates to third-party software: found, skipped, offered again, installed ----------------------------
+    set_fake(json!({ "installed": { "htop-e2e": "1.0.0" }, "available": { "htop-e2e": "2.0.0" } }));
+    admin.post("/software/scan", json!({ "agent_ids": [id1] })).await;
+    let ups = {
+        let this = admin;
+        let pid = htop_id.clone();
+        eventually(30, "the update to show up", move || {
+            let pid = pid.clone();
+            async move {
+                let u = this.get("/software/updates").await;
+                u["items"].as_array().unwrap().iter().any(|i| i["package_id"] == pid.as_str() && i["available"] == "2.0.0").then_some(u)
+            }
+        })
+        .await
+    };
+    assert_eq!(ups["packages"][0]["devices"], 1, "{ups}");
+    let one = json!({ "items": [{ "agent_id": id1, "package_id": htop_id }] });
+    admin.post("/software/updates/ignore", one.clone()).await;
+    assert!(admin.get("/software/updates").await["items"].as_array().unwrap().is_empty(), "a skipped version is hidden");
+    assert_eq!(admin.get("/software/updates?ignored=true").await["items"][0]["ignored"], "2.0.0");
+    admin.post("/software/updates/ignore", json!({ "items": one["items"], "ignore": false })).await;
+    assert_eq!(admin.get("/software/updates").await["items"].as_array().unwrap().len(), 1);
+    let r = admin.post("/software/updates/install", one.clone()).await;
+    let run = wait_run(r["runs"][0]["run_id"].as_str().unwrap().to_string()).await;
+    assert_eq!((run["op"].as_str(), run["status"].as_str(), run["from_version"].as_str(), run["to_version"].as_str()), (Some("upgrade"), Some("succeeded"), Some("1.0.0"), Some("2.0.0")), "{run}");
+    assert!(admin.get("/software/updates").await["items"].as_array().unwrap().is_empty(), "installed: nothing on offer");
+    let r = admin.post("/software/updates/install", one).await;
+    assert!(r["runs"].as_array().unwrap().is_empty() && r["skipped"][0]["reason"].as_str().unwrap().contains("no update"), "{r}");
+
+    // --- desired state: a requirement in a policy set ------------------------------------------------------------
+    let (s, v) = admin.call(Method::POST, &format!("/policy-sets/{ROOT_SET}/items"), Some(json!({ "module": "software", "name": "bad", "config": { "package_id": uuid::Uuid::new_v4(), "state": "present" } }))).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "the package must exist: {v}");
+    let (s, v) = admin.call(Method::POST, &format!("/policy-sets/{ROOT_SET}/items"), Some(json!({ "module": "software", "name": "bad", "config": { "package_id": b_only_id, "state": "present" }, "client_id": a_id }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "another client's package can't be required here: {v}");
+    let (s, v) = admin.call(Method::POST, &format!("/policy-sets/{ROOT_SET}/items"), Some(json!({ "module": "software", "name": "bad", "config": { "package_id": htop_id, "state": "sometimes" } }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    let req = admin
+        .post(
+            &format!("/policy-sets/{ROOT_SET}/items"),
+            json!({ "module": "software", "name": "Htop gone (e2e)", "config": { "package_id": htop_id, "state": "absent" }, "client_id": a_id }),
+        )
+        .await;
+    let req_id = item(&req);
+    let installed_is = |want: Option<&'static str>, what: &'static str| {
+        let pid = htop_id.clone();
+        async move {
+            eventually(60, what, || {
+                let pid = pid.clone();
+                async move {
+                    let v = admin.get(&format!("/agents/{id1}/software")).await;
+                    let row = v["items"].as_array().unwrap().iter().find(|i| i["package_id"] == pid.as_str()).cloned()?;
+                    (row["installed"].as_str() == want).then_some(row)
+                }
+            })
+            .await
+        }
+    };
+    let row = installed_is(None, "the policy to remove the package").await;
+    assert_eq!((row["desired"].as_str(), row["compliant"].as_bool()), (Some("absent"), Some(true)), "{row}");
+    let policy_runs = admin.get(&format!("/software/runs?agent_id={id1}&package_id={htop_id}")).await;
+    assert!(policy_runs.as_array().unwrap().iter().any(|r| r["trigger"] == "policy" && r["op"] == "uninstall" && r["status"] == "succeeded" && r["policy_item_id"] == req_id.as_str()), "{policy_runs}");
+    assert_eq!(fake_state()["installed"].get("htop-e2e"), None);
+    let (s, v) = admin.call(Method::DELETE, &format!("/software/packages/{htop_id}"), None).await;
+    assert_eq!(s, StatusCode::CONFLICT, "a required package can't be deleted: {v}");
+    assert!(v["error"].as_str().unwrap().contains("All devices"), "{v}");
+
+    // present: installed again, and left alone when a newer version appears
+    admin.put(&format!("/policy-items/{req_id}"), json!({ "config": { "package_id": htop_id, "state": "present" } })).await;
+    installed_is(Some("1.0.0"), "the policy to install the package").await;
+    set_fake(json!({ "installed": { "htop-e2e": "2.0.0" }, "available": { "htop-e2e": "3.0.0" } }));
+    admin.post("/software/scan", json!({ "agent_ids": [id1] })).await;
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert_eq!(fake_state()["installed"]["htop-e2e"], "2.0.0", "present doesn't chase upgrades");
+    let row = installed_is(Some("2.0.0"), "the scan").await;
+    assert_eq!((row["available"].as_str(), row["compliant"].as_bool()), (Some("3.0.0"), Some(true)), "{row}");
+    // latest: upgraded as soon as a newer version is on offer
+    admin.put(&format!("/policy-items/{req_id}"), json!({ "config": { "package_id": htop_id, "state": "latest" } })).await;
+    installed_is(Some("3.0.0"), "the policy to keep it current").await;
+
+    // a pin is a floor: older installs are brought up, newer ones are left alone
+    admin.put(&format!("/policy-items/{req_id}"), json!({ "config": { "package_id": htop_id, "state": "present" } })).await;
+    let pkg_body = |version: Value| json!({ "name": "Htop (e2e)", "apt_name": "htop-e2e", "winget_id": "Htop.Htop", "publisher": "e2e", "version": version });
+    admin.put(&format!("/software/packages/{htop_id}"), pkg_body(json!("4.0.0"))).await;
+    installed_is(Some("4.0.0"), "the pin to be applied").await;
+    admin.put(&format!("/software/packages/{htop_id}"), pkg_body(json!("1.2.0"))).await;
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert_eq!(fake_state()["installed"]["htop-e2e"], "4.0.0", "newer than the pin: left alone");
+    admin.put(&format!("/software/packages/{htop_id}"), pkg_body(Value::Null)).await;
+
+    // failures back off instead of looping
+    admin.put(&format!("/policy-items/{req_id}"), json!({ "config": { "package_id": htop_id, "state": "absent" } })).await;
+    installed_is(None, "the removal").await;
+    let mut st = fake_state();
+    st["fail"] = json!(["htop-e2e"]);
+    set_fake(st);
+    admin.put(&format!("/policy-items/{req_id}"), json!({ "config": { "package_id": htop_id, "state": "present" } })).await;
+    let failed = eventually(60, "the failing install", || async {
+        let r = admin.get(&format!("/software/runs?agent_id={id1}&package_id={htop_id}&status=failed")).await;
+        r.as_array().and_then(|l| l.first().cloned())
+    })
+    .await;
+    assert!(failed["error"].as_str().unwrap().contains("simulated failure") && failed["trigger"] == "policy", "{failed}");
+    let fails: i32 = sqlx::query_scalar("SELECT fail_count FROM software_state WHERE agent_id = $1::uuid AND package_id = $2::uuid").bind(id1).bind(&htop_id).fetch_one(db).await.unwrap();
+    assert_eq!(fails, 1);
+    let count = || async { admin.get(&format!("/software/runs?agent_id={id1}&package_id={htop_id}")).await.as_array().unwrap().len() };
+    let before = count().await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(count().await, before, "no retry before the back-off ends");
+    let row = admin.get(&format!("/agents/{id1}/software")).await["items"].as_array().unwrap().iter().find(|i| i["package_id"] == htop_id.as_str()).cloned().unwrap();
+    assert_eq!((row["compliant"].as_bool(), row["fail_count"].as_i64()), (Some(false), Some(1)), "{row}");
+    // Fixing the package (or the cause) lets it try again straight away.
+    let mut st = fake_state();
+    st["fail"] = json!([]);
+    set_fake(st);
+    admin.put(&format!("/software/packages/{htop_id}"), pkg_body(Value::Null)).await;
+    installed_is(Some("1.0.0"), "the retry after the package changed").await;
+
+    // a provider that says "done" without installing is a failure, not a success
+    admin.put(&format!("/policy-items/{req_id}"), json!({ "config": { "package_id": htop_id, "state": "absent" } })).await;
+    installed_is(None, "the removal").await;
+    let mut st = fake_state();
+    st["ghost"] = json!(["htop-e2e"]);
+    set_fake(st);
+    let r = admin.post("/software/deploy", json!({ "package_id": htop_id, "op": "install", "agent_ids": [id1] })).await;
+    let run = wait_run(r["runs"][0]["run_id"].as_str().unwrap().to_string()).await;
+    assert_eq!(run["status"], "failed", "{run}");
+    assert!(run["error"].as_str().unwrap().contains("isn't installed"), "{run}");
+    let mut st = fake_state();
+    st["ghost"] = json!([]);
+    set_fake(st);
+
+    // --- a device joins a set: its requirements arrive with it -------------------------------------------------
+    admin.delete_policy(&req_id).await;
+    let leaf = admin.get(&format!("/agents/{id1}/policy")).await["set"]["id"].as_str().unwrap().to_string();
+    let a_set = admin.post("/policy-sets", json!({ "name": "Software (e2e)", "parent_id": leaf, "client_id": a_id })).await;
+    let a_set_id = item(&a_set);
+    let join = admin
+        .post(
+            &format!("/policy-sets/{a_set_id}/items"),
+            json!({ "module": "software", "name": "A only, present", "config": { "package_id": a_only_id, "state": "present" } }),
+        )
+        .await;
+    assert_eq!(join["limit"]["client_id"], a_id, "a client's set limits its items to the client: {join}");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(fake_state()["installed"].get("a-only-e2e"), None, "no device uses the set yet");
+    admin.put(&format!("/agents/{id1}/policy-pin"), json!({ "policy_set_id": a_set_id })).await;
+    eventually(60, "the device to get the new set's requirement", || async {
+        (fake_state()["installed"].get("a-only-e2e").is_some()).then_some(())
+    })
+    .await;
+    let v = admin.get(&format!("/agents/{id1}/software")).await;
+    let row = v["items"].as_array().unwrap().iter().find(|i| i["package_id"] == a_only_id.as_str()).cloned().unwrap();
+    assert_eq!((row["desired"].as_str(), row["compliant"].as_bool()), (Some("present"), Some(true)), "{row}");
+    // The policy page of the device lists the requirement.
+    let pol = admin.get(&format!("/agents/{id1}/policy")).await;
+    assert!(pol["policies"].as_array().unwrap().iter().any(|p| p["module"] == "software"), "{pol}");
+    // Overrides: a set below can turn the requirement around, but not swap the package.
+    let child = admin.post("/policy-sets", json!({ "name": "Software child (e2e)", "parent_id": a_set_id })).await;
+    let child_id = item(&child);
+    let (s, v) = admin.call(Method::PUT, &format!("/policy-items/{}/overrides/{child_id}", item(&join)), Some(json!({ "config": { "package_id": htop_id } }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    let ov = admin.put(&format!("/policy-items/{}/overrides/{child_id}", item(&join)), json!({ "config": { "state": "absent" } })).await;
+    assert_eq!(ov["config"]["state"], "absent", "{ov}");
+    admin.put(&format!("/agents/{id1}/policy-pin"), json!({ "policy_set_id": child_id })).await;
+    eventually(60, "the override to take the package away", || async { fake_state()["installed"].get("a-only-e2e").is_none().then_some(()) }).await;
+    admin.put(&format!("/agents/{id1}/policy-pin"), json!({ "policy_set_id": null })).await;
+    admin.call(Method::DELETE, &format!("/policy-sets/{child_id}"), None).await;
+    admin.delete_policy(&item(&join)).await;
+    let (s, _) = admin.call(Method::DELETE, &format!("/policy-sets/{a_set_id}"), None).await;
+    assert_eq!(s, StatusCode::OK);
+
+    // --- the public API ----------------------------------------------------------------------------------------
+    let made = admin.post("/api-keys", json!({ "name": "e2e software", "access": "write", "scopes": ["software"], "client_ids": [a_id] })).await;
+    let token = made["token"].as_str().unwrap().to_string();
+    let v1 = format!("{url}/api/v1");
+    let (s, v, _) = key_call(&token, &v1, Method::GET, "/software/packages", None).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert!(names(&v).contains(&"Htop (e2e)".to_string()) && !names(&v).contains(&"B only (e2e)".to_string()), "a key sees what its clients see: {v}");
+    let (s, v, _) = key_call(&token, &v1, Method::GET, &format!("/agents/{id1}/software"), None).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let (s, _, _) = key_call(&token, &v1, Method::GET, "/agents", None).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "the key has the software scope only");
+    let (s, v, _) = key_call(&token, &v1, Method::POST, "/software/deploy", Some(json!({ "package_id": htop_id, "op": "install", "agent_ids": [id1] }))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    wait_run(v["runs"][0]["run_id"].as_str().unwrap().to_string()).await;
+    let (s, _, _) = key_call(&token, &v1, Method::POST, "/software/scan", Some(json!({ "agent_ids": [id1] }))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "scans aren't public");
+    let spec: Value = http.get(format!("{url}/api/v1/openapi.json")).send().await.unwrap().json().await.unwrap();
+    assert!(spec["paths"]["/software/deploy"]["post"]["operationId"] == "deploySoftware" && spec["components"]["schemas"]["SoftwareRun"].is_object(), "documented");
+    assert!(spec["paths"].get("/software/updates/install").is_none(), "only the public operations are described");
+    admin.call(Method::DELETE, &format!("/api-keys/{}", made["key"]["id"].as_str().unwrap()), None).await;
+
+    // clean up: the catalog goes (the device keeps what it has)
+    for id in [&htop_id, &acme_id, &b_only_id, &a_only_id] {
+        let (s, v) = admin.call(Method::DELETE, &format!("/software/packages/{id}"), None).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+    }
+    let (s, _) = admin.call(Method::GET, &format!("/software/packages/{htop_id}"), None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    let runs = admin.get(&format!("/software/runs?agent_id={id1}")).await;
+    assert!(runs.as_array().unwrap().iter().any(|r| r["package_id"].is_null() && r["package_name"] == "Htop (e2e)"), "runs outlive the package they installed");
+}
+
+/// Tags, custom fields (with script output → field), agent notes and saved views
+/// (docs/design/fields.md): who may do what, what is validated, scoping to a client, the audit
+/// log, and the same data through an API key.
+async fn fields_tags_notes_views(url: &str, admin: &Api, db: &sqlx::PgPool, dir: &Path, id1: &str, a_id: &str, b_id: &str) {
+    use reqwest::Method;
+    let tech = signed_in(url, admin, "fields-tech@e2e.test", "technician", None, false).await;
+    let tech_b = signed_in(url, admin, "fields-tech-b@e2e.test", "technician", Some(b_id), false).await;
+    let readonly = signed_in(url, admin, "fields-readonly@e2e.test", "readonly", None, false).await;
+
+    // An agent of client B (never started: only its record matters here).
+    let sites = admin.get("/sites").await;
+    let b_site = sites.as_array().unwrap().iter().find(|s| s["client_id"] == b_id).unwrap()["id"].as_str().unwrap().to_string();
+    let b_token = admin.post(&format!("/sites/{b_site}/enrollment-tokens"), json!({ "label": "fields" })).await["token"].as_str().unwrap().to_string();
+    let b_agent = Agent::new(dir, "fields-b").enroll(url, &b_token).unwrap();
+
+    // --- tags ------------------------------------------------------------------------------------------------------
+    let (s, v) = readonly.call(Method::POST, "/tags", Some(json!({ "name": "VIP" }))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "read-only users can't create tags: {v}");
+    let vip = tech.post("/tags", json!({ "name": " VIP ", "color": "red" })).await;
+    assert_eq!((vip["name"].as_str(), vip["color"].as_str()), (Some("VIP"), Some("red")), "{vip}");
+    let vip_id = vip["id"].as_str().unwrap().to_string();
+    let (s, v) = tech.call(Method::POST, "/tags", Some(json!({ "name": "vip" }))).await;
+    assert_eq!(s, StatusCode::CONFLICT, "names are unique ignoring case: {v}");
+    for body in [json!({ "name": "" }), json!({ "name": "x".repeat(41) }), json!({ "name": "ok", "color": "#f00" })] {
+        assert_eq!(tech.call(Method::POST, "/tags", Some(body)).await.0, StatusCode::BAD_REQUEST);
+    }
+    let server_tag = tech.post("/tags", json!({ "name": "Servers" })).await["id"].as_str().unwrap().to_string();
+    let (s, _) = tech.call(Method::PUT, &format!("/tags/{vip_id}"), Some(json!({ "color": "blue" }))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "recolouring a shared tag is for admins");
+    admin.put(&format!("/tags/{vip_id}"), json!({ "color": "violet" })).await;
+
+    // Putting tags on agents: scoped to the agents the user can see.
+    let (s, _) = tech_b.call(Method::PUT, &format!("/agents/{id1}/tags"), Some(json!({ "tag_ids": [vip_id] }))).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "an agent of another client isn't there");
+    let (s, _) = readonly.call(Method::PUT, &format!("/agents/{id1}/tags"), Some(json!({ "tag_ids": [vip_id] }))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    let (s, _) = tech.call(Method::PUT, &format!("/agents/{id1}/tags"), Some(json!({ "tag_ids": [uuid::Uuid::nil()] }))).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "an unknown tag");
+    tech.put(&format!("/agents/{id1}/tags"), json!({ "tag_ids": [vip_id, server_tag, vip_id] })).await;
+    let a = admin.get(&format!("/agents/{id1}")).await;
+    let names: Vec<&str> = a["tags"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["Servers", "VIP"], "by name: {a}");
+    assert_eq!(a["tags"][1]["color"], "violet");
+    // Bulk: add to both agents of A and B's agent, all or nothing.
+    let (s, _) = tech_b.call(Method::POST, "/agents/tags", Some(json!({ "agent_ids": [b_agent, id1], "add": [vip_id] }))).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "one agent out of reach refuses the whole request");
+    let r = tech_b.post("/agents/tags", json!({ "agent_ids": [b_agent], "add": [vip_id, server_tag] })).await;
+    assert_eq!((r["agents"].as_i64(), r["added"].as_i64()), (Some(1), Some(2)), "{r}");
+    let (s, _) = tech.call(Method::POST, "/agents/tags", Some(json!({ "agent_ids": [id1], "add": [vip_id], "remove": [vip_id] }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let r = tech.post("/agents/tags", json!({ "agent_ids": [id1, b_agent], "remove": [server_tag] })).await;
+    assert_eq!(r["removed"].as_i64(), Some(2), "{r}");
+    // The tag list counts only the agents the user can see.
+    let count = |tags: &Value, id: &str| tags.as_array().unwrap().iter().find(|t| t["id"] == id).unwrap()["agents"].as_i64().unwrap();
+    assert_eq!(count(&admin.get("/tags").await, &vip_id), 2);
+    assert_eq!(count(&tech_b.get("/tags").await, &vip_id), 1, "client B's technician sees one");
+    // The agents list filters on tags (all of them).
+    let list = |q: String| async move { admin.get(&format!("/agents{q}")).await };
+    let both = list(format!("?tag={vip_id}")).await;
+    assert_eq!(both["total"].as_i64(), Some(2), "{both}");
+    tech.put(&format!("/agents/{id1}/tags"), json!({ "tag_ids": [vip_id, server_tag] })).await;
+    let only = list(format!("?tag={vip_id},{server_tag}")).await;
+    assert_eq!((only["total"].as_i64(), only["items"][0]["id"].as_str()), (Some(1), Some(id1)), "{only}");
+    assert_eq!(admin.call(Method::GET, "/agents?tag=nope", None).await.0, StatusCode::BAD_REQUEST);
+
+    // --- custom fields: definitions --------------------------------------------------------------------------------
+    let def = |entity: &str, name: &str, kind: &str, extra: Value| {
+        let mut b = json!({ "entity": entity, "name": name, "label": name.replace('_', " "), "kind": kind });
+        b.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        b
+    };
+    let (s, _) = tech.call(Method::POST, "/custom-fields", Some(def("agent", "owner", "text", json!({})))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "definitions are for admins");
+    for (what, body) in [
+        ("bad name", def("agent", "Owner Name", "text", json!({}))),
+        ("bad kind", def("agent", "x1", "json", json!({}))),
+        ("select without options", def("agent", "x2", "select", json!({}))),
+        ("options on a text field", def("agent", "x3", "text", json!({ "options": ["a"] }))),
+        ("duplicate options", def("agent", "x4", "select", json!({ "options": ["a", "A"] }))),
+        ("script-writable client field", def("client", "x5", "text", json!({ "script_writable": true }))),
+        ("a client field limited to a client", def("client", "x6", "text", json!({ "client_id": a_id }))),
+        ("bad entity", def("ticket", "x7", "text", json!({}))),
+    ] {
+        assert_eq!(admin.call(Method::POST, "/custom-fields", Some(body)).await.0, StatusCode::BAD_REQUEST, "{what}");
+    }
+    let warranty = admin.post("/custom-fields", def("agent", "warranty_end", "date", json!({ "script_writable": true }))).await;
+    let owner = admin.post("/custom-fields", def("agent", "owner", "text", json!({}))).await;
+    let tier = admin.post("/custom-fields", def("agent", "tier", "select", json!({ "options": ["Gold", "Silver"], "script_writable": true }))).await;
+    admin.post("/custom-fields", def("agent", "seats", "number", json!({ "script_writable": true }))).await;
+    admin.post("/custom-fields", def("agent", "managed", "bool", json!({ "script_writable": true }))).await;
+    let only_b = admin.post("/custom-fields", def("agent", "b_only", "text", json!({ "client_id": b_id, "script_writable": true }))).await;
+    let client_field = admin.post("/custom-fields", def("client", "account_manager", "text", json!({}))).await;
+    let site_field = admin.post("/custom-fields", def("site", "rack", "text", json!({}))).await;
+    let (s, v) = admin.call(Method::POST, "/custom-fields", Some(def("agent", "owner", "text", json!({})))).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    let id_of = |v: &Value| v["id"].as_str().unwrap().to_string();
+    let (warranty_id, owner_id, tier_id, b_only_id) = (id_of(&warranty), id_of(&owner), id_of(&tier), id_of(&only_b));
+    // A field limited to client B is invisible to a technician of client A... who has all clients here, so
+    // check with B's technician and an A-only one instead.
+    let tech_a = signed_in(url, admin, "fields-tech-a@e2e.test", "technician", Some(a_id), false).await;
+    let seen = |defs: &Value| defs.as_array().unwrap().iter().map(|d| d["name"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+    assert!(seen(&tech_a.get("/custom-fields?entity=agent").await).iter().all(|n| n != "b_only"), "limited to B");
+    assert!(seen(&tech_b.get("/custom-fields?entity=agent").await).contains(&"b_only".to_string()));
+    assert_eq!(tech_a.call(Method::GET, "/custom-fields?entity=ticket", None).await.0, StatusCode::BAD_REQUEST);
+    let (s, _) = admin.call(Method::PUT, &format!("/custom-fields/{tier_id}"), Some(json!({ "options": ["Gold", "Silver", "Bronze"], "label": "Support tier" }))).await;
+    assert!(s.is_success());
+    assert_eq!(admin.get("/custom-fields?entity=agent").await.as_array().unwrap().iter().find(|d| d["name"] == "tier").unwrap()["options"].as_array().unwrap().len(), 3);
+
+    // --- values: typed, checked before anything is stored ------------------------------------------------------------
+    async fn fields(api: &Api, id: String) -> Value {
+        api.get(&format!("/agents/{id}/fields")).await
+    }
+    let value_of = |v: &Value, name: &str| v.as_array().unwrap().iter().find(|f| f["name"] == name).map(|f| f["value"].clone());
+    let initial = fields(admin, id1.to_string()).await;
+    assert_eq!(value_of(&initial, "warranty_end"), Some(Value::Null));
+    assert_eq!(value_of(&initial, "b_only"), None, "client B's field doesn't apply to client A's agent");
+    let path = format!("/agents/{id1}/fields");
+    for (what, values) in [
+        ("a bad date", json!({ "warranty_end": "01/03/2027" })),
+        ("a bad select", json!({ "tier": "Platinum" })),
+        ("a bad number", json!({ "seats": "many" })),
+        ("a bad bool", json!({ "managed": "maybe" })),
+        ("an unknown field", json!({ "nope": "x" })),
+        ("another client's field", json!({ "b_only": "x" })),
+        ("one bad value spoils the request", json!({ "owner": "Alice", "warranty_end": "tomorrow" })),
+    ] {
+        let (s, v) = tech.call(Method::PUT, &path, Some(json!({ "values": values }))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{what}: {v}");
+    }
+    assert_eq!(value_of(&fields(admin, id1.to_string()).await, "owner"), Some(Value::Null), "nothing was stored");
+    let (s, _) = readonly.call(Method::PUT, &path, Some(json!({ "values": { "owner": "x" } }))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    let (s, _) = tech_b.call(Method::PUT, &path, Some(json!({ "values": { "owner": "x" } }))).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    let set = tech
+        .put(&path, json!({ "values": { "owner": " Alice ", "warranty_end": "2027-3-1", "tier": "gold", "seats": "12", "managed": "yes" } }))
+        .await;
+    assert_eq!(value_of(&set, "owner"), Some(json!("Alice")));
+    assert_eq!(value_of(&set, "warranty_end"), Some(json!("2027-03-01")));
+    assert_eq!(value_of(&set, "tier"), Some(json!("Gold")), "matched ignoring case");
+    assert_eq!((value_of(&set, "seats"), value_of(&set, "managed")), (Some(json!(12)), Some(json!(true))));
+    assert_eq!(set.as_array().unwrap().iter().find(|f| f["name"] == "owner").unwrap()["source"], "user");
+    // Clearing, and leaving the rest alone.
+    let set = tech.put(&path, json!({ "values": { "owner": null } })).await;
+    assert_eq!((value_of(&set, "owner"), value_of(&set, "tier")), (Some(Value::Null), Some(json!("Gold"))));
+    tech.put(&path, json!({ "values": { "owner": "Alice" } })).await;
+    // Client and site fields follow the client's scoping.
+    let (client_field_id, site_field_id) = (id_of(&client_field), id_of(&site_field));
+    tech.put(&format!("/clients/{a_id}/fields"), json!({ "values": { "account_manager": "Bob" } })).await;
+    assert_eq!(value_of(&tech.get(&format!("/clients/{a_id}/fields")).await, "account_manager"), Some(json!("Bob")));
+    assert_eq!(tech_b.call(Method::GET, &format!("/clients/{a_id}/fields"), None).await.0, StatusCode::NOT_FOUND);
+    let a_site = admin.get("/sites").await.as_array().unwrap().iter().find(|s| s["client_id"] == a_id).unwrap()["id"].as_str().unwrap().to_string();
+    tech.put(&format!("/sites/{a_site}/fields"), json!({ "values": { "rack": "R12" } })).await;
+    assert_eq!(value_of(&tech.get(&format!("/sites/{a_site}/fields")).await, "rack"), Some(json!("R12")));
+    assert_eq!(tech_b.call(Method::GET, &format!("/sites/{a_site}/fields"), None).await.0, StatusCode::NOT_FOUND);
+    // The agents list filters on a field: exact for typed fields, a substring for text.
+    let by_owner = list(format!("?cf={owner_id}&cfv=lic")).await;
+    assert_eq!(by_owner["total"].as_i64(), Some(1), "a substring of a text field: {by_owner}");
+    let by_tier = list(format!("?cf={tier_id}&cfv=gold")).await;
+    assert_eq!(by_tier["total"].as_i64(), Some(1), "{by_tier}");
+    assert_eq!(list(format!("?cf={tier_id}&cfv=Silver")).await["total"].as_i64(), Some(0));
+    assert_eq!(list(format!("?cf={warranty_id}")).await["total"].as_i64(), Some(1), "any value");
+    assert_eq!(admin.call(Method::GET, &format!("/agents?cf={client_field_id}"), None).await.0, StatusCode::BAD_REQUEST, "agent fields only");
+    assert_eq!(admin.call(Method::GET, &format!("/agents?cf={tier_id}&cfv=Platinum"), None).await.0, StatusCode::BAD_REQUEST);
+    assert!(site_field_id.len() == 36);
+
+    // --- script output → field --------------------------------------------------------------------------------------
+    let marker = |body: &str| {
+        let body = body.to_string();
+        async move {
+            let job = admin.run_script(id1, &body, 30).await;
+            let j = admin.wait_job(&job, 30).await;
+            assert_eq!(j["status"], "succeeded", "{j}");
+            // The server reads the output when the result arrives; the values land just after.
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            job
+        }
+    };
+    let job = marker(
+        "echo 'RMM-FIELD warranty_end=2028-01-31'; echo 'RMM-FIELD tier=silver'; echo 'RMM-FIELD seats=abc'; echo 'RMM-FIELD owner=Mallory'; \
+         echo 'RMM-FIELD b_only=x'; echo 'RMM-FIELD nope=1'; echo 'RMM-FIELD managed=no'; echo 'RMM-FIELD managed=true'; echo ' RMM-FIELD seats=99'",
+    )
+    .await;
+    let vals = fields(admin, id1.to_string()).await;
+    assert_eq!(value_of(&vals, "warranty_end"), Some(json!("2028-01-31")));
+    assert_eq!(value_of(&vals, "tier"), Some(json!("Silver")));
+    assert_eq!(value_of(&vals, "managed"), Some(json!(true)), "the last line of a name wins");
+    assert_eq!(value_of(&vals, "seats"), Some(json!(12)), "a value that doesn't fit is skipped, an indented marker isn't one");
+    assert_eq!(value_of(&vals, "owner"), Some(json!("Alice")), "a field nobody flagged can't be written by a script");
+    assert_eq!(vals.as_array().unwrap().iter().find(|f| f["name"] == "warranty_end").unwrap()["source"], "script");
+    let audit: Value = sqlx::query_scalar("SELECT details FROM audit_log WHERE action = 'agent.field_script' ORDER BY ts DESC LIMIT 1").fetch_one(db).await.unwrap();
+    assert_eq!(audit["job_id"], job.as_str());
+    let reasons: Vec<String> = audit["refused"].as_array().unwrap().iter().map(|r| format!("{}: {}", r["name"].as_str().unwrap(), r["reason"].as_str().unwrap())).collect();
+    assert!(reasons.iter().any(|r| r.starts_with("seats: expected a number")) && reasons.iter().any(|r| r.starts_with("owner: the field isn't flagged")), "{reasons:?}");
+    assert!(reasons.iter().any(|r| r.starts_with("b_only: no such field")) && reasons.iter().any(|r| r.starts_with("nope: no such field")), "{reasons:?}");
+    // A script that fails changes nothing; an empty value clears.
+    let failing = admin.run_script(id1, "echo 'RMM-FIELD tier=Gold'; exit 1", 30).await;
+    assert_eq!(admin.wait_job(&failing, 30).await["status"], "failed");
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(value_of(&fields(admin, id1.to_string()).await, "tier"), Some(json!("Silver")), "failed jobs set nothing");
+    marker("echo 'RMM-FIELD warranty_end='").await;
+    assert_eq!(value_of(&fields(admin, id1.to_string()).await, "warranty_end"), Some(Value::Null), "an empty value clears");
+    // The same script can't be told to reach another agent: the marker names a field, never an agent.
+    assert_eq!(value_of(&fields(admin, b_agent.clone()).await, "tier"), Some(Value::Null));
+
+    // Deleting a field takes its values with it, and an admin does it.
+    let (s, _) = tech.call(Method::DELETE, &format!("/custom-fields/{b_only_id}"), None).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    assert!(admin.call(Method::DELETE, &format!("/custom-fields/{b_only_id}"), None).await.0.is_success());
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM custom_field_values WHERE field_id = $1::uuid").bind(&b_only_id).fetch_one(db).await.unwrap();
+    assert_eq!(left, 0);
+
+    // --- notes -----------------------------------------------------------------------------------------------------------
+    let notes = format!("/agents/{id1}/notes");
+    assert_eq!(readonly.call(Method::POST, &notes, Some(json!({ "body": "x" }))).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(tech_b.call(Method::GET, &notes, None).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(tech.call(Method::POST, &notes, Some(json!({ "body": "   " }))).await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(tech.call(Method::POST, &notes, Some(json!({ "body": "x".repeat(10_001) }))).await.0, StatusCode::BAD_REQUEST);
+    let n1 = tech.post(&notes, json!({ "body": "Gate code is 4711\nCall ahead.", "pinned": true })).await;
+    assert_eq!((n1["author_name"].as_str(), n1["pinned"].as_bool(), n1["can_edit"].as_bool()), (Some("fields-tech@e2e.test"), Some(true), Some(true)), "{n1}");
+    let n1_id = n1["id"].as_str().unwrap().to_string();
+    let n2 = admin.post(&notes, json!({ "body": "<script>alert(1)</script> stays text" })).await;
+    let n2_id = n2["id"].as_str().unwrap().to_string();
+    assert_eq!(n2["body"], "<script>alert(1)</script> stays text", "stored as written; the dashboard shows it as text");
+    let (s, _) = tech.call(Method::PUT, &format!("{notes}/{n2_id}"), Some(json!({ "body": "mine now" }))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "only the author or an admin edits the text");
+    let pinned = tech.put(&format!("{notes}/{n2_id}"), json!({ "pinned": true })).await;
+    assert_eq!(pinned["pinned"], true, "anyone who can work on the agent pins");
+    let all = tech.get(&notes).await;
+    assert_eq!(all.as_array().unwrap().iter().filter(|n| n["pinned"] == true).count(), 1, "one pinned note: {all}");
+    assert_eq!(all[0]["id"], n2_id.as_str(), "the pinned note first");
+    assert_eq!(admin.get(&format!("/agents/{id1}")).await["pinned_note"]["id"], n2_id.as_str());
+    let edited = admin.put(&format!("{notes}/{n1_id}"), json!({ "body": "Gate code is 4712" })).await;
+    assert_eq!((edited["body"].as_str(), edited["can_edit"].as_bool()), (Some("Gate code is 4712"), Some(true)), "admins edit any note");
+    assert!(edited["updated_at"] != edited["created_at"]);
+    let (s, _) = tech.call(Method::DELETE, &format!("{notes}/{n2_id}"), None).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    assert!(admin.call(Method::DELETE, &format!("{notes}/{n2_id}"), None).await.0.is_success());
+    assert_eq!(admin.get(&format!("/agents/{id1}")).await["pinned_note"], Value::Null);
+    // --- saved views ------------------------------------------------------------------------------------------------------
+    let q = format!("client={a_id}&os=linux&sort=hostname&dir=desc&tag={vip_id}&health=");
+    let view = tech.post("/saved-views", json!({ "page": "agents", "name": "Linux of A", "query": q, "hidden_columns": ["version", "cpu"] })).await;
+    assert_eq!(view["query"], format!("client={a_id}&os=linux&sort=hostname&dir=desc&tag={vip_id}"), "re-encoded, empty values dropped: {view}");
+    assert_eq!((view["client_id"].as_str(), view["shared"].as_bool(), view["can_edit"].as_bool()), (Some(a_id), Some(false), Some(true)));
+    let view_id = view["id"].as_str().unwrap().to_string();
+    for (what, body) in [
+        ("another page", json!({ "page": "tickets", "name": "x", "query": "q=1" })),
+        ("an unknown key", json!({ "page": "agents", "name": "x", "query": "evil=1" })),
+        ("a paging cursor", json!({ "page": "agents", "name": "x", "query": "after=abc" })),
+        ("a client that isn't one", json!({ "page": "agents", "name": "x", "query": "client=nope" })),
+        ("no name", json!({ "page": "agents", "name": " ", "query": "os=linux" })),
+        ("bad column ids", json!({ "page": "agents", "name": "x", "query": "os=linux", "hidden_columns": ["a b"] })),
+    ] {
+        assert_eq!(tech.call(Method::POST, "/saved-views", Some(body)).await.0, StatusCode::BAD_REQUEST, "{what}");
+    }
+    let (s, _) = tech.call(Method::POST, "/saved-views", Some(json!({ "page": "agents", "name": "linux OF a", "query": "os=windows" }))).await;
+    assert_eq!(s, StatusCode::CONFLICT, "names are unique per person, ignoring case");
+    let (s, _) = tech_b.call(Method::POST, "/saved-views", Some(json!({ "page": "agents", "name": "A's", "query": format!("client={a_id}") }))).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "a view can't name a client its saver can't see");
+    // Personal views are private; shared ones are listed to everyone who can see their client.
+    assert_eq!(admin.get("/saved-views?page=agents").await.as_array().unwrap().len(), 0);
+    assert_eq!(tech_b.get("/saved-views").await.as_array().unwrap().len(), 0);
+    assert_eq!(tech.call(Method::GET, "/saved-views?page=agents", None).await.1.as_array().unwrap().len(), 1);
+    let (s, _) = readonly.call(Method::POST, "/saved-views", Some(json!({ "page": "agents", "name": "Mine", "query": "os=linux" }))).await;
+    assert!(s.is_success(), "everyone may keep personal views");
+    let (s, _) = readonly.call(Method::POST, "/saved-views", Some(json!({ "page": "agents", "name": "Shared", "query": "os=linux", "shared": true }))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "sharing is for technicians");
+    let shared = tech.put(&format!("/saved-views/{view_id}"), json!({ "shared": true, "name": "Linux of A (shared)", "hidden_columns": null })).await;
+    assert_eq!((shared["shared"].as_bool(), shared["hidden_columns"].clone()), (Some(true), Value::Null), "{shared}");
+    let seen_by_admin = admin.get("/saved-views?page=agents").await;
+    assert_eq!((seen_by_admin.as_array().unwrap().len(), seen_by_admin[0]["owner_name"].as_str()), (1, Some("fields-tech@e2e.test")));
+    assert_eq!(seen_by_admin[0]["can_edit"], true, "an admin can change a shared view");
+    assert_eq!(tech_b.get("/saved-views?page=agents").await.as_array().unwrap().len(), 0, "a view of client A isn't listed to B's technician");
+    let (s, _) = readonly.call(Method::PUT, &format!("/saved-views/{view_id}"), Some(json!({ "name": "hijack" }))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "a shared view is read-only for others");
+    let (s, _) = tech_b.call(Method::DELETE, &format!("/saved-views/{view_id}"), None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    assert!(tech.call(Method::DELETE, &format!("/saved-views/{view_id}"), None).await.0.is_success());
+
+    // --- audit and the public API -------------------------------------------------------------------------------------
+    let actions: Vec<String> =
+        sqlx::query_scalar("SELECT DISTINCT action FROM audit_log WHERE action IN ('tag.create','agent.tags','agent.tags_bulk','custom_field.create','agent.fields','agent.field_script','agent.note_create','saved_view.create') ")
+            .fetch_all(db)
+            .await
+            .unwrap();
+    assert_eq!(actions.len(), 8, "{actions:?}");
+    let key = admin
+        .post("/api-keys", json!({ "name": "fields key", "access": "write", "scopes": ["clients", "agents"], "client_ids": [a_id] }))
+        .await["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let v1 = format!("{url}/api/v1");
+    let (s, tags, _) = key_call(&key, &v1, Method::GET, "/tags", None).await;
+    assert!(s.is_success() && tags.as_array().unwrap().iter().any(|t| t["name"] == "VIP"), "{tags}");
+    let (s, vals, _) = key_call(&key, &v1, Method::PUT, &format!("/agents/{id1}/fields"), Some(json!({ "values": { "seats": 7 } }))).await;
+    assert!(s.is_success() && value_of(&vals, "seats") == Some(json!(7)), "{vals}");
+    assert_eq!(vals.as_array().unwrap().iter().find(|f| f["name"] == "seats").unwrap()["source"], "api");
+    let (s, _, _) = key_call(&key, &v1, Method::PUT, &format!("/agents/{b_agent}/fields"), Some(json!({ "values": { "seats": 7 } }))).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "a key sees only its client's agents");
+    let (s, note, _) = key_call(&key, &v1, Method::POST, &format!("/agents/{id1}/notes"), Some(json!({ "body": "from the API" }))).await;
+    assert!(s.is_success() && note["body"] == "from the API", "{note}");
+    let (s, v, _) = key_call(&key, &v1, Method::GET, "/saved-views", None).await;
+    assert_ne!(s, StatusCode::OK, "views aren't part of the public API: {v}");
+    let (s, spec, _) = key_call(&key, &v1, Method::GET, "/openapi.json", None).await;
+    assert!(s.is_success() && spec["paths"]["/agents/{id}/fields"]["put"]["operationId"] == "setAgentFields", "documented in the OpenAPI document");
+    println!("tags, custom fields, notes, saved views: ok");
 }

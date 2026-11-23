@@ -118,6 +118,7 @@ A policy is an item in a set: `(id, set_id, module, name, enabled, config jsonb)
 | `security` | one | every column of `security_policies` | `security_policies` |
 | `remote_access` | one | `desktop_enabled`, `desktop_consent`, `shell_enabled`, `files_enabled` | `clients.desktop_consent` |
 | `agent` | one | `auto_update` | `company_settings.auto_update_agents` |
+| `automation` | many | `trigger`, `script_id`, `args`, `timeout_secs`, trigger parameters, retry and safeguard settings | (new, [automations.md](automations.md)) |
 
 - **Single-instance modules** exist exactly once, as an item in *All devices*, seeded with
   today's defaults. They can't be deleted or added elsewhere; every other set can only
@@ -141,7 +142,7 @@ A policy is an item in a set: `(id, set_id, module, name, enabled, config jsonb)
   the file tools: list, download, upload): a disabled feature answers 403 with a message naming
   the policy set. Single-instance items are always enabled; only their fields can be overridden.
 - `agent.auto_update` replaces the company-wide switch in the automatic rollout query.
-- A `software` module is reserved for roadmap block 7 and not built now.
+- A `software` module (multi-instance, like alerts and schedules; one package requirement per item) was added later: see [software.md](software.md).
 
 ### Inheritance and overrides
 
@@ -395,6 +396,6 @@ Web (step 5):
 
 ## Not in this design
 
-- Software deployment policies (roadmap block 7).
-- Run-on-enrollment scripts and other event triggers beyond `run_script_id`.
+- Software deployment policies: see [software.md](software.md).
+- Event triggers beyond `run_script_id` are the `automation` module: see [automations.md](automations.md).
 - Importing or exporting policy sets, and policy change history beyond the audit log.

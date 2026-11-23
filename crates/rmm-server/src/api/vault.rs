@@ -32,7 +32,7 @@ const HISTORY_KEPT: i64 = 10;
 
 /// Whether `u` may see vault items at all (metadata on documents included).
 pub fn can_read(u: &User) -> bool {
-    u.has(Perm::VaultRead) && u.totp_enabled
+    u.has(Perm::VaultRead) && u.second_factor()
 }
 
 /// The access checks every vault endpoint makes, in this order: the client is one `u` sees
@@ -41,7 +41,7 @@ pub fn can_read(u: &User) -> bool {
 fn gate<'a>(st: &'a AppState, u: &User, client: Uuid, perm: Perm) -> ApiResult<&'a DataKey> {
     super::access::client(u, client)?;
     u.need(perm)?;
-    if !u.totp_enabled {
+    if !u.second_factor() {
         return Err(ApiError::Denied("turn on two-factor authentication to use the vault".into()));
     }
     st.cfg.data_key.as_ref().ok_or_else(|| ApiError::Conflict("the vault needs RMM_DATA_KEY to be set on the server".into()))

@@ -33,6 +33,13 @@ const pages: [string, string][] = [
 	['policy-set-remote', '/policies/sets/ps-acme-tills?section=remote'],
 	['policy-set-schedule', '/policies/sets/00000000-0000-4000-8001-000000000002?section=schedules&item=sc-1'],
 	['policy-set-schedules-empty', '/policies/sets/ps-dc?section=schedules'],
+	['policy-set-automations', '/policies/sets/00000000-0000-4000-8001-000000000000?section=automations'],
+	['policy-set-automation-once', '/policies/sets/00000000-0000-4000-8001-000000000000?section=automations&item=au-addon'],
+	['policy-set-automation-tag', '/policies/sets/00000000-0000-4000-8001-000000000000?section=automations&item=au-tag'],
+	['policy-set-automation-field', '/policies/sets/00000000-0000-4000-8001-000000000000?section=automations&item=au-field'],
+	['policy-set-automation-event', '/policies/sets/00000000-0000-4000-8001-000000000002?section=automations&item=au-disk'],
+	['policy-set-automation-overridden', '/policies/sets/00000000-0000-4000-8001-000000000012?section=automations&item=au-addon'],
+	['policy-new-automation', '/policies/sets/00000000-0000-4000-8001-000000000000?section=automations&item=new'],
 	['policy-set-devices', '/policies/sets/ps-acme-win?section=devices'],
 	['policy-set-children', '/policies/sets/00000000-0000-4000-8001-000000000012?section=children'],
 	['policy-new', '/policies/sets/00000000-0000-4000-8001-000000000000?section=alerts&item=new'],
@@ -43,6 +50,14 @@ const pages: [string, string][] = [
 	['schedule', '/schedules/sc-2'],
 	['notifications', '/settings/notifications'],
 	['agent-patches', '/agents/a-3?tab=patches'],
+	['agent-deployments', '/agents/a-1?tab=deployments'],
+	['policy-set-software', '/policies/sets/ps-acme-win?section=software'],
+	['policy-set-software-item', '/policies/sets/ps-acme-win?section=software&item=sw-req'],
+	['software', '/software'],
+	['software-updates', '/software?tab=updates'],
+	['software-history', '/software?tab=runs'],
+	['software-package', '/software/sw-ff'],
+	['software-run', '/software/runs/sr-2'],
 	['agent-patches-windows', '/agents/a-1?tab=patches'],
 	['security', '/security'],
 	['security-detections', '/security?tab=detections&view=all'],
@@ -78,6 +93,7 @@ const pages: [string, string][] = [
 	['audit', '/audit'],
 	['settings', '/settings'],
 	['users', '/settings/users'],
+	['settings-sso', '/settings/sso'],
 	['account', '/account'],
 	['tickets', '/tickets'],
 	['tickets-triage', '/tickets?view=triage'],
@@ -91,16 +107,36 @@ const pages: [string, string][] = [
 	['client-password', '/clients/c-acme?tab=passwords&item=6f1c0c1e-9a51-4c0e-b6c9-0a4de1f3a111'],
 	['settings-documentation', '/settings/documentation'],
 	['agent-tickets', '/agents/a-3?tab=tickets'],
-	['service-desk', '/settings/service-desk']
+	['agent-notes', '/agents/a-3?tab=notes'],
+	['agents-tagged', '/agents?tag=tg-vip'],
+	['client-fields', '/clients/c-acme?tab=fields'],
+	['settings-fields', '/settings/fields'],
+	['service-desk', '/settings/service-desk'],
+	['settings-api', '/settings/api-keys'],
+	['settings-webhooks', '/settings/webhooks'],
+	['settings-siem', '/settings/siem'],
+	['developers', '/developers'],
+	['network', '/network'],
+	['network-discovered', '/network?tab=discovered'],
+	['network-discovered-all', '/network?tab=discovered&found=all'],
+	['network-device', '/network/devices/nd-1?port=1'],
+	['network-device-down', '/network/devices/nd-2'],
+	['network-device-printer', '/network/devices/nd-3'],
+	['network-settings', '/network/settings?client=c-acme']
 ];
 const phone: [string, string][] = [
 	['dashboard', '/'],
 	['agents', '/agents'],
 	['agent', '/agents/a-3'],
+	['agent-notes', '/agents/a-3?tab=notes'],
+	['settings-fields', '/settings/fields'],
 	['job', '/jobs/j-1'],
 	['alerts', '/alerts'],
 	['patches', '/patches'],
 	['agent-patches', '/agents/a-3?tab=patches'],
+	['software', '/software'],
+	['software-package', '/software/sw-ff'],
+	['agent-deployments', '/agents/a-1?tab=deployments'],
 	['security', '/security'],
 	['agent-security', '/agents/a-2?tab=security'],
 	['security-detection', '/security/detections/d-5'],
@@ -114,11 +150,16 @@ const phone: [string, string][] = [
 	['policy-set', '/policies/sets/ps-acme-win'],
 	['policy-set-patching', '/policies/sets/ps-acme-tills?section=patching'],
 	['policy-set-alert', '/policies/sets/ps-acme-win?section=alerts&item=p-disk'],
+	['policy-set-automation-once', '/policies/sets/00000000-0000-4000-8001-000000000000?section=automations&item=au-addon'],
 	['agent-policy', '/agents/a-3?tab=policy'],
 	['client-policies', '/clients/c-acme?tab=policies'],
 	['client-docs', '/clients/c-acme?tab=docs&doc=d-network'],
 	['client-docs-edit', '/clients/c-acme?tab=docs&doc=d-network&edit=1'],
-	['client-passwords', '/clients/c-acme?tab=passwords']
+	['client-passwords', '/clients/c-acme?tab=passwords'],
+	['settings-webhooks', '/settings/webhooks'],
+	['settings-siem', '/settings/siem'],
+	['network', '/network'],
+	['network-device', '/network/devices/nd-1']
 ];
 
 const jpeg = readFileSync(new URL('./fixtures/desktop.jpg', import.meta.url));
@@ -179,6 +220,54 @@ for (const theme of ['light', 'dark'] as const) {
 			await page.goto('/login');
 			await settle(page);
 			await expect(page).toHaveScreenshot(`${theme}-login.png`);
+		});
+
+		test('login with SSO required', async ({ page }) => {
+			await mockApi(page, { signedIn: false, ssoRequired: true });
+			await page.goto('/login?sso_error=not_allowed');
+			await page.getByRole('link', { name: 'Sign in with Microsoft' }).waitFor();
+			await settle(page);
+			await expect(page).toHaveScreenshot(`${theme}-login-sso-required.png`);
+			await page.getByRole('button', { name: /Use a password/ }).click();
+			await expect(page.getByLabel('Password')).toBeVisible();
+			const r = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa']).analyze();
+			expect(r.violations.filter((v) => v.impact === 'serious' || v.impact === 'critical').map((v) => v.id)).toEqual([]);
+		});
+
+		test('login second factor with a passkey', async ({ page }) => {
+			await mockApi(page, { signedIn: false });
+			await page.route('**/api/auth/login', (route) =>
+				route.fulfill({ status: 401, contentType: 'application/json', body: JSON.stringify({ error: 'two-factor code required', mfa_required: true, methods: { totp: true, passkey: true } }) })
+			);
+			await page.goto('/login');
+			await page.getByLabel('Email').fill('dana@northwind.example');
+			await page.getByLabel('Password').fill('correct horse battery');
+			await page.getByRole('button', { name: 'Sign in', exact: true }).click();
+			await page.getByRole('button', { name: 'Use a passkey' }).waitFor();
+			await settle(page);
+			await expect(page).toHaveScreenshot(`${theme}-login-passkey.png`);
+			const r = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa']).analyze();
+			expect(r.violations.filter((v) => v.impact === 'serious' || v.impact === 'critical').map((v) => v.id)).toEqual([]);
+		});
+
+		test('SSO provider form and group mappings', async ({ page }) => {
+			await mockApi(page);
+			await page.goto('/settings/sso');
+			await settle(page);
+			await page.getByRole('button', { name: 'Add provider' }).click();
+			await page.getByRole('dialog').getByLabel('Button label').fill('Contoso Entra');
+			await page.getByRole('dialog').getByLabel('Tenant').fill('organizations');
+			await page.getByRole('dialog').getByText('Allowed tenants').waitFor();
+			await expect(page).toHaveScreenshot(`${theme}-sso-provider-form.png`);
+			let r = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa']).analyze();
+			expect(r.violations.filter((v) => v.impact === 'serious' || v.impact === 'critical').map((v) => v.id)).toEqual([]);
+			await page.getByRole('button', { name: 'Cancel' }).click();
+			await page.getByRole('button', { name: 'Group mappings for Microsoft' }).click();
+			await page.getByRole('dialog').getByText('Clients and extra permissions').first().click();
+			await expect(page.getByRole('dialog').getByLabel('Group').first()).toHaveValue('0b8d1f64-2e7a-4a53-9c1b-6f1d3a7e9c02');
+			await expect(page).toHaveScreenshot(`${theme}-sso-mappings.png`);
+			r = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa']).analyze();
+			expect(r.violations.filter((v) => v.impact === 'serious' || v.impact === 'critical').map((v) => v.id)).toEqual([]);
 		});
 
 		test('command palette', async ({ page }) => {
@@ -395,21 +484,20 @@ for (const theme of ['light', 'dark'] as const) {
 			});
 		});
 
-		// WCAG 2.2 AA checks (contrast, names, roles) on every page, in this theme.
-		test('accessibility', async ({ page }) => {
-			test.setTimeout(420_000);
-			await mockApi(page);
-			const problems: string[] = [];
-			for (const [name, path] of [...pages, ['gallery', '/dev/ui'] as [string, string]]) {
+		// WCAG 2.2 AA checks (contrast, names, roles) on every page, in this theme. One test per page,
+		// so each has its own time budget and a failure names the page.
+		for (const [name, path] of [...pages, ['gallery', '/dev/ui'] as [string, string]]) {
+			test(`accessibility: ${name}`, async ({ page }) => {
+				await mockApi(page);
 				await page.goto(path);
 				await settle(page);
 				const r = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa']).analyze();
-				for (const v of r.violations.filter((v) => v.impact === 'serious' || v.impact === 'critical')) {
-					problems.push(`${name}: ${v.id} (${v.impact}): ${v.nodes.slice(0, 3).map((n) => n.target.join(' ')).join(' | ')}`);
-				}
-			}
-			expect(problems, problems.join('\n')).toEqual([]);
-		});
+				const problems = r.violations
+					.filter((v) => v.impact === 'serious' || v.impact === 'critical')
+					.map((v) => `${name}: ${v.id} (${v.impact}): ${v.nodes.slice(0, 3).map((n) => n.target.join(' ')).join(' | ')}`);
+				expect(problems, problems.join('\n')).toEqual([]);
+			});
+		}
 	});
 }
 
@@ -697,6 +785,121 @@ test.describe('vault', () => {
 	});
 });
 
+test.describe('API keys and webhooks', () => {
+	test('create an API key', async ({ page }) => {
+		await mockApi(page);
+		const token = `rmm_k_${'a1'.repeat(32)}`;
+		const calls = await routeApi(page, (method, path) => {
+			if (method === 'POST' && path === '/api-keys') return { json: { token, key: { ...{ id: 'k-9', name: 'Dashboard feed', prefix: token.slice(0, 12), owner_id: 'u-1', owner_name: 'Dana Admin', service_account: false, access: 'read', scopes: ['agents'], permissions: [], client_ids: ['c-acme'], rate_limit_per_min: 600, expires_at: null, last_used_at: null, last_used_ip: null, revoked_at: null, created_at: NOW.toISOString(), status: 'active' } } } };
+		});
+		await page.goto('/account');
+		await settle(page);
+		await page.getByRole('button', { name: 'Create key' }).click();
+		const dialog = page.getByRole('dialog', { name: 'Create API key' });
+		await expect(dialog.getByRole('button', { name: 'Create key' })).toBeDisabled();
+		await dialog.getByLabel('Name').fill('Dashboard feed');
+		await dialog.getByRole('checkbox', { name: 'Agents, inventory and metrics' }).click();
+		await dialog.getByRole('switch', { name: 'Limit to some clients' }).click();
+		await dialog.getByRole('checkbox', { name: 'Acme Corp' }).click();
+		await dialog.getByLabel('Expires').selectOption('never');
+		await dialog.getByRole('button', { name: 'Create key' }).click();
+		expect(calls).toEqual([
+			{ method: 'POST', path: '/api-keys', body: { name: 'Dashboard feed', access: 'read', scopes: ['agents'], permissions: [], client_ids: ['c-acme'], expires_in_days: null, rate_limit_per_min: 600 } }
+		]);
+		const shown = page.getByRole('dialog', { name: 'Copy your key now' });
+		await expect(shown.getByText(token)).toBeVisible();
+		await shown.getByRole('button', { name: 'I’ve copied it' }).click();
+		await expect(shown).toHaveCount(0);
+	});
+
+	test('revoke an API key', async ({ page }) => {
+		await mockApi(page);
+		const calls = await routeApi(page, () => undefined);
+		await page.goto('/account');
+		await settle(page);
+		await page.getByRole('button', { name: 'Revoke Reporting script' }).click();
+		await page.getByRole('alertdialog').getByRole('button', { name: 'Revoke key' }).click();
+		await expect(page.getByText('Reporting script revoked.')).toBeVisible();
+		expect(calls).toEqual([{ method: 'DELETE', path: '/api-keys/k-1', body: null }]);
+	});
+
+	test('add a webhook, see its secret and its log', async ({ page }) => {
+		await mockApi(page);
+		const calls = await routeApi(page, (method, path) => {
+			if (method === 'POST' && path === '/webhooks') return { json: { webhook: { id: 'wh-9' }, secret: 'whsec_0123456789abcdef' } };
+		});
+		await page.goto('/settings/webhooks');
+		await settle(page);
+		await page.getByRole('button', { name: 'Add webhook' }).click();
+		const dialog = page.getByRole('dialog', { name: 'Add webhook' });
+		await dialog.getByLabel('Name').fill('Status page');
+		await dialog.getByLabel('URL').fill('https://status.example/hook');
+		await dialog.getByRole('checkbox', { name: 'Alert acknowledged' }).click();
+		await dialog.getByRole('button', { name: 'Save' }).click();
+		expect(calls).toEqual([
+			{
+				method: 'POST',
+				path: '/webhooks',
+				body: { name: 'Status page', url: 'https://status.example/hook', events: ['ticket.created', 'ticket.updated', 'ticket.status_changed', 'ticket.resolved', 'ticket.comment', 'alert.created', 'alert.resolved'], client_id: null, internal_notes: false, enabled: true }
+			}
+		]);
+		await expect(page.getByRole('dialog', { name: 'Signing secret for Status page' }).getByText('whsec_0123456789abcdef')).toBeVisible();
+		await page.getByRole('button', { name: 'I’ve copied it' }).click();
+
+		await page.getByRole('listitem').filter({ hasText: 'Acme dashboard' }).getByRole('button', { name: 'Log' }).click();
+		const log = page.getByRole('dialog', { name: 'Deliveries to Acme dashboard' });
+		await expect(log.getByText('HTTP 502', { exact: true })).toBeVisible();
+		await expect(log.getByText('Retry 2')).toBeVisible();
+		await log.getByRole('row').filter({ hasText: 'ticket.comment' }).getByRole('button', { name: 'Send again' }).click();
+		expect(calls.at(-1)).toEqual({ method: 'POST', path: '/webhook-deliveries/8/redeliver', body: {} });
+	});
+});
+
+test.describe('Audit export and SIEM', () => {
+	test('the export links carry the filters', async ({ page }) => {
+		await mockApi(page);
+		await page.goto('/audit?action=user.&from=2026-11-01&to=2026-11-02');
+		await settle(page);
+		const csv = await page.getByRole('link', { name: 'Export CSV' }).getAttribute('href');
+		const url = new URL(csv!, 'http://x');
+		expect(url.pathname).toBe('/api/audit/export');
+		expect(url.searchParams.get('action')).toBe('user.');
+		expect(url.searchParams.get('format')).toBe('csv');
+		expect(new Date(url.searchParams.get('from')!).getTime()).toBeLessThan(new Date(url.searchParams.get('to')!).getTime());
+		expect(await page.getByRole('link', { name: 'Export JSON Lines' }).getAttribute('href')).toContain('format=jsonl');
+	});
+
+	test('add a destination and test another', async ({ page }) => {
+		await mockApi(page);
+		const calls = await routeApi(page, (method, path) => {
+			if (method === 'POST' && path === '/siem/destinations/sd-2/test') return { json: { ok: false, error: 'TLS handshake: invalid peer certificate: UnknownIssuer' } };
+			if (method === 'POST' && path === '/siem/destinations') return { json: { id: 'sd-9' } };
+		});
+		await page.goto('/settings/siem');
+		await settle(page);
+		await expect(page.getByText('Failing (6)')).toBeVisible();
+		await page.getByRole('listitem').filter({ hasText: 'Graylog (TLS)' }).getByRole('button', { name: 'Test' }).click();
+		await expect(page.getByText(/UnknownIssuer/).first()).toBeVisible();
+
+		await page.getByRole('button', { name: 'Add destination' }).click();
+		const dialog = page.getByRole('dialog', { name: 'Add destination' });
+		await dialog.getByLabel('Name').fill('Elastic');
+		await dialog.getByLabel('Type').selectOption('https');
+		await dialog.getByLabel('URL').fill('https://elastic.example/ingest');
+		await dialog.getByLabel('Bearer token').fill('s3cret');
+		await dialog.getByRole('checkbox', { name: 'Alerts' }).click();
+		await dialog.getByRole('button', { name: 'Save' }).click();
+		expect(calls.at(-1)).toEqual({
+			method: 'POST',
+			path: '/siem/destinations',
+			body: {
+				name: 'Elastic', kind: 'https', address: 'https://elastic.example/ingest', framing: 'octet', https_format: 'generic', facility: 13, ca_pem: '',
+				send_audit: true, send_detections: false, send_alerts: true, enabled: true, token: 's3cret'
+			}
+		});
+	});
+});
+
 test('filters live in the URL', async ({ page }) => {
 	await mockApi(page);
 	await page.goto('/agents');
@@ -707,4 +910,92 @@ test('filters live in the URL', async ({ page }) => {
 	await expect(page).toHaveURL(/sort=hostname&dir=desc|dir=desc/);
 	await page.reload();
 	await expect(page.getByRole('tab', { name: /^Offline/ })).toHaveAttribute('aria-selected', 'true');
+});
+
+test.describe('tags, fields, notes and saved views', () => {
+	test('choosing a saved view goes to its URL and sets its columns', async ({ page }) => {
+		await mockApi(page);
+		await page.goto('/agents');
+		await settle(page);
+		await page.getByRole('button', { name: /Views/ }).click();
+		await page.getByRole('menuitem', { name: /VIP machines/ }).click();
+		await expect(page).toHaveURL(/tag=tg-vip/);
+		await expect(page.getByRole('row', { name: /acme-dc01/ })).toBeVisible();
+		await expect(page.getByRole('row', { name: /globex/ })).toHaveCount(0);
+		// The view that matches the URL is named on the button.
+		await expect(page.getByRole('button', { name: /VIP machines/ })).toBeVisible();
+	});
+
+	test('save the current view', async ({ page }) => {
+		await mockApi(page);
+		const calls = await routeApi(page, () => undefined);
+		await page.goto('/agents?os=windows&sort=hostname&dir=desc&after=abc');
+		await settle(page);
+		await page.getByRole('button', { name: /Views/ }).click();
+		await page.getByRole('menuitem', { name: /Save this view/ }).click();
+		const dialog = page.getByRole('dialog', { name: 'Save this view' });
+		await dialog.getByLabel('Name').fill('Windows, Z to A');
+		await dialog.getByRole('switch', { name: /Share with everyone/ }).click();
+		await dialog.getByRole('button', { name: 'Save view' }).click();
+		// Paging cursors never become part of a view.
+		expect(calls[0]).toMatchObject({ method: 'POST', path: '/saved-views', body: { page: 'agents', name: 'Windows, Z to A', query: 'os=windows&sort=hostname&dir=desc', shared: true } });
+	});
+
+	test('tag several agents at once', async ({ page }) => {
+		await mockApi(page);
+		const calls = await routeApi(page, () => undefined);
+		await page.goto('/agents');
+		await settle(page);
+		await page.getByRole('checkbox', { name: /Select all/ }).click();
+		await page.getByRole('button', { name: 'Tags', exact: true }).click();
+		const dialog = page.getByRole('dialog', { name: 'Change tags' });
+		await dialog.getByLabel('What to do with Pilot ring').selectOption('add');
+		await dialog.getByLabel('What to do with Legacy').selectOption('remove');
+		await dialog.getByRole('button', { name: 'Apply' }).click();
+		expect(calls.at(-1)).toMatchObject({ method: 'POST', path: '/agents/tags', body: { add: ['tg-pilot'], remove: ['tg-legacy'] } });
+	});
+
+	test('add and pin a note', async ({ page }) => {
+		await mockApi(page);
+		const calls = await routeApi(page, () => undefined);
+		await page.goto('/agents/a-3?tab=notes');
+		await settle(page);
+		await expect(page.getByRole('complementary', { name: 'Pinned note' })).toContainText('Reboots itself every Sunday night');
+		await page.getByLabel('Add a note').fill('Swapped the PSU <b>today</b>');
+		await page.getByRole('button', { name: 'Add note' }).click();
+		expect(calls).toEqual([{ method: 'POST', path: '/agents/a-3/notes', body: { body: 'Swapped the PSU <b>today</b>', pinned: false } }]);
+		// Someone else's note can be pinned but not edited.
+		await expect(page.getByRole('button', { name: 'Edit note' })).toHaveCount(1);
+	});
+
+	test('edit custom fields on an agent', async ({ page }) => {
+		await mockApi(page);
+		const calls = await routeApi(page, () => undefined);
+		await page.goto('/agents/a-3');
+		await settle(page);
+		await page.getByRole('region', { name: 'Custom fields' }).getByRole('button', { name: 'Edit' }).click();
+		await page.getByLabel('Support tier').selectOption('Silver');
+		await page.getByLabel('Owner').fill('');
+		await page.getByRole('button', { name: 'Save' }).click();
+		// Only what changed is sent; clearing is null.
+		expect(calls).toEqual([{ method: 'PUT', path: '/agents/a-3/fields', body: { values: { support_tier: 'Silver', owner: null } } }]);
+	});
+
+	test('define a field that scripts may set', async ({ page }) => {
+		await mockApi(page);
+		const calls = await routeApi(page, () => undefined);
+		await page.goto('/settings/fields');
+		await settle(page);
+		await page.getByRole('button', { name: 'Add field' }).click();
+		const dialog = page.getByRole('dialog', { name: 'New custom field' });
+		await dialog.getByLabel('Label').fill('Last backup');
+		await expect(dialog.getByLabel('Name')).toHaveValue('last_backup');
+		await dialog.getByLabel('Type').selectOption('date');
+		await dialog.getByRole('switch', { name: 'Scripts can set it' }).click();
+		await expect(dialog.getByText('RMM-FIELD last_backup=value')).toBeVisible();
+		await dialog.getByRole('button', { name: 'Save' }).click();
+		expect(calls).toEqual([
+			{ method: 'POST', path: '/custom-fields', body: { entity: 'agent', name: 'last_backup', label: 'Last backup', description: '', kind: 'date', options: [], client_id: null, script_writable: true } }
+		]);
+	});
 });

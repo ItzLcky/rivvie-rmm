@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Building2, KeyRound, ShieldCheck, MonitorSmartphone, ShieldOff, UserCheck, UserPlus, UserX } from '@lucide/svelte';
+	import { Building2, KeyRound, LifeBuoy, ShieldCheck, MonitorSmartphone, ShieldOff, UserCheck, UserPlus, UserX } from '@lucide/svelte';
 	import { api } from '#lib/api.js';
 	import { confirmAction } from '#lib/confirm.svelte.js';
 	import { ago } from '#lib/format.js';
@@ -24,6 +24,13 @@
 		all_clients: boolean; client_ids: string[];
 		/** null = the role's defaults */
 		permissions?: string[] | null;
+		/** May sign in with a password when SSO is required. */
+		sso_exempt?: boolean;
+		sso_only?: boolean;
+		passkeys?: number;
+		sso_providers?: string[];
+		/** Can't sign in; owns API keys (Company settings → API). */
+		service_account?: boolean;
 	}
 	const res = resource(() => api.get<UserRow[]>('/users'));
 
@@ -82,11 +89,16 @@
 	async function reset2fa(u: UserRow) {
 		const ok = await confirmAction({
 			title: `Reset 2FA for ${u.email}?`,
-			message: 'Removes their authenticator and recovery codes and signs them out everywhere. Do this when they’ve lost their phone, after confirming it’s really them. If 2FA is required for them, they set it up again at their next sign-in.',
+			message: 'Removes their authenticator, passkeys and recovery codes and signs them out everywhere. Do this when they’ve lost their phone, after confirming it’s really them. If 2FA is required for them, they set it up again at their next sign-in.',
 			confirmLabel: 'Reset 2FA',
 			danger: true
 		});
 		if (ok && (await attempt(() => api.del(`/users/${u.id}/totp`), '2FA reset.'))) res.reload();
+	}
+
+	async function setExempt(u: UserRow) {
+		const on = !u.sso_exempt;
+		if (await attempt(() => api.put(`/users/${u.id}/sso-exempt`, { exempt: on }), on ? `${u.email} can sign in with a password even when SSO is required.` : `${u.email} follows the SSO requirement.`)) res.reload();
 	}
 
 	const roles: Record<string, string> = { admin: 'Admin', technician: 'Technician', readonly: 'Read-only' };
@@ -100,10 +112,11 @@
 		{ value: 'billing.manage', label: 'Manage billing', hint: 'Contracts, products, rates, invoice runs and accounting' },
 		{ value: 'time.approve', label: 'Approve time', hint: 'Approve and reject timesheets' },
 		{ value: 'vault.read', label: 'See passwords', hint: 'Reveal vault passwords and notes, show TOTP codes. Needs two-factor authentication.' },
-		{ value: 'vault.manage', label: 'Manage passwords', hint: 'Add, change and delete vault credentials. Needs two-factor authentication.' }
+		{ value: 'vault.manage', label: 'Manage passwords', hint: 'Add, change and delete vault credentials. Needs two-factor authentication.' },
+		{ value: 'audit.read', label: 'Audit log', hint: 'Read and export the audit log, in the dashboard and through API keys' }
 	];
 	const roleDefaults: Record<string, string[]> = {
-		admin: ['security.read', 'security.respond', 'security.manage', 'billing.read', 'billing.manage', 'time.approve', 'vault.read', 'vault.manage'],
+		admin: ['security.read', 'security.respond', 'security.manage', 'billing.read', 'billing.manage', 'time.approve', 'vault.read', 'vault.manage', 'audit.read'],
 		technician: ['security.read', 'security.respond', 'vault.read', 'vault.manage'],
 		readonly: ['security.read']
 	};
@@ -133,8 +146,14 @@
 
 {#snippet nameCell(u: UserRow)}
 	<div class={u.disabled ? 'opacity-60' : ''}>
-		<div class="font-medium">{u.name}{#if u.id === session.user?.id}<span class="text-muted font-normal"> (you)</span>{/if}</div>
-		<div class="text-muted text-xs">{u.email}</div>
+		<div class="font-medium">{u.name}{#if u.id === session.user?.id}<span class="text-muted font-normal"> (you)</span>{/if}{#if u.service_account} <Badge>Service account</Badge>{/if}</div>
+		<div class="text-muted text-xs">{u.service_account ? 'Can’t sign in' : u.email}</div>
+		{#if u.sso_providers?.length || u.sso_exempt}
+			<div class="mt-1 flex flex-wrap gap-1">
+				{#if u.sso_providers?.length}<Badge>SSO: {u.sso_providers.join(', ')}</Badge>{/if}
+				{#if u.sso_exempt}<Badge tone="warning">Break-glass</Badge>{/if}
+			</div>
+		{/if}
 	</div>
 {/snippet}
 {#snippet roleCell(u: UserRow)}<span class={u.disabled ? 'opacity-60' : ''}>{roles[u.role] ?? u.role}</span>{/snippet}
@@ -145,7 +164,7 @@
 	{:else}<span class="text-muted text-xs">{permLabel(roleDefaults[u.role] ?? [])}</span>{/if}
 {/snippet}
 {#snippet mfaCell(u: UserRow)}
-	{#if u.totp_enabled}<Badge tone="success">On</Badge>{:else if u.role === 'admin'}<Badge tone="warning">Not set up</Badge>{:else}<Badge>Off</Badge>{/if}
+	{#if u.totp_enabled || u.passkeys}<Badge tone="success">{u.totp_enabled && u.passkeys ? 'App + passkey' : u.passkeys ? 'Passkey' : 'On'}</Badge>{:else if u.sso_only}<span class="text-muted text-xs">Via SSO</span>{:else if u.role === 'admin'}<Badge tone="warning">Not set up</Badge>{:else}<Badge>Off</Badge>{/if}
 {/snippet}
 {#snippet statusCell(u: UserRow)}{#if u.disabled}<Badge tone="danger">Disabled</Badge>{:else}<span class="text-muted text-xs">{u.last_login_at ? `Signed in ${ago(u.last_login_at)}` : 'Never signed in'}</span>{/if}{/snippet}
 {#snippet actionsCell(u: UserRow)}
@@ -161,9 +180,10 @@
 					? [{ label: 'Client access', icon: Building2, onSelect: () => ((editingAccess = u), (accessForm = { all_clients: u.all_clients, client_ids: [...u.client_ids] })) }]
 					: []),
 				...(u.role !== 'admin' ? [{ label: 'Permissions', icon: ShieldCheck, onSelect: () => openPerms(u) }] : []),
-				{ label: 'Sessions', icon: MonitorSmartphone, onSelect: () => (viewing = u) },
-				{ label: 'Reset password', icon: KeyRound, onSelect: () => ((resetting = u), (resetPw = '')) },
-				...(u.totp_enabled ? [{ label: 'Reset 2FA', icon: ShieldOff, onSelect: () => reset2fa(u) }] : []),
+				...(u.service_account ? [] : [{ label: 'Sessions', icon: MonitorSmartphone, onSelect: () => (viewing = u) }]),
+				...(u.service_account ? [] : [{ label: 'Reset password', icon: KeyRound, onSelect: () => ((resetting = u), (resetPw = '')) }]),
+				...(u.totp_enabled || u.passkeys ? [{ label: 'Reset 2FA', icon: ShieldOff, onSelect: () => reset2fa(u) }] : []),
+				...(u.sso_only || u.service_account ? [] : [{ label: u.sso_exempt ? 'Follow the SSO requirement' : 'Allow password sign-in (break-glass)', icon: LifeBuoy, onSelect: () => setExempt(u) }]),
 				{ separator: true },
 				{ label: 'Disable user', icon: UserX, danger: true, onSelect: () => disable(u) }
 			]}

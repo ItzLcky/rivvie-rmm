@@ -284,6 +284,7 @@ async fn session(cred: &Cred, shape: &Shape, stats: &Stats, dispatched: &Dispatc
         capabilities: vec![rmm_proto::patch::CAPABILITY.into(), rmm_proto::security::CAPABILITY.into(), rmm_proto::tools::CAPABILITY.into()],
         patch_runs: vec![],
         security_actions: vec![],
+        software_runs: vec![],
     };
     ws.send(Message::Binary(rmm_proto::encode(&auth)?.into())).await?;
     let (heartbeat_secs, inventory_secs) = match recv(&mut ws).await {

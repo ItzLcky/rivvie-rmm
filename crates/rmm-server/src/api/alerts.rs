@@ -48,6 +48,9 @@ pub struct AlertRow {
     suppressed: bool,
     /// The job its policy's `run_script_id` started when it opened.
     script_job_id: Option<Uuid>,
+    /// A monitored network device it is about (`hostname` is the agent that reads it).
+    device_id: Option<Uuid>,
+    device_name: Option<String>,
     #[sqlx(default)]
     #[serde(skip)]
     sort_key: String,
@@ -61,12 +64,13 @@ fn alert_cols() -> String {
         "al.id, al.policy_id, p.name AS policy_name, al.agent_id, a.hostname, s.client_id, c.name AS client_name, s.name AS site_name,
          al.kind, al.severity, al.title, al.details, al.occurrences, {STATE} AS state, al.opened_at, al.last_seen_at,
          al.acknowledged_at, ua.name AS acknowledged_by_name, al.resolved_at, ur.name AS resolved_by_name, al.resolution, al.suppressed,
-         al.script_job_id"
+         al.script_job_id, al.device_id, nd.name AS device_name"
     )
 }
 const ALERT_FROM: &str = "FROM alerts al JOIN agents a ON a.id = al.agent_id JOIN sites s ON s.id = a.site_id
        JOIN clients c ON c.id = s.client_id LEFT JOIN policy_items p ON p.id = al.policy_id
-       LEFT JOIN users ua ON ua.id = al.acknowledged_by LEFT JOIN users ur ON ur.id = al.resolved_by";
+       LEFT JOIN users ua ON ua.id = al.acknowledged_by LEFT JOIN users ur ON ur.id = al.resolved_by
+       LEFT JOIN net_devices nd ON nd.id = al.device_id";
 
 const SORT_KEYS: &[SortKey] = &[
     SortKey { name: "opened", expr: "al.opened_at", ty: "timestamptz" },
@@ -254,6 +258,7 @@ async fn act(st: &AppState, u: &User, ids: &[Uuid], action: &str) -> ApiResult<u
     let mut woke = false;
     for (id, agent_id, client_id, policy_id) in &rows {
         st.hub.publish(Event::Alert { id: *id, agent_id: *agent_id, client_id: *client_id, state: state.into() });
+        crate::webhooks::alert_event(st, *id, if action == "resolve" { "alert.resolved" } else { "alert.acknowledged" }).await;
         if action == "resolve" {
             crate::tickets::alert_resolved(st, *id).await;
         }

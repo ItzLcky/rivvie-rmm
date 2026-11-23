@@ -1,9 +1,9 @@
 [workspace]
 resolver = "3"
-members = ["crates/rmm-proto", "crates/rmm-content", "crates/rmm-scan", "crates/rmm-agent", "crates/rmm-server", "crates/rmm-sign", "crates/rmm-loadgen"]
+members = ["crates/rmm-proto", "crates/rmm-content", "crates/rmm-scan", "crates/rmm-agent", "crates/rmm-server", "crates/rmm-sign", "crates/rmm-loadgen", "crates/rmm-snmp"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 

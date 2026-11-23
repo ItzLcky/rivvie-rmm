@@ -1,11 +1,13 @@
 mod collect;
 mod config;
 mod conn;
+mod deploy;
 mod desktop;
 mod fetch;
 mod fsutil;
 mod jobs;
 mod logwatch;
+mod net;
 mod patch;
 mod security;
 mod sensor;

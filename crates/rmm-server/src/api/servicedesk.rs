@@ -565,7 +565,7 @@ pub struct MailboxRow {
 }
 
 const MAILBOX_SELECT: &str = "SELECT m.id, m.name, m.address, m.kind, m.imap_host, m.imap_port, m.imap_security, m.imap_username,
-       m.imap_password <> '' AS has_password, m.imap_folder, m.board_id, b.name AS board_name, m.auto_reply, m.enabled,
+       m.imap_password_enc IS NOT NULL AS has_password, m.imap_folder, m.board_id, b.name AS board_name, m.auto_reply, m.enabled,
        m.graph_tenant, m.graph_client_id, m.graph_secret IS NOT NULL AS has_graph_secret, m.graph_send,
        m.last_polled_at, m.last_error,
        (SELECT count(*) FROM email_messages e WHERE e.mailbox_id = m.id AND e.created_at > now() - interval '24 hours') AS received_24h,
@@ -680,11 +680,12 @@ pub async fn create_mailbox(State(st): State<Arc<AppState>>, u: User, Json(mut b
         }
         None => (None, false),
     };
+    let imap_password = b.imap_password.as_deref().filter(|p| !p.is_empty()).map(|p| crate::crypto::store(st.cfg.data_key.as_ref(), p.as_bytes()));
     sqlx::query(
-        "INSERT INTO mailboxes (id, name, address, kind, imap_host, imap_port, imap_security, imap_username, imap_password, imap_folder,
+        "INSERT INTO mailboxes (id, name, address, kind, imap_host, imap_port, imap_security, imap_username, imap_password_enc, imap_folder,
                                 webhook_token_hash, board_id, auto_reply, enabled, graph_tenant, graph_client_id, graph_secret,
-                                graph_secret_sealed, graph_send)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)",
+                                graph_secret_sealed, graph_send, imap_password_sealed)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)",
     )
     .bind(id)
     .bind(&b.name)
@@ -694,7 +695,7 @@ pub async fn create_mailbox(State(st): State<Arc<AppState>>, u: User, Json(mut b
     .bind(b.imap_port.unwrap_or(993))
     .bind(b.imap_security.as_deref().unwrap_or("tls"))
     .bind(b.imap_username.trim())
-    .bind(b.imap_password.as_deref().unwrap_or(""))
+    .bind(imap_password.as_ref().map(|p| p.0.clone()))
     .bind(b.imap_folder.as_deref().map(str::trim).filter(|f| !f.is_empty()).unwrap_or("INBOX"))
     .bind(token.as_deref().map(auth::token_hash))
     .bind(b.board_id)
@@ -705,6 +706,7 @@ pub async fn create_mailbox(State(st): State<Arc<AppState>>, u: User, Json(mut b
     .bind(secret)
     .bind(sealed)
     .bind(b.graph_send)
+    .bind(imap_password.as_ref().is_some_and(|p| p.1))
     .execute(&st.db)
     .await
     .map_err(mailbox_conflict)?;
@@ -724,9 +726,12 @@ pub async fn update_mailbox(State(st): State<Arc<AppState>>, u: User, Path(id): 
     }
     b.validate(&st).await?;
     let secret = b.graph_secret.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(|s| crate::crypto::store(st.cfg.data_key.as_ref(), s.as_bytes()));
+    // Omitted: unchanged. "": cleared. Otherwise sealed.
+    let imap_password = b.imap_password.as_deref().map(|p| (!p.is_empty()).then(|| crate::crypto::store(st.cfg.data_key.as_ref(), p.as_bytes())));
     sqlx::query(
         "UPDATE mailboxes SET name = $2, address = $3, imap_host = $4, imap_port = $5, imap_security = $6, imap_username = $7,
-                imap_password = coalesce($8, imap_password), imap_folder = $9, board_id = $10, auto_reply = $11, enabled = $12,
+                imap_password_enc = CASE WHEN $18 THEN $8 ELSE imap_password_enc END,
+                imap_password_sealed = CASE WHEN $18 THEN $19 ELSE imap_password_sealed END, imap_folder = $9, board_id = $10, auto_reply = $11, enabled = $12,
                 graph_tenant = $13, graph_client_id = $14, graph_secret = coalesce($15, graph_secret),
                 graph_secret_sealed = CASE WHEN $15::bytea IS NULL THEN graph_secret_sealed ELSE $16 END, graph_send = $17,
                 last_error = NULL
@@ -739,7 +744,7 @@ pub async fn update_mailbox(State(st): State<Arc<AppState>>, u: User, Path(id): 
     .bind(b.imap_port.unwrap_or(993))
     .bind(b.imap_security.as_deref().unwrap_or("tls"))
     .bind(b.imap_username.trim())
-    .bind(b.imap_password.as_deref())
+    .bind(imap_password.as_ref().and_then(|p| p.as_ref()).map(|p| p.0.clone()))
     .bind(b.imap_folder.as_deref().map(str::trim).filter(|f| !f.is_empty()).unwrap_or("INBOX"))
     .bind(b.board_id)
     .bind(b.auto_reply)
@@ -749,6 +754,8 @@ pub async fn update_mailbox(State(st): State<Arc<AppState>>, u: User, Path(id): 
     .bind(secret.as_ref().map(|s| s.0.clone()))
     .bind(secret.as_ref().is_some_and(|s| s.1))
     .bind(b.graph_send)
+    .bind(imap_password.is_some())
+    .bind(imap_password.as_ref().and_then(|p| p.as_ref()).is_some_and(|p| p.1))
     .execute(&st.db)
     .await
     .map_err(mailbox_conflict)?;

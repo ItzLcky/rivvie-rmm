@@ -47,7 +47,9 @@ pub struct Mailbox {
     pub imap_port: i32,
     pub imap_security: String,
     pub imap_username: String,
-    pub imap_password: String,
+    /// Sealed with RMM_DATA_KEY when the server has one (`imap_password_sealed`); see [`Mailbox::imap_password`].
+    pub imap_password_enc: Option<Vec<u8>>,
+    pub imap_password_sealed: bool,
     pub imap_folder: String,
     pub board_id: Uuid,
     pub auto_reply: bool,
@@ -58,7 +60,16 @@ pub struct Mailbox {
     pub graph_secret_sealed: bool,
 }
 
-pub const MAILBOX_COLS: &str = "id, name, address, kind, imap_host, imap_port, imap_security, imap_username, imap_password, imap_folder,
+impl Mailbox {
+    /// The IMAP password, opened.
+    pub fn imap_password(&self, key: Option<&crate::crypto::DataKey>) -> Result<String> {
+        let Some(stored) = self.imap_password_enc.as_deref() else { return Ok(String::new()) };
+        let plain = crate::crypto::load(key, stored, self.imap_password_sealed).context("the IMAP password can't be read: RMM_DATA_KEY is missing or changed")?;
+        Ok(String::from_utf8_lossy(&plain).into_owned())
+    }
+}
+
+pub const MAILBOX_COLS: &str = "id, name, address, kind, imap_host, imap_port, imap_security, imap_username, imap_password_enc, imap_password_sealed, imap_folder,
      board_id, auto_reply, enabled, graph_tenant, graph_client_id, graph_secret, graph_secret_sealed";
 
 // ---------------------------------------------------------------------------
@@ -1092,7 +1103,8 @@ where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::Debug + Send,
 {
     client.read_response().await?.context("no IMAP greeting")?;
-    let mut session = client.login(&mb.imap_username, &mb.imap_password).await.map_err(|(e, _)| anyhow::anyhow!("login: {e}"))?;
+    let password = mb.imap_password(st.cfg.data_key.as_ref())?;
+    let mut session = client.login(&mb.imap_username, &password).await.map_err(|(e, _)| anyhow::anyhow!("login: {e}"))?;
     session.select(&mb.imap_folder).await.with_context(|| format!("selecting {}", mb.imap_folder))?;
     let mut uids: Vec<u32> = session.uid_search("UNSEEN").await?.into_iter().collect();
     uids.sort_unstable();

@@ -1,0 +1,20 @@
+[package]
+name = "rmm-snmp"
+description = "Minimal pure-Rust SNMP v2c and v3 (USM) client for the RMM agent, with a simulator for tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tokio.workspace = true
+sha2.workspace = true
+md-5 = "0.11"
+sha1 = "0.11"
+hmac = "0.13"
+aes = "0.9"
+des = "0.9"
+getrandom = "0.4"
+
+[dev-dependencies]
+hex.workspace = true

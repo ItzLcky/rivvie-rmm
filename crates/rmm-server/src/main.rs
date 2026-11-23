@@ -4,18 +4,29 @@ mod billing;
 mod pdf;
 mod policy;
 mod alerts;
+mod automation;
+mod apikeys;
+mod webhooks;
 mod desktop_ws;
 mod api;
 mod auth;
 mod email;
 mod error;
 mod events;
+mod fields;
 mod hub;
 mod metrics;
+mod netalerts;
+mod netmon;
 mod notify;
+mod oui;
+mod oidc;
 mod paging;
 mod patches;
+mod software;
 mod ratelimit;
+mod rotate;
+mod siem;
 mod scheduler;
 mod crypto;
 mod csat;
@@ -28,6 +39,7 @@ mod storage;
 mod tickets;
 mod totp;
 mod updates;
+mod webauthn;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -76,6 +88,14 @@ enum Cmd {
     Reset2fa {
         #[arg(long)]
         email: String,
+    },
+    /// Replace RMM_DATA_KEY: re-encrypt everything sealed with it under a new key, in one
+    /// transaction. Stop the server first. The keys come from the environment (never the
+    /// command line): RMM_DATA_KEY_NEW, and RMM_DATA_KEY_OLD (default: RMM_DATA_KEY).
+    RotateDataKey {
+        /// Count what would change and check that the old key opens everything; write nothing.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -227,7 +247,18 @@ async fn main() -> Result<()> {
             sqlx::query("DELETE FROM user_sessions WHERE user_id = $1").bind(id).execute(&mut *tx).await?;
             tx.commit().await?;
             auth::audit(&db, None, "user.mfa_reset", Some(("user", id)), serde_json::json!({ "via": "cli" })).await;
-            println!("two-factor auth removed for {email}; they will be asked to set it up again if required");
+            println!("two-factor auth (authenticator app, passkeys and recovery codes) removed for {email}; they will be asked to set it up again if required");
+            Ok(())
+        }
+        Cmd::RotateDataKey { dry_run } => {
+            let (old, new) = rotate::keys_from_env()?;
+            let report = rotate::rotate(&db, old.as_ref(), &new, dry_run).await?;
+            if dry_run {
+                println!("dry run, nothing written:\n{report}");
+            } else {
+                auth::audit(&db, None, "system.data_key_rotated", None, rotate::audit_details(&report)).await;
+                println!("RMM_DATA_KEY rotated:\n{report}\nSet RMM_DATA_KEY to the new key and start the server.");
+            }
             Ok(())
         }
         Cmd::Serve(args) => serve(db, args).await,
@@ -240,7 +271,6 @@ async fn serve(db: sqlx::PgPool, args: ServeArgs) -> Result<()> {
     // Jobs left `sent` by the previous process aren't lost: agents keep running them and
     // report when they reconnect (and anything they don't hold is marked `lost` then).
     bootstrap_admin(&db).await?;
-    let company = state::Company::load(&db).await.context("loading company settings")?;
     let trusted_proxies = ratelimit::parse_trusted(&args.trusted_proxies).map_err(anyhow::Error::msg)?;
 
     let http = reqwest::Client::builder()
@@ -260,6 +290,10 @@ async fn serve(db: sqlx::PgPool, args: ServeArgs) -> Result<()> {
         }
     };
     api::seal_totp_secrets(&db, data_key.as_ref()).await.context("encrypting two-factor secrets")?;
+    api::seal_sso_secrets(&db, data_key.as_ref()).await.context("encrypting single sign-on secrets")?;
+    rotate::seal_plaintext_credentials(&db, data_key.as_ref()).await.context("encrypting mail and notification credentials")?;
+    // After sealing: the company settings in memory hold the mail server password as stored.
+    let company = state::Company::load(&db).await.context("loading company settings")?;
     if data_key.is_none() {
         let (n,): (i64,) = sqlx::query_as("SELECT count(*) FROM vault_keys").fetch_one(&db).await.context("checking vault keys")?;
         if n > 0 {
@@ -298,18 +332,24 @@ async fn serve(db: sqlx::PgPool, args: ServeArgs) -> Result<()> {
             metrics_token: args.metrics_token.clone().map(|t| t.trim().to_string()).filter(|t| !t.is_empty()),
         },
         triage: Default::default(),
+        oidc: oidc::Cache::new(),
+        passkeys: webauthn::Passkeys::new(args.public_url.trim_end_matches('/')),
     });
     tokio::spawn(housekeeping(state.clone()));
     tokio::spawn(alerts::run(state.clone()));
     tokio::spawn(notify::worker(state.clone()));
     tokio::spawn(scheduler::run(state.clone()));
+    tokio::spawn(automation::run(state.clone()));
     tokio::spawn(patches::scheduler(state.clone()));
+    tokio::spawn(software::scheduler(state.clone()));
     tokio::spawn(security::rollout_loop(state.clone()));
     tokio::spawn(email::poll_loop(state.clone(), args.mail_poll_secs));
     tokio::spawn(sla::run(state.clone()));
     tokio::spawn(accounting::run(state.clone()));
     tokio::spawn(metrics::probe_pool(state.clone()));
     tokio::spawn(updates::run(state.clone()));
+    tokio::spawn(siem::run(state.clone()));
+    tokio::spawn(netmon::run(state.clone()));
     if state.cfg.metrics_token.is_some() {
         info!("metrics: GET /metrics (bearer token required)");
     }
@@ -330,6 +370,8 @@ async fn serve(db: sqlx::PgPool, args: ServeArgs) -> Result<()> {
         .route("/healthz", get(|| async { "ok" }))
         .route("/metrics", get(metrics::handler))
         .nest("/api", api::router(state.cfg.attachment_max_bytes()))
+        // The same routes under a version: what API keys and integrations should use.
+        .nest("/api/v1", api::router(state.cfg.attachment_max_bytes()))
         .fallback_service(ServeDir::new(&args.web_dir).fallback(ServeFile::new(index)))
         // (The API sets its own body limit, see `api::router`.)
         .layer(axum::middleware::from_fn(metrics::http_layer));
@@ -421,6 +463,12 @@ async fn housekeeping(state: Arc<AppState>) {
         if let Err(e) = security::sweep(&state).await {
             warn!("housekeeping: security actions: {e}");
         }
+        // Stored agent health follows alerts, jobs and patches through triggers; this catches
+        // what only the clock changes (a job failed 24 hours ago, an update missing for a week)
+        // and anything the triggers missed.
+        if let Err(e) = api::refresh_agent_health(db).await {
+            warn!("housekeeping: refreshing agent health: {e}");
+        }
         // Roll the last few complete hours of samples up (idempotent; late samples are folded in).
         results.push(
             sqlx::query(
@@ -438,9 +486,15 @@ async fn housekeeping(state: Arc<AppState>) {
             .execute(db)
             .await,
         );
+        if let Err(e) = netmon::rollup(db).await {
+            warn!("housekeeping: rolling up network samples: {e}");
+        }
         // The rest is bulk deletion; hourly is plenty.
         if runs.is_multiple_of(12) {
             state.limits.prune();
+            state.passkeys.prune();
+            // Sign-ins started but never finished at the identity provider.
+            results.push(sqlx::query("DELETE FROM sso_login_states WHERE expires_at < now()").execute(db).await);
             results.push(
                 sqlx::query(
                     "DELETE FROM user_sessions
@@ -450,8 +504,14 @@ async fn housekeeping(state: Arc<AppState>) {
                 .execute(db)
                 .await,
             );
+            if let Err(e) = netmon::prune(db, state.cfg.metrics_raw_days as i32, state.cfg.metrics_retention_days as i32).await {
+                warn!("housekeeping: pruning network samples: {e}");
+            }
             if let Err(e) = patches::prune(db).await {
                 warn!("housekeeping: pruning patches: {e}");
+            }
+            if let Err(e) = software::prune(db).await {
+                warn!("housekeeping: pruning software runs: {e}");
             }
             results.push(
                 sqlx::query("DELETE FROM agent_metrics WHERE ts < now() - make_interval(days => $1)")
@@ -474,6 +534,9 @@ async fn housekeeping(state: Arc<AppState>) {
                 .execute(db)
                 .await,
             );
+            if let Err(e) = automation::prune(db).await {
+                warn!("housekeeping: pruning automation runs: {e}");
+            }
             results.push(
                 sqlx::query("DELETE FROM alerts WHERE resolved_at < now() - make_interval(days => $1)")
                     .bind(state.cfg.alert_retention_days as i32)
@@ -487,6 +550,11 @@ async fn housekeeping(state: Arc<AppState>) {
             results.push(sqlx::query("DELETE FROM attachment_links WHERE expires_at < now()").execute(db).await);
             results.push(
                 sqlx::query("DELETE FROM notifications WHERE status <> 'pending' AND created_at < now() - interval '30 days'")
+                    .execute(db)
+                    .await,
+            );
+            results.push(
+                sqlx::query("DELETE FROM webhook_deliveries WHERE status <> 'pending' AND created_at < now() - interval '30 days'")
                     .execute(db)
                     .await,
             );

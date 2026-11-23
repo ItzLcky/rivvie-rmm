@@ -25,10 +25,15 @@
 	items={billingOnly ? [{ value: '/settings/billing', label: 'Billing' }] : [
 		{ value: '/settings', label: 'General' },
 		{ value: '/settings/users', label: 'Users' },
+		{ value: '/settings/sso', label: 'Single sign-on' },
 		{ value: '/settings/notifications', label: 'Notifications' },
 		{ value: '/settings/service-desk', label: 'Service desk' },
 		{ value: '/settings/sla', label: 'SLAs' },
 		{ value: '/settings/documentation', label: 'Documentation' },
+		{ value: '/settings/fields', label: 'Fields & tags' },
+		{ value: '/settings/api-keys', label: 'API' },
+		{ value: '/settings/webhooks', label: 'Webhooks' },
+		{ value: '/settings/siem', label: 'SIEM' },
 		{ value: '/settings/billing', label: 'Billing' }
 	]}
 />

@@ -14,73 +14,27 @@ use crate::error::{ApiError, ApiResult};
 use crate::paging::{self, Page, PageQuery, Plan, SortKey};
 use crate::state::AppState;
 
-/// Fullest disk, in percent, from the last heartbeat (0 if none).
-macro_rules! disk_pct {
-    () => {
-        "coalesce((SELECT max(100 * (1 - (d->>'available')::float8 / (d->>'total')::float8))
-                     FROM jsonb_array_elements(a.last_metrics->'disks') d WHERE (d->>'total')::float8 > 0), 0)"
-    };
-}
-/// Jobs on this agent that failed, errored, timed out or were lost in the last 24 hours.
-macro_rules! failed_24h {
-    () => {
-        "(SELECT count(*) FROM jobs fj WHERE fj.agent_id = a.id AND fj.created_at > now() - interval '24 hours'
-             AND fj.status IN ('failed', 'error', 'timed_out', 'lost'))"
-    };
-}
-/// Unresolved alerts on this agent with the given severity. Alerts held back by a
-/// maintenance window or snooze don't count.
-macro_rules! open_alert {
-    ($sev:literal) => {
-        concat!(
-            "EXISTS (SELECT 1 FROM alerts oa WHERE oa.agent_id = a.id AND oa.resolved_at IS NULL AND NOT oa.suppressed AND oa.severity = '",
-            $sev,
-            "')"
-        )
-    };
-}
-/// Security or critical updates missing for more than a week (a normal monthly cycle with a
-/// short deferral stays clear of it), not declined.
-macro_rules! patches_overdue {
-    () => {
-        "(SELECT count(*) FROM patches pp WHERE pp.agent_id = a.id AND pp.state <> 'installed' AND pp.approval <> 'declined'
-             AND (pp.category IN ('security', 'critical') OR pp.severity = 'critical') AND pp.first_seen_at < now() - interval '7 days')"
-    };
-}
-/// Updates whose last install failed, not declined since.
-macro_rules! patches_failed {
-    () => {
-        "(SELECT count(*) FROM patches pp WHERE pp.agent_id = a.id AND pp.state = 'failed' AND pp.approval <> 'declined')"
-    };
-}
-/// A restart has been pending for over a day.
-macro_rules! reboot_overdue {
-    () => {
-        "(a.reboot_pending AND a.reboot_pending_since < now() - interval '24 hours')"
-    };
-}
-/// Health rank: 0 healthy, 1 unknown (never reported), 2 needs attention, 3 unhealthy.
-/// Online/offline is separate: a workstation that is switched off isn't unhealthy (unless an
-/// offline alert policy says so). Open critical alerts make an agent unhealthy, warnings
-/// make it need attention.
-macro_rules! health_rank {
-    () => {
-        concat!(
-            "(CASE WHEN ", open_alert!("critical"), " THEN 3 WHEN a.last_metrics IS NULL THEN 1 WHEN ", disk_pct!(), " >= 95 THEN 3 WHEN ",
-            disk_pct!(), " >= 90 OR ", open_alert!("warning"), " OR ",
-            failed_24h!(), " > 0 OR (a.update_state IN ('failed', 'rolled_back') AND a.update_at > now() - interval '7 days') OR ",
-            "EXISTS (SELECT 1 FROM patches pp WHERE pp.agent_id = a.id AND pp.state <> 'installed' AND pp.approval <> 'declined'
-               AND (pp.state = 'failed' OR ((pp.category IN ('security', 'critical') OR pp.severity = 'critical')
-                                            AND pp.first_seen_at < now() - interval '7 days'))) OR ",
-            reboot_overdue!(), " ",
-            "THEN 2 ELSE 0 END)"
-        )
-    };
-}
+// Health is stored on the agent (migration 0026): the inputs (open alerts, failed jobs, overdue
+// and failed patches, the fullest disk), and the rank worked out from them, are kept current
+// by triggers and a periodic reconcile (`refresh_health`), so listing agents and the dashboard
+// only read columns. The rules themselves are the SQL function `agent_health_rank`:
+// 0 healthy, 1 unknown (never reported), 2 needs attention, 3 unhealthy.
+// Online/offline is separate: a workstation that is switched off isn't unhealthy (unless an
+// offline alert policy says so). Open critical alerts make an agent unhealthy, warnings make it
+// need attention.
 macro_rules! health_name {
     () => {
-        concat!("(ARRAY['healthy', 'unknown', 'attention', 'unhealthy'])[", health_rank!(), " + 1]")
+        "(ARRAY['healthy', 'unknown', 'attention', 'unhealthy'])[a.health_rank + 1]"
     };
+}
+
+/// Works the stored health of every agent out again from the tables (alerts, jobs, patches) and
+/// the clock. Triggers keep it current as those change; this catches what time alone changes (a
+/// failed job passing 24 hours, a reboot pending for a day) and is a safety net for anything
+/// the triggers missed. Cheap when nothing changed: only differing rows are written.
+pub async fn refresh_health(db: &sqlx::PgPool) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT refresh_agent_health()").execute(db).await?;
+    Ok(())
 }
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -105,13 +59,13 @@ pub struct AgentSummary {
     update_version: Option<String>,
     update_detail: Option<String>,
     update_at: Option<DateTime<Utc>>,
-    /// healthy / attention / unhealthy / unknown: see `health_rank!`.
+    /// healthy / attention / unhealthy / unknown: see `agent_health_rank` (migration 0026).
     health: String,
     disk_max_pct: f64,
     failed_jobs_24h: i64,
     /// Unresolved alerts.
     open_alerts: i64,
-    /// See `patches_overdue!`.
+    /// Security or critical updates missing for more than a week, not declined.
     patches_overdue: i64,
     patches_failed: i64,
     reboot_pending: bool,
@@ -125,6 +79,8 @@ pub struct AgentSummary {
     /// The policy set it uses (see `/agents/{id}/policy` for why).
     policy_set_id: Uuid,
     policy_set_name: String,
+    /// `[{id, name, color}]`, by name.
+    tags: serde_json::Value,
     #[sqlx(default)]
     #[serde(skip)]
     sort_key: String,
@@ -135,17 +91,12 @@ pub(crate) const SUMMARY_COLS: &str = concat!(
        a.last_seen_at, a.enrolled_at, a.site_id, s.name AS site_name, c.id AS client_id, c.name AS client_name, a.last_metrics,
        a.update_state, a.update_version, a.update_detail, a.update_at, ",
     health_name!(),
-    " AS health, ",
-    disk_pct!(),
-    " AS disk_max_pct, ",
-    failed_24h!(),
-    " AS failed_jobs_24h, (SELECT count(*) FROM alerts oa WHERE oa.agent_id = a.id AND oa.resolved_at IS NULL) AS open_alerts, ",
-    patches_overdue!(),
-    " AS patches_overdue, ",
-    patches_failed!(),
-    " AS patches_failed, a.reboot_pending, a.reboot_pending_since, agent_muted(a.id, now()) AS alerts_muted, a.platform, a.category_id,
+    " AS health, a.disk_max_pct, a.failed_jobs_24h::bigint AS failed_jobs_24h, a.open_alerts::bigint AS open_alerts,
+       a.patches_overdue::bigint AS patches_overdue, a.patches_failed::bigint AS patches_failed, a.reboot_pending, a.reboot_pending_since, agent_muted(a.id, now()) AS alerts_muted, a.platform, a.category_id,
        (SELECT dc.name FROM device_categories dc WHERE dc.id = a.category_id) AS category_name, a.policy_set_id,
-       (SELECT ps.name FROM policy_sets ps WHERE ps.id = a.policy_set_id) AS policy_set_name"
+       (SELECT ps.name FROM policy_sets ps WHERE ps.id = a.policy_set_id) AS policy_set_name,
+       coalesce((SELECT jsonb_agg(jsonb_build_object('id', t.id, 'name', t.name, 'color', t.color) ORDER BY lower(t.name))
+                   FROM agent_tags atg JOIN tags t ON t.id = atg.tag_id WHERE atg.agent_id = a.id), '[]'::jsonb) AS tags"
 );
 const AGENT_FROM: &str = "FROM agents a JOIN sites s ON s.id = a.site_id JOIN clients c ON c.id = s.client_id";
 
@@ -154,7 +105,7 @@ const SORT_KEYS: &[SortKey] = &[
     SortKey { name: "client", expr: "lower(c.name || ' / ' || s.name || ' / ' || a.hostname)", ty: "text" },
     SortKey { name: "os", expr: "lower(a.os_family || ' ' || a.os_name)", ty: "text" },
     SortKey { name: "status", expr: "a.online::int", ty: "int" },
-    SortKey { name: "health", expr: health_rank!(), ty: "int" },
+    SortKey { name: "health", expr: "a.health_rank::int", ty: "int" },
     SortKey { name: "last_seen", expr: "coalesce(a.last_seen_at, 'epoch'::timestamptz)", ty: "timestamptz" },
     SortKey { name: "enrolled", expr: "a.enrolled_at", ty: "timestamptz" },
     SortKey { name: "cpu", expr: "coalesce((a.last_metrics->>'cpu_percent')::float8, -1)", ty: "float8" },
@@ -163,7 +114,7 @@ const SORT_KEYS: &[SortKey] = &[
         expr: "coalesce((a.last_metrics->>'mem_used')::float8 / nullif((a.last_metrics->>'mem_total')::float8, 0), -1)",
         ty: "float8",
     },
-    SortKey { name: "disk", expr: disk_pct!(), ty: "float8" },
+    SortKey { name: "disk", expr: "a.disk_max_pct", ty: "float8" },
     SortKey { name: "version", expr: "a.agent_version", ty: "text" },
     SortKey { name: "category", expr: "(SELECT lower(dc.name) FROM device_categories dc WHERE dc.id = a.category_id)", ty: "text" },
 ];
@@ -182,17 +133,24 @@ pub struct ListQuery {
     new_days: Option<i32>,
     category_id: Option<Uuid>,
     policy_set_id: Option<Uuid>,
+    /// Comma-separated tag ids: agents that have all of them.
+    tag: Option<String>,
+    /// A custom field of agents (its id): agents with a value for it...
+    cf: Option<Uuid>,
+    /// ...and, with `cf`, that value: matched exactly, or as a case-insensitive substring for text fields.
+    cfv: Option<String>,
 }
 
 /// Matches hostname, OS name, an IP address prefix or a logged-in user. `$n` is the search text.
+/// Each part is an index lookup (trigram indexes on the hostname, the OS name and the stored
+/// addresses and users in `agent_search_terms`, migration 0026), not a scan of the fleet's
+/// inventories.
 pub(crate) fn agent_search(n: usize) -> String {
     format!(
-        "(a.hostname ILIKE '%' || ${n} || '%' OR a.os_name ILIKE '%' || ${n} || '%'
-          OR EXISTS (SELECT 1 FROM jsonb_array_elements(coalesce(a.inventory->'network', '[]')) nic,
-                            jsonb_array_elements_text(coalesce(nic->'addrs', '[]')) ip
-                      WHERE ip LIKE ${n} || '%')
-          OR EXISTS (SELECT 1 FROM jsonb_array_elements_text(coalesce(a.inventory->'logged_in_users', '[]')) lu
-                      WHERE lu ILIKE ${n} || '%'))"
+        "a.id IN (SELECT m.id FROM agents m WHERE m.hostname ILIKE '%' || ${n} || '%'
+                  UNION SELECT m.id FROM agents m WHERE m.os_name ILIKE '%' || ${n} || '%'
+                  UNION SELECT t.agent_id FROM agent_search_terms t WHERE t.kind = 'ip' AND t.term LIKE ${n} || '%'
+                  UNION SELECT t.agent_id FROM agent_search_terms t WHERE t.kind = 'user' AND t.term ILIKE ${n} || '%')"
     )
 }
 
@@ -202,7 +160,9 @@ pub async fn list(
     Query(q): Query<ListQuery>,
     Query(page): Query<PageQuery>,
 ) -> ApiResult<Json<Page<AgentSummary>>> {
-    let plan = Plan::new(SORT_KEYS, ("hostname", false), &page, "a.id", "uuid", 11)?;
+    let plan = Plan::new(SORT_KEYS, ("hostname", false), &page, "a.id", "uuid", 15)?;
+    let tags = super::tags::parse_filter(q.tag.as_deref())?;
+    let cf = super::fields::filter(&st, &u, q.cf, q.cfv.as_deref()).await?;
     let health: Option<Vec<String>> =
         q.health.as_deref().filter(|h| !h.is_empty()).map(|h| h.split(',').map(str::to_string).collect());
     let filters = format!(
@@ -216,7 +176,11 @@ pub async fn list(
             AND ($7::text[] IS NULL OR {health} = ANY($7))
             AND ($8::int IS NULL OR a.enrolled_at > now() - make_interval(days => $8))
             AND ($9::uuid IS NULL OR a.category_id = $9)
-            AND ($10::uuid IS NULL OR a.policy_set_id = $10)",
+            AND ($10::uuid IS NULL OR a.policy_set_id = $10)
+            AND ($11::uuid[] IS NULL OR (SELECT count(*) FROM agent_tags x WHERE x.agent_id = a.id AND x.tag_id = ANY($11)) = cardinality($11))
+            AND ($12::uuid IS NULL OR EXISTS (SELECT 1 FROM custom_field_values v WHERE v.field_id = $12 AND v.agent_id = a.id
+                   AND ($13::jsonb IS NULL OR v.value = $13)
+                   AND ($14::text IS NULL OR strpos(lower(v.value #>> '{{}}'), lower($14)) > 0)))",
         search = agent_search(3),
         health = health_name!(),
     );
@@ -225,7 +189,7 @@ pub async fn list(
     let os = q.os.as_deref().filter(|s| !s.is_empty());
     macro_rules! bind_filters {
         ($query:expr) => {
-            $query.bind(q.client_id).bind(q.site_id).bind(search).bind(q.online).bind(os).bind(u.scope()).bind(&health).bind(q.new_days).bind(q.category_id).bind(q.policy_set_id)
+            $query.bind(q.client_id).bind(q.site_id).bind(search).bind(q.online).bind(os).bind(u.scope()).bind(&health).bind(q.new_days).bind(q.category_id).bind(q.policy_set_id).bind(&tags).bind(cf.field).bind(&cf.exact).bind(&cf.contains)
         };
     }
     let mut rows = bind_filters!(sqlx::query_as::<_, AgentSummary>(AssertSqlSafe(sql)));
@@ -247,6 +211,8 @@ pub struct AgentDetail {
     inventory_at: Option<DateTime<Utc>>,
     /// Optional features its build supports, as of its last connection (`patch`, `desktop`).
     capabilities: Vec<String>,
+    /// The pinned note, shown in the header.
+    pinned_note: Option<super::notes::Note>,
 }
 
 pub async fn get(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uuid>) -> ApiResult<Json<AgentDetail>> {
@@ -268,7 +234,8 @@ pub async fn get(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uuid>)
         .bind(id)
         .fetch_one(&st.db)
         .await?;
-    Ok(Json(AgentDetail { summary, kernel_version, machine_id, inventory, inventory_at, capabilities }))
+    let pinned_note = super::notes::pinned(&st, &u, id).await?;
+    Ok(Json(AgentDetail { summary, kernel_version, machine_id, inventory, inventory_at, capabilities, pinned_note }))
 }
 
 pub async fn remove(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uuid>) -> ApiResult<Json<serde_json::Value>> {
@@ -437,15 +404,14 @@ pub async fn dashboard(State(st): State<Arc<AppState>>, u: User, Query(q): Query
     .fetch_all(&st.db)
     .await?;
     let high_disk = sqlx::query_as(AssertSqlSafe(format!(
-        "SELECT {SUMMARY_COLS} {scoped} AND {disk} >= 90 ORDER BY {disk} DESC, a.hostname LIMIT 10",
-        disk = disk_pct!()
+        "SELECT {SUMMARY_COLS} {scoped} AND a.disk_max_pct >= 90 ORDER BY a.disk_max_pct DESC, a.hostname LIMIT 10"
     )))
     .bind(scope)
     .fetch_all(&st.db)
     .await?;
     let failed_jobs = super::jobs::recent_failures(&st, scope).await?;
-    // Health is the expensive part (alerts, jobs and patches, and the disks in last_metrics, for
-    // every agent): work it out once per agent, for both the per-client rows and the totals.
+    // Health is stored on each agent (see `refresh_health`): count it, for both the per-client
+    // rows and the totals.
     #[derive(sqlx::FromRow)]
     struct ClientRow {
         id: Uuid,
@@ -457,9 +423,7 @@ pub async fn dashboard(State(st): State<Arc<AppState>>, u: User, Query(q): Query
         open_alerts: i64,
     }
     let rows: Vec<ClientRow> = sqlx::query_as(AssertSqlSafe(format!(
-        "WITH r AS (SELECT s.client_id, a.online, {rank} AS rank, {failed} AS failed,
-                           (SELECT count(*) FROM alerts oa WHERE oa.agent_id = a.id AND oa.resolved_at IS NULL) AS open_alerts
-                      {scoped})
+        "WITH r AS (SELECT s.client_id, a.online, a.health_rank AS rank, a.failed_jobs_24h AS failed, a.open_alerts {scoped})
          SELECT c.id, c.name, count(r.client_id) AS agents, count(r.client_id) FILTER (WHERE r.online) AS online,
                 ARRAY[count(r.client_id) FILTER (WHERE r.rank = 0), count(r.client_id) FILTER (WHERE r.rank = 1),
                       count(r.client_id) FILTER (WHERE r.rank = 2), count(r.client_id) FILTER (WHERE r.rank = 3)] AS ranks,
@@ -468,9 +432,7 @@ pub async fn dashboard(State(st): State<Arc<AppState>>, u: User, Query(q): Query
           WHERE ($1::uuid[] IS NULL OR c.id = ANY($1))
           GROUP BY c.id
           ORDER BY count(r.client_id) FILTER (WHERE r.rank = 3) DESC, count(r.client_id) FILTER (WHERE r.rank = 2) DESC, 7 DESC,
-                   count(r.client_id) - count(r.client_id) FILTER (WHERE r.online) DESC, lower(c.name)",
-        rank = health_rank!(),
-        failed = failed_24h!(),
+                   count(r.client_id) - count(r.client_id) FILTER (WHERE r.online) DESC, lower(c.name)"
     )))
     .bind(scope)
     .fetch_all(&st.db)
@@ -605,4 +567,330 @@ pub async fn rollout(State(st): State<Arc<AppState>>, u: User, Json(b): Json<Rol
     }
     auth::audit(&st.db, Some(u.id), "agent.update_rollout", None, json!({ "offered": offered, "considered": ids.len() })).await;
     Ok(Json(json!({ "offered": offered, "skipped": ids.len() - offered })))
+}
+
+/// Migration 0026 against the expressions it replaced: the stored health and the indexed search
+/// must give what computing them from the inventories, alerts, jobs and patches gives.
+///
+/// Needs only a Postgres it can `CREATE DATABASE` on (the same `RMM_E2E_DATABASE_URL` as the e2e
+/// suite):
+/// `RMM_E2E_DATABASE_URL=postgres://rmm:rmm@localhost:5432/postgres cargo test -p rmm-server stored_columns -- --ignored --nocapture`
+#[cfg(test)]
+mod tests {
+    use serde_json::Value;
+    use sqlx::Connection;
+
+    use super::agent_search;
+
+    /// The health expressions as they were before the columns (one per input), the reference.
+    const OLD_DISK: &str = "coalesce((SELECT max(100 * (1 - (d->>'available')::float8 / (d->>'total')::float8))
+                     FROM jsonb_array_elements(a.last_metrics->'disks') d WHERE (d->>'total')::float8 > 0), 0)";
+    const OLD_FAILED: &str = "(SELECT count(*) FROM jobs fj WHERE fj.agent_id = a.id AND fj.created_at > now() - interval '24 hours'
+             AND fj.status IN ('failed', 'error', 'timed_out', 'lost'))";
+    const OLD_OPEN_ALERTS: &str = "(SELECT count(*) FROM alerts oa WHERE oa.agent_id = a.id AND oa.resolved_at IS NULL)";
+    const OLD_OVERDUE: &str = "(SELECT count(*) FROM patches pp WHERE pp.agent_id = a.id AND pp.state <> 'installed' AND pp.approval <> 'declined'
+             AND (pp.category IN ('security', 'critical') OR pp.severity = 'critical') AND pp.first_seen_at < now() - interval '7 days')";
+    const OLD_PATCHES_FAILED: &str = "(SELECT count(*) FROM patches pp WHERE pp.agent_id = a.id AND pp.state = 'failed' AND pp.approval <> 'declined')";
+
+    fn old_alert(sev: &str) -> String {
+        format!("EXISTS (SELECT 1 FROM alerts oa WHERE oa.agent_id = a.id AND oa.resolved_at IS NULL AND NOT oa.suppressed AND oa.severity = '{sev}')")
+    }
+    fn old_rank() -> String {
+        format!(
+            "(CASE WHEN {crit} THEN 3 WHEN a.last_metrics IS NULL THEN 1 WHEN {OLD_DISK} >= 95 THEN 3 WHEN
+             {OLD_DISK} >= 90 OR {warn} OR {OLD_FAILED} > 0 OR (a.update_state IN ('failed', 'rolled_back') AND a.update_at > now() - interval '7 days') OR
+             EXISTS (SELECT 1 FROM patches pp WHERE pp.agent_id = a.id AND pp.state <> 'installed' AND pp.approval <> 'declined'
+               AND (pp.state = 'failed' OR ((pp.category IN ('security', 'critical') OR pp.severity = 'critical')
+                                            AND pp.first_seen_at < now() - interval '7 days'))) OR
+             (a.reboot_pending AND a.reboot_pending_since < now() - interval '24 hours')
+             THEN 2 ELSE 0 END)",
+            crit = old_alert("critical"),
+            warn = old_alert("warning"),
+        )
+    }
+    /// The old per-agent figures, and the stored ones, as one JSON object per agent.
+    fn figures(live: bool) -> String {
+        let (rank, disk, failed, alerts, overdue, pfailed) = if live {
+            (old_rank(), OLD_DISK.to_string(), OLD_FAILED.to_string(), OLD_OPEN_ALERTS.to_string(), OLD_OVERDUE.to_string(), OLD_PATCHES_FAILED.to_string())
+        } else {
+            (
+                "a.health_rank".into(),
+                "a.disk_max_pct".into(),
+                "a.failed_jobs_24h".into(),
+                "a.open_alerts".into(),
+                "a.patches_overdue".into(),
+                "a.patches_failed".into(),
+            )
+        };
+        format!(
+            "SELECT a.hostname, jsonb_build_object('rank', {rank}, 'disk', {disk}, 'failed', {failed}, 'alerts', {alerts},
+                                                    'overdue', {overdue}, 'patches_failed', {pfailed})
+               FROM agents a ORDER BY a.hostname"
+        )
+    }
+    async fn all(db: &sqlx::PgPool, sql: String) -> Vec<(String, Value)> {
+        sqlx::query_as(sqlx::AssertSqlSafe(sql)).fetch_all(db).await.unwrap()
+    }
+    /// Stored health equals the live expressions, for every agent; returns how many differ in
+    /// rank from "healthy", so the test can see it isn't comparing all-zero.
+    async fn health_matches(db: &sqlx::PgPool, what: &str) {
+        let live = all(db, figures(true)).await;
+        let stored = all(db, figures(false)).await;
+        assert_eq!(live.len(), stored.len());
+        for (l, s) in live.iter().zip(&stored) {
+            assert_eq!(l, s, "{what}: stored health of {} differs from the expressions", l.0);
+        }
+    }
+    /// The indexed search finds the agents the old scan of the inventories found.
+    async fn search_matches(db: &sqlx::PgPool, what: &str) -> usize {
+        let old = "(a.hostname ILIKE '%' || $1 || '%' OR a.os_name ILIKE '%' || $1 || '%'
+          OR EXISTS (SELECT 1 FROM jsonb_array_elements(coalesce(a.inventory->'network', '[]')) nic,
+                            jsonb_array_elements_text(coalesce(nic->'addrs', '[]')) ip
+                      WHERE ip LIKE $1 || '%')
+          OR EXISTS (SELECT 1 FROM jsonb_array_elements_text(coalesce(a.inventory->'logged_in_users', '[]')) lu
+                      WHERE lu ILIKE $1 || '%'))";
+        let mut found = 0;
+        for q in [
+            "host", "HOST", "Host-0", "srv_", "_", "%", "sr%1", "10.0", "10.0.1.", "10.0.1.1", "fe80", "FE80", "alice", "ALICE", "Ali", "ice", "bob1", "bo", "b",
+            "windows", "UBUNTU", "22.04", "nomatch", "x_y", "\\", "10.0.2.%", "%.1/24", "admin", "root",
+        ] {
+            let mut ids = vec![];
+            for cond in [old.to_string(), agent_search(1)] {
+                let rows: Vec<(String,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!("SELECT a.hostname FROM agents a WHERE {cond} ORDER BY a.hostname")))
+                    .bind(q)
+                    .fetch_all(db)
+                    .await
+                    .unwrap_or_else(|e| panic!("{what}: searching for {q:?}: {e}"));
+                ids.push(rows);
+            }
+            assert_eq!(ids[0], ids[1], "{what}: search for {q:?}");
+            found += ids[0].len();
+        }
+        found
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs Postgres: see the module docs"]
+    async fn stored_columns_match_the_live_expressions() {
+        let admin_url = std::env::var("RMM_E2E_DATABASE_URL").expect("set RMM_E2E_DATABASE_URL (see the module docs)");
+        let db_name = format!("rmm_stored_{}", uuid::Uuid::new_v4().simple());
+        let mut admin_conn = sqlx::PgConnection::connect(&admin_url).await.unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {db_name}"))).execute(&mut admin_conn).await.unwrap();
+        let db = sqlx::PgPool::connect(&format!("{}/{db_name}", admin_url.rsplit_once('/').unwrap().0)).await.unwrap();
+
+        let all_migrations = sqlx::migrate!("./migrations");
+        let mut before = sqlx::migrate!("./migrations");
+        before.migrations = std::borrow::Cow::Owned(all_migrations.migrations.iter().filter(|m| m.version < 26).cloned().collect());
+        before.run(&db).await.unwrap();
+
+        // --- agents of every shape, before the migration ----------------------------------------------------------
+        sqlx::raw_sql(
+            r#"
+            INSERT INTO clients (id, name) VALUES ('c1000000-0000-4000-8000-000000000000', 'Stored Co');
+            INSERT INTO sites (id, client_id, name) VALUES ('51000000-0000-4000-8000-000000000000', 'c1000000-0000-4000-8000-000000000000', 'HQ');
+            INSERT INTO agents (id, site_id, secret_hash, hostname, os_family, os_name, last_metrics, inventory, update_state, update_at, reboot_pending, reboot_pending_since)
+            SELECT ('a0000000-0000-4000-8000-' || lpad(i::text, 12, '0'))::uuid, '51000000-0000-4000-8000-000000000000', '\x00',
+                   (ARRAY['host-', 'HOST-', 'srv_', 'Host-', 'x_y-'])[i % 5 + 1] || lpad(i::text, 3, '0'),
+                   CASE WHEN i % 3 = 0 THEN 'linux' ELSE 'windows' END,
+                   CASE WHEN i % 3 = 0 THEN 'Ubuntu 22.04' ELSE 'Windows 11 Pro' END,
+                   -- never reported / disks of every fill, none, or with a zero size / no disks key
+                   CASE WHEN i % 6 = 0 THEN NULL
+                        WHEN i % 9 = 0 THEN jsonb_build_object('cpu_percent', 5, 'disks', jsonb_build_array(jsonb_build_object('total', 100, 'available', 3), jsonb_build_object('total', 100, 'available', 90)))
+                        WHEN i % 9 = 1 THEN jsonb_build_object('cpu_percent', 5, 'disks', jsonb_build_array(jsonb_build_object('total', 1000, 'available', 90)))
+                        WHEN i % 9 = 2 THEN jsonb_build_object('cpu_percent', 5, 'disks', jsonb_build_array(jsonb_build_object('total', 0, 'available', 0)))
+                        WHEN i % 9 = 3 THEN jsonb_build_object('cpu_percent', 5)
+                        WHEN i % 9 = 4 THEN jsonb_build_object('cpu_percent', 5, 'disks', '[]'::jsonb)
+                        ELSE jsonb_build_object('cpu_percent', 5, 'disks', jsonb_build_array(jsonb_build_object('total', 100, 'available', 80))) END,
+                   -- no inventory yet / empty / addresses and users in varied case, with duplicates
+                   CASE WHEN i % 5 = 0 THEN NULL
+                        WHEN i % 11 = 0 THEN '{}'::jsonb
+                        ELSE jsonb_build_object(
+                            'network', jsonb_build_array(
+                                jsonb_build_object('name', 'eth0', 'addrs', jsonb_build_array('10.0.' || (i % 4) || '.' || i || '/24', 'fe80::' || i || '/64')),
+                                jsonb_build_object('name', 'lo', 'addrs', jsonb_build_array('127.0.0.1/8', '10.0.' || (i % 4) || '.' || i || '/24')),
+                                jsonb_build_object('name', 'dead')),
+                            'logged_in_users', jsonb_build_array(CASE WHEN i % 2 = 0 THEN 'Alice' ELSE 'alice' END, 'bob' || (i % 3), 'DOMAIN\\user_' || i)) END,
+                   CASE WHEN i % 10 = 7 THEN 'failed' WHEN i % 10 = 8 THEN 'completed' END,
+                   CASE WHEN i % 20 = 7 THEN now() - interval '8 days' WHEN i % 10 = 7 THEN now() - interval '1 day' END,
+                   i % 13 = 0,
+                   CASE WHEN i % 26 = 0 THEN now() - interval '3 days' WHEN i % 13 = 0 THEN now() - interval '2 hours' END
+              FROM generate_series(1, 60) i;
+            -- alerts: critical / warning / info open, held back, resolved
+            INSERT INTO alerts (id, agent_id, kind, severity, title, resolved_at)
+            SELECT gen_random_uuid(), ('a0000000-0000-4000-8000-' || lpad(i::text, 12, '0'))::uuid, 'cpu',
+                   (ARRAY['critical', 'warning', 'info'])[i % 3 + 1], 'alert ' || i, CASE WHEN i % 7 = 0 THEN now() END
+              FROM generate_series(1, 60) i WHERE i % 2 = 0 OR i % 5 = 0;
+            UPDATE alerts SET suppressed = true WHERE title IN ('alert 6', 'alert 12', 'alert 30', 'alert 5');
+            INSERT INTO alerts (id, agent_id, kind, severity, title) -- a second open one on some agents
+            SELECT gen_random_uuid(), ('a0000000-0000-4000-8000-' || lpad(i::text, 12, '0'))::uuid, 'disk', 'warning', 'disk ' || i FROM generate_series(1, 60, 4) i;
+            INSERT INTO jobs (id, agent_id, interpreter, body, timeout_secs, status, created_at)
+            SELECT gen_random_uuid(), ('a0000000-0000-4000-8000-' || lpad(i::text, 12, '0'))::uuid, 'bash', 'true', 60,
+                   (ARRAY['queued', 'sent', 'succeeded', 'failed', 'timed_out', 'error', 'lost', 'cancelled', 'expired'])[(i + j) % 9 + 1],
+                   now() - (j * interval '9 hours')
+              FROM generate_series(1, 60) i, generate_series(0, 4) j WHERE (i + j) % 3 <> 0;
+            INSERT INTO patches (agent_id, update_id, title, category, severity, state, approval, first_seen_at)
+            SELECT ('a0000000-0000-4000-8000-' || lpad(i::text, 12, '0'))::uuid, 'KB' || j, 'update ' || j,
+                   (ARRAY['security', 'critical', 'other', 'driver'])[(i + j) % 4 + 1],
+                   (ARRAY[NULL, 'critical', 'low'])[(i * j) % 3 + 1],
+                   (ARRAY['missing', 'installing', 'installed', 'failed'])[(i + 2 * j) % 4 + 1],
+                   (ARRAY['pending', 'approved', 'declined'])[(i + j) % 3 + 1],
+                   now() - (((i * j) % 12) * interval '1 day')
+              FROM generate_series(1, 60) i, generate_series(1, 3) j WHERE (i + j) % 2 = 0;
+            "#,
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+
+        // The migration: stored columns backfilled from what is there.
+        all_migrations.run(&db).await.unwrap();
+        health_matches(&db, "after the migration").await;
+        let found = search_matches(&db, "after the migration").await;
+        assert!(found > 100, "the search patterns find something to compare: {found}");
+        let spread: Vec<(i16, i64)> =
+            sqlx::query_as("SELECT health_rank, count(*) FROM agents GROUP BY 1 ORDER BY 1").fetch_all(&db).await.unwrap();
+        assert_eq!(spread.iter().map(|(r, _)| *r).collect::<Vec<_>>(), [0, 1, 2, 3], "the data covers every health rank: {spread:?}");
+
+        // --- incremental: each change through the tables the health comes from ------------------------------------
+        let agent = |i: i32| format!("'a0000000-0000-4000-8000-{i:012}'");
+        let run = |sql: String| {
+            let db = db.clone();
+            async move { sqlx::raw_sql(sqlx::AssertSqlSafe(sql)).execute(&db).await.unwrap() }
+        };
+        // Alerts: resolve, hold back, release, re-rate, open, delete.
+        run("UPDATE alerts SET resolved_at = now() WHERE severity = 'critical' AND resolved_at IS NULL AND title IN ('alert 2', 'alert 8')".into()).await;
+        health_matches(&db, "alerts resolved").await;
+        run("UPDATE alerts SET suppressed = NOT suppressed WHERE title IN ('alert 4', 'alert 6', 'alert 10')".into()).await;
+        health_matches(&db, "alerts held back / released").await;
+        run("UPDATE alerts SET severity = 'critical' WHERE title IN ('alert 16', 'alert 20', 'alert 22')".into()).await;
+        health_matches(&db, "alerts re-rated").await;
+        run(format!(
+            "INSERT INTO alerts (id, agent_id, kind, severity, title) VALUES (gen_random_uuid(), {}, 'cpu', 'critical', 'new'), (gen_random_uuid(), {}, 'cpu', 'warning', 'new')",
+            agent(1),
+            agent(3)
+        ))
+        .await;
+        health_matches(&db, "alerts opened").await;
+        run("DELETE FROM alerts WHERE title IN ('alert 10', 'alert 24', 'new')".into()).await;
+        health_matches(&db, "alerts deleted").await;
+        run("DELETE FROM alerts WHERE resolved_at IS NOT NULL".into()).await;
+        health_matches(&db, "resolved alerts pruned").await;
+        // Jobs: results arrive, new ones are queued (a bulk run), old ones are pruned.
+        run("UPDATE jobs SET status = 'failed' WHERE status = 'sent'".into()).await;
+        health_matches(&db, "jobs failed").await;
+        run("UPDATE jobs SET status = 'succeeded' WHERE status IN ('error', 'lost') AND created_at > now() - interval '12 hours'".into()).await;
+        health_matches(&db, "jobs recovered").await;
+        run("INSERT INTO jobs (id, agent_id, interpreter, body, timeout_secs, status) SELECT gen_random_uuid(), id, 'bash', 'true', 60, 'queued' FROM agents".into()).await;
+        health_matches(&db, "jobs queued for every agent").await;
+        run("UPDATE jobs SET status = 'timed_out' WHERE status = 'queued' AND agent_id IN (SELECT id FROM agents ORDER BY hostname LIMIT 7)".into()).await;
+        health_matches(&db, "queued jobs timed out").await;
+        run("DELETE FROM jobs WHERE status IN ('failed', 'cancelled')".into()).await;
+        health_matches(&db, "failed jobs pruned").await;
+        // Patches: a scan's upserts, installs, declines, new ones.
+        run("UPDATE patches SET state = 'installed' WHERE state = 'failed' AND update_id = 'KB2'".into()).await;
+        health_matches(&db, "patches installed").await;
+        run("UPDATE patches SET approval = 'declined' WHERE state = 'missing' AND update_id = 'KB1'".into()).await;
+        health_matches(&db, "patches declined").await;
+        run("UPDATE patches SET state = 'failed', approval = 'approved' WHERE state = 'installing'".into()).await;
+        health_matches(&db, "installs failed").await;
+        run(format!("INSERT INTO patches (agent_id, update_id, title, category, state, first_seen_at) VALUES ({}, 'KBnew', 'new', 'security', 'missing', now() - interval '9 days')", agent(1))).await;
+        health_matches(&db, "an old security update seen").await;
+        run(format!(
+            "INSERT INTO patches (agent_id, update_id, title, category, state) VALUES ({}, 'KBfresh', 'new', 'security', 'missing')
+             ON CONFLICT (agent_id, update_id) DO UPDATE SET state = 'missing', last_seen_at = now()",
+            agent(1)
+        ))
+        .await;
+        run(format!("UPDATE patches SET first_seen_at = now() - interval '2 days' WHERE agent_id = {} AND update_id = 'KBnew'", agent(1))).await;
+        health_matches(&db, "an update's first sighting moved").await;
+        run("DELETE FROM patches WHERE state = 'installed'".into()).await;
+        health_matches(&db, "installed patches pruned").await;
+        // The agent row itself: heartbeats (disks), update state, reboot flag, inventory.
+        run("UPDATE agents SET last_metrics = jsonb_build_object('cpu_percent', 9, 'disks', jsonb_build_array(jsonb_build_object('total', 100, 'available', 2)))
+              WHERE hostname LIKE 'host-%'"
+            .into())
+        .await;
+        health_matches(&db, "heartbeats with full disks").await;
+        run("UPDATE agents SET last_metrics = jsonb_build_object('cpu_percent', 9, 'disks', jsonb_build_array(jsonb_build_object('total', 100, 'available', 60)))
+              WHERE last_metrics IS NULL"
+            .into())
+        .await;
+        health_matches(&db, "first heartbeats").await;
+        run("UPDATE agents SET update_state = 'rolled_back', update_at = now() WHERE hostname LIKE 'srv_%'".into()).await;
+        run("UPDATE agents SET update_state = 'failed', update_at = now() - interval '9 days' WHERE hostname LIKE 'x_y-%'".into()).await;
+        health_matches(&db, "self-update failures").await;
+        run("UPDATE agents SET reboot_pending = true, reboot_pending_since = now() - interval '30 hours' WHERE hostname LIKE 'Host-%'".into()).await;
+        run("UPDATE agents SET reboot_pending = false WHERE hostname LIKE 'HOST-%'".into()).await;
+        health_matches(&db, "reboot flags").await;
+        run("UPDATE agents SET online = NOT online".into()).await;
+        health_matches(&db, "online flags (not an input)").await;
+        // Inventory: addresses and users change, one agent's inventory goes away.
+        run(format!(
+            "UPDATE agents SET inventory = jsonb_build_object('network', jsonb_build_array(jsonb_build_object('addrs', jsonb_build_array('192.168.7.7/24'))),
+                                                              'logged_in_users', jsonb_build_array('Carol'))
+              WHERE id IN ({}, {}, {})",
+            agent(1),
+            agent(2),
+            agent(3)
+        ))
+        .await;
+        run(format!("UPDATE agents SET inventory = NULL WHERE id = {}", agent(4))).await;
+        run(format!("UPDATE agents SET hostname = 'renamed-host', os_name = 'Fedora 41' WHERE id = {}", agent(7))).await;
+        let after_inv = search_matches(&db, "inventory changed").await;
+        assert!(after_inv > 50);
+        let carol: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT count(*) FROM agents a WHERE {}",
+            agent_search(1)
+        )))
+        .bind("carol")
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(carol, 3, "the new logged-in user is found");
+        let gone: i64 = sqlx::query_scalar("SELECT count(*) FROM agent_search_terms WHERE agent_id = 'a0000000-0000-4000-8000-000000000004'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(gone, 0, "an agent without an inventory has no terms");
+        health_matches(&db, "inventory changes").await;
+        // An agent with alerts, jobs, patches and terms goes away.
+        run(format!("DELETE FROM agents WHERE id = {}", agent(2))).await;
+        health_matches(&db, "an agent deleted").await;
+        search_matches(&db, "an agent deleted").await;
+        // A malformed inventory (the old search failed outright on it) just has no terms.
+        run(format!("UPDATE agents SET inventory = '{{\"network\": null, \"logged_in_users\": \"nobody\"}}' WHERE id = {}", agent(6))).await;
+        let nobody: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT count(*) FROM agents a WHERE {}", agent_search(1))))
+            .bind("nobody")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(nobody, 0);
+        // A new agent: unknown until it reports.
+        run("INSERT INTO agents (id, site_id, secret_hash, hostname, os_family) VALUES ('a0000000-0000-4000-8000-0000000000ff', '51000000-0000-4000-8000-000000000000', '\\x00', 'brand-new', 'linux')".into()).await;
+        health_matches(&db, "a new agent").await;
+        let rank: i16 = sqlx::query_scalar("SELECT health_rank FROM agents WHERE hostname = 'brand-new'").fetch_one(&db).await.unwrap();
+        assert_eq!(rank, 1);
+
+        // --- the reconcile: what only time changes, and anything that drifted ---------------------------------------
+        run("UPDATE jobs SET created_at = now() - interval '30 hours' WHERE status IN ('timed_out', 'error', 'lost')".into()).await;
+        let live = all(&db, figures(true)).await;
+        let stored = all(&db, figures(false)).await;
+        assert_ne!(live, stored, "jobs aging out of the 24 hours are not seen by a trigger");
+        super::refresh_health(&db).await.unwrap();
+        health_matches(&db, "reconciled after time passed").await;
+        run("UPDATE agents SET health_rank = 0, open_alerts = 99, failed_jobs_24h = 7, patches_overdue = 3 WHERE hostname LIKE 'host-%'".into()).await;
+        assert_ne!(all(&db, figures(true)).await, all(&db, figures(false)).await);
+        super::refresh_health(&db).await.unwrap();
+        health_matches(&db, "reconciled after drift").await;
+        // A reconcile that finds nothing rewrites nothing.
+        let versions = "SELECT array_agg(xmin::text ORDER BY id) FROM agents";
+        let before: Vec<String> = sqlx::query_scalar(versions).fetch_one(&db).await.unwrap();
+        super::refresh_health(&db).await.unwrap();
+        let after: Vec<String> = sqlx::query_scalar(versions).fetch_one(&db).await.unwrap();
+        assert_eq!(before, after, "a reconcile that finds nothing new rewrites no agent rows");
+
+        db.close().await;
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE IF EXISTS {db_name} WITH (FORCE)"))).execute(&mut admin_conn).await.unwrap();
+        println!("stored columns: ok");
+    }
 }

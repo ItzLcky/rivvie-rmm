@@ -83,8 +83,13 @@
 		<div class="text-muted max-w-md truncate text-xs"><span class="sm:hidden">{a.hostname} · {a.severity} · {ago(a.opened_at)}</span><span class="hidden sm:inline">{a.policy_name ?? kindLabels[a.kind]}</span>{a.occurrences > 1 ? ` · ${num(a.occurrences)} times` : ''}</div>
 	{/snippet}
 	{#snippet agentCell(a: Alert)}
-		<a class="hover:text-accent font-medium" href="/agents/{a.agent_id}?tab=alerts">{a.hostname}</a>
-		<div class="text-muted truncate text-xs">{a.client_name} › {a.site_name}</div>
+		{#if a.device_id}
+			<a class="hover:text-accent font-medium" href="/network/devices/{a.device_id}">{a.device_name ?? 'Network device'}</a>
+			<div class="text-muted truncate text-xs">{a.client_name} › {a.site_name} · read by {a.hostname}</div>
+		{:else}
+			<a class="hover:text-accent font-medium" href="/agents/{a.agent_id}?tab=alerts">{a.hostname}</a>
+			<div class="text-muted truncate text-xs">{a.client_name} › {a.site_name}</div>
+		{/if}
 	{/snippet}
 	{#snippet stateCell(a: Alert)}<AlertStateBadge alert={a} />{/snippet}
 	{#snippet openedCell(a: Alert)}<span class="whitespace-nowrap" title={datetime(a.opened_at)}>{ago(a.opened_at)}</span>{/snippet}

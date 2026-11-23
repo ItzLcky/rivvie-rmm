@@ -15,6 +15,10 @@ pub enum ApiError {
     /// Password was right; a TOTP or recovery code is needed (or was wrong).
     #[error("{0}")]
     MfaRequired(&'static str),
+    /// Password was right; a second factor is needed (or was wrong), and these are the ones the
+    /// account has.
+    #[error("{msg}")]
+    MfaMethods { msg: &'static str, totp: bool, passkey: bool },
     /// Signed in, but the account must set up 2FA before using anything else.
     #[error("set up two-factor authentication to continue")]
     MfaSetupRequired,
@@ -45,7 +49,7 @@ impl IntoResponse for ApiError {
         let status = match &self {
             ApiError::Unauthorized => StatusCode::UNAUTHORIZED,
             ApiError::Forbidden | ApiError::Denied(_) | ApiError::MfaSetupRequired => StatusCode::FORBIDDEN,
-            ApiError::MfaRequired(_) => StatusCode::UNAUTHORIZED,
+            ApiError::MfaRequired(_) | ApiError::MfaMethods { .. } => StatusCode::UNAUTHORIZED,
             ApiError::NotFound(_) => StatusCode::NOT_FOUND,
             ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
             ApiError::Conflict(_) => StatusCode::CONFLICT,
@@ -69,6 +73,10 @@ impl IntoResponse for ApiError {
         let mut body = json!({ "error": msg });
         match self {
             ApiError::MfaRequired(_) => body["mfa_required"] = true.into(),
+            ApiError::MfaMethods { totp, passkey, .. } => {
+                body["mfa_required"] = true.into();
+                body["methods"] = json!({ "totp": totp, "passkey": passkey });
+            }
             ApiError::MfaSetupRequired => body["mfa_setup_required"] = true.into(),
             ApiError::TooManyRequests(wait) | ApiError::Throttled(wait) => {
                 return (status, [(axum::http::header::RETRY_AFTER, wait.as_secs().to_string())], Json(body)).into_response();

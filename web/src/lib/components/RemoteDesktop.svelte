@@ -305,7 +305,7 @@
 
 <svelte:document {onfullscreenchange} />
 
-<div bind:this={container} class={cx('card flex flex-col overflow-hidden', !full && 'h-[calc(100dvh-14rem)] min-h-96')}>
+<div bind:this={container} class={cx('card flex flex-col overflow-hidden', !full && 'h-[calc(100dvh-16rem)] min-h-96')}>
 	<div class="border-border flex flex-wrap items-center gap-x-2 gap-y-1 border-b px-3 py-1.5 text-xs">
 		<span class={cx('inline-flex items-center gap-1.5 font-medium', tone === 'success' ? 'text-success' : tone === 'warning' ? 'text-warning' : 'text-muted')}>
 			<span class={cx('size-2 rounded-full', tone === 'success' ? 'bg-success' : tone === 'warning' ? 'bg-warning animate-pulse' : 'bg-subtle')}></span>

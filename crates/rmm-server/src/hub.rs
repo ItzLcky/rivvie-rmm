@@ -59,9 +59,21 @@ pub enum Event {
         #[serde(skip)]
         client_id: Uuid,
     },
+    /// An agent's software state changed: a scan, a run's progress or result.
+    Software {
+        agent_id: Uuid,
+        #[serde(skip)]
+        client_id: Uuid,
+    },
     /// An agent's protection state changed: a report, or a scan or update's progress.
     Security {
         agent_id: Uuid,
+        #[serde(skip)]
+        client_id: Uuid,
+    },
+    /// A site's network changed: a scan stored, a device read.
+    Network {
+        site_id: Uuid,
         #[serde(skip)]
         client_id: Uuid,
     },
@@ -82,7 +94,9 @@ impl Event {
             | Event::Alert { client_id, .. }
             | Event::Services { client_id, .. }
             | Event::Patches { client_id, .. }
-            | Event::Security { client_id, .. } => Some(*client_id),
+            | Event::Software { client_id, .. }
+            | Event::Security { client_id, .. }
+            | Event::Network { client_id, .. } => Some(*client_id),
             Event::Ticket { client_id, .. } => *client_id,
             Event::Jobs => None,
         }

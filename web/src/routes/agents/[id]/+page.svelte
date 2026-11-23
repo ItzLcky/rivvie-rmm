@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
-	import { BellOff, CloudDownload, Copy, LifeBuoy, MonitorUp, Play, RefreshCw, Search, SquareTerminal, Trash2 } from '@lucide/svelte';
+	import { BellOff, CloudDownload, Copy, LifeBuoy, MonitorUp, Pencil, Pin, Play, RefreshCw, Search, SquareTerminal, Tag, Trash2 } from '@lucide/svelte';
 	import { api } from '#lib/api.js';
 	import { confirmAction } from '#lib/confirm.svelte.js';
 	import { ago, bytes, datetime, duration, ms, num, pct } from '#lib/format.js';
@@ -37,6 +37,10 @@
 	import AgentProcesses from '#lib/components/agent/AgentProcesses.svelte';
 	import MuteDialog from '#lib/components/MuteDialog.svelte';
 	import AgentLogs from '#lib/components/agent/AgentLogs.svelte';
+	import AgentNotes from '#lib/components/agent/AgentNotes.svelte';
+	import FieldsCard from '#lib/components/fields/FieldsCard.svelte';
+	import TagChip from '#lib/components/tags/TagChip.svelte';
+	import TagPicker from '#lib/components/tags/TagPicker.svelte';
 	import AgentSecurity from '#lib/components/agent/AgentSecurity.svelte';
 	import AgentServices from '#lib/components/agent/AgentServices.svelte';
 	import NewTicket from '#lib/components/ticket/NewTicket.svelte';
@@ -86,6 +90,7 @@
 	let running = $state(false);
 	let ticketing = $state(false);
 	let snoozing = $state(false);
+	let tagging = $state(false);
 	/** Terminal or desktop opened from a ticket: the session is recorded there. */
 	const fromTicket = $derived(param('ticket'));
 
@@ -170,6 +175,13 @@
 			'alert.unmute': 'Ended an alert snooze or maintenance window',
 			'policy.exclude_agent': `Left out of the policy ${d.name}`,
 			'policy.include_agent': `Covered by the policy ${d.name} again`,
+			'agent.tags': `Changed tags${Array.isArray(r.details.added) && r.details.added.length ? `, added ${(r.details.added as string[]).join(', ')}` : ''}${Array.isArray(r.details.removed) && r.details.removed.length ? `, removed ${(r.details.removed as string[]).join(', ')}` : ''}`,
+			'agent.tags_bulk': 'Changed tags together with other agents',
+			'agent.fields': `Changed ${Object.keys(r.details).join(', ')}`,
+			'agent.field_script': `A script set ${((r.details.set as { name: string }[] | undefined) ?? []).map((f) => f.name).join(', ') || 'no fields'}${((r.details.refused as unknown[] | undefined) ?? []).length ? ` (${(r.details.refused as unknown[]).length} refused)` : ''}`,
+			'agent.note_create': 'Added a note',
+			'agent.note_update': r.details.edited ? 'Edited a note' : r.details.pinned ? 'Pinned a note' : 'Unpinned a note',
+			'agent.note_delete': 'Deleted a note',
 			'agent.policy_pin': d.policy_set_id ? 'Pinned a policy set' : 'Unpinned its policy set',
 			'agent.policy_customize': 'Customized its policies (a set of its own, pinned)',
 			'security.quick_scan': `Started a quick scan (${productLabels[d.product as ProductKind] ?? d.product})`,
@@ -194,6 +206,7 @@
 
 	// Loaded with its tab.
 	const patches = $derived(tab === 'patches' ? import('#lib/components/AgentPatches.svelte') : null);
+	const deployments = $derived(tab === 'deployments' ? import('#lib/components/AgentDeployments.svelte') : null);
 	// The terminal (xterm.js) loads only when its tab opens.
 	const terminal = $derived(tab === 'terminal' ? import('#lib/components/Terminal.svelte') : null);
 	const desktop = $derived(tab === 'desktop' ? import('#lib/components/RemoteDesktop.svelte') : null);
@@ -222,6 +235,7 @@
 				...(can('technician') ? [{ label: 'New ticket for this agent', icon: LifeBuoy, onSelect: () => (ticketing = true) }] : []),
 				...(can('technician') ? [{ label: 'Refresh inventory', icon: RefreshCw, onSelect: refreshInventory, disabled: !a.online }] : []),
 				...(can('technician') ? [{ label: 'Snooze alerts…', icon: BellOff, onSelect: () => (snoozing = true) }] : []),
+				...(can('technician') ? [{ label: 'Edit tags…', icon: Tag, onSelect: () => (tagging = true) }] : []),
 				...(can('admin') && release && release.version !== a.agent_version ? [{ label: `Update agent to v${release.version}`, icon: CloudDownload, onSelect: update, disabled: !a.online }] : []),
 				{ label: 'Copy agent ID', icon: Copy, onSelect: () => navigator.clipboard?.writeText(a.id).then(() => toast.success('Agent ID copied.')) },
 				...(can('admin') ? [{ separator: true } as const, { label: 'Remove agent…', icon: Trash2, onSelect: remove, danger: true }] : [])
@@ -233,6 +247,7 @@
 				<OsBadge os={a.os_family} name={a.os_version || a.os_name} />
 				{#if a.alerts_muted}<Badge tone="neutral" icon={BellOff} title="A maintenance window or snooze is holding this agent's alerts back">Alerts muted</Badge>{/if}
 				<span>{a.client_name} › {a.site_name}</span>
+				{#each a.tags ?? [] as t (t.id)}<TagChip name={t.name} color={t.color} href="/agents?tag={t.id}" />{/each}
 			{/snippet}
 			{#snippet actions()}
 				{#if can('technician')}
@@ -242,6 +257,16 @@
 				{/if}
 			{/snippet}
 		</PageHeader>
+
+		{#if a.pinned_note}
+			<aside class="card border-accent/40 mb-4 flex items-start gap-3 p-3 text-sm" aria-label="Pinned note">
+				<Pin class="text-accent mt-0.5 size-4 shrink-0" />
+				<div class="min-w-0 flex-1">
+					<p class="break-words whitespace-pre-wrap">{a.pinned_note.body}</p>
+					<p class="text-muted mt-1 text-xs">{a.pinned_note.author_name} · {ago(a.pinned_note.created_at)} · <a class="link" href="?tab=notes">All notes</a></p>
+				</div>
+			</aside>
+		{/if}
 
 		<div class="lg:grid lg:grid-cols-[11rem_minmax(0,1fr)] lg:gap-6">
 		<SubNav
@@ -255,6 +280,7 @@
 					{ value: 'overview', label: 'Overview' },
 					{ value: 'alerts', label: 'Alerts', count: a.open_alerts ? num(a.open_alerts) : undefined },
 					{ value: 'tickets', label: 'Tickets' },
+					{ value: 'notes', label: 'Notes' },
 					{ value: 'activity', label: 'Activity' }
 				] },
 				{ label: 'Inventory', items: [
@@ -269,6 +295,7 @@
 				{ label: 'Management', items: [
 					{ value: 'policy', label: 'Policy' },
 					{ value: 'patches', label: 'Patches', count: a.patches_overdue || a.patches_failed ? num(a.patches_overdue + a.patches_failed) : undefined, title: a.patches_overdue || a.patches_failed ? 'Overdue security updates and failed installs' : undefined },
+					{ value: 'deployments', label: 'Deployments' },
 					{ value: 'security', label: 'Security' },
 					{ value: 'jobs', label: 'Jobs' },
 					{ value: 'files', label: 'Files', hidden: !can('technician') }
@@ -283,7 +310,8 @@
 
 		{#if tab === 'overview'}
 			<div class="grid gap-4 lg:grid-cols-[minmax(18rem,22rem)_1fr]">
-				<section class="card self-start p-4" aria-label="System">
+				<div class="min-w-0 space-y-4 self-start">
+				<section class="card p-4" aria-label="System">
 					<h2 class="mb-3 panel-title">System</h2>
 					<dl class="dl">
 						<dt>Client</dt><dd><a class="link" href="/clients/{a.client_id}">{a.client_name}</a><span class="text-subtle mx-1" aria-hidden="true">›</span>{a.site_name}</dd>
@@ -304,11 +332,21 @@
 								<Badge tone={a.update_state === 'failed' || a.update_state === 'rolled_back' ? 'danger' : 'info'} title={a.update_detail ?? ''}>
 									v{a.update_version}: {updateLabels[a.update_state ?? ''] ?? a.update_state}
 								</Badge>
+								{#if (a.update_state === 'failed' || a.update_state === 'rolled_back') && a.update_detail}
+									<p class="text-muted mt-1 text-[13px] break-words">{a.update_detail}</p>
+								{/if}
 							{/if}
 						</dd>
 						<dt>Agent ID</dt><dd class="text-muted font-mono text-[13px] break-all">{a.id}</dd>
+						<dt>Tags</dt>
+						<dd class="flex flex-wrap items-center gap-1">
+							{#each a.tags ?? [] as t (t.id)}<TagChip name={t.name} color={t.color} href="/agents?tag={t.id}" />{:else}<span class="text-muted">–</span>{/each}
+							{#if can('technician')}<button class="text-muted hover:text-fg ml-1 cursor-pointer" aria-label="Edit tags" onclick={() => (tagging = true)}><Pencil class="size-3.5" /></button>{/if}
+						</dd>
 					</dl>
 				</section>
+				{#key a.id}<FieldsCard entity="agent" id={a.id} />{/key}
+				</div>
 
 				<div class="min-w-0 space-y-4">
 					<section class="card p-4" aria-label="Performance">
@@ -439,6 +477,14 @@
 					<P.default agent={a} />
 				{/await}
 			{/if}
+		{:else if tab === 'deployments'}
+			{#if deployments}
+				{#await deployments}
+					<div class="card flex h-40 items-center justify-center" aria-busy="true"><Spinner label="Loading" /></div>
+				{:then P}
+					<P.default agent={a} />
+				{/await}
+			{/if}
 		{:else if tab === 'jobs'}
 			{#snippet startedCell(j: Job)}<a class="hover:text-accent" href="/jobs/{j.id}">{datetime(j.created_at)}</a>{/snippet}
 			{#snippet scriptCell(j: Job)}{j.script_name ?? `Ad-hoc ${j.interpreter}`}{/snippet}
@@ -468,6 +514,8 @@
 			</DataTable>
 		{:else if tab === 'policy'}
 			<AgentPolicy agent={a} onchange={() => agent.reload()} />
+		{:else if tab === 'notes'}
+			<AgentNotes agentId={a.id} onchange={() => agent.reload()} />
 		{:else if tab === 'alerts'}
 			<AgentAlerts agentId={a.id} hostname={a.hostname} onchange={() => agent.reload()} />
 		{:else if tab === 'processes'}
@@ -538,6 +586,7 @@
 		</div>
 		</div>
 
+		{#if tagging}<TagPicker agentId={a.id} hostname={a.hostname} current={a.tags ?? []} onclose={() => (tagging = false)} ondone={() => agent.reload()} />{/if}
 		{#if running}<RunScript agents={[a]} onclose={() => (running = false)} />{/if}
 		{#if snoozing}<MuteDialog target={{ agent_id: a.id, name: a.hostname }} onclose={() => (snoozing = false)} onsaved={() => agent.reload()} />{/if}
 		{#if ticketing}<NewTicket onclose={() => (ticketing = false)} initial={{ clientId: a.client_id, agents: [a] }} />{/if}

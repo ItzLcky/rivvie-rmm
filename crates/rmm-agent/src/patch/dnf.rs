@@ -126,7 +126,7 @@ fn progress_line(line: &str, total: usize, done: &mut usize) -> Option<(PatchSta
 
 /// `name.arch  version  repo`, one per line. Long names wrap the rest onto the next line.
 /// Stops at the "Obsoleting Packages" section.
-fn parse_check_update(out: &str) -> Vec<PatchUpdate> {
+pub(crate) fn parse_check_update(out: &str) -> Vec<PatchUpdate> {
     let mut updates = Vec::new();
     let mut pending: Vec<&str> = Vec::new();
     for line in out.lines() {

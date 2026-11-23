@@ -246,6 +246,9 @@ pub struct NewJob {
 
 pub async fn create(State(st): State<Arc<AppState>>, u: User, Json(b): Json<NewJob>) -> ApiResult<Json<serde_json::Value>> {
     u.require(Role::Technician)?;
+    if u.api_key.is_some() && b.script_id.is_none() {
+        return Err(ApiError::Denied("API keys run saved scripts only: send script_id".into()));
+    }
     if b.agent_ids.is_empty() || b.agent_ids.len() > 5000 {
         return Err(ApiError::BadRequest("agent_ids must contain 1-5000 agents".into()));
     }

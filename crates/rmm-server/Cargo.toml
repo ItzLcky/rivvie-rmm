@@ -44,13 +44,19 @@ lettre = { version = "0.11", default-features = false, features = ["tokio1-rustl
 croner = "4"
 chrono-tz = "0.10"
 regex-lite = "0.1"
+serde_urlencoded = "0.7"
 mail-parser = "1"
 async-imap = { version = "0.12", default-features = false, features = ["runtime-tokio"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 rustls-native-certs = "0.8"
 chacha20poly1305 = "0.10"
+ring = "0.17"
+
+webauthn-rs = "0.6"
 
 [dev-dependencies]
+# A software authenticator for the passkey tests.
+webauthn-authenticator-rs = { version = "0.6", features = ["softpasskey"] }
 ed25519-dalek.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["json", "cookies", "multipart"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake"] }

@@ -1,5 +1,6 @@
 //! Self-service TOTP two-factor auth. Admins always need it; Company settings can require it
-//! for everyone. Until a required user sets it up, their session only reaches these endpoints.
+//! for everyone. Until a required user sets it up (a TOTP app or a passkey, see `passkeys`),
+//! their session only reaches these endpoints.
 
 use std::sync::Arc;
 
@@ -64,8 +65,10 @@ pub enum Factor {
 }
 
 /// Check a TOTP code (each time step is accepted once) or a single-use recovery code.
-pub async fn check_code(db: &sqlx::PgPool, user_id: Uuid, secret: &[u8], code: &str) -> ApiResult<Option<Factor>> {
+/// `secret` is `None` for an account with passkeys but no authenticator app: only recovery codes apply.
+pub async fn check_code(db: &sqlx::PgPool, user_id: Uuid, secret: Option<&[u8]>, code: &str) -> ApiResult<Option<Factor>> {
     if totp::is_totp_shaped(code) {
+        let Some(secret) = secret else { return Ok(None) };
         let Some(step) = totp::verify(secret, code, Utc::now().timestamp()) else { return Ok(None) };
         let n = sqlx::query(
             "UPDATE users SET totp_last_step = $2 WHERE id = $1 AND (totp_last_step IS NULL OR totp_last_step < $2)",
@@ -94,7 +97,7 @@ pub async fn check_code(db: &sqlx::PgPool, user_id: Uuid, secret: &[u8], code: &
     Ok(Some(Factor::Recovery { remaining }))
 }
 
-async fn verify_password(st: &AppState, u: &User, password: &str) -> ApiResult<()> {
+pub(super) async fn verify_password(st: &AppState, u: &User, password: &str) -> ApiResult<()> {
     let (hash,): (String,) =
         sqlx::query_as("SELECT password_hash FROM users WHERE id = $1").bind(u.id).fetch_one(&st.db).await?;
     if auth::verify_password_async(password, hash).await {
@@ -110,7 +113,7 @@ async fn verify_own_code(st: &AppState, u: &User, code: &str) -> ApiResult<Facto
         sqlx::query_as("SELECT totp_secret, totp_sealed FROM users WHERE id = $1").bind(u.id).fetch_one(&st.db).await?;
     let secret = secret.ok_or_else(|| ApiError::BadRequest("two-factor authentication is not enabled".into()))?;
     let secret = open(st, &secret, sealed)?;
-    match check_code(&st.db, u.id, &secret, code).await? {
+    match check_code(&st.db, u.id, Some(&secret), code).await? {
         Some(f) => Ok(f),
         None => {
             auth::audit(&st.db, Some(u.id), "auth.mfa_failed", Some(("user", u.id)), json!({})).await;
@@ -120,7 +123,7 @@ async fn verify_own_code(st: &AppState, u: &User, code: &str) -> ApiResult<Facto
 }
 
 /// Replace the user's recovery codes; returns the new plaintext codes (shown once).
-async fn replace_recovery_codes(tx: &mut sqlx::PgConnection, user_id: Uuid) -> ApiResult<Vec<String>> {
+pub(super) async fn replace_recovery_codes(tx: &mut sqlx::PgConnection, user_id: Uuid) -> ApiResult<Vec<String>> {
     let codes = totp::new_recovery_codes();
     sqlx::query("DELETE FROM user_recovery_codes WHERE user_id = $1").bind(user_id).execute(&mut *tx).await?;
     let hashes: Vec<Vec<u8>> = codes.iter().map(|c| auth::token_hash(&totp::normalize_recovery_code(c))).collect();
@@ -240,7 +243,12 @@ pub async fn disable(State(st): State<Arc<AppState>>, u: User, Json(b): Json<Dis
     verify_password(&st, &u, &b.password).await?;
     verify_own_code(&st, &u, &b.code).await?;
     let mut tx = st.db.begin().await?;
-    clear(&mut tx, u.id).await?;
+    clear_totp(&mut tx, u.id).await?;
+    // Passkeys stay a way in, and the recovery codes with them.
+    sqlx::query("DELETE FROM user_recovery_codes WHERE user_id = $1 AND NOT EXISTS (SELECT 1 FROM user_passkeys WHERE user_id = $1)")
+        .bind(u.id)
+        .execute(&mut *tx)
+        .await?;
     tx.commit().await?;
     auth::audit(&st.db, Some(u.id), "auth.mfa_disable", Some(("user", u.id)), json!({})).await;
     Ok(Json(json!({ "ok": true })))
@@ -260,8 +268,17 @@ pub async fn regenerate_recovery(
     Ok(Json(json!({ "recovery_codes": codes })))
 }
 
-/// Remove a user's 2FA and recovery codes. Shared by self-service disable, admin reset and the CLI.
+/// Remove a user's 2FA entirely: the authenticator app, passkeys and recovery codes. Used by
+/// the admin reset and the CLI (a lost phone or security key).
 pub async fn clear(tx: &mut sqlx::PgConnection, user_id: Uuid) -> ApiResult<u64> {
+    let n = clear_totp(tx, user_id).await?;
+    sqlx::query("DELETE FROM user_passkeys WHERE user_id = $1").bind(user_id).execute(&mut *tx).await?;
+    sqlx::query("DELETE FROM user_recovery_codes WHERE user_id = $1").bind(user_id).execute(&mut *tx).await?;
+    Ok(n)
+}
+
+/// Remove just the authenticator app's secret; returns the rows touched (0: no such user).
+async fn clear_totp(tx: &mut sqlx::PgConnection, user_id: Uuid) -> ApiResult<u64> {
     let n = sqlx::query(
         "UPDATE users SET totp_secret = NULL, totp_pending = NULL, totp_sealed = false, totp_last_step = NULL, totp_enabled_at = NULL
           WHERE id = $1",
@@ -270,6 +287,5 @@ pub async fn clear(tx: &mut sqlx::PgConnection, user_id: Uuid) -> ApiResult<u64>
     .execute(&mut *tx)
     .await?
     .rows_affected();
-    sqlx::query("DELETE FROM user_recovery_codes WHERE user_id = $1").bind(user_id).execute(&mut *tx).await?;
     Ok(n)
 }

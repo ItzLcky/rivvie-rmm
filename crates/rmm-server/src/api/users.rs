@@ -1,8 +1,7 @@
 use std::sync::Arc;
 
 use axum::Json;
-use axum::extract::{Path, Query, State};
-use sqlx::AssertSqlSafe;
+use axum::extract::{Path, State};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -10,7 +9,6 @@ use uuid::Uuid;
 
 use crate::auth::{self, Role, User};
 use crate::error::{ApiError, ApiResult};
-use crate::paging::{self, Page, PageQuery, Plan, SortKey};
 use crate::state::AppState;
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -28,6 +26,16 @@ pub struct UserRow {
     client_ids: Vec<Uuid>,
     /// Explicit permission set; null = the role's defaults.
     permissions: Option<Vec<String>>,
+    /// May sign in with a password when SSO is required.
+    sso_exempt: bool,
+    /// Created by SSO, with no password.
+    sso_only: bool,
+    /// Passkeys registered.
+    passkeys: i64,
+    /// Identity providers the account is linked to.
+    sso_providers: Vec<String>,
+    /// Can't sign in; owns API keys (Company settings → API).
+    service_account: bool,
 }
 
 pub async fn list(State(st): State<Arc<AppState>>, u: User) -> ApiResult<Json<Vec<UserRow>>> {
@@ -35,7 +43,10 @@ pub async fn list(State(st): State<Arc<AppState>>, u: User) -> ApiResult<Json<Ve
     Ok(Json(
         sqlx::query_as(
             "SELECT id, email, name, role, disabled, totp_secret IS NOT NULL AS totp_enabled, created_at, last_login_at,
-                    all_clients, ARRAY(SELECT client_id FROM user_clients WHERE user_id = users.id) AS client_ids, permissions
+                    all_clients, ARRAY(SELECT client_id FROM user_clients WHERE user_id = users.id) AS client_ids, permissions,
+                    sso_exempt, sso_only, (SELECT count(*) FROM user_passkeys k WHERE k.user_id = users.id) AS passkeys,
+                    ARRAY(SELECT p.name FROM user_identities i JOIN sso_providers p ON p.id = i.provider_id WHERE i.user_id = users.id ORDER BY p.name) AS sso_providers,
+                    service_account
                FROM users ORDER BY email",
         )
         .fetch_all(&st.db)
@@ -156,6 +167,8 @@ pub async fn disable(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uu
     let mut tx = st.db.begin().await?;
     sqlx::query("UPDATE users SET disabled = true WHERE id = $1").bind(id).execute(&mut *tx).await?;
     sqlx::query("DELETE FROM user_sessions WHERE user_id = $1").bind(id).execute(&mut *tx).await?;
+    // With SSO required, the last break-glass admin has to stay able to sign in.
+    super::sso::lockout_check(&mut tx).await?;
     tx.commit().await?;
     auth::audit(&st.db, Some(u.id), "user.disable", Some(("user", id)), json!({})).await;
     Ok(Json(json!({ "ok": true })))
@@ -190,7 +203,7 @@ pub async fn reset_password(
     }
     let hash = auth::hash_password_async(&b.password).await?;
     let mut tx = st.db.begin().await?;
-    let n = sqlx::query("UPDATE users SET password_hash = $2 WHERE id = $1")
+    let n = sqlx::query("UPDATE users SET password_hash = $2, sso_only = false WHERE id = $1 AND NOT service_account")
         .bind(id)
         .bind(hash)
         .execute(&mut *tx)
@@ -265,7 +278,7 @@ pub async fn revoke_session(
 
 #[derive(Serialize, sqlx::FromRow)]
 pub struct AuditRow {
-    id: i64,
+    pub(super) id: i64,
     ts: DateTime<Utc>,
     user_name: Option<String>,
     action: String,
@@ -274,55 +287,7 @@ pub struct AuditRow {
     details: serde_json::Value,
     #[sqlx(default)]
     #[serde(skip)]
-    sort_key: String,
-}
-
-const AUDIT_KEYS: &[SortKey] = &[SortKey { name: "ts", expr: "l.ts", ty: "timestamptz" }];
-
-#[derive(Deserialize)]
-pub struct AuditQuery {
-    /// Exact action, or a prefix ending in `.` (`agent.`).
-    action: Option<String>,
-    user_id: Option<Uuid>,
-    target_type: Option<String>,
-    target_id: Option<Uuid>,
-}
-
-pub async fn audit_log(
-    State(st): State<Arc<AppState>>,
-    u: User,
-    Query(q): Query<AuditQuery>,
-    Query(page): Query<PageQuery>,
-) -> ApiResult<Json<Page<AuditRow>>> {
-    u.require(Role::Admin)?;
-    let plan = Plan::new(AUDIT_KEYS, ("ts", true), &page, "l.id", "bigint", 5)?;
-    let filters = "FROM audit_log l LEFT JOIN users u ON u.id = l.user_id
-          WHERE ($1::text IS NULL OR l.action = $1 OR (right($1, 1) = '.' AND starts_with(l.action, $1)))
-            AND ($2::uuid IS NULL OR l.user_id = $2)
-            AND ($3::text IS NULL OR l.target_type = $3)
-            AND ($4::uuid IS NULL OR l.target_id = $4)";
-    let action = q.action.as_deref().filter(|s| !s.is_empty());
-    let target_type = q.target_type.as_deref().filter(|s| !s.is_empty());
-    let sql = format!(
-        "SELECT l.id, l.ts, u.name AS user_name, l.action, l.target_type, l.target_id, l.details, {} {filters} {} {} {}",
-        plan.key_select,
-        plan.keyset,
-        plan.order,
-        plan.limit_sql()
-    );
-    let mut rows = sqlx::query_as::<_, AuditRow>(AssertSqlSafe(sql)).bind(action).bind(q.user_id).bind(target_type).bind(q.target_id);
-    if let Some((k, id)) = &plan.cursor {
-        rows = rows.bind(k).bind(id);
-    }
-    let rows = rows.fetch_all(&st.db).await?;
-    let total: i64 = sqlx::query_scalar(AssertSqlSafe(paging::count_sql(filters)))
-        .bind(action)
-        .bind(q.user_id)
-        .bind(target_type)
-        .bind(q.target_id)
-        .fetch_one(&st.db)
-        .await?;
-    Ok(Json(plan.finish(rows, |r| (r.sort_key.clone(), r.id.to_string()), total)))
+    pub(super) sort_key: String,
 }
 
 #[derive(Deserialize)]

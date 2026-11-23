@@ -120,6 +120,50 @@ fn yes() -> bool {
     true
 }
 
+fn five() -> i32 {
+    5
+}
+
+/// A monitored network device that doesn't answer SNMP. Evaluated per device as the designated
+/// agent reports ([`crate::netmon`]); the item is the designated agent's, like any other.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct NetDownRule {
+    /// Unreachable for this long.
+    #[serde(default = "five")]
+    pub minutes: i32,
+    /// Only these kinds of device (switch, router, firewall, printer...). Empty: all.
+    #[serde(default)]
+    pub kinds: Vec<String>,
+}
+
+/// A monitored interface that isn't up (and wasn't switched off on purpose).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct NetInterfaceRule {
+    /// Only interfaces whose name or description matches (`*` globs, like services). Empty: all monitored interfaces.
+    #[serde(default)]
+    pub names: Vec<String>,
+    #[serde(default = "five")]
+    pub minutes: i32,
+    #[serde(default)]
+    pub kinds: Vec<String>,
+}
+
+/// A measurement of a device at or past a limit: `cpu` and `memory` percent, `interface_util`
+/// percent of an interface's speed (for `minutes`), or `supply` percent left in a printer's
+/// toner or ink (at or below).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NetThresholdRule {
+    pub metric: String,
+    pub threshold: f64,
+    #[serde(default = "five")]
+    pub minutes: i32,
+    /// `interface_util` only: limit to these interfaces (as in [`NetInterfaceRule`]).
+    #[serde(default)]
+    pub names: Vec<String>,
+    #[serde(default)]
+    pub kinds: Vec<String>,
+}
+
 /// What a policy checks: `kind` and `params` columns together.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "params", rename_all = "snake_case")]
@@ -136,6 +180,9 @@ pub enum Rule {
     Log(LogRule),
     Security(SecurityRule),
     Patch(PatchRule),
+    NetDown(NetDownRule),
+    NetInterface(NetInterfaceRule),
+    NetThreshold(NetThresholdRule),
 }
 
 impl Rule {
@@ -201,6 +248,30 @@ impl Rule {
                 }
                 Ok(())
             }
+            Rule::NetDown(NetDownRule { minutes, kinds }) | Rule::NetInterface(NetInterfaceRule { minutes, kinds, .. }) => {
+                if !(1..=1440).contains(minutes) {
+                    return Err("minutes must be 1-1440".into());
+                }
+                if let Rule::NetInterface(r) = self {
+                    list(&r.names, "interfaces")?;
+                }
+                list(kinds, "device kinds")
+            }
+            Rule::NetThreshold(r) => {
+                match r.metric.as_str() {
+                    "cpu" | "memory" | "interface_util" if !(1.0..=100.0).contains(&r.threshold) => {
+                        return Err("threshold must be 1-100 percent".into());
+                    }
+                    "supply" if !(0.0..=99.0).contains(&r.threshold) => return Err("supply level must be 0-99 percent".into()),
+                    "cpu" | "memory" | "interface_util" | "supply" => {}
+                    _ => return Err("metric must be cpu, memory, interface_util or supply".into()),
+                }
+                if !(1..=1440).contains(&r.minutes) {
+                    return Err("minutes must be 1-1440".into());
+                }
+                list(&r.names, "interfaces")?;
+                list(&r.kinds, "device kinds")
+            }
             Rule::Patch(r) => {
                 if r.reboot_hours.is_some_and(|h| !(1..=8760).contains(&h)) {
                     return Err("restart pending must be 1-8760 hours".into());
@@ -263,7 +334,7 @@ impl PolicyRow {
 }
 
 impl Policy {
-    fn rule(&self) -> Option<Rule> {
+    pub(crate) fn rule(&self) -> Option<Rule> {
         Rule::parse(&self.kind, &self.params).inspect_err(|e| warn!(policy = %self.id, "{e}")).ok()
     }
 }
@@ -287,7 +358,7 @@ fn in_sets(n: usize) -> String {
 }
 
 /// Enabled alert items of one kind that apply to this agent, with its set's config.
-async fn policies_for(st: &AppState, agent_id: Uuid, kind: &str) -> sqlx::Result<Vec<Policy>> {
+pub(crate) async fn policies_for(st: &AppState, agent_id: Uuid, kind: &str) -> sqlx::Result<Vec<Policy>> {
     let rows: Vec<PolicyRow> = sqlx::query_as(
         "SELECT ap.item_id AS id, ap.name, ap.client_id, ap.site_id, ap.excluded_agents, ap.config, ARRAY[a.policy_set_id] AS sets
            FROM agent_policy ap JOIN agents a ON a.id = ap.agent_id
@@ -318,7 +389,7 @@ async fn alert_channels(st: &AppState, policy_id: Option<Uuid>, agent_id: Uuid) 
 /// Announces alerts that just opened or resolved: live events, and notifications unless
 /// `notify` is false. Alerts held back by a mute (`suppressed`) only get the live event: they
 /// are announced properly if they're still open when the mute ends ([`unsuppress`]).
-async fn announce(st: &AppState, ids: &[Uuid], event: &'static str, channels: &[Uuid], notify: bool) {
+pub(crate) async fn announce(st: &AppState, ids: &[Uuid], event: &'static str, channels: &[Uuid], notify: bool) {
     if ids.is_empty() {
         return;
     }
@@ -341,6 +412,7 @@ async fn announce(st: &AppState, ids: &[Uuid], event: &'static str, channels: &[
         if suppressed {
             continue;
         }
+        crate::webhooks::alert_event(st, id, if event == "opened" { "alert.created" } else { "alert.resolved" }).await;
         if notify {
             crate::notify::enqueue(st, id, event, channels).await;
             woke |= !channels.is_empty();
@@ -351,6 +423,7 @@ async fn announce(st: &AppState, ids: &[Uuid], event: &'static str, channels: &[
             if let Err(e) = run_alert_script(st, id).await {
                 warn!(alert = %id, "running the alert's script: {e:#}");
             }
+            crate::automation::alert_opened(st, id).await;
         } else {
             crate::tickets::alert_resolved(st, id).await;
         }
@@ -410,7 +483,7 @@ async fn run_alert_script(st: &AppState, alert_id: Uuid) -> anyhow::Result<()> {
         "SELECT al.agent_id, s.client_id, sc.id, sc.interpreter, sc.body, sc.timeout_secs, sc.client_id, al.details
            FROM alerts al JOIN agents a ON a.id = al.agent_id JOIN sites s ON s.id = a.site_id
            JOIN scripts sc ON sc.id = (policy_config(al.policy_id, al.agent_id) ->> 'run_script_id')::uuid
-          WHERE al.id = $1 AND al.policy_id IS NOT NULL AND al.script_job_id IS NULL",
+          WHERE al.id = $1 AND al.policy_id IS NOT NULL AND al.script_job_id IS NULL AND al.device_id IS NULL",
     )
     .bind(alert_id)
     .fetch_optional(&st.db)
@@ -453,9 +526,24 @@ async fn run_alert_script(st: &AppState, alert_id: Uuid) -> anyhow::Result<()> {
 /// Opens (or refreshes) the alert for (policy, agent, key). `bump` adds to its occurrence
 /// count when it was already open.
 async fn fire(st: &AppState, p: &Policy, agent_id: Uuid, key: &str, title: &str, details: Value, bump: i32) -> sqlx::Result<()> {
+    fire_for(st, p, agent_id, None, key, title, details, bump).await
+}
+
+/// [`fire`], for an alert about a network device (read through `agent_id`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn fire_for(
+    st: &AppState,
+    p: &Policy,
+    agent_id: Uuid,
+    device_id: Option<Uuid>,
+    key: &str,
+    title: &str,
+    details: Value,
+    bump: i32,
+) -> sqlx::Result<()> {
     let (id, inserted): (Uuid, bool) = sqlx::query_as(
-        "INSERT INTO alerts (id, policy_id, agent_id, key, kind, severity, title, details, occurrences)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, greatest($9, 1))
+        "INSERT INTO alerts (id, policy_id, agent_id, key, kind, severity, title, details, occurrences, device_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, greatest($9, 1), $10)
          ON CONFLICT (policy_id, agent_id, key) WHERE resolved_at IS NULL
          DO UPDATE SET last_seen_at = now(), title = EXCLUDED.title, details = EXCLUDED.details,
                        occurrences = alerts.occurrences + $9
@@ -470,6 +558,7 @@ async fn fire(st: &AppState, p: &Policy, agent_id: Uuid, key: &str, title: &str,
     .bind(title)
     .bind(details)
     .bind(bump)
+    .bind(device_id)
     .fetch_one(&st.db)
     .await?;
     if inserted {
@@ -543,6 +632,7 @@ pub async fn close_for_item(st: &AppState, item_id: Uuid) {
 
 /// An alert item changed: re-check event-driven kinds against every agent it covers now.
 pub async fn recheck_item(st: &AppState, item_id: Uuid) {
+    crate::netalerts::recheck_item(st, item_id).await;
     let rows: sqlx::Result<Vec<(Uuid, Uuid)>> = sqlx::query_as(
         "SELECT ap.agent_id, a.policy_set_id FROM agent_policy ap JOIN agents a ON a.id = ap.agent_id
           WHERE ap.item_id = $1 AND ap.module = 'alert' AND ap.enabled
@@ -564,6 +654,7 @@ pub async fn recheck_item(st: &AppState, item_id: Uuid) {
 /// An agent may run under different policies now (moved category, set, pin): re-check its
 /// event-driven alerts from its last reports.
 pub async fn recheck_agent(st: &AppState, agent_id: Uuid) {
+    crate::netalerts::recheck_agent(st, agent_id).await;
     for kind in ["service", "security", "patch"] {
         match policies_for(st, agent_id, kind).await {
             Ok(ps) => {

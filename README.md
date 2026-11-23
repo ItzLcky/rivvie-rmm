@@ -46,14 +46,16 @@ docs/           Roadmap and design notes
 - **Terminal:** xterm.js ↔ server relay ↔ PTY on the agent (bash/zsh on Linux, PowerShell through ConPTY on Windows).
 - **Remote desktop:** view and control the machine's screen from the browser, relayed over the agent's existing socket (no extra ports). Changed areas are sent as JPEG, paced by the browser so slow links get fewer frames rather than lag. An optional consent prompt, and whether remote desktop, the terminal and file access are allowed at all, come from the device's policy set. See [Remote desktop](#remote-desktop).
 - **Per-client access:** admins see every client. Technicians and read-only users see every client by default, or only the clients an admin picks under Company settings → Users. Everything they can reach (agents, sites, tokens, jobs, terminal, dashboard counts) is scoped to those clients, and anything outside them reads as "not found". Scripts are MSP-wide (admins edit them; they run anywhere) or belong to one client (its technicians edit them; they only run on its agents).
-- **Policies:** every device sits in one device category (Windows, Linux or macOS, workstation or server, or one you make, such as kiosks) and uses one policy set from a tree that starts at *All devices*. Sets inherit everything above them and can override single fields; a client or one of its sites is assigned a set per category, and a single device can be pinned to its own. Alert policies, scheduled scripts, patching, the security policy, remote access and automatic agent updates all live there, and each device's page says which set it uses, why, and where each of its policies comes from. See [Policies](#policies).
+- **Policies:** every device sits in one device category (Windows, Linux or macOS, workstation or server, or one you make, such as kiosks) and uses one policy set from a tree that starts at *All devices*. Sets inherit everything above them and can override single fields; a client or one of its sites is assigned a set per category, and a single device can be pinned to its own. Alert policies, scheduled scripts, automations, patching, the security policy, remote access and automatic agent updates all live there, and each device's page says which set it uses, why, and where each of its policies comes from. See [Policies](#policies).
 - **Alerting:** alert policies, in a policy set (optionally limited to one client or site, minus devices you leave out), raise alerts for agents that are offline, CPU, memory or disk held over a threshold, a stopped or failed service, a failed script, a log entry that matches, failed patch installs and restarts left pending. Offline and threshold policies are checked every minute; the others act as agents report. An alert stays open until its condition clears (or someone resolves it), reminds its channels while nobody acknowledges it, and feeds the health model. Maintenance windows and snoozes hold alerts back during planned work. See [Monitoring and alerts](#monitoring-and-alerts).
 - **Processes and files:** technicians see an agent's processes live and kill them (or a whole tree), and browse its file system, downloading and uploading files of any size in pieces over the agent's socket. Kills and transfers are audited.
 - **Schedules:** saved scripts run on a cron timetable, in any time zone, on every device using a policy set (or a set below it), optionally limited to one client or site. Each schedule keeps its runs' output for as many days as you choose.
+- **Automations:** a saved script that runs when something happens on a device (it enrolls, comes back online after a while, an alert of a chosen type opens, a patch install leaves a restart pending, a chosen tag is put on it, a chosen custom field changes) or once on every device a policy set reaches, including devices that join later. Run-once scripts keep a status per device, can retry failures, and can be reset to run again. Each automation has a cooldown per device, an hourly limit and an option to wait for the site's maintenance window, so one event hitting a whole fleet doesn't start a storm of scripts. Each device's Policy tab lists what ran, waited or was skipped. See [docs/design/automations.md](docs/design/automations.md).
 - **Patch management:** agents scan for OS updates (Windows Update Agent, apt, dnf/yum, pacman, softwareupdate) when they connect and every `RMM_PATCH_SCAN_HOURS`. The patch policy approves updates by category or severity and can install them during each site's maintenance window (or a window of its own, so servers and workstations at one site patch at different times), with a reboot policy. Technicians approve, decline and install from the Patches page or an agent's Patches tab, and the Compliance tab shows how many agents per client are fully patched. See [Patch management](#patch-management).
+- **Software deployment:** a catalog of packages (MSP-wide or per client) installed with winget, Chocolatey, apt, dnf or an uploaded MSI/EXE, deployed to chosen devices or required in policy sets (present, kept current, or absent), with per-device status, history and a view of available third-party updates. See [Software deployment](#software-deployment).
 - **Endpoint protection:** agents report the antivirus the machine already has (Microsoft Defender and other Windows Security Center products, ClamAV, XProtect), and can run our own sensor: telemetry, behaviour rules and file scanning from signed content rolled out to canary clients first, quarantine, network isolation, triage packages and fleet-wide hunting. Technicians start scans and signature updates from the Security page or an agent's Security tab, and alert policies raise alerts for protection that's off or out of date and for threats. See [Endpoint protection](#endpoint-protection).
 - **Self-update:** agents install new versions signed with an offline ed25519 key whose public half is compiled into the agent, and roll themselves back if the new version can't reconnect. See [Agent updates](#agent-updates).
-- **Security:** argon2id passwords; opaque, revocable session tokens in an HttpOnly SameSite=Strict cookie, with an idle timeout and a 7-day cap; users can change their password and review or revoke their sessions, and admins can reset passwords, re-enable users, and revoke anyone's sessions; TOTP two-factor auth with single-use recovery codes, required for admins and optionally for everyone; an Origin check on the terminal and desktop sockets; three roles (admin / technician / readonly); an audit log covering logins, shells, remote desktop sessions, jobs, enrollment, and deletes. Failed sign-ins are rate-limited per client IP and per account, and bad enrollment tokens per IP (see `RMM_TRUSTED_PROXIES`). The dashboard ships a hash-based script CSP, so no inline or third-party script runs.
+- **Security:** argon2id passwords; opaque, revocable session tokens in an HttpOnly SameSite=Strict cookie, with an idle timeout and a 7-day cap; users can change their password and review or revoke their sessions, and admins can reset passwords, re-enable users, and revoke anyone's sessions; TOTP or passkey (WebAuthn) two-factor auth with single-use recovery codes, required for admins and optionally for everyone; single sign-on for technicians with OpenID Connect ([design](docs/design/sso.md)); an Origin check on the terminal and desktop sockets; three roles (admin / technician / readonly); an audit log covering logins, shells, remote desktop sessions, jobs, enrollment, and deletes. Failed sign-ins are rate-limited per client IP and per account, and bad enrollment tokens per IP (see `RMM_TRUSTED_PROXIES`). The dashboard ships a hash-based script CSP, so no inline or third-party script runs.
 
 ## Development
 
@@ -93,10 +95,19 @@ RMM_E2E_DATABASE_URL=postgres://rmm:rmm@localhost:5432/postgres \
   cargo test -p rmm-server --test e2e -- --ignored --nocapture
 ```
 
+The network section (`RMM_E2E_ONLY=network` runs just that) needs an SNMP device to scan and read:
+a net-snmp `snmpd` in a container, whose address (and name, so the test can pause it to make it go
+quiet) is passed as `RMM_E2E_SNMP=<ip>:<container>`. The recipe, with the users and community it
+needs, is in `crates/rmm-snmp/tests/netsnmp.rs`, which also tests the SNMP client against it.
+Without `RMM_E2E_SNMP` the section checks what doesn't need a device.
+
 `tests/e2e_windows.rs` is the Windows counterpart: it installs the agent from the generated MSI as
 a real service and runs PowerShell and cmd jobs, a Job Object tree kill, a service restart, an
-upgrade and an uninstall. It changes the machine it runs on, so it runs in CI (`windows-latest`)
-or on a throwaway VM; see the file for the command.
+upgrade, ConPTY terminals, Event Log watchers, a Windows Update scan, Defender, the sensor, a
+signed self-update with a forced rollback, and an uninstall. `RMM_E2E_ONLY` / `RMM_E2E_SKIP` pick
+sections. It changes the machine it runs on, so it runs in CI (`windows-latest`) or on a throwaway
+VM; see the file for the command. What CI can't cover (real hardware, RDP, third-party antivirus,
+Server editions) is a checklist in [docs/design/windows-testing.md](docs/design/windows-testing.md).
 
 The dashboard has visual regression and accessibility tests. Playwright screenshots every page,
 in light and dark, against a mocked API, and runs WCAG 2.2 AA checks with axe. The baselines are
@@ -116,6 +127,11 @@ npm run test:visual:docker -- --update-snapshots    # after an intended UI chang
 
 ## Deploying
 
+For a production install, follow the [operator guide](docs/OPERATOR.md): the install path,
+TLS and proxy settings, sizing, the secrets to keep safe, backups, monitoring and upgrades. Releases
+are listed in the [changelog](CHANGELOG.md) and cut as in [docs/RELEASING.md](docs/RELEASING.md).
+The quick version:
+
 ```sh
 cp deploy/.env.example deploy/.env      # set RMM_DOMAIN, POSTGRES_PASSWORD and RMM_DATA_KEY
 docker compose -f deploy/docker-compose.yml up -d --build
@@ -123,7 +139,7 @@ docker compose -f deploy/docker-compose.yml exec server \
   sh -c 'RMM_PASSWORD=... rmm-server create-user --email you@example.com --name You'
 ```
 
-Admins must set up two-factor auth (any authenticator app) at their first sign-in. If the
+Admins must set up two-factor auth (any authenticator app, or a passkey) at their first sign-in. If the
 only admin loses their phone and recovery codes, clear it from the server:
 
 ```sh
@@ -139,20 +155,70 @@ the sign-in rate limit applies to all users at once.
 
 **Backups**
 
-The `backup` service runs `pg_dump` every `BACKUP_INTERVAL_HOURS` (default 24) and keeps
-`BACKUP_KEEP_DAYS` (default 14) of dumps in `deploy/backups/` (the `rmm-backups` volume in the
-Arcane stack). The dumps contain password hashes, 2FA secrets (encrypted with `RMM_DATA_KEY`, so keep the key with the backups) and agent credential hashes, so
-they're written mode 0600. Copy them off the host. To restore one into an empty database:
+The `backup` service ([`deploy/backup.sh`](deploy/backup.sh)) runs every `BACKUP_INTERVAL_HOURS`
+(default 24) and writes two files with one timestamp into `deploy/backups/` (the `rmm-backups`
+volume in the Arcane stack): `rmm-<ts>.dump`, a `pg_dump`, and `rmm-<ts>.files.tar.gz`, the local
+object storage (ticket attachments, raw inbound email, invoice PDFs, triage packages: everything
+the database points to that isn't in it). It keeps `BACKUP_KEEP_DAYS` (default 14) of both. The
+dumps contain password hashes, 2FA secrets (encrypted with `RMM_DATA_KEY`, so keep the key with the
+backups) and agent credential hashes, so the files are written mode 0600. **Copy them off the
+host.** The dump goes first, so a file uploaded in between is in the tarball without a row
+(harmless), never a row without its file.
+
+**With S3 storage** (`RMM_S3_BUCKET`) the tarball is empty: the files are in your bucket, and the
+dump's rows point at keys in it. **Turn on versioning on the bucket** (and, for real safety,
+replication to another account or region). The server never overwrites a key, but it does delete
+them (a deleted ticket attachment, a removed triage package); versioning is what lets you get
+those back, and what keeps the bucket consistent with a dump taken a few hours earlier. Restore
+the dump and leave the bucket alone.
+
+**Restoring.** [`deploy/restore.sh`](deploy/restore.sh) is the `restore` service, a profile that
+only runs when asked. Stop the server, pick a backup (`latest`, or a name from `deploy/backups/`),
+and start the server again when it's done:
 
 ```sh
 docker compose -f deploy/docker-compose.yml stop server
-docker compose -f deploy/docker-compose.yml exec -T db \
-  pg_restore -U rmm -d rmm --clean --if-exists < deploy/backups/rmm-20260101T030000Z.dump
+docker compose -f deploy/docker-compose.yml --profile restore run --rm restore rmm-20260101T030000Z
 docker compose -f deploy/docker-compose.yml start server
 ```
 
-Ticket attachments and raw inbound email aren't in the database: they're files in the `files`
-volume (`rmm-files` in the Arcane stack), or in your S3 bucket. Back that up too.
+The database is replaced in one transaction (a failed restore leaves the old data); the storage
+directory must be empty, or set `RESTORE_REPLACE_STORAGE=1` to have it emptied first. Start the
+server with the `RMM_DATA_KEY` the backup was taken under: it seals 2FA secrets, mailbox and
+accounting credentials, single sign-on and webhook secrets, detection context and the vault's keys. (If the key was rotated since,
+a backup made before a rotation needs the old key.)
+
+CI runs this as a **restore drill** (the `restore-drill` job, `scripts/restore-drill.sh`, which
+you can run locally): it runs the e2e suite, backs its database and storage up with these exact
+scripts, restores them into a new database and an empty directory, starts the server on them and
+reads the rows back, including an attachment's bytes by hash. The `s3` job runs the storage code
+against MinIO (multipart uploads, ranged reads, aborted uploads; `scripts/minio-test.sh`).
+
+**Rotating `RMM_DATA_KEY`** (it leaked, or on a schedule): `rmm-server rotate-data-key` re-encrypts
+everything sealed with it under a new key, in one transaction: two-factor secrets of users and
+portal contacts, Microsoft Graph mailbox secrets, QuickBooks and Xero credentials and tokens,
+single sign-on client secrets, webhook signing secrets, detection context, and the vault's per-client keys (the vault's items are sealed with those, so
+none of them is touched). The keys come from the environment, never the command line:
+`RMM_DATA_KEY_NEW`, and `RMM_DATA_KEY_OLD` (default: the `RMM_DATA_KEY` the container already
+has).
+
+```sh
+docker compose -f deploy/docker-compose.yml stop server backup
+NEW=$(openssl rand -hex 32)                 # keep it somewhere safe before going on
+docker compose -f deploy/docker-compose.yml run --rm -e RMM_DATA_KEY_NEW=$NEW server rotate-data-key --dry-run
+docker compose -f deploy/docker-compose.yml run --rm -e RMM_DATA_KEY_NEW=$NEW server rotate-data-key
+# put $NEW in deploy/.env as RMM_DATA_KEY, then
+docker compose -f deploy/docker-compose.yml up -d
+```
+
+`--dry-run` counts what would change and checks that the old key opens everything, writing
+nothing. A wrong old key, or a value nothing opens, stops the run with nothing changed and names
+the row. It is safe to run again: a value the old key opens is rotated, one that only the new key
+opens is already done (a server started on the new key in between, say), and a second run does
+nothing. **Stop the server first**: a running one holds the old key and would write new rows with
+it (running the command again picks those up). Take a backup before, and keep it with the old key
+until you no longer need to restore it. The IMAP and SMTP passwords of mailboxes are stored as they are (use an
+account limited to that mailbox), so they aren't touched.
 
 **Upgrading**
 
@@ -232,6 +298,8 @@ to SYSTEM and Administrators. Windows service logs go to `C:\ProgramData\RMM\log
 
 ## Server configuration
 
+The settings most installs touch; [docs/OPERATOR.md](docs/OPERATOR.md#environment-variable-reference) has every variable.
+
 | Env var | Default | |
 |---|---|---|
 | `DATABASE_URL` | required | Postgres connection string |
@@ -245,15 +313,17 @@ to SYSTEM and Administrators. Windows service logs go to `C:\ProgramData\RMM\log
 | `RMM_METRICS_RETENTION_DAYS` | `90` | Hourly metric rollups kept (charts beyond 48 hours) |
 | `RMM_ALERT_RETENTION_DAYS` | `180` | Resolved alerts are deleted after this |
 | `RMM_JOB_QUEUE_DAYS` | `7` | Jobs (and patch installs) queued for an offline agent expire after this |
+| `RMM_AUTOMATION_RESTART_GRACE_MINUTES` | `10` | After the server starts, an agent's offline time (for the *comes back online* automation trigger) is counted from the start for this long, so a restart doesn't fire every automation |
 | `RMM_PATCH_SCAN_HOURS` | `12` | Online agents scan for OS updates when their last scan is older than this |
 | `RMM_SESSION_IDLE_HOURS` | `12` | Dashboard sessions unused this long are signed out (sessions last 7 days at most). Admins can override it under Company settings |
-| `RMM_STORAGE_DIR` | `data/storage` (`/srv/data/storage` in the image) | Ticket attachments and raw inbound email, unless `RMM_S3_BUCKET` is set |
+| `RMM_STORAGE_DIR` | `data/storage` (`/srv/data/storage` in the image) | Ticket attachments, raw inbound email, invoice PDFs and triage packages, unless `RMM_S3_BUCKET` is set. The compose `backup` service archives it beside each database dump |
 | `RMM_S3_BUCKET` | empty | Store those files in an S3-compatible bucket instead. With `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `RMM_S3_REGION` (default `us-east-1`), and `RMM_S3_ENDPOINT` for MinIO and other non-AWS stores (path-style URLs then; `RMM_S3_PATH_STYLE` overrides) |
 | `RMM_MAIL_POLL_SECS` | `60` | How often IMAP support mailboxes are checked |
 | `RMM_TICKET_CLOSE_DAYS` | `7` | Resolved tickets move to Closed after this |
 | `RMM_PUBLIC_URL` callbacks | | QuickBooks and Xero redirect to `<RMM_PUBLIC_URL>/api/billing/accounting/qbo/callback` (or `/xero/callback`): register that in the provider's developer portal. For the QuickBooks sandbox set `RMM_QBO_API_URL=https://sandbox-quickbooks.api.intuit.com` |
 | `RMM_EMAIL_RAW_DAYS` | `90` | Raw MIME of inbound mail is deleted after this (the ticket keeps the text and attachments) |
-| `RMM_DATA_KEY` | empty (required by the compose files) | 32 bytes, hex or base64 (`openssl rand -hex 32`). Encrypts two-factor secrets and detection context at rest, and the password vault's per-client keys (the vault is unavailable without it). Secrets stored before it was set are encrypted at the next start. Keep a copy off the server: if it's lost, users with 2FA can't sign in until `rmm-server reset2fa` clears it, and the server refuses to start without it once anything has been encrypted |
+| `RMM_DATA_KEY` | empty (required by the compose files) | 32 bytes, hex or base64 (`openssl rand -hex 32`). Encrypts two-factor secrets, single sign-on client secrets and detection context at rest, and the password vault's per-client keys (the vault is unavailable without it). Secrets stored before it was set are encrypted at the next start. Keep a copy off the server: if it's lost, users with 2FA can't sign in until `rmm-server reset2fa` clears it, and the server refuses to start without it once anything has been encrypted. To replace it, see *Rotating `RMM_DATA_KEY`* under Backups |
+| `RMM_DATA_KEY_OLD`, `RMM_DATA_KEY_NEW` | none | Only read by `rmm-server rotate-data-key`: the key the data is sealed with now (default `RMM_DATA_KEY`) and the one to seal it with |
 | `RMM_TRUSTED_PROXIES` | empty | Reverse proxies whose `X-Forwarded-For` gives the client IP (for rate limiting and the audit log): comma-separated addresses/CIDRs, or `private` for loopback + RFC 1918 + IPv6 ULA. The bundled compose stack sets `private` for Caddy |
 | `RMM_ATTACHMENT_MAX_MB` | `100` | Largest ticket or portal attachment, per file. Uploads and downloads stream to and from storage (S3 multipart over 8 MB), so this bounds disk use, not server memory. Replies email attachments up to 15 MB in total; larger files go as links (the portal for contacts who can sign in, otherwise a download link valid for 30 days) |
 | `RMM_METRICS_TOKEN` | empty | Turns on `GET /metrics` (see [Monitoring the server](#monitoring-the-server)); without it the route answers 404 |
@@ -332,6 +402,21 @@ with power-loss protection, not a copy-on-write filesystem such as btrfs), and b
 4.5 MB of database per agent at the default metric retention. `rmm-loadgen` repeats the test
 against your own hardware.
 
+**Stored search and health.** What the dashboard and the agent search need is kept in columns,
+not worked out per request (migration 0026). An agent's addresses and logged-in users are copied
+out of its inventory into `agent_search_terms` when the inventory arrives, and hostname, OS name
+and those terms have `pg_trgm` indexes, so a search is an index lookup rather than a scan of
+every inventory (the extension needs `CREATE EXTENSION` rights on the database, which the
+default container has). An agent's health is stored on its row (`health_rank`, with the counts
+it comes from: open alerts, failed jobs in 24 hours, overdue and failed patches, the fullest
+disk). Triggers on alerts, jobs, patches and the agent row keep it current as they change, and
+the server's housekeeping runs `refresh_agent_health()` every five minutes for what only time
+changes (a job aging past 24 hours, an update missing for a week) and as a safety net. The rules
+are the SQL function `agent_health_rank`; to see what the stored values would be, run
+`SELECT refresh_agent_health()` (it rewrites only what differs). `cargo test -p rmm-server
+stored_columns -- --ignored` (needs `RMM_E2E_DATABASE_URL`, as the e2e suite) checks the stored
+values and the indexed search against the old expressions on a mixed fleet.
+
 ## Policies
 
 **Policies** (Monitoring → Policies) has three tabs.
@@ -353,14 +438,14 @@ says which and why, lets technicians change its category, pin a set, or **Custom
 device** (a new set below its current one, named after the host and pinned to it), and lists every
 policy that reaches it with the set it's defined in and the sets that change it.
 
-**Inheritance.** A set gets every policy of the sets above it. Alert policies and scheduled scripts
+**Inheritance.** A set gets every policy of the sets above it. Alert policies, scheduled scripts and software requirements
 can be added to any set (and optionally limited to one client or site, minus single devices).
 Patching, the security policy, remote access and the agent policy exist once, in All devices. On a
 set's page each policy, and each of its fields, says whether it's defined here, inherited (and from
 which set) or overridden here. Changing an inherited field stores only that field in the set's
 override; **Reset** next to it goes back to the inherited value, and **Reset all** drops the
 override. A scheduled script's timetable stays the same everywhere; sets below can change its
-arguments and timeout, or switch it off. A change that would leave any set below with an invalid
+arguments and timeout, or switch it off. The same goes for an automation's trigger and script. A change that would leave any set below with an invalid
 policy is refused with the name of that set.
 
 ## Monitoring and alerts
@@ -506,6 +591,42 @@ security tags either: include **Updates** in the policy for Arch machines). On A
 macOS updates that need a restart may need a signed-in user to approve them. The Windows provider
 is compile-checked only so far, like the rest of the Windows agent.
 
+## Software deployment
+
+**Software** (Automation → Software) holds a catalog of packages. A package says how to get it on
+each platform: a winget id, a Chocolatey id, an apt and/or dnf package, or an MSI or EXE you
+upload (stored and hashed in object storage, limited by `RMM_ATTACHMENT_MAX_MB`; an EXE needs
+silent arguments, an MSI gets `/qn /norestart`). Packages are MSP-wide (admins) or one client's
+own (technicians of that client). A **version** holds devices at that version (older installs are
+brought up to it, newer ones are left alone); empty means the latest. A device uses the first way
+it has: winget, then Chocolatey, then the uploaded installer on Windows; apt, then dnf or yum on
+Linux.
+
+- **Deploy by hand**: a package's page lists devices; pick some and Install, Upgrade or
+  Uninstall. An agent's **Deployments** tab does the same for one device and shows what it has of
+  the catalog, what its policies ask and its recent runs.
+- **Desired state**: in a policy set, **Software** requirements say a package must be *installed*,
+  *installed and kept current* (upgraded whenever the provider offers a newer version, inside the
+  site's maintenance window or one of its own) or *not installed*. They're enforced when a scan
+  arrives, when a device joins the set, when policies change and every minute for retries, one run
+  per device at a time. Failures back off (15 minutes, doubling to a day) and show on the device.
+  A package can't be deleted while a policy requires it.
+- **Updates**: the Updates tab lists installed catalog packages with a newer version on offer
+  (winget's *Available* column, `choco outdated`, `apt-get -s dist-upgrade`, `dnf check-update`).
+  *Upgrade now* is the approval; a version can be skipped. Packages in a *kept current* requirement
+  upgrade by themselves.
+- **History**: every run, with the provider's output, who or which policy started it, and the
+  versions before and after. The agent checks what is installed after each run, so a provider
+  that says "done" without installing is reported as a failure.
+
+Winget runs as SYSTEM, which has no `winget` on its PATH: the agent finds the newest App Installer
+under `Program Files\WindowsApps` itself. Chocolatey is only installed on a device when the
+requirement (or the person deploying) allows it, because that downloads and runs Chocolatey's
+install script. Package ids and versions are checked against a strict character set before they
+reach a command line. Scans use `RMM_PATCH_SCAN_HOURS`. The Windows providers are compile-checked
+and tested against recorded output only (see the roadmap's Windows block). Design and API:
+[docs/design/software.md](docs/design/software.md).
+
 ## Service desk (tickets)
 
 **Tickets** (Service desk → Tickets) live on **boards** (queues such as Service Desk and Alerts), each
@@ -636,6 +757,56 @@ Design: [docs/design/documentation.md](docs/design/documentation.md).
   delete): technicians and admins by default; read-only users and portal contacts have no vault
   access. Both also need **two-factor authentication turned on** for the user, and access to the
   client.
+
+## API, keys and webhooks
+
+Design: [docs/design/api.md](docs/design/api.md).
+
+- **API keys** authenticate `Authorization: Bearer rmm_k_…` on the public REST API, mounted at `/api/v1`
+  (the dashboard's own routes, with cookies, stay at `/api`). Create them under Account → API keys; admins
+  also create **service accounts** (users that can't sign in) and their keys under Company settings → API.
+  The key is shown once (only a hash is stored). **A key acts as its owner and never with more**: it has
+  read or write access, one or more scopes (`clients`, `agents`, `jobs`, `scripts`, `alerts`, `tickets`,
+  `security`, `audit`), only the named permissions it lists (and its owner holds), optionally a subset of clients,
+  an expiry and a rate limit per minute (HTTP 429 over it). The owner's rights are checked on every
+  request, so demoting or disabling the owner narrows or kills their keys at once. Keys can't use the
+  agent socket, shell or desktop relays, the vault, users, settings, billing or key management, and
+  start jobs from saved scripts only. Writes with a key are audited (`api.request`), and lists show each
+  key's last use.
+- **OpenAPI 3.1** at `/api/v1/openapi.json` (no credentials needed), generated from the same registry
+  that decides which routes keys may call (`crates/rmm-server/src/api/public.rs`); the dashboard renders
+  it at **API reference** (`/developers`).
+- **Webhooks** (Company settings → Webhooks, admins) post ticket events (`ticket.created`, `.updated`,
+  `.status_changed`, `.resolved`, `.comment`) and alert events (`alert.created`, `.acknowledged`,
+  `.resolved`) as signed JSON to a URL, for all clients or one. The body is signed like the webhook
+  notification channel: `X-RMM-Signature: sha256=<hex HMAC-SHA256 of the raw body>` with a per-webhook secret
+  (shown once, sealed with `RMM_DATA_KEY`), plus `X-RMM-Event` and `X-RMM-Delivery`. Deliveries go through a
+  Postgres outbox, written in the transaction that changed the ticket, retried after 1, 5, 30 and 120
+  minutes with identical bytes, and logged in the dashboard (HTTP status, duration, error, *Send again*).
+  Internal notes are only sent when a subscription asks for them.
+
+### Audit log, export and the SIEM stream
+
+Design: [docs/design/audit-siem.md](docs/design/audit-siem.md).
+
+- **Export:** the Audit log page (admins, or anyone holding the `audit.read` permission) downloads
+  everything matching the current filters as CSV or JSON Lines, streamed (the table is never
+  buffered). Every export is itself audited (`audit.export`). With an API key that has the `audit`
+  scope and the `audit.read` permission: `GET /api/v1/audit/export?format=jsonl&from=…&to=…`.
+- **SIEM stream** (Company settings → SIEM, admins): send the audit log, and optionally security
+  detections and alerts, to syslog over UDP, TCP or TLS (RFC 5424; octet counting per RFC 6587 and
+  RFC 5425) or to an HTTPS endpoint (generic JSON with a bearer token, or Splunk HEC). Events go
+  through a Postgres outbox written in the transaction that wrote them, so nothing is lost across
+  a restart or an outage: a failing destination backs off (5 s doubling to 15 min), its status and
+  last error are on the page, there is a Test button, and events not delivered for 7 days are
+  dropped (and counted). Delivery is at least once; every event carries its audit `id`.
+  Destination tokens are sealed with `RMM_DATA_KEY`.
+- IMAP and SMTP passwords and webhook channel secrets are sealed with `RMM_DATA_KEY` too (they used
+  to be stored in the clear): existing values are sealed at the first start with a key set.
+
+## Network discovery and SNMP
+
+A site's designated agent scans its network (ICMP where it may, TCP, the ARP table, reverse DNS, mDNS, SNMP `sysDescr`) and lists what it finds under **Network**: hosts matched to agents by MAC or IP, and an *unmanaged devices* list with ignore, mark-as-known, monitor and deploy-an-agent actions. The same agent reads switches, firewalls and printers over SNMP v2c or v3 (uptime, interface status and traffic, CPU and memory, toner), with charts, hourly rollups and three new alert kinds: device down, interface down and thresholds. SNMP credentials are per client, sealed with `RMM_DATA_KEY`, and never shown again. Scans stay in private address space and are bounded. Design: [docs/design/network.md](docs/design/network.md).
 
 ## Remote desktop
 

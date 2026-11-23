@@ -18,7 +18,7 @@ use crate::desktop::DesktopSession;
 use crate::shell::ShellSession;
 use crate::update::Updater;
 use crate::logwatch::LogWatchers;
-use crate::{jobs, patch, security, services, shell};
+use crate::{deploy, jobs, patch, security, services, shell};
 
 type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -77,6 +77,10 @@ pub async fn run_forever(cfg: Config, config_path: std::path::PathBuf, mut shutd
     let tracker = Arc::new(jobs::Tracker::open());
     let watchers = Arc::new(LogWatchers::default());
     let patches = Arc::new(patch::Manager::new());
+    let software = Arc::new(deploy::Manager::new(
+        deploy::Server { url: cfg.server_url.clone(), agent_id: cfg.agent_id, secret: cfg.secret.clone() },
+        patches.op_lock(),
+    ));
     let sensor = security::supervisor::Supervisor::new();
     sensor.set_server(cfg.server_url.clone(), cfg.agent_id, cfg.secret.clone());
     tokio::spawn(sensor.clone().run());
@@ -94,7 +98,7 @@ pub async fn run_forever(cfg: Config, config_path: std::path::PathBuf, mut shutd
     loop {
         let started = std::time::Instant::now();
         tokio::select! {
-            res = session(&cfg, collector.clone(), tracker.clone(), updater.clone(), watchers.clone(), patches.clone(), security.clone()) => match res {
+            res = session(&cfg, collector.clone(), tracker.clone(), updater.clone(), watchers.clone(), patches.clone(), software.clone(), security.clone()) => match res {
                 Ok(()) => info!("connection closed"),
                 Err(e) => warn!("connection error: {e:#}"),
             },
@@ -119,6 +123,7 @@ pub async fn run_forever(cfg: Config, config_path: std::path::PathBuf, mut shutd
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn session(
     cfg: &Config,
     collector: Arc<Mutex<Collector>>,
@@ -126,6 +131,7 @@ async fn session(
     updater: Arc<Updater>,
     watchers: Arc<LogWatchers>,
     patches: Arc<patch::Manager>,
+    software: Arc<deploy::Manager>,
     security: Arc<security::Manager>,
 ) -> Result<()> {
     let mut ws = connect(&cfg.ws_url()).await?;
@@ -140,6 +146,7 @@ async fn session(
             capabilities: capabilities(),
             patch_runs: patches.ids().await,
             security_actions: security.ids(),
+            software_runs: software.ids().await,
         },
     )
     .await?;
@@ -173,6 +180,7 @@ async fn session(
     tracker.attach(tx.clone()).await;
     updater.attach(tx.clone()).await;
     patches.attach(tx.clone()).await;
+    software.attach(tx.clone()).await;
     security.attach(tx.clone()).await;
     security.sensor().attach(tx.clone());
     let security_watch = tokio::spawn(security.clone().watch(tx.clone()));
@@ -181,7 +189,7 @@ async fn session(
     watchers.attach(tx.clone());
     let (services_refresh, refresh_rx) = mpsc::channel(4);
     let services = tokio::spawn(services::watch(tx.clone(), refresh_rx));
-    let ctx = Ctx { tx: tx.clone(), collector, tracker: tracker.clone(), updater: updater.clone(), watchers: watchers.clone(), patches: patches.clone(), security: security.clone(), services_refresh };
+    let ctx = Ctx { tx: tx.clone(), collector, tracker: tracker.clone(), updater: updater.clone(), watchers: watchers.clone(), patches: patches.clone(), software: software.clone(), security: security.clone(), services_refresh };
 
     let mut shells: HashMap<Uuid, ShellSession> = HashMap::new();
     let mut desktops: HashMap<Uuid, DesktopSession> = HashMap::new();
@@ -216,6 +224,7 @@ async fn session(
     security.sensor().detach();
     drop(ctx);
     patches.detach();
+    software.detach();
     heartbeat.abort();
     inventory.abort();
     drop(shells);
@@ -237,6 +246,7 @@ struct Ctx {
     updater: Arc<Updater>,
     watchers: Arc<LogWatchers>,
     patches: Arc<patch::Manager>,
+    software: Arc<deploy::Manager>,
     security: Arc<security::Manager>,
     /// Makes the service watcher send its list now.
     services_refresh: mpsc::Sender<()>,
@@ -305,6 +315,13 @@ async fn handle(msg: ServerMsg, ctx: &Ctx, shells: &mut HashMap<Uuid, ShellSessi
             tokio::spawn(ctx.patches.clone().install(run_id, ids, reboot_policy));
         }
         ServerMsg::PatchAck { run_id } => ctx.patches.ack(run_id).await,
+        ServerMsg::SoftwareScan { request_id, packages } => {
+            tokio::spawn(ctx.software.clone().scan(Some(request_id), packages));
+        }
+        ServerMsg::SoftwareRun { run_id, op, package, bootstrap_choco } => {
+            tokio::spawn(ctx.software.clone().run(run_id, op, package, bootstrap_choco));
+        }
+        ServerMsg::SoftwareAck { run_id } => ctx.software.ack(run_id).await,
         ServerMsg::SecurityRefresh => ctx.security.refresh(),
         ServerMsg::SecurityAction { request_id, product, action } => {
             tokio::spawn(ctx.security.clone().action(request_id, product, action));
@@ -340,6 +357,12 @@ async fn handle(msg: ServerMsg, ctx: &Ctx, shells: &mut HashMap<Uuid, ShellSessi
                     .unwrap_or_else(|e| rmm_proto::tools::Reply::Error(e.to_string()));
                 let _ = tx.send(AgentMsg::ToolReply { request_id, reply }).await;
             });
+        }
+        ServerMsg::NetScan { scan_id, spec } => {
+            tokio::spawn(crate::net::scan(scan_id, spec, tx.clone()));
+        }
+        ServerMsg::SnmpPoll { poll_id, targets } => {
+            tokio::spawn(crate::net::snmp_poll(poll_id, targets, tx.clone()));
         }
         ServerMsg::DesktopOpen { session_id, settings, consent } => {
             if desktops.len() >= MAX_DESKTOPS {
@@ -381,10 +404,12 @@ const MAX_DESKTOPS: usize = 3;
 fn capabilities() -> Vec<String> {
     let mut caps = vec![
         rmm_proto::patch::CAPABILITY.to_string(),
+        rmm_proto::software::CAPABILITY.to_string(),
         rmm_proto::security::CAPABILITY.to_string(),
         rmm_proto::security::SENSOR_CAPABILITY.to_string(),
         rmm_proto::security::SIGDB_CAPABILITY.to_string(),
         rmm_proto::tools::CAPABILITY.to_string(),
+        rmm_proto::net::CAPABILITY.to_string(),
     ];
     if cfg!(any(target_os = "linux", windows)) || std::env::var_os("RMM_DESKTOP_FAKE").is_some() {
         caps.push(rmm_proto::desktop::CAPABILITY.to_string());

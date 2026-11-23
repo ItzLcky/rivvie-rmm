@@ -49,7 +49,8 @@ function agent(i: number, host: string, siteId: string, os: 'linux' | 'windows',
 		last_metrics: health === 'unknown' ? null : metrics(online ? ago(0) : ago(37 + i * 90), cpu, mem, [['/', disk], ['/var', Math.max(5, disk - 30)]]),
 		update_state: null, update_version: null, update_detail: null, update_at: null,
 		health, disk_max_pct: health === 'unknown' ? 0 : disk, failed_jobs_24h: failed, open_alerts: 0,
-		patches_overdue: 0, patches_failed: 0, reboot_pending: false, reboot_pending_since: null as string | null, alerts_muted: false
+		patches_overdue: 0, patches_failed: 0, reboot_pending: false, reboot_pending_since: null as string | null, alerts_muted: false,
+		tags: [] as { id: string; name: string; color: string }[]
 	};
 }
 const agents: Agent[] = [
@@ -66,6 +67,46 @@ agents[6].enrolled_at = ago(60 * 24 * 2);
 // Patch state that counts against health, and a snoozed machine.
 Object.assign(agents[2], { patches_overdue: 2, patches_failed: 1, reboot_pending: true, reboot_pending_since: ago(60 * 30) });
 agents[3].alerts_muted = true;
+
+// --- tags, custom fields, notes, saved views -----------------------------------------------------
+const tagList = [
+	{ id: 'tg-vip', name: 'VIP', color: 'violet', created_at: ago(60 * 24 * 30) },
+	{ id: 'tg-dc', name: 'Domain controller', color: 'red', created_at: ago(60 * 24 * 30) },
+	{ id: 'tg-pilot', name: 'Pilot ring', color: 'teal', created_at: ago(60 * 24 * 12) },
+	{ id: 'tg-legacy', name: 'Legacy', color: 'amber', created_at: ago(60 * 24 * 9) }
+];
+const tagOf = (...ids: string[]) => ids.map((id) => tagList.find((t) => t.id === id)!).map(({ id, name, color }) => ({ id, name, color }));
+agents[0].tags = tagOf('tg-dc', 'tg-vip');
+agents[1].tags = tagOf('tg-vip');
+agents[2].tags = tagOf('tg-pilot');
+agents[3].tags = tagOf('tg-legacy');
+const tagsOut = () => tagList.map((t) => ({ ...t, agents: agents.filter((a) => a.tags.some((x) => x.id === t.id)).length }));
+const fieldDefs = [
+	{ id: 'cf-warranty', entity: 'agent', name: 'warranty_end', label: 'Warranty ends', description: 'From the vendor portal', kind: 'date', options: [], client_id: null, client_name: null, script_writable: true, position: 0, in_use: 3 },
+	{ id: 'cf-tier', entity: 'agent', name: 'support_tier', label: 'Support tier', description: '', kind: 'select', options: ['Gold', 'Silver', 'Bronze'], client_id: null, client_name: null, script_writable: false, position: 1, in_use: 2 },
+	{ id: 'cf-owner', entity: 'agent', name: 'owner', label: 'Owner', description: 'Who uses the machine', kind: 'text', options: [], client_id: 'c-acme', client_name: 'Acme Corp', script_writable: false, position: 2, in_use: 1 },
+	{ id: 'cf-am', entity: 'client', name: 'account_manager', label: 'Account manager', description: '', kind: 'text', options: [], client_id: null, client_name: null, script_writable: false, position: 0, in_use: 2 },
+	{ id: 'cf-rack', entity: 'site', name: 'rack', label: 'Rack', description: 'Where the server sits', kind: 'text', options: [], client_id: null, client_name: null, script_writable: false, position: 0, in_use: 1 }
+];
+const fieldValues = (entity: string) =>
+	fieldDefs
+		.filter((f) => f.entity === entity)
+		.map((f) => {
+			const v: Record<string, [string, string, number]> = { cf_warranty: ['2027-03-01', 'script', 90], cf_tier: ['Gold', 'user', 600], cf_owner: ['Jo Smith', 'user', 1200], cf_am: ['Priya Nair', 'user', 3000], cf_rack: ['R12, U8', 'user', 3000] };
+			const [value, source, mins] = v[f.id.replace('-', '_')] ?? [null, null, 0];
+			return {
+				field_id: f.id, name: f.name, label: f.label, description: f.description, kind: f.kind, options: f.options, script_writable: f.script_writable, client_id: f.client_id,
+				value, source, updated_at: value ? ago(mins) : null, updated_by_name: source === 'user' ? 'Dana Admin' : null
+			};
+		});
+const notes = [
+	{ id: 'n-1', agent_id: 'a-3', body: 'Reboots itself every Sunday night: that is the patch window, not a fault.\nCall Jo at the front desk before touching it in office hours.', author_id: 'u-admin', author_name: 'Dana Admin', pinned: true, created_at: ago(60 * 24 * 6), updated_at: ago(60 * 24 * 6), can_edit: true },
+	{ id: 'n-2', agent_id: 'a-3', body: 'Replaced the failing disk on the 3rd; old one is in the cupboard.', author_id: 'u-other', author_name: 'Sam Technician', pinned: false, created_at: ago(60 * 24 * 20), updated_at: ago(60 * 24 * 19), can_edit: false }
+];
+const savedViews = [
+	{ id: 'sv-1', page: 'agents', name: 'Windows servers', shared: false, query: 'os=windows&health=attention%2Cunhealthy', hidden_columns: null, client_id: null, owner_id: 'u-admin', owner_name: 'Dana Admin', can_edit: true, created_at: ago(60 * 24 * 3), updated_at: ago(60 * 24 * 3) },
+	{ id: 'sv-2', page: 'agents', name: 'VIP machines', shared: true, query: 'tag=tg-vip', hidden_columns: null, client_id: null, owner_id: 'u-other', owner_name: 'Sam Technician', can_edit: true, created_at: ago(60 * 24 * 8), updated_at: ago(60 * 24 * 8) }
+];
 
 // --- monitoring -----------------------------------------------------------------------------
 const policies = [
@@ -158,6 +199,7 @@ const detail = (a: Agent) => ({
 	machine_id: 'm-' + a.id,
 	// globex-db01 runs an agent build without remote desktop.
 	capabilities: a.id === 'a-6' ? ['patch'] : ['patch', 'desktop', 'tools'],
+	pinned_note: a.id === 'a-3' ? notes[0] : null,
 	inventory_at: ago(12),
 	inventory: {
 		collected_at: ago(12), cpu_brand: 'Intel(R) Xeon(R) Silver 4314 CPU @ 2.40GHz', cpu_cores_physical: 16, cpu_cores_logical: 32, mem_total: 64 * 2 ** 30,
@@ -303,6 +345,44 @@ const runs = [
 		created_at: ago(r.created), sent_at: r.status === 'queued' ? null : ago(r.created), finished_at: r.finished == null ? null : ago(r.finished), duration_ms: r.finished == null ? null : (r.created - r.finished) * 60_000
 	};
 });
+
+// --- software deployment ---------------------------------------------------------------------------------
+const swPackages = [
+	{ id: 'sw-ff', client_id: null, client_name: null, name: 'Mozilla Firefox', description: 'The browser, from winget, Chocolatey and apt.', publisher: 'Mozilla', winget_id: 'Mozilla.Firefox', choco_id: 'firefox', apt_name: 'firefox', dnf_name: 'firefox', version: null as string | null, installer: null as null | { name: string; kind: 'msi' | 'exe'; size: number; sha256: string }, silent_args: '', uninstall_cmd: null, product_code: null, detect_name: null, platforms: ['windows', 'linux'], installed_on: 3, updates: 2, policies: 1, created_at: ago(60 * 24 * 40), updated_at: ago(60 * 24 * 3) },
+	{ id: 'sw-7z', client_id: null, client_name: null, name: '7-Zip', description: '', publisher: 'Igor Pavlov', winget_id: '7zip.7zip', choco_id: '7zip', apt_name: null, dnf_name: null, version: '23.01', installer: null, silent_args: '', uninstall_cmd: null, product_code: null, detect_name: null, platforms: ['windows'], installed_on: 2, updates: 0, policies: 0, created_at: ago(60 * 24 * 30), updated_at: ago(60 * 24 * 30) },
+	{ id: 'sw-crm', client_id: 'c-acme', client_name: 'Acme Corp', name: 'Acme CRM agent', description: 'Line-of-business app, uploaded MSI.', publisher: 'Acme IT', winget_id: null, choco_id: null, apt_name: null, dnf_name: null, version: '4.2.1', installer: { name: 'AcmeCRM-4.2.1.msi', kind: 'msi' as const, size: 48_220_160, sha256: 'c4'.repeat(32) }, silent_args: 'SERVER=crm.acme.test', uninstall_cmd: null, product_code: '{4C1D7A52-0E6B-4F0A-9A34-2B8C5E7D1F93}', detect_name: null, platforms: ['windows'], installed_on: 1, updates: 0, policies: 0, created_at: ago(60 * 24 * 12), updated_at: ago(60 * 24 * 2) },
+	{ id: 'sw-new', client_id: null, client_name: null, name: 'Vendor tool (installer to come)', description: '', publisher: null, winget_id: null, choco_id: null, apt_name: null, dnf_name: null, version: null, installer: null, silent_args: '', uninstall_cmd: null, product_code: null, detect_name: null, platforms: [], installed_on: 0, updates: 0, policies: 0, created_at: ago(60), updated_at: ago(60) }
+];
+const swDev = (agent: string, pkg: string, o: Record<string, unknown>) => {
+	const a = agents.find((x) => x.id === agent)!;
+	const p = swPackages.find((x) => x.id === pkg)!;
+	return { agent_id: a.id, hostname: a.hostname, os_family: a.os_family, online: a.online, client_id: a.client_id, client_name: a.client_name, site_name: a.site_name, package_id: p.id, package_name: p.name, pin: p.version,
+		installed: null as string | null, available: null as string | null, ignored: null as string | null, provider: 'winget' as string | null, checked_at: ago(95), desired: null as string | null, policy_items: [] as string[], compliant: null as boolean | null, last_run: null as unknown, fail_count: 0, last_error: null as string | null, ...o };
+};
+const swDevices = [
+	swDev('a-1', 'sw-ff', { installed: '124.0.1', available: '125.0.3', desired: 'latest', policy_items: ['sw-req'], compliant: false }),
+	swDev('a-3', 'sw-ff', { installed: '124.0.1', available: '125.0.3', provider: 'apt', desired: 'latest', policy_items: ['sw-req'], compliant: false }),
+	swDev('a-2', 'sw-ff', { installed: '125.0.3', desired: 'latest', policy_items: ['sw-req'], compliant: true }),
+	swDev('a-1', 'sw-7z', { installed: '23.01' }),
+	swDev('a-2', 'sw-7z', { installed: null, desired: 'present', policy_items: ['sw-req-7z'], compliant: false, fail_count: 2, last_error: 'winget install failed (exit 0x8a150010): No applicable installer found', last_run: { id: 'sr-2', op: 'install', status: 'failed', trigger: 'policy', at: ago(40), error: 'winget install failed (exit 0x8a150010): No applicable installer found' } }),
+	swDev('a-1', 'sw-crm', { installed: '4.2.0', available: '4.2.1', provider: 'installer', desired: 'present', policy_items: ['sw-req-crm'], compliant: false })
+];
+const swRuns = [
+	{ id: 'sr-1', agent_id: 'a-1', package_id: 'sw-ff', package_name: 'Mozilla Firefox', op: 'upgrade', trigger: 'policy', policy_item_id: 'sw-req', created_by_name: null, status: 'sent', stage: 'installing', progress: 'winget upgrade Mozilla.Firefox', error: null, provider: null, from_version: '124.0.1', to_version: null, reboot_required: false, created: 3, finished: null as number | null, duration_ms: null as number | null },
+	{ id: 'sr-2', agent_id: 'a-2', package_id: 'sw-7z', package_name: '7-Zip', op: 'install', trigger: 'policy', policy_item_id: 'sw-req-7z', created_by_name: null, status: 'failed', stage: null, progress: null, error: 'winget install failed (exit 0x8a150010): No applicable installer found', provider: 'winget', from_version: null, to_version: null, reboot_required: false, created: 40, finished: 39, duration_ms: 41_000 },
+	{ id: 'sr-3', agent_id: 'a-3', package_id: 'sw-ff', package_name: 'Mozilla Firefox', op: 'install', trigger: 'manual', policy_item_id: null, created_by_name: 'Dana Admin', status: 'succeeded', stage: null, progress: null, error: null, provider: 'apt', from_version: null, to_version: '124.0.1', reboot_required: false, created: 60 * 26, finished: 60 * 26 - 1, duration_ms: 52_000 },
+	{ id: 'sr-4', agent_id: 'a-1', package_id: 'sw-crm', package_name: 'Acme CRM agent', op: 'upgrade', trigger: 'manual', policy_item_id: null, created_by_name: 'Dana Admin', status: 'queued', stage: null, progress: null, error: null, provider: null, from_version: '4.2.0', to_version: null, reboot_required: false, created: 8, finished: null, duration_ms: null }
+].map((r) => {
+	const a = agents.find((x) => x.id === r.agent_id)!;
+	const { created, finished, ...rest } = r;
+	return { ...rest, hostname: a.hostname, client_id: a.client_id, client_name: a.client_name, created_at: ago(created), sent_at: r.status === 'queued' ? null : ago(created), finished_at: finished == null ? null : ago(finished), output: r.status === 'sent' ? '' : '$ winget install --exact --id 7zip.7zip --source winget --silent\nNo applicable installer found; see logs for more details.\n[exit -1978335216]\n' };
+});
+function agentSoftware(a: Agent) {
+	return {
+		capable: a.id !== 'a-7', providers: a.os_family === 'windows' ? ['winget', 'choco', 'installer'] : ['apt'], scanned_at: ago(95), scan_requested_at: null, scan_error: null,
+		items: swDevices.filter((d) => d.agent_id === a.id), runs: swRuns.filter((r) => r.agent_id === a.id)
+	};
+}
 function agentPatches(a: Agent) {
 	const rows = updates.filter((u) => u.on.includes(a.id) || u.installedOn.includes(a.id)).map((u) => ({
 		update_id: u.update_id, title: u.title, kb: u.kb, severity: u.severity, category: u.category, size: u.size, requires_reboot: u.requires_reboot,
@@ -783,6 +863,19 @@ const items: PItem[] = [
 	{ id: 'p-veeam', set: SET.acmeWin, module: 'alert', name: 'Backup service stopped', enabled: true, client_id: 'c-acme', site_id: null, excluded: [],
 		config: { kind: 'service', params: { services: ['VeeamBackupSvc'], auto_only: false, exclude: [] }, severity: 'critical', channel_ids: ['ch-mail'], notify_resolved: true, renotify_minutes: null, ticket_board_id: 'b-alerts', ticket_priority: 2, ticket_auto_resolve: true, run_script_id: null } },
 	...schedules.map((x) => ({ id: x.id, set: x.set_id, module: 'schedule', name: x.name, enabled: x.enabled, client_id: x.client_id, site_id: x.site_id, excluded: [], config: { script_id: x.script_id, cron: x.cron, timezone: x.timezone, args: x.args, timeout_secs: x.timeout_secs, retain_days: x.retain_days } })),
+	{ id: 'sw-req', set: SET.acmeWin, module: 'software', name: 'Firefox on Acme Windows devices', enabled: true, client_id: 'c-acme', site_id: null, excluded: [], config: { package_id: 'sw-ff', state: 'latest', bootstrap_choco: false, window: null } },
+	{ id: 'au-welcome', set: SET.root, module: 'automation', name: 'Welcome new devices', enabled: true, client_id: null, site_id: null, excluded: [],
+		config: { trigger: 'enrollment', script_id: 's-disk', args: [], timeout_secs: null, offline_minutes: null, alert_kind: null, retry_failed: true, max_attempts: 3, retry_minutes: 30, cooldown_minutes: 60, max_runs_per_hour: 100, respect_window: false, retain_days: 30 } },
+	{ id: 'au-addon', set: SET.root, module: 'automation', name: 'Install the monitoring add-on', enabled: true, client_id: null, site_id: null, excluded: [],
+		config: { trigger: 'run_once', script_id: 's-upd', args: ['--quiet'], timeout_secs: 300, offline_minutes: null, alert_kind: null, retry_failed: true, max_attempts: 3, retry_minutes: 30, cooldown_minutes: 60, max_runs_per_hour: 50, respect_window: true, retain_days: 30 } },
+	{ id: 'au-back', set: SET.win, module: 'automation', name: 'Resync after a long absence', enabled: true, client_id: 'c-acme', site_id: null, excluded: [],
+		config: { trigger: 'agent_online', script_id: 's-spool', args: [], timeout_secs: null, offline_minutes: 120, alert_kind: null, retry_failed: false, max_attempts: 3, retry_minutes: 30, cooldown_minutes: 240, max_runs_per_hour: 20, respect_window: false, retain_days: 14 } },
+	{ id: 'au-disk', set: SET.linux, module: 'automation', name: 'Clean up when the disk fills', enabled: true, client_id: null, site_id: null, excluded: [],
+		config: { trigger: 'alert_opened', script_id: 's-disk', args: [], timeout_secs: 120, offline_minutes: null, alert_kind: 'disk', retry_failed: false, max_attempts: 3, retry_minutes: 30, cooldown_minutes: 60, max_runs_per_hour: 100, respect_window: true, retain_days: 30 } },
+	{ id: 'au-tag', set: SET.root, module: 'automation', name: 'Set up pilot machines', enabled: true, client_id: null, site_id: null, excluded: [],
+		config: { trigger: 'tag_added', script_id: 's-upd', args: ['--pilot'], timeout_secs: null, offline_minutes: null, alert_kind: null, tag_id: 'tg-pilot', field_id: null, field_value: null, retry_failed: false, max_attempts: 3, retry_minutes: 30, cooldown_minutes: 60, max_runs_per_hour: 100, respect_window: false, retain_days: 30 } },
+	{ id: 'au-field', set: SET.root, module: 'automation', name: 'Gold support onboarding', enabled: true, client_id: null, site_id: null, excluded: [],
+		config: { trigger: 'field_changed', script_id: 's-disk', args: [], timeout_secs: null, offline_minutes: null, alert_kind: null, tag_id: null, field_id: 'cf-tier', field_value: 'Gold', retry_failed: false, max_attempts: 3, retry_minutes: 30, cooldown_minutes: 60, max_runs_per_hour: 100, respect_window: false, retain_days: 30 } },
 	{ id: PATCH_ITEM, set: SET.root, module: 'patch', name: 'Patching', enabled: true, client_id: null, site_id: null, excluded: [],
 		config: { auto_approve_severities: [], auto_approve_categories: ['security', 'critical', 'definition'], deferral_days: 0, auto_install: false, reboot_policy: 'never', window: null } },
 	{ id: SECURITY_ITEM, set: SET.root, module: 'security', name: 'Security', enabled: true, client_id: null, site_id: null, excluded: [],
@@ -798,6 +891,7 @@ const overrides: { item: string; set: string; enabled: boolean | null; config: C
 	{ item: SECURITY_ITEM, set: SET.linSrv, enabled: null, config: { canaries: false, telemetry_mb: 512 } },
 	{ item: SECURITY_ITEM, set: SET.web01, enabled: null, config: { prevention: false, archive_depth: 3 } },
 	{ item: 'p-off', set: SET.dc, enabled: null, config: { renotify_minutes: 30 } },
+	{ item: 'au-addon', set: SET.winSrv, enabled: null, config: { max_runs_per_hour: 10, respect_window: false } },
 	{ item: 'p-svc', set: SET.web01, enabled: false, config: {} },
 	{ item: AGENT_ITEM, set: SET.winSrv, enabled: null, config: { auto_update: false } },
 	{ item: PATCH_ITEM, set: SET.dc, enabled: null, config: { auto_install: false, reboot_policy: 'never' } }
@@ -839,7 +933,7 @@ function chainOf(id: string): PSet[] {
 	for (let s: PSet | undefined = setOf(id); s; s = s.parent_id ? setOf(s.parent_id) : undefined) out.unshift(s);
 	return out;
 }
-const moduleOrder = ['alert', 'schedule', 'patch', 'security', 'remote_access', 'agent'];
+const moduleOrder = ['alert', 'schedule', 'software', 'automation', 'patch', 'security', 'remote_access', 'agent'];
 function itemView(it: PItem, chain: PSet[], agent?: Agent) {
 	const ids = chain.map((c) => c.id);
 	const at = ids.indexOf(it.set);
@@ -866,6 +960,7 @@ function itemView(it: PItem, chain: PSet[], agent?: Agent) {
 		editable: true, overridable: it.set !== here,
 		open_alerts: alerts.filter((x) => x.policy_id === it.id && x.state !== 'resolved' && (!agent || x.agent_id === agent.id)).length,
 		schedule: sched ? { next_run_at: sched.next_run_at, last_run_at: sched.last_run_at } : null,
+		runs: it.module === 'automation' ? runCounts(automationRuns.filter((r) => r.item_id === it.id && (!agent || r.agent_id === agent.id))) : null,
 		...(agent ? { applies: (!it.client_id || it.client_id === agent.client_id) && (!it.site_id || it.site_id === agent.site_id) && !it.excluded.some((x) => x.id === agent.id), excluded: it.excluded.some((x) => x.id === agent.id) } : {})
 	};
 }
@@ -905,6 +1000,35 @@ function agentPatchPolicy(a: Agent, site: { days: number[] | null; start: string
 	const window = eff.window ? { ...eff.window, tz: eff.window.tz === 'site' ? site.tz : eff.window.tz, open_now: false, next_start: '2026-06-21T07:00:00.000Z' } : site;
 	return { ...eff, id: PATCH_ITEM, set_id: set, source: setOf(set).name, own_window: own, window };
 }
+/** Runs of the automations: the device states `/policy-items/{id}/runs` and `/agents/{id}/automations` report. */
+type RunStatus = 'waiting' | 'pending' | 'succeeded' | 'failed' | 'skipped';
+const autoRun = (id: string, item: string, agent: number, trigger: string, status: RunStatus, reason: string | null, mins: number, attempts = 1, job: string | null = null, exit: number | null = null) => {
+	const a = agents[agent - 1];
+	const it = items.find((i) => i.id === item)!;
+	return {
+		id, item_id: item, item_name: it.name, agent_id: a.id, hostname: a.hostname, trigger, status, reason, context: {}, job_id: status === 'waiting' || status === 'skipped' ? null : (job ?? `j-${agent}`),
+		script_id: it.config.script_id as string, script_name: scripts.find((x) => x.id === it.config.script_id)?.name ?? null, exit_code: exit, attempts,
+		created_at: ago(mins + 1), started_at: status === 'waiting' || status === 'skipped' ? null : ago(mins), finished_at: status === 'succeeded' || status === 'failed' || status === 'skipped' ? ago(mins - 0.2) : null
+	};
+};
+const automationRuns = [
+	autoRun('ar-1', 'au-addon', 1, 'run_once', 'succeeded', null, 60 * 5, 1, 'j-1', 0),
+	autoRun('ar-2', 'au-addon', 2, 'run_once', 'failed', 'failed', 60 * 3, 2, 'j-2', 1),
+	autoRun('ar-3', 'au-addon', 3, 'run_once', 'succeeded', null, 60 * 5, 1, 'j-3', 0),
+	autoRun('ar-4', 'au-addon', 4, 'run_once', 'pending', null, 20),
+	autoRun('ar-5', 'au-addon', 5, 'run_once', 'waiting', 'maintenance_window', 90),
+	autoRun('ar-6', 'au-addon', 6, 'run_once', 'succeeded', null, 60 * 4, 1, 'j-6', 0),
+	autoRun('ar-7', 'au-welcome', 7, 'enrollment', 'succeeded', null, 60 * 24 * 2, 1, 'j-7', 0),
+	autoRun('ar-8', 'au-disk', 3, 'alert_opened', 'succeeded', null, 60 * 2, 1, 'j-3', 0),
+	autoRun('ar-9', 'au-disk', 3, 'alert_opened', 'skipped', 'cooldown', 30),
+	autoRun('ar-10', 'au-back', 1, 'agent_online', 'succeeded', null, 60 * 26, 1, 'j-1', 0),
+	autoRun('ar-11', 'au-back', 1, 'agent_online', 'skipped', 'rate_limited', 60 * 8),
+	{ ...autoRun('ar-12', 'au-tag', 3, 'tag_added', 'succeeded', null, 60 * 3, 1, 'j-3', 0), context: { tag_id: 'tg-pilot', tag: 'Pilot ring', source: 'user' } },
+	{ ...autoRun('ar-13', 'au-field', 3, 'field_changed', 'succeeded', null, 60 * 9, 1, 'j-3', 0), context: { field: 'support_tier', from: 'Silver', to: 'Gold', source: 'user' } },
+	{ ...autoRun('ar-14', 'au-field', 3, 'field_changed', 'skipped', 'own_write', 60 * 9 - 2), context: { field: 'support_tier', from: 'Gold', to: 'Platinum', source: 'script' } }
+];
+const runCounts = (rows: typeof automationRuns) =>
+	Object.fromEntries((['waiting', 'pending', 'succeeded', 'failed', 'skipped'] as RunStatus[]).map((st) => [st, rows.filter((r) => r.status === st).length])) as Record<RunStatus, number>;
 const scheduleOut = (x: (typeof schedules)[number]) => ({ ...x, set_name: setOf(x.set_id).name });
 /** GET routes of the policy API; undefined when `path` isn't one, null for an unknown set. */
 function policyRoute(path: string, q: URLSearchParams): unknown {
@@ -926,6 +1050,12 @@ function policyRoute(path: string, q: URLSearchParams): unknown {
 		}));
 		return page(list, Number(q.get('limit') ?? 50));
 	}
+	if ((m = path.match(/^\/policy-items\/([^/]+)\/runs$/))) {
+		const all = automationRuns.filter((r) => r.item_id === m![1]);
+		const only = q.get('status');
+		return { counts: runCounts(all), runs: only ? all.filter((r) => r.status === only) : all };
+	}
+	if ((m = path.match(/^\/agents\/([^/]+)\/automations$/))) return [...automationRuns].filter((r) => r.agent_id === m![1]).reverse();
 	if ((m = path.match(/^\/policy-items\/([^/]+)$/))) {
 		const it = items.find((i) => i.id === m![1]);
 		return it ? itemView(it, chainOf(it.set)) : null;
@@ -1077,7 +1207,115 @@ const categoryOut = (c: (typeof docCategories)[number]) => ({ ...c, docs: client
 
 const admin = { id: 'u-1', email: 'dana@northwind.example', name: 'Dana Admin', role: 'admin', totp_enabled: true, mfa_setup_required: false, client_ids: null, preferences: {}, permissions: ['security.read', 'security.respond', 'security.manage', 'vault.read', 'vault.manage'] };
 
-export async function mockApi(p: Page, opts: { signedIn?: boolean } = {}) {
+// --- Network discovery and SNMP devices ------------------------------------------------------------
+const netDev = (n: number, name: string, kind: string, host: string, state: 'up' | 'down', extra: Record<string, unknown> = {}) => ({
+	id: `nd-${n}`, site_id: 's-acme-hq', site_name: 'Head office', client_id: 'c-acme', client_name: 'Acme Corp', name, host, port: 161, credential_id: 'nc-1', credential_name: 'Switches (read-only)',
+	kind, enabled: true, poll_secs: null, sys_descr: null as string | null, sys_name: name.toLowerCase().replace(/ /g, '-'), sys_object_id: '1.3.6.1.4.1.9.1.1208', sys_location: 'Comms room, level 1', vendor: null as string | null,
+	mac: null as string | null, state, state_since: ago(state === 'down' ? 47 : 60 * 24 * 12), last_poll_at: ago(state === 'down' ? 0 : 2), last_ok_at: state === 'down' ? ago(47) : ago(2),
+	last_error: state === 'down' ? 'timeout after 3 tries' : null, rtt_ms: state === 'down' ? null : 3, uptime_secs: state === 'down' ? null : 86400 * 41 + 3600 * 5, cpu_percent: null as number | null, mem_used: null as number | null,
+	mem_total: null as number | null, storage: [] as unknown[], supplies: [] as unknown[], created_at: ago(60 * 24 * 30), agent_id: 'a-1', agent_hostname: 'acme-dc01', agent_online: true,
+	open_alerts: state === 'down' ? 1 : 0, interfaces: 0, interfaces_up: 0, ...extra
+});
+const netPorts = Array.from({ length: 8 }, (_, i) => ({
+	if_index: i + 1, name: i === 7 ? 'Gi1/0/48' : `Gi1/0/${i + 1}`, descr: `GigabitEthernet1/0/${i + 1}`, alias: ['Uplink to firewall', 'Reception PC', 'Accounts PC', '', 'Wi-Fi AP lobby', 'Meeting room', '', 'Spare'][i], if_type: 6,
+	speed_bps: 1_000_000_000, admin_status: i === 7 ? 2 : 1, oper_status: [1, 1, 1, 2, 1, 1, 2, 2][i], status_since: ago(60 * 24 * (i + 2)), monitored: i !== 7 && [1, 1, 1, 0, 1, 1, 0, 0][i] === 1,
+	in_bps: [i === 0 ? 182_000_000 : 3_400_000 * i, 0][oper(i)], out_bps: [i === 0 ? 96_000_000 : 1_100_000 * i, 0][oper(i)], util_pct: i === 0 ? 18 : oper(i) ? null : 0.3 * i,
+	in_errors: i === 4 ? 312 : 0, out_errors: 0, in_discards: i === 0 ? 14 : 0, out_discards: 0, last_at: ago(2)
+}));
+function oper(i: number) {
+	return [0, 0, 0, 1, 0, 0, 1, 1][i];
+}
+const netDevices = [
+	netDev(1, 'Core switch', 'switch', '192.168.10.2', 'up', { sys_descr: 'Cisco IOS Software, Catalyst L3 Switch Software (CAT9K_IOSXE), Version 17.9.4', vendor: 'Cisco Systems', mac: '00:1b:54:aa:10:02', cpu_percent: 17, mem_used: 612_000_000, mem_total: 2_000_000_000, interfaces: 8, interfaces_up: 5, storage: [{ descr: 'flash:', kind: 'disk', used: 410_000_000, total: 1_600_000_000 }] }),
+	netDev(2, 'Edge firewall', 'firewall', '192.168.10.1', 'down', { sys_descr: 'Fortinet FortiGate-60F v7.4.3', vendor: 'Fortinet', mac: '90:6c:ac:11:22:33', interfaces: 4, interfaces_up: 0 }),
+	netDev(3, 'Reception printer', 'printer', '192.168.10.41', 'up', {
+		sys_descr: 'HP LaserJet MFP M430f', vendor: 'HP', mac: '3c:2a:f4:5d:0e:91', uptime_secs: 86400 * 3,
+		supplies: [{ index: 1, description: 'Black Toner Cartridge', class: 3, kind: 3, percent: 8 }, { index: 2, description: 'Imaging Drum', class: 3, kind: 9, percent: 64 }, { index: 3, description: 'Waste Toner Box', class: 4, kind: 4, percent: 31 }]
+	})
+];
+const netDetail = (d: (typeof netDevices)[number]) => ({
+	...d, interfaces: d.id === 'nd-1' ? netPorts : [],
+	alerts: d.state === 'down' ? [{ id: 'al-net-1', title: 'Edge firewall isn’t answering SNMP', severity: 'critical', kind: 'net_down', opened_at: ago(46), acknowledged_at: null }] : []
+});
+const netPoints = (dev: string) =>
+	Array.from({ length: 48 }, (_, i) => ({
+		ts: new Date(NOW.getTime() - (47 - i) * 30 * 60_000).toISOString(), reachable_pct: dev === 'nd-2' && i > 45 ? 0 : 100, rtt_ms: dev === 'nd-2' && i > 45 ? null : 2 + ((i * 7) % 5),
+		cpu_percent: dev === 'nd-1' ? 12 + ((i * 5) % 14) : null, mem_used: dev === 'nd-1' ? 580_000_000 + ((i * 3) % 9) * 6_000_000 : null, mem_total: dev === 'nd-1' ? 2_000_000_000 : null
+	}));
+const discovered = (n: number, ip: string, name: string, kind: string, state: string, extra: Record<string, unknown> = {}) => ({
+	id: `dd-${n}`, site_id: 's-acme-hq', site_name: 'Head office', client_id: 'c-acme', client_name: 'Acme Corp', ip, mac: null as string | null, hostname: null as string | null, mdns_name: null as string | null,
+	vendor: null as string | null, sys_name: null as string | null, sys_descr: null as string | null, sys_object_id: null, sys_location: null, credential_id: null as string | null, open_ports: [] as number[],
+	methods: ['tcp', 'arp'], kind, status: state === 'unmanaged' || state === 'managed' || state === 'monitored' ? 'unmanaged' : state, note: '', agent_id: null as string | null, agent_hostname: null as string | null,
+	net_device_id: null as string | null, online: true, rtt_ms: 2, first_seen_at: ago(60 * 24 * 9), last_seen_at: ago(14), state, name, ...extra
+});
+const discoveredHosts = [
+	discovered(1, '192.168.10.88', 'CAM-LOBBY', 'other', 'unmanaged', { mac: '9c:8e:cd:01:7a:42', vendor: 'Amcrest Technologies', open_ports: [80, 554], first_seen_at: ago(60 * 5) }),
+	discovered(2, '192.168.10.130', 'jsmith-laptop', 'windows', 'unmanaged', { mac: 'f8:75:a4:6e:12:09', vendor: 'LCFC(HeFei) Electronics', hostname: 'jsmith-laptop.acme.local', open_ports: [135, 445, 3389], methods: ['icmp', 'tcp', 'arp', 'dns'] }),
+	discovered(3, '192.168.10.45', 'switch-2f', 'switch', 'unmanaged', { mac: '24:a4:3c:9b:aa:10', vendor: 'Ubiquiti Inc', sys_name: 'switch-2f', sys_descr: 'UniFi US-24-250W, 6.6.65', credential_id: 'nc-1', open_ports: [22, 80, 443], methods: ['tcp', 'arp', 'snmp'] }),
+	discovered(4, '192.168.10.12', 'acme-dc01', 'windows', 'managed', { mac: '00:15:5d:0a:0b:0c', agent_id: 'a-1', agent_hostname: 'acme-dc01', open_ports: [135, 445, 3389] }),
+	discovered(5, '192.168.10.2', 'Core switch', 'switch', 'monitored', { net_device_id: 'nd-1', sys_name: 'core-switch', credential_id: 'nc-1', methods: ['tcp', 'snmp'] }),
+	discovered(6, '192.168.10.201', 'Label printer', 'printer', 'known', { note: 'Dispatch label printer', open_ports: [9100], vendor: 'Zebra Technologies', mac: '00:07:4d:11:22:33' }),
+	discovered(7, '192.168.10.99', 'unknown-99', 'other', 'unmanaged', { online: false, last_seen_at: ago(60 * 30), mac: 'b8:27:eb:12:34:56', vendor: 'Raspberry Pi Foundation' })
+];
+const netCredentials = [
+	{ id: 'nc-1', client_id: 'c-acme', name: 'Switches (read-only)', version: 'v2c', username: '', auth_proto: null, priv_proto: null, context: '', devices: 2, created_at: ago(60 * 24 * 30), updated_at: ago(60 * 24 * 30) },
+	{ id: 'nc-2', client_id: 'c-acme', name: 'Firewall (SNMPv3)', version: 'v3', username: 'rmm-monitor', auth_proto: 'sha256', priv_proto: 'aes128', context: '', devices: 1, created_at: ago(60 * 24 * 12), updated_at: ago(60 * 24 * 2) }
+];
+const siteNetwork = (site: (typeof sites)[number]) => ({
+	site_id: site.id, site_name: site.name, client_id: site.client_id, agent_id: site.id === 's-acme-hq' ? 'a-1' : null, agent_hostname: site.id === 's-acme-hq' ? 'acme-dc01' : null,
+	agent_online: site.id === 's-acme-hq', agent_capable: site.id === 's-acme-hq', subnets: site.id === 's-acme-hq' ? ['192.168.10.0/24'] : [], discovery_hours: site.id === 's-acme-hq' ? 24 : 0, credential_ids: site.id === 's-acme-hq' ? ['nc-1'] : [],
+	poll_secs: 300, candidates: agents.filter((a) => a.site_id === site.id).map((a) => ({ id: a.id, hostname: a.hostname, online: a.online, capable: a.os_family === 'windows' })),
+	last_scan: site.id === 's-acme-hq' ? { id: 'sc-n1', status: 'done', subnets: ['192.168.10.0/24'], scanned: 254, found: 31, new_hosts: 2, error: null, requested_by_name: null, created_at: ago(60 * 3), finished_at: ago(60 * 3 - 2) } : null,
+	devices: site.id === 's-acme-hq' ? 3 : 0
+});
+
+// --- API keys, service accounts and webhooks -----------------------------------------------------
+const apiKeys = [
+	{ id: 'k-1', name: 'Reporting script', prefix: 'rmm_k_3f9a1c', owner_id: 'u-1', owner_name: 'Dana Admin', service_account: false, access: 'read', scopes: ['clients', 'agents', 'alerts'], permissions: [] as string[], client_ids: null as string[] | null, rate_limit_per_min: 600, expires_at: ago(-60 * 24 * 80), last_used_at: ago(12), last_used_ip: '203.0.113.20', revoked_at: null as string | null, created_at: ago(60 * 24 * 10), status: 'active' },
+	{ id: 'k-2', name: 'Ticket sync', prefix: 'rmm_k_b84e07', owner_id: 'u-1', owner_name: 'Dana Admin', service_account: false, access: 'write', scopes: ['tickets', 'jobs'], permissions: [], client_ids: ['c-acme'], rate_limit_per_min: 120, expires_at: null, last_used_at: null, last_used_ip: null, revoked_at: null, created_at: ago(60 * 24 * 2), status: 'active' },
+	{ id: 'k-3', name: 'Old exporter', prefix: 'rmm_k_09d2c5', owner_id: 'u-1', owner_name: 'Dana Admin', service_account: false, access: 'read', scopes: ['agents', 'security'], permissions: ['security.read'], client_ids: null, rate_limit_per_min: 600, expires_at: ago(60 * 24 * 3), last_used_at: ago(60 * 24 * 40), last_used_ip: '198.51.100.4', revoked_at: null, created_at: ago(60 * 24 * 120), status: 'expired' }
+];
+const allApiKeys = [
+	...apiKeys,
+	{ id: 'k-4', name: 'Backup monitor', prefix: 'rmm_k_71c0aa', owner_id: 'u-sa', owner_name: 'Backup monitor', service_account: true, access: 'read', scopes: ['agents', 'alerts'], permissions: [], client_ids: ['c-globex'], rate_limit_per_min: 300, expires_at: ago(-60 * 24 * 300), last_used_at: ago(3), last_used_ip: '10.0.0.8', revoked_at: null, created_at: ago(60 * 24 * 30), status: 'active' },
+	{ id: 'k-5', name: 'Leaked in a gist', prefix: 'rmm_k_5e22f9', owner_id: 'u-2', owner_name: 'Terry Tech', service_account: false, access: 'read', scopes: ['tickets'], permissions: [], client_ids: null, rate_limit_per_min: 600, expires_at: null, last_used_at: ago(60 * 24), last_used_ip: '192.0.2.77', revoked_at: ago(60 * 24 * 2), created_at: ago(60 * 24 * 60), status: 'revoked' }
+];
+const serviceAccounts = [
+	{ id: 'u-sa', name: 'Backup monitor', role: 'readonly', disabled: false, all_clients: false, client_ids: ['c-globex'], keys: 1, created_at: ago(60 * 24 * 30) },
+	{ id: 'u-sa2', name: 'Reporting pipeline', role: 'technician', disabled: false, all_clients: true, client_ids: [] as string[], keys: 0, created_at: ago(60 * 24 * 5) }
+];
+const webhookEvents = ['ticket.created', 'ticket.updated', 'ticket.status_changed', 'ticket.resolved', 'ticket.comment', 'alert.created', 'alert.acknowledged', 'alert.resolved'];
+const webhooks = [
+	{ id: 'wh-1', name: 'Ticket mirror', url: 'https://hooks.northwind.example/rmm/tickets', client_id: null, client_name: null, events: webhookEvents.slice(0, 5), internal_notes: false, enabled: true, created_at: ago(60 * 24 * 20), pending: 0, failed_24h: 0, last_sent_at: ago(9) },
+	{ id: 'wh-2', name: 'Acme dashboard', url: 'https://acme.example/api/rmm-events', client_id: 'c-acme', client_name: 'Acme Corp', events: webhookEvents, internal_notes: true, enabled: true, created_at: ago(60 * 24 * 6), pending: 2, failed_24h: 1, last_sent_at: ago(60 * 5) },
+	{ id: 'wh-3', name: 'Chat bridge (paused)', url: 'http://10.0.0.30:8088/hook', client_id: null, client_name: null, events: ['alert.created', 'alert.resolved'], internal_notes: false, enabled: false, created_at: ago(60 * 24 * 40), pending: 0, failed_24h: 0, last_sent_at: null }
+];
+const webhookDeliveries = [
+	{ id: 9, delivery_id: '6f1c0c1e-9a51-4c0e-b6c9-0a4de1f3a111', event: 'ticket.status_changed', status: 'pending', attempts: 2, response_status: 502, duration_ms: 1840, last_error: 'HTTP 502 Bad Gateway: upstream timed out', created_at: ago(40), sent_at: null, next_attempt_at: ago(-20) },
+	{ id: 8, delivery_id: '2c7d9b30-5a0e-4a6f-8a1d-77f5a1b3c9e2', event: 'ticket.comment', status: 'failed', attempts: 5, response_status: null, duration_ms: 15012, last_error: 'request failed: error sending request for url (https://acme.example/api/rmm-events)', created_at: ago(60 * 20), sent_at: null, next_attempt_at: ago(60 * 17) },
+	{ id: 7, delivery_id: 'b0a84e2c-91d3-4b57-bf0a-35c2d1e8f640', event: 'alert.created', status: 'sent', attempts: 1, response_status: 200, duration_ms: 118, last_error: null, created_at: ago(60 * 5), sent_at: ago(60 * 5), next_attempt_at: ago(60 * 5) },
+	{ id: 6, delivery_id: '91e3f7a2-0c4b-4d18-a6e5-5d2b8c7f1a03', event: 'ticket.created', status: 'sent', attempts: 1, response_status: 204, duration_ms: 87, last_error: null, created_at: ago(60 * 7), sent_at: ago(60 * 7), next_attempt_at: ago(60 * 7) },
+	{ id: 5, delivery_id: '5d6a0f19-3e8c-4c72-9b41-e0a7c2d8b6f5', event: 'ping', status: 'sent', attempts: 1, response_status: 200, duration_ms: 64, last_error: null, created_at: ago(60 * 24), sent_at: ago(60 * 24), next_attempt_at: ago(60 * 24) }
+];
+const siemDestinations = [
+	{ id: 'sd-1', name: 'Splunk (HEC)', kind: 'https', address: 'https://splunk.northwind.example:8088/services/collector/event', framing: 'octet', https_format: 'splunk_hec', has_token: true, ca_pem: null, facility: 13, send_audit: true, send_detections: true, send_alerts: true, enabled: true, consecutive_failures: 0, next_attempt_at: ago(1), last_attempt_at: ago(1), last_success_at: ago(1), last_error: null, sent_total: 18432, dropped_total: 0, pending: 0, created_at: ago(60 * 24 * 12) },
+	{ id: 'sd-2', name: 'Graylog (TLS)', kind: 'syslog_tls', address: 'logs.northwind.example:6514', framing: 'octet', https_format: 'generic', has_token: false, ca_pem: '-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----', facility: 13, send_audit: true, send_detections: false, send_alerts: false, enabled: true, consecutive_failures: 6, next_attempt_at: ago(-9), last_attempt_at: ago(2), last_success_at: ago(60 * 3), last_error: 'TLS handshake: invalid peer certificate: UnknownIssuer', sent_total: 912, dropped_total: 0, pending: 241, created_at: ago(60 * 24 * 4) },
+	{ id: 'sd-3', name: 'Lab syslog (paused)', kind: 'syslog_udp', address: '10.0.0.40:514', framing: 'octet', https_format: 'generic', has_token: false, ca_pem: null, facility: 16, send_audit: true, send_detections: false, send_alerts: true, enabled: false, consecutive_failures: 0, next_attempt_at: ago(60 * 24), last_attempt_at: null, last_success_at: null, last_error: null, sent_total: 0, dropped_total: 0, pending: 0, created_at: ago(60 * 24 * 2) }
+];
+const openapi = {
+	openapi: '3.1.0',
+	info: { title: 'RMM API', version: '1.0.0', description: 'Authenticate with an API key.' },
+	tags: [{ name: 'clients', description: 'Clients and sites' }, { name: 'agents', description: 'Agents, inventory and metrics' }, { name: 'tickets', description: 'Tickets' }],
+	paths: {
+		'/clients': { get: { operationId: 'listClients', summary: 'List clients with their sites', description: 'Any key that holds the `clients` scope. Only the clients the key can see.', tags: ['clients'], parameters: [], 'x-rmm-scope': 'clients', 'x-rmm-access': 'read' } },
+		'/agents': { get: { operationId: 'listAgents', summary: 'List agents (devices)', description: 'Any key that holds the `agents` scope. Search matches hostname, OS, IP address prefix and logged-in user.', tags: ['agents'], parameters: [{ name: 'client_id', in: 'query', description: 'Only this client.', schema: { type: 'string', format: 'uuid' } }, { name: 'online', in: 'query', description: 'Only online or only offline agents.', schema: { type: 'boolean' } }, { name: 'limit', in: 'query', schema: { type: 'integer' } }], 'x-rmm-scope': 'agents', 'x-rmm-access': 'read' } },
+		'/agents/{id}': { get: { operationId: 'getAgent', summary: 'Get an agent with its hardware and software inventory', description: 'Any key that holds the `agents` scope.', tags: ['agents'], parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string', format: 'uuid' } }], 'x-rmm-scope': 'agents', 'x-rmm-access': 'read' } },
+		'/tickets': { post: { operationId: 'createTicket', summary: 'Open a ticket', description: 'A key with `write` access that holds the `tickets` scope.', tags: ['tickets'], parameters: [], requestBody: { content: { 'application/json': { schema: { $ref: '#/components/schemas/NewTicket' } } } }, 'x-rmm-scope': 'tickets', 'x-rmm-access': 'write' } }
+	},
+	components: { schemas: { NewTicket: { type: 'object', required: ['subject'], properties: { subject: { type: 'string' }, client_id: { type: 'string', format: 'uuid' }, priority: { type: 'integer' } } } } }
+};
+
+export async function mockApi(p: Page, opts: { signedIn?: boolean; ssoRequired?: boolean } = {}) {
 	const signedIn = opts.signedIn ?? true;
 	await p.clock.setFixedTime(NOW);
 	await p.route('**/api/**', async (route: Route) => {
@@ -1110,6 +1348,11 @@ export async function mockApi(p: Page, opts: { signedIn?: boolean } = {}) {
 		if ((m = path.match(/^\/doc-templates\/([^/]+)$/))) return json({ ...docTemplates.find((t) => t.id === m![1])!, body: '# {{client.name}}\n\n```fields\nLabel:\n```\n' });
 		if ((m = path.match(/^\/clients\/([^/]+)\/vault$/))) return json(vaultItems.filter((v) => v.client_id === m![1]));
 		if ((m = path.match(/^\/vault\/([^/]+)$/))) return json(vaultDetail(m![1]));
+		if (path === '/tags') return json(tagsOut());
+		if (path === '/custom-fields') return json(fieldDefs.filter((f) => !q.get('entity') || f.entity === q.get('entity')));
+		if ((m = path.match(/^\/(agents|clients|sites)\/([^/]+)\/fields$/))) return json(fieldValues(m[1].slice(0, -1)).filter((f) => m![1] !== 'agents' || f.client_id !== 'c-acme' || m![2] === 'a-1' || m![2] === 'a-2' || m![2] === 'a-3'));
+		if ((m = path.match(/^\/agents\/([^/]+)\/notes$/))) return json(notes.filter((n) => n.agent_id === m![1]));
+		if (path === '/saved-views') return json(savedViews);
 		if (path === '/agents') {
 			let list = agents.filter((a) => (!q.get('client_id') || a.client_id === q.get('client_id')) && (!q.get('online') || String(a.online) === q.get('online')));
 			if (q.get('health')) list = list.filter((a) => q.get('health')!.split(',').includes(a.health));
@@ -1118,6 +1361,7 @@ export async function mockApi(p: Page, opts: { signedIn?: boolean } = {}) {
 			if (q.get('category_id')) list = list.filter((a) => a.category_id === q.get('category_id'));
 			if (q.get('policy_set_id')) list = list.filter((a) => a.policy_set_id === q.get('policy_set_id'));
 			if (q.get('q')) list = list.filter((a) => a.hostname.includes(q.get('q')!));
+			if (q.get('tag')) list = list.filter((a) => q.get('tag')!.split(',').every((t) => a.tags.some((x) => x.id === t)));
 			return json(page(list, Number(q.get('limit') ?? 50)));
 		}
 		if ((m = path.match(/^\/agents\/([^/]+)$/))) return json(detail(agents.find((a) => a.id === m![1])!));
@@ -1172,6 +1416,19 @@ export async function mockApi(p: Page, opts: { signedIn?: boolean } = {}) {
 				)
 			);
 		}
+		if ((m = path.match(/^\/agents\/([^/]+)\/software$/))) return json(agentSoftware(agents.find((a) => a.id === m![1])!));
+		if (path === '/software/packages') {
+			const t = q.get('q')?.toLowerCase();
+			return json(swPackages.filter((p) => (!t || `${p.name} ${p.publisher ?? ''} ${p.winget_id ?? ''}`.toLowerCase().includes(t)) && (!q.get('platform') || p.platforms.includes(q.get('platform')!))));
+		}
+		if ((m = path.match(/^\/software\/packages\/([^/]+)$/))) return json(swPackages.find((p) => p.id === m![1])!);
+		if ((m = path.match(/^\/software\/packages\/([^/]+)\/devices$/))) return json({ items: swDevices.filter((d) => d.package_id === m![1] && (q.get('show') === 'all' || d.installed || d.desired) && (q.get('show') !== 'noncompliant' || d.compliant === false)) });
+		if (path === '/software/updates') {
+			const items = swDevices.filter((d) => d.installed && d.available && d.ignored !== d.available && (!q.get('client_id') || d.client_id === q.get('client_id')));
+			return json({ items, packages: [...new Set(items.map((d) => d.package_id))].map((id) => ({ package_id: id, name: swPackages.find((p) => p.id === id)!.name, devices: items.filter((d) => d.package_id === id).length })) });
+		}
+		if (path === '/software/runs') return json(swRuns.filter((r) => (!q.get('status') || q.get('status')!.split(',').includes(r.status)) && (!q.get('client_id') || r.client_id === q.get('client_id'))).map(({ output, ...r }) => r));
+		if ((m = path.match(/^\/software\/runs\/([^/]+)$/))) return json(swRuns.find((r) => r.id === m![1])!);
 		if (path === '/patches') {
 			let list = updateGroups();
 			if (q.get('client_id')) list = list.filter((u) => updates.find((x) => x.update_id === u.update_id)!.on.some((id) => agents.find((a) => a.id === id)!.client_id === q.get('client_id')));
@@ -1211,10 +1468,47 @@ export async function mockApi(p: Page, opts: { signedIn?: boolean } = {}) {
 					{ ...admin, permissions: null },
 					{ ...admin, id: 'u-2', email: 'terry@northwind.example', name: 'Terry Tech', role: 'technician', totp_enabled: false, client_ids: ['c-acme'], permissions: null },
 					{ ...admin, id: 'u-3', email: 'sam@northwind.example', name: 'Sam Security', role: 'readonly', totp_enabled: true, client_ids: null, permissions: ['security.read', 'security.respond', 'security.manage'] }
-				].map((u) => ({ ...u, disabled: false, last_login_at: ago(60), all_clients: u.role === 'admin' || u.client_ids === null, client_ids: u.client_ids ?? [] }))
+				].map((u, i) => ({
+					...u, disabled: false, last_login_at: ago(60), all_clients: u.role === 'admin' || u.client_ids === null, client_ids: u.client_ids ?? [],
+					sso_exempt: i === 0, sso_only: i === 1, passkeys: i === 2 ? 1 : 0, sso_providers: i === 1 ? ['Microsoft'] : []
+				}))
 			);
 		if (path === '/settings') return json({ company_name: 'Northwind IT', session_idle_hours: null, session_idle_hours_default: 12, require_2fa_all: false });
 		if (path === '/auth/totp') return json({ enabled: true, required: true, recovery_codes_left: 8 });
+		if (path === '/auth/passkeys')
+			return json({
+				available: true,
+				recovery_codes_left: 10,
+				sso_only: false,
+				passkeys: [
+					{ id: 'pk-1', name: 'YubiKey 5C', created_at: ago(60 * 24 * 30), last_used_at: ago(60 * 5) },
+					{ id: 'pk-2', name: 'Work laptop', created_at: ago(60 * 24 * 3), last_used_at: null }
+				]
+			});
+		if (path === '/auth/sso/providers')
+			return json({ providers: [{ id: 'sso-entra', name: 'Microsoft', preset: 'entra' }, { id: 'sso-google', name: 'Google', preset: 'google' }], sso_required: opts.ssoRequired ?? false });
+		if (path === '/settings/sso')
+			return json({
+				redirect_uri: 'https://rmm.northwind.example/api/auth/sso/callback',
+				sso_required: false,
+				break_glass: [{ id: 'u-1', email: 'dana@northwind.example', name: 'Dana Admin' }],
+				providers: [
+					{
+						id: 'sso-entra', name: 'Microsoft', preset: 'entra', issuer: 'https://login.microsoftonline.com/6b1c0c1e-9a51-4c0e-b6c9-0a4de1f3a111/v2.0',
+						client_id: '3f2a1c9e-77aa-4c2c-9d1e-5b0e8c4d2a10', has_secret: true, scopes: 'openid email profile', enabled: true, groups_claim: 'groups', jit: true,
+						group_sync: true, default_role: null, allowed_domains: ['northwind.example'], allowed_tenants: [], trust_email: true, identities: 6,
+						maps: [
+							{ group_value: '0b8d1f64-2e7a-4a53-9c1b-6f1d3a7e9c02', role: 'admin', extra_permissions: [], all_clients: true, client_ids: [] },
+							{ group_value: '7c2e5a90-1b44-4d8e-a3f6-2d9b8e4c1f33', role: 'technician', extra_permissions: ['billing.read'], all_clients: false, client_ids: ['c-acme'] }
+						]
+					},
+					{
+						id: 'sso-google', name: 'Google', preset: 'google', issuer: 'https://accounts.google.com', client_id: '812345678901-abc.apps.googleusercontent.com',
+						has_secret: true, scopes: 'openid email profile', enabled: false, groups_claim: 'groups', jit: false, group_sync: false, default_role: null,
+						allowed_domains: [], allowed_tenants: [], trust_email: false, identities: 0, maps: []
+					}
+				]
+			});
 		if (path === '/auth/sessions') return json([{ id: 'x1', created_at: ago(600), last_seen_at: ago(0), expires_at: ago(-6000), user_agent: 'Mozilla/5.0 (X11; Linux x86_64) Chrome/140.0', current: true }]);
 		if (path.match(/^\/sites\/[^/]+\/enrollment-tokens$/)) return json([{ id: 't1', label: 'Office rollout', max_uses: 50, uses: 12, expires_at: ago(-60 * 24 * 20), created_at: ago(60 * 24 * 10), category_id: null, category_name: null }, { id: 't2', label: 'Warehouse tills', max_uses: null, uses: 3, expires_at: null, created_at: ago(60 * 24 * 4), category_id: 'cat-kiosk', category_name: 'Kiosks' }]);
 		if (path === '/alerts/summary') return json(alertSummary(q.get('client_id')));
@@ -1241,6 +1535,26 @@ export async function mockApi(p: Page, opts: { signedIn?: boolean } = {}) {
 		if (path === '/notification-channels') return json(channels);
 		if (path === '/notifications') return json(deliveries);
 		if (path === '/settings/smtp') return json({ host: 'smtp.office365.com', port: 587, security: 'starttls', username: 'rmm@northwind.example', password_set: true, from: 'Northwind RMM <rmm@northwind.example>' });
+		if (path === '/api-keys') return json(q.get('all') ? allApiKeys : apiKeys);
+		if (path === '/api-keys/options') return json({ groups: [{ id: 'clients', label: 'Clients and sites' }, { id: 'agents', label: 'Agents, inventory and metrics' }, { id: 'jobs', label: 'Jobs and results' }, { id: 'scripts', label: 'Script library' }, { id: 'alerts', label: 'Alerts' }, { id: 'tickets', label: 'Tickets' }, { id: 'security', label: 'Endpoint protection (needs the security.read permission)' }], permissions: admin.permissions, can_write: true, default_rate_limit: 600 });
+		if (path === '/network/summary') return json({ unmanaged: discoveredHosts.filter((d) => d.state === 'unmanaged' && d.online).length, devices: netDevices.length, down: netDevices.filter((d) => d.state === 'down').length });
+		if (path === '/network/devices')
+			return json(netDevices.filter((d) => (!q.get('state') || d.state === q.get('state')) && (!q.get('kind') || d.kind === q.get('kind')) && (!q.get('client_id') || d.client_id === q.get('client_id'))));
+		if ((m = path.match(/^\/network\/devices\/([^/]+)\/metrics$/))) return json(netPoints(m[1]));
+		if ((m = path.match(/^\/network\/devices\/([^/]+)\/interfaces\/(\d+)\/metrics$/)))
+			return json(Array.from({ length: 48 }, (_, i) => ({ ts: new Date(NOW.getTime() - (47 - i) * 30 * 60_000).toISOString(), in_bps: 90_000_000 + ((i * 13) % 17) * 6_000_000, out_bps: 40_000_000 + ((i * 7) % 11) * 5_000_000, util_pct: 14, up_pct: 100 })));
+		if ((m = path.match(/^\/network\/devices\/([^/]+)$/))) return json(netDetail(netDevices.find((d) => d.id === m![1])!));
+		if (path === '/network/discovered') {
+			const st = q.get('state') ?? 'unmanaged';
+			return json(discoveredHosts.filter((d) => (st === 'all' || d.state === st) && (!q.get('client_id') || d.client_id === q.get('client_id'))));
+		}
+		if ((m = path.match(/^\/clients\/([^/]+)\/network-credentials$/))) return json(netCredentials.filter((c) => c.client_id === m![1]));
+		if ((m = path.match(/^\/sites\/([^/]+)\/network$/))) return json(siteNetwork(sites.find((x) => x.id === m![1])!));
+		if (path === '/service-accounts') return json(serviceAccounts);
+		if (path === '/siem/destinations') return json({ destinations: siemDestinations, retain_days: 7 });
+		if (path === '/webhooks') return json({ webhooks, events: webhookEvents });
+		if ((m = path.match(/^\/webhooks\/([^/]+)\/deliveries$/))) return json(q.get('status') ? webhookDeliveries.filter((d) => d.status === q.get('status')) : webhookDeliveries);
+		if (path === '/openapi.json') return json(openapi);
 		const pr = policyRoute(path, q);
 		if (pr !== undefined) return pr === null ? json({ error: 'policy set not found' }, 404) : json(pr);
 		if (path === '/schedules') return json(schedules.map(scheduleOut));

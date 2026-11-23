@@ -9,6 +9,7 @@ pub mod access;
 mod agents;
 mod attachments;
 mod alerts;
+mod apikeys;
 mod billing;
 mod channels;
 mod auth;
@@ -16,33 +17,48 @@ mod clients;
 mod desk;
 mod docs;
 mod downloads;
+mod fields;
 mod kb;
 mod jobs;
 mod msi;
+mod notes;
 mod mutes;
+mod network;
 mod packages;
+mod passkeys;
+mod automations;
 mod schedules;
 mod patches;
 mod pm;
 pub(crate) mod policies;
 pub(crate) mod portal;
+pub(crate) mod public;
 mod reports;
 mod search;
 mod scripts;
 mod security;
 mod servicedesk;
+mod software;
 mod services;
 mod settings;
+mod sso;
 pub(crate) mod sla;
 pub(crate) mod tickets;
+mod tags;
 mod time;
 mod tools;
 mod totp;
 pub(crate) mod users;
+mod audit;
+mod siem;
 mod vault;
+mod views;
+mod webhooks;
 
+pub use agents::refresh_health as refresh_agent_health;
 pub use jobs::{FAILED as JOB_FAILED, deliver as deliver_job};
 pub use portal::PORTAL_LINK_MINUTES;
+pub use sso::seal_existing as seal_sso_secrets;
 pub use totp::{clear as clear_totp, seal_existing as seal_totp_secrets};
 pub use users::create_user as create_user_cli;
 
@@ -65,10 +81,30 @@ pub fn router(attachment_max: u64) -> Router<Arc<AppState>> {
     let upload_limit = |files: usize| axum::extract::DefaultBodyLimit::max((attachment_max as usize).saturating_mul(files).saturating_add(1 << 20));
     Router::new()
         .route("/auth/login", post(auth::login))
+        .route("/auth/login/passkey", post(passkeys::login_challenge))
+        .route("/auth/sso/providers", get(sso::public_providers))
+        .route("/auth/sso/callback", get(sso::callback))
+        .route("/auth/sso/{id}/start", get(sso::start))
         .route("/auth/logout", post(auth::logout))
         .route("/auth/me", get(auth::me))
         .route("/auth/preferences", axum::routing::put(auth::update_preferences))
         .route("/events", get(crate::events::handler))
+        .route("/openapi.json", get(public::openapi))
+        .route("/api-keys", get(apikeys::list).post(apikeys::create))
+        .route("/api-keys/options", get(apikeys::options))
+        .route("/api-keys/{id}", delete(apikeys::revoke))
+        .route("/service-accounts", get(apikeys::service_accounts).post(apikeys::create_service_account))
+        .route("/service-accounts/{id}", delete(apikeys::remove_service_account))
+        .route("/siem/destinations", get(siem::list).post(siem::create))
+        .route("/siem/destinations/{id}", axum::routing::put(siem::update).delete(siem::remove))
+        .route("/siem/destinations/{id}/test", post(siem::test))
+        .route("/webhooks", get(webhooks::list).post(webhooks::create))
+        .route("/webhooks/{id}", axum::routing::put(webhooks::update).delete(webhooks::remove))
+        .route("/webhooks/{id}/rotate-secret", post(webhooks::rotate_secret))
+        .route("/webhooks/{id}/test", post(webhooks::test))
+        .route("/webhooks/{id}/deliveries", get(webhooks::deliveries))
+        .route("/webhook-deliveries/{id}", get(webhooks::delivery))
+        .route("/webhook-deliveries/{id}/redeliver", post(webhooks::redeliver))
         .route("/search", get(search::search))
         .route("/auth/password", post(auth::change_password))
         .route("/auth/sessions", get(auth::my_sessions).delete(auth::revoke_other_sessions))
@@ -78,11 +114,18 @@ pub fn router(attachment_max: u64) -> Router<Arc<AppState>> {
         .route("/auth/totp/enable", post(totp::enable))
         .route("/auth/totp/disable", post(totp::disable))
         .route("/auth/totp/recovery-codes", post(totp::regenerate_recovery))
+        .route("/auth/passkeys", get(passkeys::list))
+        .route("/auth/passkeys/register/start", post(passkeys::register_start))
+        .route("/auth/passkeys/register/finish", post(passkeys::register_finish))
+        .route("/auth/passkeys/recovery-codes", post(passkeys::recovery_codes))
+        .route("/auth/passkeys/{id}", axum::routing::patch(passkeys::rename))
+        .route("/auth/passkeys/{id}/remove", post(passkeys::remove))
         .route("/dashboard", get(agents::dashboard))
         .route("/clients", get(clients::list).post(clients::create))
         .route("/clients/{id}", get(clients::get).put(clients::rename).delete(clients::remove))
         .route("/clients/{id}/sites", post(clients::create_site))
-        .route("/sites/{id}", axum::routing::put(clients::rename_site).delete(clients::remove_site))
+        .route("/sites", get(clients::list_sites))
+        .route("/sites/{id}", get(clients::get_site).put(clients::rename_site).delete(clients::remove_site))
         .route("/sites/{id}/enrollment-tokens", get(clients::list_tokens).post(clients::create_token))
         .route("/enrollment-tokens/{id}", delete(clients::revoke_token))
         .route("/agent-downloads", get(downloads::list))
@@ -91,6 +134,19 @@ pub fn router(attachment_max: u64) -> Router<Arc<AppState>> {
         .route("/agents", get(agents::list))
         .route("/agents/{id}", get(agents::get).delete(agents::remove))
         .route("/agents/{id}/metrics", get(agents::metrics))
+        .route("/tags", get(tags::list).post(tags::create))
+        .route("/tags/{id}", axum::routing::put(tags::update).delete(tags::remove))
+        .route("/agents/tags", post(tags::bulk))
+        .route("/agents/{id}/tags", axum::routing::put(tags::set_for_agent))
+        .route("/custom-fields", get(fields::list_defs).post(fields::create_def))
+        .route("/custom-fields/{id}", axum::routing::put(fields::update_def).delete(fields::delete_def))
+        .route("/agents/{id}/fields", get(fields::agent_values).put(fields::set_agent_values))
+        .route("/clients/{id}/fields", get(fields::client_values).put(fields::set_client_values))
+        .route("/sites/{id}/fields", get(fields::site_values).put(fields::set_site_values))
+        .route("/agents/{id}/notes", get(notes::list).post(notes::create))
+        .route("/agents/{id}/notes/{note_id}", axum::routing::put(notes::update).delete(notes::remove))
+        .route("/saved-views", get(views::list).post(views::create))
+        .route("/saved-views/{id}", axum::routing::put(views::update).delete(views::remove))
         .route("/agents/{id}/activity", get(agents::activity))
         .route("/agents/{id}/inventory/refresh", post(agents::refresh_inventory))
         .route("/agents/{id}/update", post(agents::update))
@@ -108,6 +164,20 @@ pub fn router(attachment_max: u64) -> Router<Arc<AppState>> {
         .route("/patch-runs/{id}", get(patches::run))
         .route("/patch-runs/{id}/cancel", post(patches::cancel_run))
         .route("/patch-windows", get(patches::windows))
+        .route("/software/packages", get(software::list).post(software::create))
+        .route("/software/packages/{id}", get(software::get).put(software::update).delete(software::delete))
+        .route("/software/packages/{id}/devices", get(software::package_devices))
+        .route("/software/packages/{id}/installer", axum::routing::delete(software::delete_installer))
+        .route("/software/deploy", post(software::deploy))
+        .route("/software/scan", post(software::scan))
+        .route("/software/runs", get(software::runs))
+        .route("/software/runs/{id}", get(software::run))
+        .route("/software/runs/{id}/cancel", post(software::cancel_run))
+        .route("/software/updates", get(software::updates))
+        .route("/software/updates/install", post(software::install_updates))
+        .route("/software/updates/ignore", post(software::ignore_updates))
+        .route("/agents/{id}/software", get(software::for_agent))
+        .route("/agent/software/{id}/installer", get(software::agent_installer))
         .route("/sites/{id}/maintenance-window", axum::routing::put(patches::set_window))
         .route("/agents/{id}/security", get(security::for_agent))
         .route("/agents/{id}/security/actions", post(security::start))
@@ -151,11 +221,18 @@ pub fn router(attachment_max: u64) -> Router<Arc<AppState>> {
         .route("/users/{id}/access", axum::routing::put(users::update_access))
         .route("/users/{id}/password", post(users::reset_password))
         .route("/users/{id}/totp", delete(users::reset_totp))
+        .route("/users/{id}/sso-exempt", axum::routing::put(sso::set_exempt))
         .route("/users/{id}/sessions", get(users::sessions).delete(users::revoke_sessions))
         .route("/users/{id}/sessions/{sid}", delete(users::revoke_session))
-        .route("/audit", get(users::audit_log))
+        .route("/audit", get(audit::list))
+        .route("/audit/export", get(audit::export))
         .route("/settings", get(settings::get).put(settings::update))
         .route("/settings/public", get(settings::public))
+        .route("/settings/sso", get(sso::settings).put(sso::set_required))
+        .route("/settings/sso/providers", post(sso::create_provider))
+        .route("/settings/sso/providers/{id}", axum::routing::put(sso::update_provider).delete(sso::delete_provider))
+        .route("/settings/sso/providers/{id}/maps", axum::routing::put(sso::update_maps))
+        .route("/settings/sso/providers/{id}/test", post(sso::test_provider))
         .route("/settings/smtp", get(channels::get_smtp).put(channels::update_smtp))
         .route("/notification-channels", get(channels::list).post(channels::create))
         .route("/notification-channels/{id}", axum::routing::put(channels::update).delete(channels::remove))
@@ -180,6 +257,9 @@ pub fn router(attachment_max: u64) -> Router<Arc<AppState>> {
         .route("/policy-sets/{id}/items", post(policies::create_item))
         .route("/policy-items/{id}", get(policies::get_item).put(policies::update_item).delete(policies::delete_item))
         .route("/policy-items/{id}/overrides/{set_id}", axum::routing::put(policies::put_override).delete(policies::delete_override))
+        .route("/policy-items/{id}/runs", get(automations::for_item))
+        .route("/policy-items/{id}/runs/reset", post(automations::reset))
+        .route("/agents/{id}/automations", get(automations::for_agent))
         .route("/policy-items/{id}/exclusions/{agent_id}", axum::routing::put(policies::exclude).delete(policies::include))
         .route("/device-categories", get(policies::list_categories).post(policies::create_category))
         .route("/device-categories/{id}", axum::routing::put(policies::update_category).delete(policies::delete_category))
@@ -319,6 +399,23 @@ pub fn router(attachment_max: u64) -> Router<Arc<AppState>> {
         .route("/reports/utilisation", get(reports::utilisation))
         .route("/reports/profitability", get(reports::profitability))
         .route("/reports/qbr/{id}", get(reports::qbr))
+        .route("/sites/{id}/network", get(network::site_settings).put(network::update_settings))
+        .route("/sites/{id}/network/scan", post(network::scan))
+        .route("/sites/{id}/network/scans", get(network::scans))
+        .route("/network/summary", get(network::summary))
+        .route("/network/discovered", get(network::list_discovered))
+        .route("/network/discovered/bulk", post(network::bulk_discovered))
+        .route("/network/discovered/{id}", axum::routing::patch(network::update_discovered))
+        .route("/network/discovered/{id}/deploy", get(network::deploy_hint))
+        .route("/network/discovered/{id}/monitor", post(network::monitor_discovered))
+        .route("/network/devices", get(network::list_devices).post(network::create_device))
+        .route("/network/devices/{id}", get(network::get_device).put(network::update_device).delete(network::remove_device))
+        .route("/network/devices/{id}/poll", post(network::poll_now))
+        .route("/network/devices/{id}/metrics", get(network::device_metrics))
+        .route("/network/devices/{id}/interfaces/{index}", axum::routing::put(network::set_interface))
+        .route("/network/devices/{id}/interfaces/{index}/metrics", get(network::interface_metrics))
+        .route("/clients/{id}/network-credentials", get(network::list_credentials).post(network::create_credential))
+        .route("/network-credentials/{id}", axum::routing::put(network::update_credential).delete(network::remove_credential))
         .route("/agents/{id}/processes", get(tools::processes))
         .route("/agents/{id}/processes/{pid}/kill", post(tools::kill))
         .route("/agents/{id}/files", get(tools::list))
@@ -335,6 +432,7 @@ pub fn router(attachment_max: u64) -> Router<Arc<AppState>> {
                 .delete(security::delete_reputation_list)
                 .layer(axum::extract::DefaultBodyLimit::max(security::REPUTATION_LIST_MAX)),
         )
+        .route("/software/packages/{id}/installer", post(software::upload_installer).layer(upload_limit(1)))
         .route("/tickets/{id}/attachments", post(tickets::upload).layer(upload_limit(tickets::MAX_UPLOAD_FILES)))
         .route("/portal/tickets", post(portal::create_ticket).layer(upload_limit(portal::MAX_FILES)))
         .route("/portal/tickets/{id}/messages", post(portal::add_message).layer(upload_limit(portal::MAX_FILES)))

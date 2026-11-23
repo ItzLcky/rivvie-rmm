@@ -1,6 +1,12 @@
 export type Role = 'admin' | 'technician' | 'readonly';
 export interface User {
 	id: string; email: string; name: string; role: Role; totp_enabled: boolean; mfa_setup_required: boolean;
+	/** An authenticator app or a passkey is set up. */
+	mfa_enabled?: boolean;
+	/** Signed in through single sign-on (the identity provider did the second factor). */
+	sso_session?: boolean;
+	/** Created by SSO: no password anyone knows. */
+	sso_only?: boolean;
 	/** null = every client */
 	client_ids: string[] | null;
 	preferences?: import('./prefs.svelte').Prefs;
@@ -32,6 +38,30 @@ export interface AgentSummary {
 	alerts_muted: boolean;
 	/** Policy management: its device category and the policy set it uses. */
 	platform?: 'workstation' | 'server'; category_id?: string; category_name?: string; policy_set_id?: string; policy_set_name?: string;
+	/** Labels on it, by name. */
+	tags?: TagRef[];
+}
+
+export type TagColor = 'slate' | 'red' | 'orange' | 'amber' | 'green' | 'teal' | 'blue' | 'violet' | 'pink';
+export interface TagRef { id: string; name: string; color: TagColor }
+export interface Tag extends TagRef { agents: number; created_at: string }
+
+export type FieldKind = 'text' | 'number' | 'bool' | 'date' | 'select';
+export type FieldEntity = 'agent' | 'client' | 'site';
+export interface CustomField {
+	id: string; entity: FieldEntity; name: string; label: string; description: string; kind: FieldKind; options: string[];
+	client_id: string | null; client_name: string | null; script_writable: boolean; position: number; in_use: number;
+}
+export interface FieldValue {
+	field_id: string; name: string; label: string; description: string; kind: FieldKind; options: string[]; script_writable: boolean;
+	client_id: string | null; value: string | number | boolean | null; source: 'user' | 'api' | 'script' | null; updated_at: string | null; updated_by_name: string | null;
+}
+export interface AgentNote {
+	id: string; agent_id: string; body: string; author_id: string | null; author_name: string; pinned: boolean; created_at: string; updated_at: string; can_edit: boolean;
+}
+export interface SavedView {
+	id: string; page: string; name: string; shared: boolean; query: string; hidden_columns: string[] | null; client_id: string | null;
+	owner_id: string; owner_name: string; can_edit: boolean; created_at: string; updated_at: string;
 }
 
 export type UpdateState = 'offered' | 'downloading' | 'waiting' | 'applying' | 'completed' | 'rolled_back' | 'failed';
@@ -48,6 +78,8 @@ export interface AgentDetail extends AgentSummary {
 	kernel_version: string; machine_id: string | null; inventory: Inventory | null; inventory_at: string | null;
 	/** Optional features its build supports, as of its last connection (`patch`, `desktop`). */
 	capabilities: string[];
+	/** The note shown in the header. */
+	pinned_note?: AgentNote | null;
 }
 
 export interface MetricPoint {
@@ -109,13 +141,13 @@ export interface Session { id: string; created_at: string; last_seen_at: string;
 
 export type Severity = 'critical' | 'warning' | 'info';
 export type AlertState = 'open' | 'acknowledged' | 'resolved';
-export type PolicyKind = 'offline' | 'cpu' | 'memory' | 'disk' | 'service' | 'job_failed' | 'log' | 'security' | 'patch';
+export type PolicyKind = 'offline' | 'cpu' | 'memory' | 'disk' | 'service' | 'job_failed' | 'log' | 'security' | 'patch' | 'net_down' | 'net_interface' | 'net_threshold';
 export type LogLevel = 'critical' | 'error' | 'warning' | 'info';
 
 export interface Alert {
 	id: string; policy_id: string | null; policy_name: string | null; agent_id: string; hostname: string; client_id: string;
 	client_name: string; site_name: string; kind: PolicyKind; severity: Severity; title: string; details: Record<string, unknown>;
-	occurrences: number; state: AlertState; opened_at: string; last_seen_at: string; acknowledged_at: string | null;
+	occurrences: number; state: AlertState; device_id?: string | null; device_name?: string | null; opened_at: string; last_seen_at: string; acknowledged_at: string | null;
 	acknowledged_by_name: string | null; resolved_at: string | null; resolved_by_name: string | null;
 	/** cleared (condition went away), manual, policy (policy changed or deleted) */
 	resolution: 'cleared' | 'manual' | 'policy' | null;

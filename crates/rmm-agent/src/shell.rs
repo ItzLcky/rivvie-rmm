@@ -1,6 +1,8 @@
 //! Interactive PTY shells (bash/zsh on unix, PowerShell via ConPTY on Windows).
 
 use std::io::{Read, Write};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
@@ -15,6 +17,9 @@ pub struct ShellSession {
     /// Everything started from the terminal, killed when the session closes.
     #[cfg(windows)]
     tree: Option<crate::winjob::ProcessTree>,
+    /// Ends the Windows exit watcher (see [`watch_exit`]).
+    #[cfg(windows)]
+    stop: Arc<AtomicBool>,
 }
 
 impl ShellSession {
@@ -47,6 +52,15 @@ impl ShellSession {
 
         let mut reader = pair.master.try_clone_reader().context("pty reader")?;
         let writer = pair.master.take_writer().context("pty writer")?;
+        // Whichever of the reader thread and the exit watcher notices the end reports it.
+        let closed = Arc::new(AtomicBool::new(false));
+        #[cfg(windows)]
+        let stop = Arc::new(AtomicBool::new(false));
+        #[cfg(windows)]
+        if let Some(pid) = child.process_id() {
+            watch_exit(session_id, pid, out.clone(), closed.clone(), stop.clone());
+        }
+        let reader_closed = closed.clone();
 
         // PTY reads are blocking, so each session gets a small OS thread.
         std::thread::Builder::new().name(format!("pty-{session_id}")).spawn(move || {
@@ -61,7 +75,9 @@ impl ShellSession {
                     }
                 }
             }
-            let _ = out.blocking_send(AgentMsg::ShellClosed { session_id, reason: Some("shell exited".into()) });
+            if !reader_closed.swap(true, Ordering::SeqCst) {
+                let _ = out.blocking_send(AgentMsg::ShellClosed { session_id, reason: Some("shell exited".into()) });
+            }
         })?;
 
         Ok(Self {
@@ -70,6 +86,8 @@ impl ShellSession {
             child,
             #[cfg(windows)]
             tree,
+            #[cfg(windows)]
+            stop,
         })
     }
 
@@ -93,10 +111,47 @@ impl Drop for ShellSession {
         // Kill-on-close would do this when the handle drops; terminate first so the shell
         // goes with its children rather than after them.
         #[cfg(windows)]
-        if let Some(t) = self.tree.take() {
-            t.kill();
+        {
+            self.stop.store(true, Ordering::SeqCst);
+            if let Some(t) = self.tree.take() {
+                t.kill();
+            }
         }
         let _ = self.child.kill();
+    }
+}
+
+/// Windows: a ConPTY's output pipe stays open after the shell exits, until the pseudo console
+/// is closed, so the reader thread never sees the end when someone types `exit` and the
+/// console would sit on a dead terminal. This waits on the shell process itself (a handle of
+/// its own, so it can't outlive or race the session's) and reports the exit. It gives up once
+/// the session is dropped (`stop`).
+#[cfg(windows)]
+fn watch_exit(session_id: Uuid, pid: u32, out: mpsc::Sender<AgentMsg>, closed: Arc<AtomicBool>, stop: Arc<AtomicBool>) {
+    use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject};
+    // SAFETY: plain Win32 calls; the handle is closed exactly once, on every path below.
+    let Ok(handle) = (unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) }) else { return };
+    // A HANDLE isn't Send; the thread gets its address and owns the handle from here.
+    let raw = handle.0 as usize;
+    let spawned = std::thread::Builder::new().name(format!("pty-exit-{session_id}")).spawn(move || {
+        let handle = HANDLE(raw as *mut std::ffi::c_void);
+        while !stop.load(Ordering::SeqCst) {
+            if unsafe { WaitForSingleObject(handle, 500) } == WAIT_OBJECT_0 {
+                if !closed.swap(true, Ordering::SeqCst) {
+                    let _ = out.blocking_send(AgentMsg::ShellClosed { session_id, reason: Some("shell exited".into()) });
+                }
+                break;
+            }
+        }
+        unsafe {
+            let _ = CloseHandle(handle);
+        }
+    });
+    if spawned.is_err() {
+        unsafe {
+            let _ = CloseHandle(handle);
+        }
     }
 }
 

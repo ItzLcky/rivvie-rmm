@@ -1,6 +1,6 @@
 /** Policy management (docs/design/policies.md, docs/design/policies-api.md). */
 
-export type Module = 'alert' | 'schedule' | 'patch' | 'security' | 'remote_access' | 'agent';
+export type Module = 'alert' | 'schedule' | 'software' | 'automation' | 'patch' | 'security' | 'remote_access' | 'agent';
 export type Platform = 'workstation' | 'server';
 /** Why a device uses its set. */
 export type Reason = 'pin' | 'site' | 'client' | 'default';
@@ -44,6 +44,8 @@ export interface ItemView {
 	editable: boolean; overridable: boolean;
 	open_alerts: number;
 	schedule: { next_run_at: string | null; last_run_at: string | null } | null;
+	/** Automations: runs per status, on the devices the user can see (in the agent view, on that device). */
+	runs?: Record<'waiting' | 'pending' | 'succeeded' | 'failed' | 'skipped', number> | null;
 	/** Agent view only. */
 	applies?: boolean; excluded?: boolean;
 }
@@ -78,3 +80,14 @@ export interface AgentPolicy {
 	set: ChainEntry; reason: Reason; assignment_id: string | null; pin: ChainEntry | null;
 	chain: ChainEntry[]; policies: ItemView[];
 }
+
+/** One run of an automation on a device (`GET /agents/{id}/automations`, `/policy-items/{id}/runs`). */
+export interface AutomationRun {
+	id: string; item_id: string; item_name: string; agent_id: string; hostname: string;
+	trigger: 'enrollment' | 'agent_online' | 'alert_opened' | 'patch_reboot_pending' | 'tag_added' | 'field_changed' | 'run_once';
+	status: 'waiting' | 'pending' | 'succeeded' | 'failed' | 'skipped';
+	reason: string | null; context: Record<string, unknown>;
+	job_id: string | null; script_id: string | null; script_name: string | null; exit_code: number | null; attempts: number;
+	created_at: string; started_at: string | null; finished_at: string | null;
+}
+export interface ItemRuns { counts: Record<AutomationRun['status'], number>; runs: AutomationRun[] }

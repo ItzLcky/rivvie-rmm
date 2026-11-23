@@ -17,7 +17,9 @@ export const moduleLabels: Record<Module, string> = {
 	patch: 'Patching',
 	security: 'Security',
 	remote_access: 'Remote access',
-	agent: 'Agent'
+	agent: 'Agent',
+	software: 'Software',
+	automation: 'Automations'
 };
 /** Singular, for one item: "the Patching policy". */
 export const moduleNoun: Record<Module, string> = {
@@ -26,13 +28,17 @@ export const moduleNoun: Record<Module, string> = {
 	patch: 'patch policy',
 	security: 'security policy',
 	remote_access: 'remote access policy',
-	agent: 'agent policy'
+	agent: 'agent policy',
+	software: 'software requirement',
+	automation: 'automation'
 };
 
 /** Sections of the policy set page, in order; `?section=`. */
 export const sections = [
 	{ value: 'alerts', module: 'alert' },
 	{ value: 'schedules', module: 'schedule' },
+	{ value: 'software', module: 'software' },
+	{ value: 'automations', module: 'automation' },
 	{ value: 'patching', module: 'patch' },
 	{ value: 'security', module: 'security' },
 	{ value: 'remote', module: 'remote_access' },
@@ -179,6 +185,9 @@ export const fieldLabels: Record<string, string> = {
 	'params.reboot_hours': 'Pending restart',
 	'params.failed': 'Failed installs',
 	args: 'Arguments',
+	state: 'Requirement',
+	bootstrap_choco: 'Chocolatey install',
+	package_id: 'Package',
 	timeout_secs: 'Timeout',
 	auto_approve_severities: 'Severities',
 	auto_approve_categories: 'Categories',
@@ -218,4 +227,83 @@ export function overriddenAlong(v: Pick<ItemView, 'sources' | 'origin_set_id'>, 
 	const by = new Map<string, string[]>();
 	for (const [p, s] of Object.entries(v.sources)) if (s !== v.origin_set_id) by.set(s, [...(by.get(s) ?? []), fieldLabel(p.startsWith('window.') ? 'window' : p)]);
 	return chain.filter((c) => by.has(c.id)).map((c) => ({ set: c, fields: [...new Set(by.get(c.id))] }));
+}
+
+// --- Automations (docs/design/automations.md) ----------------------------------------------------
+
+export type AutomationTrigger = 'enrollment' | 'agent_online' | 'alert_opened' | 'patch_reboot_pending' | 'tag_added' | 'field_changed' | 'run_once';
+export const triggerLabels: Record<AutomationTrigger, string> = {
+	enrollment: 'Device enrolls',
+	agent_online: 'Device comes back online',
+	alert_opened: 'Alert opens',
+	patch_reboot_pending: 'Patch install leaves a restart pending',
+	tag_added: 'Tag added to a device',
+	field_changed: 'Custom field changes',
+	run_once: 'Once per device'
+};
+export const triggerHelp: Record<AutomationTrigger, string> = {
+	enrollment: 'Runs the first time a new device connects, once.',
+	agent_online: 'Runs when a device connects again after being offline for at least the time you set.',
+	alert_opened: 'Runs when an alert of the chosen type opens on a device (not while it is muted).',
+	patch_reboot_pending: 'Runs when a patch install has finished and the device still needs a restart.',
+	tag_added: 'Runs when the chosen tag is put on a device that didn’t have it.',
+	field_changed: 'Runs when the chosen custom field of a device is set, changed or cleared, by a person, the API or a script. A script that sets the field it watches doesn’t start itself again.',
+	run_once: 'Runs once on every device using this set, including devices that join later. Each device has its own status; failed ones can retry, and a reset runs it again.'
+};
+/** Triggers that happen once per device ever (a row per device holds the state). */
+export const oncePerDevice: AutomationTrigger[] = ['enrollment', 'run_once'];
+
+export type RunStatus = 'waiting' | 'pending' | 'succeeded' | 'failed' | 'skipped';
+export const runStatusLabels: Record<RunStatus, string> = { waiting: 'Waiting', pending: 'Running', succeeded: 'Succeeded', failed: 'Failed', skipped: 'Skipped' };
+export const runReasonLabels: Record<string, string> = {
+	maintenance_window: 'waiting for the maintenance window',
+	rate_limited: 'over the hourly limit',
+	cooldown: 'ran recently on this device',
+	own_write: 'set by this automation’s own script',
+	expired: 'waited too long',
+	no_longer_applies: 'the automation no longer applies',
+	script_missing: 'the script was deleted',
+	script_other_client: 'the script belongs to another client',
+	script_unavailable: 'the script can’t run here',
+	timed_out: 'timed out',
+	lost: 'the agent lost the job',
+	error: 'the script couldn’t start',
+	cancelled: 'cancelled',
+	failed: 'the script failed',
+	expired_job: 'the job expired'
+};
+export const runReason = (r: string | null) => (r ? (runReasonLabels[r] ?? r.replaceAll('_', ' ')) : '');
+
+Object.assign(fieldLabels, {
+	trigger: 'Trigger',
+	script_id: 'Script',
+	offline_minutes: 'Offline for',
+	alert_kind: 'Alert type',
+	tag_id: 'Tag',
+	field_id: 'Custom field',
+	field_value: 'Field value',
+	retry_failed: 'Retry failures',
+	max_attempts: 'Attempts',
+	retry_minutes: 'Retry after',
+	cooldown_minutes: 'Cooldown',
+	max_runs_per_hour: 'Runs per hour',
+	respect_window: 'Maintenance window',
+	retain_days: 'Keep runs'
+});
+
+/** One line for the list: what starts it. `names` says what the tag and field ids are called. */
+export function describeAutomation(c: Config, names?: { tag?: string; field?: string }): string {
+	const t = c.trigger as AutomationTrigger;
+	switch (t) {
+		case 'tag_added':
+			return `${triggerLabels[t]}: ${names?.tag ?? 'unknown tag'}`;
+		case 'field_changed':
+			return `${triggerLabels[t]}: ${names?.field ?? 'unknown field'}${c.field_value != null ? ` → ${c.field_value}` : ''}`;
+		case 'agent_online':
+			return `${triggerLabels[t]} after ${c.offline_minutes} min offline`;
+		case 'alert_opened':
+			return `${triggerLabels[t]}: ${String(c.alert_kind ?? '').replaceAll('_', ' ')}`;
+		default:
+			return triggerLabels[t] ?? String(t ?? '');
+	}
 }

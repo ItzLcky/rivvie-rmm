@@ -10,7 +10,10 @@ export const kindLabels: Record<PolicyKind, string> = {
 	job_failed: 'Failed job',
 	log: 'Event log match',
 	security: 'Antivirus',
-	patch: 'Patches'
+	patch: 'Patches',
+	net_down: 'Network device down',
+	net_interface: 'Network interface down',
+	net_threshold: 'Network device threshold'
 };
 
 export const kindHelp: Record<PolicyKind, string> = {
@@ -22,7 +25,10 @@ export const kindHelp: Record<PolicyKind, string> = {
 	job_failed: 'A script fails, errors or times out. Clears when the same script next succeeds.',
 	log: 'An entry in the journal (Linux) or the Event Log (Windows) matches your rules.',
 	security: 'Protection is off or out of date, stopped reporting, or the antivirus finds a threat.',
-	patch: 'An update fails to install, or a restart to finish updates stays pending.'
+	patch: 'An update fails to install, or a restart to finish updates stays pending.',
+	net_down: 'A switch, firewall, printer or other device read over SNMP stops answering.',
+	net_interface: 'A monitored port that is switched on has no link.',
+	net_threshold: 'A device’s CPU, memory, port traffic or toner level crosses a limit.'
 };
 
 export const severityTone: Record<Severity, Tone> = { critical: 'danger', warning: 'warning', info: 'info' };
@@ -79,6 +85,15 @@ export function describePolicy(p: { kind: PolicyKind; params: Record<string, unk
 			if (q.failed !== false) bits.push('failed installs');
 			if (q.reboot_hours) bits.push(`restart pending over ${q.reboot_hours} h`);
 			return bits.join(', ') || 'Nothing';
+		}
+		case 'net_down':
+			return `No answer for ${q.minutes} min${list(q.kinds).length ? ` (${list(q.kinds).join(', ')})` : ''}`;
+		case 'net_interface':
+			return `Port down for ${q.minutes} min${list(q.names).length ? `: ${list(q.names).join(', ')}` : ''}`;
+		case 'net_threshold': {
+			const m = q.metric as string;
+			if (m === 'supply') return `Toner or ink at or below ${q.threshold}%`;
+			return `${m === 'interface_util' ? 'Port use' : kindLabels[m as 'cpu' | 'memory']} ≥ ${q.threshold}% for ${q.minutes} min`;
 		}
 		case 'log': {
 			const bits = [`${String(q.min_level ?? 'error')} or worse`];

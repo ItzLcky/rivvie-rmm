@@ -20,7 +20,7 @@ pub struct ChannelView {
     id: Uuid,
     name: String,
     kind: String,
-    /// Admins only, with any webhook secret removed (see `has_secret`).
+    /// Admins only. A webhook secret is never in it (see `has_secret`).
     #[serde(skip_serializing_if = "Option::is_none")]
     config: Option<Value>,
     has_secret: bool,
@@ -37,24 +37,18 @@ struct ChannelRow {
     kind: String,
     config: Value,
     enabled: bool,
+    has_secret: bool,
     policies: i64,
     created_at: DateTime<Utc>,
 }
 
-const SELECT: &str = "SELECT ch.id, ch.name, ch.kind, ch.config, ch.enabled, ch.created_at,
+const SELECT: &str = "SELECT ch.id, ch.name, ch.kind, ch.config, ch.enabled, ch.created_at, ch.secret IS NOT NULL AS has_secret,
        (SELECT count(*) FROM policy_items p WHERE p.module = 'alert' AND p.config -> 'channel_ids' ? ch.id::text) AS policies
   FROM notification_channels ch";
 
 fn view(r: ChannelRow, admin: bool) -> ChannelView {
-    let has_secret = r.config.get("secret").and_then(Value::as_str).is_some_and(|s| !s.is_empty());
-    let config = admin.then(|| {
-        let mut c = r.config;
-        if let Some(o) = c.as_object_mut() {
-            o.remove("secret");
-        }
-        c
-    });
-    ChannelView { id: r.id, name: r.name, kind: r.kind, config, has_secret, enabled: r.enabled, policies: r.policies, created_at: r.created_at }
+    let config = admin.then_some(r.config);
+    ChannelView { id: r.id, name: r.name, kind: r.kind, config, has_secret: r.has_secret, enabled: r.enabled, policies: r.policies, created_at: r.created_at }
 }
 
 /// Everyone signed in can list channels (to pick them in a policy); only admins see where
@@ -106,15 +100,18 @@ fn check_name(name: &str) -> ApiResult<&str> {
 pub async fn create(State(st): State<Arc<AppState>>, u: User, Json(b): Json<ChannelIn>) -> ApiResult<Json<ChannelView>> {
     u.require(Role::Admin)?;
     let name = check_name(&b.name)?;
-    let config = notify::validate_config(&b.kind, &b.config).map_err(ApiError::BadRequest)?;
+    let mut config = notify::validate_config(&b.kind, &b.config).map_err(ApiError::BadRequest)?;
+    let secret = take_secret(&mut config).map(|s| crate::crypto::store(st.cfg.data_key.as_ref(), s.as_bytes()));
     let id = Uuid::new_v4();
-    sqlx::query("INSERT INTO notification_channels (id, name, kind, config, enabled, created_by) VALUES ($1, $2, $3, $4, $5, $6)")
+    sqlx::query("INSERT INTO notification_channels (id, name, kind, config, enabled, created_by, secret, secret_sealed) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)")
         .bind(id)
         .bind(name)
         .bind(&b.kind)
         .bind(&config)
         .bind(b.enabled)
         .bind(u.id)
+        .bind(secret.as_ref().map(|s| s.0.clone()))
+        .bind(secret.as_ref().is_some_and(|s| s.1))
         .execute(&st.db)
         .await
         .map_err(conflict)?;
@@ -122,26 +119,33 @@ pub async fn create(State(st): State<Arc<AppState>>, u: User, Json(b): Json<Chan
     Ok(Json(view(fetch(&st, id).await?, true)))
 }
 
+/// Moves the webhook secret out of a validated config (it lives sealed in its own column).
+fn take_secret(config: &mut Value) -> Option<String> {
+    config.as_object_mut()?.remove("secret")?.as_str().map(str::to_string).filter(|s| !s.is_empty())
+}
+
 /// A webhook secret left out of the config is kept; send `"secret": ""` to remove it.
 pub async fn update(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uuid>, Json(b): Json<ChannelIn>) -> ApiResult<Json<ChannelView>> {
     u.require(Role::Admin)?;
     let current = fetch(&st, id).await?;
     let name = check_name(&b.name)?;
-    let mut config_in = b.config.clone();
-    if b.kind == "webhook"
-        && current.kind == "webhook"
-        && config_in.get("secret").is_none()
-        && let (Some(o), Some(old)) = (config_in.as_object_mut(), current.config.get("secret"))
-    {
-        o.insert("secret".into(), old.clone());
-    }
-    let config = notify::validate_config(&b.kind, &config_in).map_err(ApiError::BadRequest)?;
-    sqlx::query("UPDATE notification_channels SET name = $2, kind = $3, config = $4, enabled = $5, updated_at = now() WHERE id = $1")
+    // The secret: left out = kept (when it stays a webhook channel), "" = removed, else replaced.
+    let keep = b.kind == "webhook" && current.kind == "webhook" && b.config.get("secret").is_none();
+    let mut config = notify::validate_config(&b.kind, &b.config).map_err(ApiError::BadRequest)?;
+    let secret = take_secret(&mut config).map(|s| crate::crypto::store(st.cfg.data_key.as_ref(), s.as_bytes()));
+    sqlx::query(
+        "UPDATE notification_channels SET name = $2, kind = $3, config = $4, enabled = $5, updated_at = now(),
+                secret = CASE WHEN $6 THEN secret ELSE $7 END, secret_sealed = CASE WHEN $6 THEN secret_sealed ELSE $8 END
+          WHERE id = $1",
+    )
         .bind(id)
         .bind(name)
         .bind(&b.kind)
         .bind(&config)
         .bind(b.enabled)
+        .bind(keep)
+        .bind(secret.as_ref().map(|s| s.0.clone()))
+        .bind(secret.as_ref().is_some_and(|s| s.1))
         .execute(&st.db)
         .await
         .map_err(conflict)?;
@@ -181,8 +185,16 @@ pub async fn remove(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uui
 /// Sends a test message right away and reports the outcome (nothing is queued).
 pub async fn test(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uuid>) -> ApiResult<Json<Value>> {
     u.require(Role::Admin)?;
-    let r = fetch(&st, id).await?;
-    let channel = notify::Channel { id: r.id, name: r.name, kind: r.kind, config: r.config, enabled: r.enabled };
+    let row: notify::ChannelRow =
+        sqlx::query_as(sqlx::AssertSqlSafe(format!("SELECT {} FROM notification_channels WHERE id = $1", notify::ChannelRow::COLUMNS)))
+            .bind(id)
+            .fetch_optional(&st.db)
+            .await?
+            .ok_or(ApiError::NotFound("channel"))?;
+    let channel = match row.open(st.cfg.data_key.as_ref()) {
+        Ok(c) => c,
+        Err(e) => return Ok(Json(json!({ "ok": false, "error": e }))),
+    };
     let result = notify::send_test(&st, &channel).await;
     auth::audit(&st.db, Some(u.id), "channel.test", Some(("channel", id)), json!({ "ok": result.is_ok() })).await;
     Ok(Json(match result {
@@ -244,7 +256,7 @@ fn smtp_view(c: &Company) -> SmtpView {
         port: c.smtp_port,
         security: c.smtp_security.clone(),
         username: c.smtp_username.clone(),
-        password_set: !c.smtp_password.is_empty(),
+        password_set: c.smtp_password_enc.is_some(),
         from: c.smtp_from.clone(),
     }
 }
@@ -282,9 +294,19 @@ pub async fn update_smtp(State(st): State<Arc<AppState>>, u: User, Json(b): Json
     if !from.is_empty() && from.parse::<lettre::message::Mailbox>().is_err() {
         return Err(ApiError::BadRequest("the sender must be an address, like RMM <rmm@example.com>".into()));
     }
+    // Omitted: unchanged. "": cleared. Otherwise sealed with RMM_DATA_KEY when the server has one.
+    let password: Option<(Option<Vec<u8>>, bool)> = b.password.as_deref().map(|p| match p {
+        "" => (None, false),
+        p => {
+            let (bytes, sealed) = crate::crypto::store(st.cfg.data_key.as_ref(), p.as_bytes());
+            (Some(bytes), sealed)
+        }
+    });
     let new: Company = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "UPDATE company_settings SET smtp_host = $1, smtp_port = $2, smtp_security = $3, smtp_username = $4,
-                smtp_password = COALESCE($5, smtp_password), smtp_from = $6, updated_at = now(), updated_by = $7
+                smtp_password_enc = CASE WHEN $5 THEN $6 ELSE smtp_password_enc END,
+                smtp_password_sealed = CASE WHEN $5 THEN $7 ELSE smtp_password_sealed END,
+                smtp_from = $8, updated_at = now(), updated_by = $9
          RETURNING {}",
         Company::COLUMNS
     )))
@@ -292,7 +314,9 @@ pub async fn update_smtp(State(st): State<Arc<AppState>>, u: User, Json(b): Json
     .bind(b.port)
     .bind(&b.security)
     .bind(b.username.trim())
-    .bind(&b.password)
+    .bind(password.is_some())
+    .bind(password.as_ref().and_then(|p| p.0.as_deref()))
+    .bind(password.as_ref().is_some_and(|p| p.1))
     .bind(from)
     .bind(u.id)
     .fetch_one(&st.db)

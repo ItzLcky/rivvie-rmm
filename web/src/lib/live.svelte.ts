@@ -14,6 +14,7 @@ export type LiveEvent =
 	| { type: 'alert'; id: string; agent_id: string; state: 'open' | 'acknowledged' | 'resolved' }
 	| { type: 'services'; agent_id: string }
 	| { type: 'patches'; agent_id: string }
+	| { type: 'software'; agent_id: string }
 	| { type: 'security'; agent_id: string }
 	| { type: 'ticket'; id: string };
 

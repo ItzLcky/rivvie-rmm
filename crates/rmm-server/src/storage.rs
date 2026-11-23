@@ -751,4 +751,99 @@ mod tests {
         assert!(s.get("a/b.txt").await.is_err());
         let _ = std::fs::remove_dir_all(dir);
     }
+
+    /// The same paths as the fake above, against a real S3 implementation (MinIO): signatures,
+    /// multipart uploads (the part boundaries), ranged reads, aborts, deletes. Run by
+    /// `scripts/minio-test.sh`, and by the `s3` CI job:
+    ///
+    /// ```sh
+    /// RMM_TEST_S3_ENDPOINT=http://127.0.0.1:9000 cargo test -p rmm-server s3_against_minio -- --ignored --nocapture
+    /// ```
+    ///
+    /// Also `RMM_TEST_S3_BUCKET` (default `rmm-test`, created if missing), `RMM_TEST_S3_ACCESS_KEY`
+    /// and `RMM_TEST_S3_SECRET_KEY` (default `minioadmin`).
+    #[tokio::test]
+    #[ignore = "needs MinIO: see the doc comment"]
+    async fn s3_against_minio() {
+        let var = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
+        let endpoint = std::env::var("RMM_TEST_S3_ENDPOINT").expect("set RMM_TEST_S3_ENDPOINT");
+        // Exactly what an operator sets (Storage::from_env: a custom endpoint means path-style).
+        unsafe {
+            std::env::set_var("RMM_S3_BUCKET", var("RMM_TEST_S3_BUCKET", "rmm-test"));
+            std::env::set_var("RMM_S3_ENDPOINT", &endpoint);
+            std::env::set_var("AWS_ACCESS_KEY_ID", var("RMM_TEST_S3_ACCESS_KEY", "minioadmin"));
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", var("RMM_TEST_S3_SECRET_KEY", "minioadmin"));
+        }
+        let s = Storage::from_env(PathBuf::from("unused"), reqwest::Client::new()).unwrap();
+        let Storage::S3(s3) = &s else { panic!("RMM_S3_BUCKET selects S3") };
+        assert!(s3.path_style);
+        let res = s3.send(reqwest::Method::PUT, "", "", Some((vec![], "text/plain")), &[]).await.unwrap();
+        assert!(res.status().is_success() || res.status().as_u16() == 409, "creating the bucket: {}", res.status());
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let key = |name: &str| format!("minio-test/{run}/{name}");
+
+        // Small objects: one PUT, whole and ranged reads, the size from HEAD, deletes that don't mind
+        // a missing key. Zero bytes too.
+        s.put(&key("small.txt"), b"hello world".to_vec(), "text/plain").await.unwrap();
+        assert_eq!(s.get(&key("small.txt")).await.unwrap(), b"hello world");
+        assert_eq!(s.size(&key("small.txt")).await.unwrap(), 11);
+        assert_eq!(read_all(&s, &key("small.txt"), 6, 5).await, b"world");
+        assert_eq!(read_all(&s, &key("small.txt"), 0, 11).await, b"hello world");
+        let mut w = s.writer(&key("empty"), "application/octet-stream").await.unwrap();
+        w.write(b"").await.unwrap();
+        assert_eq!(w.finish().await.unwrap().size, 0);
+        assert_eq!(s.size(&key("empty")).await.unwrap(), 0);
+        assert!(read_all(&s, &key("empty"), 0, 0).await.is_empty());
+        s.delete(&key("small.txt")).await.unwrap();
+        s.delete(&key("small.txt")).await.unwrap();
+        assert!(s.get(&key("small.txt")).await.is_err());
+        assert!(s.size(&key("small.txt")).await.is_err());
+        assert!(s.read(&key("small.txt"), 0, 5).await.is_err(), "a missing object is an error, not an empty stream");
+
+        // Multipart, around the part boundaries: just under one part (a single PUT), exactly one
+        // part, one byte over, exactly two parts, and two parts and a tail.
+        for (name, n) in [
+            ("under", PART_SIZE - 1),
+            ("one-part", PART_SIZE),
+            ("one-over", PART_SIZE + 1),
+            ("two-parts", 2 * PART_SIZE),
+            ("two-and-tail", 2 * PART_SIZE + 3 * 1024 * 1024),
+        ] {
+            let mut w = s.writer(&key(name), "application/zip").await.unwrap();
+            let data = write_pattern(&mut w, n).await;
+            let stored = w.finish().await.unwrap();
+            assert_eq!((stored.size, stored.sha256.as_slice()), (n as u64, Sha256::digest(&data).as_slice()), "{name}");
+            assert_eq!(s.size(&key(name)).await.unwrap(), n as u64, "{name}: size");
+            assert_eq!(read_all(&s, &key(name), 0, n as u64).await, data, "{name}: whole object");
+            let part = PART_SIZE as u64;
+            // Ranges: the start, inside, across a part boundary, the last byte, the tail.
+            for (offset, len) in [(0, 1), (100, 50), (part.saturating_sub(10), 20), (n as u64 - 1, 1), (n as u64 / 2, n as u64 - n as u64 / 2)] {
+                if offset + len <= n as u64 {
+                    assert_eq!(read_all(&s, &key(name), offset, len).await, &data[offset as usize..(offset + len) as usize], "{name}: bytes {offset}+{len}");
+                }
+            }
+            s.delete(&key(name)).await.unwrap();
+        }
+
+        // Abandoned uploads leave no parts behind (the bucket's list of uploads in progress).
+        let mut w = s.writer(&key("aborted"), "application/octet-stream").await.unwrap();
+        write_pattern(&mut w, PART_SIZE + 1).await;
+        w.abort().await;
+        let mut w = s.writer(&key("dropped"), "application/octet-stream").await.unwrap();
+        write_pattern(&mut w, PART_SIZE + 1).await;
+        drop(w);
+        for _ in 0..100 {
+            let res = s3.send(reqwest::Method::GET, "", &format!("prefix=minio-test%2F{run}&uploads="), None, &[]).await.unwrap();
+            let xml = res.text().await.unwrap();
+            if !xml.contains("<UploadId>") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let res = s3.send(reqwest::Method::GET, "", &format!("prefix=minio-test%2F{run}&uploads="), None, &[]).await.unwrap();
+        let xml = res.text().await.unwrap();
+        assert!(!xml.contains("<UploadId>"), "parts of abandoned uploads are still in the bucket: {xml}");
+        assert!(s.get(&key("aborted")).await.is_err() && s.get(&key("dropped")).await.is_err(), "nothing is visible under an abandoned key");
+        s.delete(&key("empty")).await.unwrap();
+    }
 }

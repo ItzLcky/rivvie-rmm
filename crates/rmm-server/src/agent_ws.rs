@@ -75,7 +75,7 @@ async fn handle(mut ws: WebSocket, state: Arc<AppState>, ip: IpAddr) -> anyhow::
             let _ = ws.close().await;
             Ok(())
         }
-        AgentMsg::Auth { protocol, agent_id, secret, agent_version, jobs, capabilities, patch_runs, security_actions } => {
+        AgentMsg::Auth { protocol, agent_id, secret, agent_version, jobs, capabilities, patch_runs, security_actions, software_runs } => {
             if protocol != PROTOCOL_VERSION {
                 send(&mut ws, &ServerMsg::AuthFailed { reason: format!("unsupported protocol {protocol}") }).await?;
                 return Ok(());
@@ -92,7 +92,7 @@ async fn handle(mut ws: WebSocket, state: Arc<AppState>, ip: IpAddr) -> anyhow::
             )
             .await?;
             crate::metrics::inc(&crate::metrics::M.agent_connects);
-            let held = Held { jobs, patch_runs, security_actions };
+            let held = Held { jobs, patch_runs, security_actions, software_runs };
             run_session(ws, state, agent_id, agent_version, held, capabilities).await
         }
         _ => Ok(()),
@@ -206,6 +206,7 @@ struct Held {
     jobs: Vec<Uuid>,
     patch_runs: Vec<Uuid>,
     security_actions: Vec<Uuid>,
+    software_runs: Vec<Uuid>,
 }
 
 async fn run_session(
@@ -225,11 +226,19 @@ async fn run_session(
     if let Some(old) = state.hub.register(agent_id, AgentHandle { conn_id, tx: tx.clone() }) {
         debug!(%agent_id, old = %old.conn_id, "replacing stale connection");
     }
-    sqlx::query("UPDATE agents SET online = true, last_seen_at = now(), connected_at = now(), agent_version = $2 WHERE id = $1")
-        .bind(agent_id)
-        .bind(&agent_version)
-        .execute(&state.db)
-        .await?;
+    // What it was before this connection: automations fire on the first one, and on coming back
+    // after a while away.
+    let (first_connect, last_seen): (bool, Option<chrono::DateTime<chrono::Utc>>) = sqlx::query_as(
+        "UPDATE agents a SET online = true, last_seen_at = now(), connected_at = now(), agent_version = $2,
+                first_connected_at = coalesce(a.first_connected_at, now())
+           FROM (SELECT id, first_connected_at, last_seen_at FROM agents WHERE id = $1) old
+          WHERE a.id = old.id
+      RETURNING old.first_connected_at IS NULL, old.last_seen_at",
+    )
+    .bind(agent_id)
+    .bind(&agent_version)
+    .fetch_one(&state.db)
+    .await?;
     info!(%agent_id, %agent_version, "agent online");
     // Agents don't move between clients, so this holds for the whole connection.
     let client_id: Uuid =
@@ -265,6 +274,10 @@ async fn run_session(
     let _ = tx.send(ServerMsg::RequestInventory).await;
     let _ = tx.send(ServerMsg::Watchers { watchers: crate::alerts::watchers_for(&state, agent_id).await }).await;
     crate::alerts::agent_online(&state, agent_id).await;
+    {
+        let state = state.clone();
+        tokio::spawn(async move { crate::automation::on_connect(&state, agent_id, first_connect, last_seen).await });
+    }
     let dispatched = dispatch_queued(&state, agent_id, &tx).await.unwrap_or_else(|e| {
         warn!(%agent_id, "dispatching queued jobs: {e}");
         0
@@ -274,6 +287,9 @@ async fn run_session(
     }
     if let Err(e) = crate::patches::on_connect(&state, agent_id, client_id, &capabilities, &held.patch_runs, &tx).await {
         warn!(%agent_id, "patch state on connect: {e:#}");
+    }
+    if let Err(e) = crate::software::on_connect(&state, agent_id, client_id, &capabilities, &held.software_runs).await {
+        warn!(%agent_id, "software state on connect: {e:#}");
     }
     if let Err(e) = crate::security::on_connect(&state, agent_id, client_id, &capabilities, &held.security_actions).await {
         warn!(%agent_id, "security state on connect: {e:#}");
@@ -443,6 +459,10 @@ async fn on_message(
             if let Some(s) = &status {
                 crate::alerts::job_finished(state, agent_id, job_id, s).await;
                 crate::tickets::job_finished(state, job_id).await;
+                if s == "succeeded" {
+                    crate::fields::apply_job_output(state, agent_id, job_id).await;
+                }
+                crate::automation::job_finished(state, job_id).await;
             }
             job_event(job_id, status, false);
             // Stored (or already final from an earlier delivery): the agent can forget it.
@@ -536,6 +556,18 @@ async fn on_message(
                 let _ = tx.send(ServerMsg::PatchAck { run_id: outcome.run_id }).await;
             }
         }
+        AgentMsg::SoftwareScanResult { request_id: _, providers, error, items } => {
+            crate::software::ingest_scan(state, agent_id, client_id, providers, error, &items).await?
+        }
+        AgentMsg::SoftwareProgress { run_id, stage, message } => {
+            crate::software::ingest_progress(state, agent_id, client_id, run_id, stage, message).await?
+        }
+        AgentMsg::SoftwareResult(outcome) => {
+            crate::software::ingest_result(state, agent_id, client_id, &outcome).await?;
+            if let Some(tx) = reply.upgrade() {
+                let _ = tx.send(ServerMsg::SoftwareAck { run_id: outcome.run_id }).await;
+            }
+        }
         AgentMsg::SecurityStatus(report) => crate::security::ingest_report(state, agent_id, client_id, report).await?,
         AgentMsg::SecurityActionResult { request_id, state: phase, message, data } => {
             crate::security::ingest_action(state, agent_id, client_id, request_id, phase, message, data).await?
@@ -561,6 +593,10 @@ async fn on_message(
                 let _ = tx.send(ServerMsg::ReputationResult { known }).await;
             }
         }
+        AgentMsg::NetScanResult { scan_id, subnets, scanned, hosts, error, duration_ms: _ } => {
+            crate::netmon::ingest_scan(state, agent_id, scan_id, subnets, scanned, hosts, error).await?
+        }
+        AgentMsg::SnmpPollResult { poll_id, results } => crate::netmon::ingest_poll(state, agent_id, poll_id, results).await,
         AgentMsg::Pong { .. } => {}
         AgentMsg::Enroll { .. } | AgentMsg::Auth { .. } => {}
     }
@@ -601,6 +637,11 @@ fn message_type(m: &AgentMsg) -> usize {
         AgentMsg::TriageChunk { .. } => 28,
         AgentMsg::ToolReply { .. } => 29,
         AgentMsg::ReputationQuery { .. } => 30,
+        AgentMsg::SoftwareScanResult { .. } => 31,
+        AgentMsg::SoftwareProgress { .. } => 32,
+        AgentMsg::SoftwareResult(_) => 33,
+        AgentMsg::NetScanResult { .. } => 34,
+        AgentMsg::SnmpPollResult { .. } => 35,
     }
 }
 

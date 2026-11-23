@@ -86,6 +86,10 @@ jobs:
         env:
           RMM_E2E_DATABASE_URL: postgres://rmm:rmm@localhost:5432/postgres
           RMM_E2E_PROMTOOL: /tmp/promtool
+      - name: Stored search and health against the old expressions
+        run: cargo test -p rmm-server --bin rmm-server stored_columns -- --ignored --nocapture
+        env:
+          RMM_E2E_DATABASE_URL: postgres://rmm:rmm@localhost:5432/postgres
       # Keeps the load generator working: 200 simulated agents for a minute, with dashboards,
       # page requests and bulk jobs; --check fails on any refused connection, dropped session or
       # API error. The full runs (docs/research/load-test-2026-11.md) are manual.
@@ -112,6 +116,66 @@ jobs:
           path: |
             /tmp/rmm_e2e_*/*.log
             /tmp/load/*.log
+
+  # A backup nobody has restored is a hope. Runs the e2e suite, backs its database and storage up
+  # with the compose stack's own deploy/backup.sh (a pg_dump and a tarball of the attachments,
+  # invoice PDFs, triage packages), restores them with deploy/restore.sh into a new database and an
+  # empty directory, starts the server on them and reads the rows back, an attachment's bytes by hash
+  # among them (crates/rmm-server/tests/drill.rs). Locally: scripts/restore-drill.sh.
+  restore-drill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env: { POSTGRES_USER: rmm, POSTGRES_PASSWORD: rmm, POSTGRES_DB: rmm }
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U rmm" --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Package tools (to validate the generated .deb/.rpm)
+        run: sudo apt-get install -y --no-install-recommends rpm
+      - run: cargo build -p rmm-agent
+      - name: Restore drill
+        run: scripts/restore-drill.sh
+        env:
+          RMM_E2E_DATABASE_URL: postgres://rmm:rmm@localhost:5432/postgres
+      - name: Logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: restore-drill-logs
+          path: |
+            /tmp/rmm-drill.*/*.log
+            /tmp/rmm_e2e_*/*.log
+
+  # The S3 storage code (SigV4, multipart uploads around the part boundaries, ranged reads, aborted
+  # uploads) against a real MinIO. A step, not a service container: it needs `server /data`.
+  # The image is pinned: MinIO stopped publishing to Docker Hub, and this is the last tag of a
+  # community rebuild. Locally: scripts/minio-test.sh.
+  s3:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio -p 9000:9000 -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
+            ghcr.io/coollabsio/minio:RELEASE.2025-10-15T17-29-55Z server /data
+          for i in $(seq 60); do curl -fs http://127.0.0.1:9000/minio/health/ready && break; sleep 1; done
+          curl -fs http://127.0.0.1:9000/minio/health/ready
+      - name: S3 storage against MinIO
+        run: cargo test -p rmm-server s3_against_minio -- --ignored --nocapture
+        env:
+          RMM_TEST_S3_ENDPOINT: http://127.0.0.1:9000
+      - name: MinIO log
+        if: failure()
+        run: docker logs minio
 
   # An upgrade keeps data: the previous release (the newest v* tag, from its GHCR image) makes a
   # database with real rows in it (admin, client and site, its own agent enrolled with metrics
@@ -204,8 +268,11 @@ jobs:
 
   # The agent installed from the generated MSI as a real Windows service: install, jobs
   # (PowerShell, cmd), Job Object tree kill, results across a service restart, services,
-  # upgrade over itself, uninstall. See crates/rmm-server/tests/e2e_windows.rs. The runner
-  # image ships PostgreSQL (service disabled; user postgres, password root).
+  # upgrade over itself, then ConPTY shells, Event Log watchers, a Windows Update scan,
+  # Defender (with the EICAR file), the sensor, a signed self-update with a forced rollback,
+  # and uninstall. See crates/rmm-server/tests/e2e_windows.rs (RMM_E2E_ONLY / RMM_E2E_SKIP pick
+  # sections; the logs of a failed run are uploaded). The runner image ships PostgreSQL
+  # (service disabled; user postgres, password root).
   #
   # On ab72ebc the tests passed and the job then hung in its post-job steps (rust-cache's save)
   # until GitHub killed it at the default limit; that run's log was never written, so what was
@@ -213,7 +280,7 @@ jobs:
   # left (so the next hang says why) and then stops it before the post-job steps run.
   e2e-windows:
     runs-on: windows-latest
-    timeout-minutes: 40
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -224,12 +291,35 @@ jobs:
           $pg = Get-Service -Name postgresql*
           Set-Service -InputObject $pg -Status Running -StartupType Automatic
           & "$env:PGBIN\pg_isready.exe" -h localhost -t 60
-      - run: cargo build -p rmm-agent
+      # The agent is built with the e2e's release key (the fixed test seed, "09" x 32), twice:
+      # a newer one for the self-update to install, then the one the MSI installs.
+      - name: Release key and agent builds
+        shell: pwsh
+        run: |
+          cargo build -p rmm-sign
+          New-Item -ItemType Directory -Force target | Out-Null
+          Set-Content -NoNewline -Path target/e2e-release.key -Value ('09' * 32)
+          $pub = (& target/debug/rmm-sign.exe pubkey --key target/e2e-release.key).Trim()
+          $env:RMM_UPDATE_PUBKEY = $pub
+          $env:RMM_AGENT_VERSION = '99.0.0'
+          cargo build -p rmm-agent
+          Copy-Item target/debug/rmm-agent.exe target/e2e-agent-new.exe
+          Remove-Item Env:RMM_AGENT_VERSION
+          cargo build -p rmm-agent
+      - name: Build the end-to-end test
+        run: cargo test -p rmm-server --test e2e_windows --no-run
+        env:
+          RMM_E2E_DATABASE_URL: postgres://postgres:root@localhost:5432/postgres
+          RMM_E2E_NEW_AGENT_BIN: ${{ github.workspace }}/target/e2e-agent-new.exe
+      # The runner image excludes whole drives from Defender, so the test skips the EICAR
+      # detection check here (the manual plan in docs/design/windows-testing.md covers it).
+      # Removing the exclusions stalled the runner for the whole job timeout.
       - name: End-to-end (Windows)
-        timeout-minutes: 20
+        timeout-minutes: 30
         run: cargo test -p rmm-server --test e2e_windows -- --ignored --nocapture
         env:
           RMM_E2E_DATABASE_URL: postgres://postgres:root@localhost:5432/postgres
+          RMM_E2E_NEW_AGENT_BIN: ${{ github.workspace }}/target/e2e-agent-new.exe
       - name: Stop what the test started
         if: always()
         timeout-minutes: 5
