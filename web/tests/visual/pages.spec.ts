@@ -133,7 +133,18 @@ const pages: [string, string][] = [
 	['uptime-monitor', '/uptime/um-vpn'],
 	['uptime-monitor-down', '/uptime/um-erp'],
 	['backups', '/backups'],
-	['agent-backups', '/agents/a-2']
+	['agent-backups', '/agents/a-2'],
+	['vulnerabilities', '/vulnerabilities'],
+	['vulnerabilities-devices', '/vulnerabilities?tab=devices'],
+	['vulnerabilities-software', '/vulnerabilities?tab=software'],
+	['vulnerabilities-unassessed', '/vulnerabilities?tab=unassessed'],
+	['vulnerabilities-feeds', '/vulnerabilities?tab=feeds'],
+	['vulnerability', '/vulnerabilities/CVE-2024-6387'],
+	['vulnerability-windows', '/vulnerabilities/CVE-2024-7971'],
+	['agent-vulnerabilities', '/agents/a-3?tab=vulnerabilities'],
+	['agent-vulnerabilities-windows', '/agents/a-1?tab=vulnerabilities'],
+	['agent-vulnerabilities-unassessed', '/agents/a-7?tab=vulnerabilities'],
+	['policy-new-vulnerability', '/policies/sets/00000000-0000-4000-8001-000000000000?section=alerts&item=new&kind=vulnerability']
 ];
 const phone: [string, string][] = [
 	['dashboard', '/'],
@@ -173,7 +184,10 @@ const phone: [string, string][] = [
 	['network-device', '/network/devices/nd-1'],
 	['uptime', '/uptime'],
 	['uptime-monitor', '/uptime/um-web'],
-	['backups', '/backups']
+	['backups', '/backups'],
+	['vulnerabilities', '/vulnerabilities'],
+	['vulnerability', '/vulnerabilities/CVE-2024-6387'],
+	['agent-vulnerabilities', '/agents/a-3?tab=vulnerabilities']
 ];
 
 const jpeg = readFileSync(new URL('./fixtures/desktop.jpg', import.meta.url));

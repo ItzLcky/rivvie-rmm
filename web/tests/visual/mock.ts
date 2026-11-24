@@ -1363,6 +1363,79 @@ const backupJobsMock = [
 	{ agent_id: 'a-5', hostname: 'globex-app01', online: true, client_id: 'c-globex', client_name: 'Globex', site_name: 'Main', provider: 'file_age', job: '/srv/dumps/*.sql.gz', last_run_at: ago(60 * 50), last_success_at: ago(60 * 50), last_result: 'success', message: 'newest file app-2026-06-13.sql.gz', size_bytes: 734_003_200, updated_at: ago(33), alerting: true }
 ];
 
+// --- vulnerabilities ---------------------------------------------------------------------------
+const vulnRows = [
+	{ key: 'CVE-2024-6387', cve: 'CVE-2024-6387', advisories: ['UBUNTU-CVE-2024-6387'], summary: 'regreSSHion: signal handler race condition in OpenSSH’s server (sshd)', severity: 'critical', cvss: 9.8, epss: 0.38, kev: false, published: ago(60 * 24 * 400), devices: 2, accepted_devices: 0, fix_available: true, packages: ['openssh'], first_seen: ago(60 * 24 * 21) },
+	{ key: 'CVE-2024-7971', cve: 'CVE-2024-7971', advisories: ['CVE-2024-7971'], summary: 'Type confusion in V8 in Google Chrome prior to 128.0.6613.84', severity: 'high', cvss: 8.8, epss: 0.61, kev: true, published: ago(60 * 24 * 300), devices: 2, accepted_devices: 0, fix_available: true, packages: ['google:chrome'], first_seen: ago(60 * 24 * 9) },
+	{ key: 'CVE-2024-6119', cve: 'CVE-2024-6119', advisories: ['UBUNTU-CVE-2024-6119'], summary: 'OpenSSL: possible denial of service in X.509 name checks', severity: 'medium', cvss: 5.9, epss: 0.004, kev: false, published: ago(60 * 24 * 280), devices: 3, accepted_devices: 1, fix_available: true, packages: ['openssl'], first_seen: ago(60 * 24 * 40) },
+	{ key: 'CVE-2025-0167', cve: 'CVE-2025-0167', advisories: ['UBUNTU-CVE-2025-0167'], summary: 'curl: netrc and default credential leak', severity: 'high', cvss: 7.5, epss: 0.02, kev: false, published: ago(60 * 24 * 160), devices: 1, accepted_devices: 0, fix_available: false, packages: ['curl'], first_seen: ago(60 * 24 * 3) },
+	{ key: 'CVE-2023-38545', cve: 'CVE-2023-38545', advisories: ['CVE-2023-38545'], summary: 'SOCKS5 heap buffer overflow in 7-Zip’s bundled curl', severity: 'critical', cvss: 9.8, epss: 0.27, kev: false, published: ago(60 * 24 * 600), devices: 1, accepted_devices: 0, fix_available: true, packages: ['7-zip:7-zip'], first_seen: ago(60 * 24 * 60) }
+];
+const vulnPatch = { kind: 'patch', update_id: 'openssh-server', title: 'openssh-server', version: '1:9.6p1-3ubuntu13.4', approval: 'pending', state: 'missing' };
+const agentFindings = (id: string) =>
+	id === 'a-3'
+		? [
+				{ key: 'CVE-2024-6387', cve: 'CVE-2024-6387', vuln_id: 'UBUNTU-CVE-2024-6387', summary: vulnRows[0].summary, severity: 'critical', cvss: 9.8, epss: 0.38, kev: false, package: 'openssh', software_name: 'openssh-server', installed_version: '1:9.6p1-3ubuntu13', fixed_version: '1:9.6p1-3ubuntu13.4', fix_available: true, first_seen: ago(60 * 24 * 21), accepted: false, remediation: vulnPatch },
+				{ key: 'CVE-2025-0167', cve: 'CVE-2025-0167', vuln_id: 'UBUNTU-CVE-2025-0167', summary: vulnRows[3].summary, severity: 'high', cvss: 7.5, epss: 0.02, kev: false, package: 'curl', software_name: 'libcurl4t64', installed_version: '8.5.0-2ubuntu10.6', fixed_version: null, fix_available: false, first_seen: ago(60 * 24 * 3), accepted: false, remediation: null },
+				{ key: 'CVE-2024-6119', cve: 'CVE-2024-6119', vuln_id: 'UBUNTU-CVE-2024-6119', summary: vulnRows[2].summary, severity: 'medium', cvss: 5.9, epss: 0.004, kev: false, package: 'openssl', software_name: 'libssl3t64', installed_version: '3.0.13-0ubuntu3.1', fixed_version: '3.0.13-0ubuntu3.4', fix_available: true, first_seen: ago(60 * 24 * 40), accepted: true, remediation: null }
+			]
+		: id === 'a-1'
+			? [
+					{ key: 'CVE-2024-7971', cve: 'CVE-2024-7971', vuln_id: 'CVE-2024-7971', summary: vulnRows[1].summary, severity: 'high', cvss: 8.8, epss: 0.61, kev: true, package: 'google:chrome', software_name: 'Google Chrome', installed_version: '127.0.6533.120', fixed_version: '128.0.6613.84', fix_available: true, first_seen: ago(60 * 24 * 9), accepted: false, remediation: { kind: 'upgrade', package_id: 'sw-chrome', package_name: 'Google Chrome' } },
+					{ key: 'CVE-2023-38545', cve: 'CVE-2023-38545', vuln_id: 'CVE-2023-38545', summary: vulnRows[4].summary, severity: 'critical', cvss: 9.8, epss: 0.27, kev: false, package: '7-zip:7-zip', software_name: '7-Zip 22.01 (x64)', installed_version: '22.01', fixed_version: '23.01', fix_available: true, first_seen: ago(60 * 24 * 60), accepted: false, remediation: { kind: 'catalog', product_id: 'vp-7zip', product_name: '7-Zip' } }
+				]
+			: [];
+const vulnAgent = (id: string) => {
+	const f = agentFindings(id);
+	const unassessed = id === 'a-7' ? 'old_agent' : null;
+	const a = agents.find((x) => x.id === id);
+	return {
+		ecosystem: unassessed ? null : a?.os_family === 'windows' ? 'Windows' : 'Ubuntu:24.04', unassessed, evaluated_at: unassessed ? null : ago(42),
+		critical: f.filter((x) => x.severity === 'critical' && !x.accepted).length, high: f.filter((x) => x.severity === 'high' && !x.accepted).length, findings: f
+	};
+};
+const vulnDevices = (key: string) => {
+	const rows = ['a-1', 'a-2', 'a-3', 'a-5', 'a-6'].flatMap((id) => agentFindings(id === 'a-2' ? 'a-1' : id === 'a-5' || id === 'a-6' ? 'a-3' : id).filter((f) => f.key === key).map((f) => ({ f, a: agents.find((x) => x.id === id)! })));
+	return rows.map(({ f, a }) => ({
+		agent_id: a.id, hostname: a.hostname, online: a.online, os_family: a.os_family, os_name: a.os_name, client_id: a.client_id, client_name: a.client_name, site_name: a.site_name,
+		vuln_id: f.vuln_id, package: f.package, software_name: f.software_name, installed_version: f.installed_version, fixed_version: f.fixed_version, fix_available: f.fix_available,
+		first_seen: f.first_seen, accepted: f.accepted, product_id: f.package.includes(':') ? 'vp-x' : null, remediation: f.remediation
+	}));
+};
+const vulnDetail = (key: string) => {
+	const r = vulnRows.find((x) => x.key === key)!;
+	const nvd = r.advisories[0].startsWith('CVE-');
+	return {
+		key, cve: key, summary: r.summary, severity: r.severity, cvss: r.cvss, cvss_vector: 'CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:H/A:H', epss: r.epss, epss_percentile: 0.97, kev: r.kev,
+		kev_added: r.kev ? '2024-08-26' : null, kev_due: r.kev ? '2024-09-16' : null, devices: r.devices, accepted_devices: r.accepted_devices,
+		advisories: [{ id: r.advisories[0], source: nvd ? 'nvd' : 'osv:Ubuntu', aliases: [], summary: r.summary, details: `${r.summary}. A remote, unauthenticated attacker may be able to run code as root on glibc-based Linux systems.`, severity: r.severity, cvss: r.cvss, cvss_vector: null, published: r.published, modified: ago(60 * 24 * 30), url: 'https://ubuntu.com/security/CVE-2024-6387' }],
+		ranges: nvd
+			? [{ vuln_id: r.advisories[0], ecosystem: 'NVD', package: r.packages[0], introduced: null, fixed: '128.0.6613.84', last_affected: null }]
+			: [
+					{ vuln_id: r.advisories[0], ecosystem: 'Ubuntu:24.04', package: r.packages[0], introduced: '0', fixed: '1:9.6p1-3ubuntu13.4', last_affected: null },
+					{ vuln_id: r.advisories[0], ecosystem: 'Ubuntu:22.04', package: r.packages[0], introduced: '1:8.5p1-1', fixed: '1:8.9p1-3ubuntu0.10', last_affected: null }
+				],
+		acceptances: key === 'CVE-2024-6387' ? [{ id: 'va-1', vuln_id: key, client_id: 'c-globex', client_name: 'Globex', agent_id: 'a-5', hostname: 'globex-app01', note: 'sshd is only reachable over the VPN; upgrade planned for the July window.', expires_at: ago(-60 * 24 * 30), by_name: 'Dana Admin', created_at: ago(60 * 24 * 5), active: true }] : []
+	};
+};
+const vulnFeeds = {
+	running: false, nvd_api_key: false, automatic: true,
+	feeds: [
+		{ name: 'osv:Ubuntu', label: 'OSV: Ubuntu', enabled: true, needed: true, last_sync_at: ago(300), last_attempt_at: ago(300), progress: null, records: 48213, error: null },
+		{ name: 'osv:Debian', label: 'OSV: Debian', enabled: true, needed: false, last_sync_at: null, last_attempt_at: null, progress: null, records: 0, error: null },
+		{ name: 'arch', label: 'Arch Linux security tracker', enabled: true, needed: false, last_sync_at: null, last_attempt_at: null, progress: null, records: 0, error: null },
+		{ name: 'nvd', label: 'NVD (Windows applications in the product map)', enabled: true, needed: true, last_sync_at: ago(310), last_attempt_at: ago(310), progress: null, records: 1874, error: null },
+		{ name: 'kev', label: 'CISA Known Exploited Vulnerabilities', enabled: true, needed: true, last_sync_at: ago(312), last_attempt_at: ago(312), progress: null, records: 1239, error: null },
+		{ name: 'epss', label: 'EPSS (FIRST)', enabled: true, needed: true, last_sync_at: null, last_attempt_at: ago(312), progress: null, records: 0, error: 'GET https://epss.empiricalsecurity.com/epss_scores-current.csv.gz: 503 Service Unavailable' }
+	],
+	attribution: ['This product uses the NVD API but is not endorsed or certified by the NVD.', 'Advisory data from OSV.dev (CC-BY 4.0), collected from the distributions’ security teams.', 'Known exploited vulnerabilities from CISA’s KEV catalog (CC0).', 'EPSS scores from FIRST (first.org/epss).']
+};
+const vulnProducts = [
+	{ id: 'vp-7zip', vendor: '7-zip', product: '7-zip', name: '7-Zip', name_patterns: ['7-Zip*'], publisher_pattern: 'Igor Pavlov*', package_id: null, package_name: null, builtin: true, nvd_synced_at: ago(310), devices: 1 },
+	{ id: 'vp-chrome', vendor: 'google', product: 'chrome', name: 'Google Chrome', name_patterns: ['Google Chrome'], publisher_pattern: 'Google*', package_id: 'sw-chrome', package_name: 'Google Chrome', builtin: true, nvd_synced_at: ago(310), devices: 2 },
+	{ id: 'vp-erp', vendor: 'contoso', product: 'erp_client', name: 'Contoso ERP client', name_patterns: ['Contoso ERP*'], publisher_pattern: 'Contoso*', package_id: null, package_name: null, builtin: false, nvd_synced_at: ago(310), devices: 0 }
+];
+
 const netDevices = [
 	netDev(1, 'Core switch', 'switch', '192.168.10.2', 'up', { sys_descr: 'Cisco IOS Software, Catalyst L3 Switch Software (CAT9K_IOSXE), Version 17.9.4', vendor: 'Cisco Systems', mac: '00:1b:54:aa:10:02', cpu_percent: 17, mem_used: 612_000_000, mem_total: 2_000_000_000, interfaces: 8, interfaces_up: 5, storage: [{ descr: 'flash:', kind: 'disk', used: 410_000_000, total: 1_600_000_000 }] }),
 	netDev(2, 'Edge firewall', 'firewall', '192.168.10.1', 'down', { sys_descr: 'Fortinet FortiGate-60F v7.4.3', vendor: 'Fortinet', mac: '90:6c:ac:11:22:33', interfaces: 4, interfaces_up: 0 }),
@@ -1786,6 +1859,34 @@ export async function mockApi(p: Page, opts: { signedIn?: boolean; ssoRequired?:
 			return json(page([...rows].sort((a, b) => rank[a.last_result] - rank[b.last_result]), Number(q.get('limit') ?? 50)));
 		}
 		if ((m = path.match(/^\/agents\/([^/]+)\/backups$/))) return json(backupJobsMock.filter((j) => j.agent_id === m![1]));
+		if (path === '/vulnerabilities/summary') return json(q.get('client_id') === 'c-globex' ? { critical: 0, high: 0, devices_affected: 0, kev: 0, unassessed: 0, assessed: 2, last_sync_at: ago(300) } : { critical: 3, high: 3, devices_affected: 3, kev: 1, unassessed: 1, assessed: 6, last_sync_at: ago(300) });
+		if (path === '/vulnerabilities') {
+			const sev = q.get('severity')?.split(',');
+			return json(page(vulnRows.filter((r) => (!sev || sev.includes(r.severity)) && (!q.get('kev') || r.kev)), Number(q.get('limit') ?? 50)));
+		}
+		if (path === '/vulnerabilities/agents')
+			return json(['a-1', 'a-2', 'a-3'].map((id) => { const a = agents.find((x) => x.id === id)!; const v = vulnAgent(id === 'a-2' ? 'a-1' : id); return { agent_id: id, hostname: a.hostname, online: a.online, os_family: a.os_family, os_name: a.os_name, client_name: a.client_name, site_name: a.site_name, ecosystem: v.ecosystem, critical: v.critical, high: v.high, open: v.findings.filter((f) => !f.accepted).length, kev: v.findings.filter((f) => f.kev).length, fixable: v.findings.filter((f) => f.fix_available && !f.accepted).length, evaluated_at: v.evaluated_at }; }));
+		if (path === '/vulnerabilities/software')
+			return json([
+				{ package: 'openssh', ecosystems: ['Ubuntu:24.04'], product_id: null, product_name: null, package_id: null, devices: 2, cves: 1, severity: 'critical', kev: false, fix_available: true, fixed_versions: ['1:9.6p1-3ubuntu13.4'] },
+				{ package: '7-zip:7-zip', ecosystems: ['Windows'], product_id: 'vp-7zip', product_name: '7-Zip', package_id: null, devices: 1, cves: 1, severity: 'critical', kev: false, fix_available: true, fixed_versions: ['23.01'] },
+				{ package: 'google:chrome', ecosystems: ['Windows'], product_id: 'vp-chrome', product_name: 'Google Chrome', package_id: 'sw-chrome', devices: 2, cves: 1, severity: 'high', kev: true, fix_available: true, fixed_versions: ['128.0.6613.84'] },
+				{ package: 'curl', ecosystems: ['Ubuntu:24.04'], product_id: null, product_name: null, package_id: null, devices: 1, cves: 1, severity: 'high', kev: false, fix_available: false, fixed_versions: [] }
+			]);
+		if (path === '/vulnerabilities/unassessed')
+			return json({
+				products: 150,
+				devices: [{ agent_id: 'a-7', hostname: 'initech-ws-12', os_family: 'windows', os_name: 'Windows 11 Pro', agent_version: '0.2.0', client_name: 'Initech', reason: 'old_agent' }],
+				titles: [
+					{ title: 'Contoso Line-of-Business Suite', publisher: 'Contoso Ltd', devices: 3, versions: ['4.2.1', '4.3.0'] },
+					{ title: 'Sage 50 Accounts', publisher: 'Sage (UK) Ltd', devices: 1, versions: ['30.1.211.0'] }
+				]
+			});
+		if (path === '/vulnerabilities/feeds') return json(vulnFeeds);
+		if (path === '/vulnerabilities/products') return json(vulnProducts);
+		if ((m = path.match(/^\/vulnerabilities\/([^/]+)\/devices$/))) return json(vulnDevices(decodeURIComponent(m[1])));
+		if ((m = path.match(/^\/vulnerabilities\/([^/]+)$/))) return vulnRows.some((r) => r.key === decodeURIComponent(m![1])) ? json(vulnDetail(decodeURIComponent(m[1]))) : json({ error: 'vulnerability not found' }, 404);
+		if ((m = path.match(/^\/agents\/([^/]+)\/vulnerabilities$/))) return json(vulnAgent(m[1]));
 		if (path === '/network/summary') return json({ unmanaged: discoveredHosts.filter((d) => d.state === 'unmanaged' && d.online).length, devices: netDevices.length, down: netDevices.filter((d) => d.state === 'down').length });
 		if (path === '/network/devices')
 			return json(netDevices.filter((d) => (!q.get('state') || d.state === q.get('state')) && (!q.get('kind') || d.kind === q.get('kind')) && (!q.get('client_id') || d.client_id === q.get('client_id'))));

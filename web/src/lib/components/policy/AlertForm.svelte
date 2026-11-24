@@ -16,6 +16,7 @@
 		metric: 'cpu' | 'memory' | 'interface_util' | 'supply'; net_kinds: string; net_names: string;
 		up_failures: number; up_kinds: string; up_cert: boolean; up_cert_days: number; up_latency: boolean; up_latency_ms: number;
 		bk_providers: string[]; bk_sources: BackupSource[]; bk_jobs: string; bk_max_age: number; bk_warning: boolean; bk_require: boolean;
+		vu_severity: 'critical' | 'high' | 'medium' | 'low'; vu_kev: boolean; vu_fix: boolean; vu_days: number; vu_epss_check: boolean; vu_epss: number;
 	};
 	export type BackupSource = { provider: 'restic' | 'borg' | 'file_age'; env_file: string; repo: string; path: string; glob: string };
 	const defaults: Record<PolicyKind, Partial<Draft>> = {
@@ -32,7 +33,8 @@
 		net_interface: { minutes: 5 },
 		net_threshold: { threshold: 90, minutes: 10, metric: 'cpu' },
 		uptime: {},
-		backup: {}
+		backup: {},
+		vulnerability: {}
 	};
 	const blank = (kind: PolicyKind): Draft => ({
 		kind, severity: 'warning', channel_ids: [], notify_resolved: true, ticket_board_id: null, ticket_priority: 3, ticket_auto_resolve: true, run_script_id: '',
@@ -41,6 +43,7 @@
 		stale_check: false, stale_hours: 24, patch_failed: true, reboot_check: true, reboot_hours: 72, renotify: false, renotify_minutes: 240, metric: 'cpu', net_kinds: '', net_names: '',
 		up_failures: 2, up_kinds: '', up_cert: true, up_cert_days: 14, up_latency: false, up_latency_ms: 1000,
 		bk_providers: ['auto'], bk_sources: [], bk_jobs: '*', bk_max_age: 26, bk_warning: false, bk_require: false,
+		vu_severity: 'critical', vu_kev: false, vu_fix: true, vu_days: 14, vu_epss_check: false, vu_epss: 10,
 		...defaults[kind]
 	});
 	const list = (s: string) => s.split(/[\n,]/).map((x) => x.trim()).filter(Boolean);
@@ -70,7 +73,9 @@
 			bk_sources: Array.isArray(q.sources)
 				? (q.sources as Record<string, string | null>[]).map((s) => ({ provider: (s.provider as BackupSource['provider']) ?? 'restic', env_file: s.env_file ?? '', repo: s.repo ?? '', path: s.path ?? '', glob: s.glob ?? '' }))
 				: [],
-			bk_jobs: Array.isArray(q.jobs) ? (q.jobs as string[]).join('\n') : '*', bk_max_age: Number(q.max_age_hours ?? 26), bk_warning: !!q.warning_is_failure, bk_require: !!q.require
+			bk_jobs: Array.isArray(q.jobs) ? (q.jobs as string[]).join('\n') : '*', bk_max_age: Number(q.max_age_hours ?? 26), bk_warning: !!q.warning_is_failure, bk_require: !!q.require,
+			vu_severity: (q.min_severity as Draft['vu_severity']) ?? 'critical', vu_kev: !!q.kev_only, vu_fix: q.fix_available_only !== false,
+			vu_days: Number(q.older_than_days ?? 14), vu_epss_check: q.min_epss != null, vu_epss: Math.round(Number(q.min_epss ?? 0.1) * 100)
 		};
 	}
 	function params(d: Draft): Record<string, unknown> {
@@ -106,6 +111,11 @@
 				return { failed: d.patch_failed, reboot_hours: d.reboot_check ? Number(d.reboot_hours) : null };
 			case 'uptime':
 				return { failures: Number(d.up_failures), kinds: list(d.up_kinds), cert_days: d.up_cert ? Number(d.up_cert_days) : 0, latency_ms: d.up_latency ? Number(d.up_latency_ms) : null };
+			case 'vulnerability':
+				return {
+					min_severity: d.vu_severity, kev_only: d.vu_kev, fix_available_only: d.vu_fix, older_than_days: Number(d.vu_days),
+					min_epss: d.vu_epss_check ? Number(d.vu_epss) / 100 : null
+				};
 			case 'backup': {
 				const opt = (s: string) => s.trim() || null;
 				return {
@@ -378,6 +388,25 @@
 				{/if}
 			</PField>
 			<p class="hint -mt-1">Add this item to the policy set of the <em>agents that run the monitors</em> (each monitor’s agent, or its site’s designated agent). A monitor whose agent is offline shows as unknown and doesn’t alert. Monitors are set up on the <a class="link" href="/uptime">Uptime</a> page.</p>
+		{:else if draft.kind === 'vulnerability'}
+			<PField path="params.min_severity" label="At least" id="p-vsev" hint="Findings this severe or worse count (CVSS, or the distribution’s own rating).">
+				<Select id="p-vsev" class="max-w-48" bind:value={draft.vu_severity} options={[{ value: 'critical', label: 'Critical' }, { value: 'high', label: 'High' }, { value: 'medium', label: 'Medium' }, { value: 'low', label: 'Low' }]} />
+			</PField>
+			<PField path="params.fix_available_only" name="Fixes"><Switch bind:checked={draft.vu_fix}>Only when a fixed version is available</Switch></PField>
+			<PField path="params.kev_only" name="Exploited"><Switch bind:checked={draft.vu_kev}>Only CVEs known to be exploited (CISA KEV)</Switch></PField>
+			<PField path="params.older_than_days" label="Open for at least (days)" id="p-vdays" hint="Time to patch the usual way first. 0: at once.">
+				<Input id="p-vdays" type="number" min="0" max="365" class="max-w-40" bind:value={draft.vu_days} />
+			</PField>
+			<PField path="params.min_epss" name="Likely to be exploited">
+				<Switch bind:checked={draft.vu_epss_check}>Only with an EPSS score of at least</Switch>
+				{#if draft.vu_epss_check}
+					<div class="mt-2 ml-11.5 flex items-center gap-2">
+						<Input id="p-vepss" type="number" min="0" max="100" class="w-24" aria-label="Minimum EPSS in percent" bind:value={draft.vu_epss} />
+						<span class="text-muted text-sm">% chance of exploitation in the next 30 days</span>
+					</div>
+				{/if}
+			</PField>
+			<p class="hint -mt-1">One alert per device, listing its worst CVEs; accepted risks don’t count. The <a class="link" href="/vulnerabilities">Vulnerabilities</a> page lists every finding.</p>
 		{:else if draft.kind === 'backup'}
 			<PField path="params.providers" name="Look for">
 				<div class="grid gap-1.5 sm:grid-cols-2">

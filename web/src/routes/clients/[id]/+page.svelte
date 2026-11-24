@@ -1,4 +1,5 @@
 <script lang="ts">
+	import VulnStrip from '#lib/components/vulns/VulnStrip.svelte';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import { CircleSlash, Contact as ContactIcon, ExternalLink, FolderPlus, FolderTree, KeyRound, LifeBuoy, MapPin, Monitor, Pencil, Plus, Star, Stethoscope, Trash2, UserPlus } from '@lucide/svelte';
@@ -209,6 +210,7 @@
 			<Stat label="Need attention" icon={Stethoscope} value={(dash.data?.health.attention ?? 0) + (dash.data?.health.unhealthy ?? 0)} tone={dash.data?.health.unhealthy ? 'danger' : 'warning'} href="/agents?client={c.id}&view=attention" />
 			<Stat label="Failed jobs (24 h)" icon={CircleSlash} value={dash.data?.failed_jobs.length ?? 0} capped={(dash.data?.failed_jobs.length ?? 0) >= 10} tone="danger" href="/jobs?client={c.id}&status=failed" />
 		</div>
+		<VulnStrip clientId={c.id} class="mb-4" />
 
 		<Tabs
 			label="Client sections"
