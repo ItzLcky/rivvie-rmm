@@ -86,7 +86,7 @@ impl Module {
             // The rule's type is what its open alerts mean.
             Module::Alert => field != "kind" && ALERT_FIELDS.contains(&field),
             // One cron clock per item.
-            Module::Schedule => matches!(field, "args" | "timeout_secs"),
+            Module::Schedule => matches!(field, "args" | "timeout_secs" | "params"),
             Module::Patch => PATCH_FIELDS.contains(&field),
             Module::Security => SECURITY_FIELDS.contains(&field),
             Module::RemoteAccess => REMOTE_FIELDS.contains(&field),
@@ -100,7 +100,7 @@ impl Module {
 }
 
 const AUTOMATION_OVERRIDABLE: &[&str] =
-    &["args", "timeout_secs", "retry_failed", "max_attempts", "retry_minutes", "cooldown_minutes", "max_runs_per_hour", "respect_window"];
+    &["args", "params", "timeout_secs", "retry_failed", "max_attempts", "retry_minutes", "cooldown_minutes", "max_runs_per_hour", "respect_window"];
 
 const ALERT_FIELDS: &[&str] = &[
     "kind",
@@ -207,6 +207,10 @@ pub struct ScheduleConfig {
     pub timezone: String,
     #[serde(default)]
     pub args: Vec<String>,
+    /// Values of the script's parameters (crate::params), by name; a descendant set can
+    /// override single ones. Text may hold placeholders; a secret is `vault:<item id>`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub params: BTreeMap<String, String>,
     /// None: the script's own timeout.
     #[serde(default)]
     pub timeout_secs: Option<i32>,
@@ -226,6 +230,7 @@ impl ScheduleConfig {
         if self.args.len() > 50 || self.args.iter().any(|a| a.len() > 4096) {
             return Err("at most 50 arguments of at most 4096 characters".into());
         }
+        check_param_shape(&self.params)?;
         crate::scheduler::next_run(&self.cron, &self.timezone, chrono::Utc::now()).map(|_| ())
     }
 }
@@ -290,6 +295,9 @@ pub struct AutomationConfig {
     pub script_id: Uuid,
     #[serde(default)]
     pub args: Vec<String>,
+    /// Values of the script's parameters, as on [`ScheduleConfig::params`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub params: BTreeMap<String, String>,
     /// None: the script's own timeout.
     #[serde(default)]
     pub timeout_secs: Option<i32>,
@@ -391,8 +399,24 @@ impl AutomationConfig {
         if self.args.len() > 50 || self.args.iter().any(|a| a.len() > 4096) {
             return Err("at most 50 arguments of at most 4096 characters".into());
         }
+        check_param_shape(&self.params)?;
         Ok(())
     }
+}
+
+/// What can be checked of parameter values without the script (that is
+/// [`crate::params::check_policy`], from [`validate_effective`]).
+fn check_param_shape(params: &BTreeMap<String, String>) -> Result<(), String> {
+    if params.len() > crate::params::MAX_PARAMS {
+        return Err(format!("at most {} parameters", crate::params::MAX_PARAMS));
+    }
+    if let Some(k) = params.keys().find(|k| !crate::params::valid_name(k)) {
+        return Err(format!("{k:?} isn't a parameter name"));
+    }
+    if params.values().any(|v| v.len() > crate::params::VALUE_MAX) {
+        return Err(format!("a parameter value is at most {} bytes", crate::params::VALUE_MAX));
+    }
+    Ok(())
 }
 
 /// A patch window of the policy's own (otherwise the site's maintenance window applies).
@@ -584,8 +608,8 @@ pub fn clean_override(module: Module, config: &Value) -> Result<Value, String> {
     if let Some(bad) = m.keys().find(|k| !module.overridable(k)) {
         return Err(match (module, bad.as_str()) {
             (Module::Alert, "kind") => "an alert's type can't be overridden".into(),
-            (Module::Schedule, _) => format!("{bad} can't be overridden: a scheduled script's overrides are limited to enabled, args and timeout_secs"),
-            (Module::Automation, _) => format!("{bad} can't be overridden: an automation's trigger and script are fixed; its args, timeout, retries and limits can change"),
+            (Module::Schedule, _) => format!("{bad} can't be overridden: a scheduled script's overrides are limited to enabled, args, params and timeout_secs"),
+            (Module::Automation, _) => format!("{bad} can't be overridden: an automation's trigger and script are fixed; its args, params, timeout, retries and limits can change"),
             _ => format!("{bad} isn't a {} setting", module.as_str()),
         });
     }
@@ -738,22 +762,43 @@ pub async fn rebuild(tx: &mut PgConnection, items: Option<&[Uuid]>) -> sqlx::Res
 
 /// Every merged config of these items (in every set they reach) must still be valid. The error
 /// names the set.
+///
+/// Schedules and automations are also checked against their script's parameters
+/// ([`crate::params::check_policy`]), and an alert's script must not need any.
 pub async fn validate_effective(tx: &mut PgConnection, items: &[Uuid]) -> sqlx::Result<Result<(), String>> {
-    let rows: Vec<(String, String, Value)> = sqlx::query_as(
-        "SELECT ps.name, e.module, e.config FROM policy_effective e JOIN policy_sets ps ON ps.id = e.set_id
+    let rows: Vec<(String, String, Value, String, Option<Uuid>)> = sqlx::query_as(
+        "SELECT ps.name, e.module, e.config, i.name, i.client_id FROM policy_effective e JOIN policy_sets ps ON ps.id = e.set_id
+           JOIN policy_items i ON i.id = e.item_id
           WHERE e.item_id = ANY($1) ORDER BY ps.parent_id NULLS FIRST, ps.name",
     )
     .bind(items)
     .fetch_all(&mut *tx)
     .await?;
     let mut seen = HashSet::new();
-    for (set, module, config) in rows {
-        if !seen.insert((module.clone(), config.to_string())) {
+    for (set, module, config, item, item_client) in rows {
+        if !seen.insert((module.clone(), config.to_string(), item_client)) {
             continue;
         }
         let Some(m) = Module::parse(&module) else { continue };
         if let Err(e) = validate(m, &config) {
             return Ok(Err(format!("in {set}: {e}")));
+        }
+        let params = match m {
+            Module::Schedule | Module::Automation => crate::params::check_policy(&mut *tx, &config, item_client).await?,
+            Module::Alert => match config.get("run_script_id").and_then(Value::as_str).and_then(|s| Uuid::parse_str(s).ok()) {
+                Some(script) => {
+                    let mut alert_cfg = json!({ "script_id": script });
+                    alert_cfg["params"] = json!({});
+                    crate::params::check_policy(&mut *tx, &alert_cfg, item_client)
+                        .await?
+                        .map_err(|e| format!("its script needs parameters an alert can't pass ({e})"))
+                }
+                None => Ok(()),
+            },
+            _ => Ok(()),
+        };
+        if let Err(e) = params {
+            return Ok(Err(format!("{item} in {set}: {e}")));
         }
     }
     Ok(Ok(()))

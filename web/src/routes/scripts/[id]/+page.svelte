@@ -9,7 +9,7 @@
 	import { clients, loadClients } from '#lib/scope.svelte.js';
 	import { can } from '#lib/session.svelte.js';
 	import { attempt, toast } from '#lib/toast.svelte.js';
-	import type { Interpreter, Script } from '#lib/types.js';
+	import type { Interpreter, ParamSpec, Script } from '#lib/types.js';
 	import Button from '#lib/ui/Button.svelte';
 	import ErrorState from '#lib/ui/ErrorState.svelte';
 	import Field from '#lib/ui/Field.svelte';
@@ -18,9 +18,10 @@
 	import Select from '#lib/ui/Select.svelte';
 	import Skeleton from '#lib/ui/Skeleton.svelte';
 	import CodeEditor from '#lib/components/CodeEditor.svelte';
+	import ParamsEditor from '#lib/components/scripts/ParamsEditor.svelte';
 
 	/** The script editor; `/scripts/new` creates one. */
-	type Draft = { name: string; description: string; interpreter: Interpreter; body: string; timeout_secs: number; client_id: string | null };
+	type Draft = { name: string; description: string; interpreter: Interpreter; body: string; timeout_secs: number; client_id: string | null; params: ParamSpec[] };
 	const isNew = $derived(page.params.id === 'new');
 	let script = $state<Script | null>(null);
 	let draft = $state<Draft | null>(null);
@@ -35,7 +36,7 @@
 		if (id === 'new') {
 			script = null;
 			// Built locally: reading `draft` back here would make the effect depend on itself.
-			const d: Draft = { name: '', description: '', interpreter: 'powershell', body: '', timeout_secs: 300, client_id: can('admin') ? null : (untrack(() => clients.list[0]?.id) ?? null) };
+			const d: Draft = { name: '', description: '', interpreter: 'powershell', body: '', timeout_secs: 300, client_id: can('admin') ? null : (untrack(() => clients.list[0]?.id) ?? null), params: [] };
 			draft = d;
 			saved = JSON.stringify(d);
 			return;
@@ -44,7 +45,7 @@
 		api.get<Script>(`/scripts/${id}`)
 			.then((s) => {
 				script = s;
-				const d: Draft = { name: s.name, description: s.description, interpreter: s.interpreter, body: s.body, timeout_secs: s.timeout_secs, client_id: s.client_id };
+				const d: Draft = { name: s.name, description: s.description, interpreter: s.interpreter, body: s.body, timeout_secs: s.timeout_secs, client_id: s.client_id, params: s.params ?? [] };
 				draft = d;
 				saved = JSON.stringify(d);
 			})
@@ -128,7 +129,8 @@
 	{#if !editable}<p class="border-border bg-sunken text-muted mb-4 rounded-md border px-3 py-2 text-sm">Read only: MSP-wide scripts can only be changed by admins.</p>{/if}
 
 	<form id="script-form" class="grid gap-4 xl:grid-cols-[22rem_1fr]" onsubmit={save}>
-		<fieldset class="card space-y-3 self-start p-4" disabled={!editable}>
+		<div class="space-y-4 self-start">
+		<fieldset class="card space-y-3 p-4" disabled={!editable}>
 			<Field label="Name" id="s-name" required><Input id="s-name" bind:value={draft.name} required maxlength={200} /></Field>
 			<Field label="Description" id="s-desc"><Input id="s-desc" bind:value={draft.description} placeholder="What it does, when to run it" /></Field>
 			<div class="grid grid-cols-2 gap-3">
@@ -142,8 +144,10 @@
 					options={[...(can('admin') ? [{ value: null, label: 'All clients (MSP-wide)' }] : []), ...clients.list.map((c) => ({ value: c.id, label: `${c.name} only` }))]}
 				/>
 			</Field>
-			<p class="text-muted text-xs">Arguments are given when you run it. <kbd class="kbd">{navigator.platform.includes('Mac') ? '⌘' : 'Ctrl'}</kbd> <kbd class="kbd">S</kbd> saves.</p>
+			<p class="text-muted text-xs">Arguments and parameter values are given when you run it. <kbd class="kbd">{navigator.platform.includes('Mac') ? '⌘' : 'Ctrl'}</kbd> <kbd class="kbd">S</kbd> saves.</p>
 		</fieldset>
+		<ParamsEditor bind:params={draft.params} disabled={!editable} />
+		</div>
 		<div class="min-w-0">
 			<label class="label" for="s-body">Script</label>
 			<CodeEditor id="s-body" bind:value={draft.body} interpreter={draft.interpreter} minHeight="min(60vh, 32rem)" readonly={!editable} />

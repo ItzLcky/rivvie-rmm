@@ -1,20 +1,26 @@
 <script lang="ts" module>
 	import type { Config } from '#lib/policy/types.js';
 
-	type Draft = { script_id: string; cron: string; timezone: string; args: string; timeout_secs: string; retain_days: number };
+	type Draft = { script_id: string; cron: string; timezone: string; args: string; params: Record<string, string>; timeout_secs: string; retain_days: number };
 	export const localTz = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
 
 	function fromConfig(c: Config): Draft {
 		return {
 			script_id: (c.script_id as string) ?? '', cron: (c.cron as string) ?? '0 2 * * *', timezone: (c.timezone as string) ?? 'UTC',
-			args: ((c.args as string[]) ?? []).join('\n'), timeout_secs: c.timeout_secs == null ? '' : String(c.timeout_secs), retain_days: Number(c.retain_days ?? 30)
+			args: ((c.args as string[]) ?? []).join('\n'), params: { ...((c.params as Record<string, string>) ?? {}) }, timeout_secs: c.timeout_secs == null ? '' : String(c.timeout_secs), retain_days: Number(c.retain_days ?? 30)
 		};
 	}
 	function toConfig(d: Draft): Config {
 		return {
 			script_id: d.script_id || null, cron: d.cron.trim(), timezone: d.timezone, args: d.args.split('\n').map((a) => a.trim()).filter(Boolean),
+			...cleanParams(d.params),
 			timeout_secs: d.timeout_secs.trim() ? Number(d.timeout_secs) : null, retain_days: Number(d.retain_days)
 		};
+	}
+	/** Only the values set (`params` is left out when there are none, as the server stores it). */
+	export function cleanParams(p: Record<string, string>): { params?: Record<string, string> } {
+		const set = Object.fromEntries(Object.entries(p).filter(([, v]) => v !== ''));
+		return Object.keys(set).length ? { params: set } : {};
 	}
 	export const normalize = (c: Config) => toConfig(fromConfig(c));
 	export const blankSchedule = (): Config => ({ script_id: null, cron: '0 2 * * *', timezone: localTz, args: [], timeout_secs: null, retain_days: 30 });
@@ -34,6 +40,7 @@
 	import Skeleton from '#lib/ui/Skeleton.svelte';
 	import Textarea from '#lib/ui/Textarea.svelte';
 	import PField from './PField.svelte';
+	import ParamInputs, { missing } from '../scripts/ParamInputs.svelte';
 
 	/** A scheduled script: what runs, with which arguments, and when, as a config. */
 	let {
@@ -67,7 +74,7 @@
 	const timeoutError = $derived(draft.timeout_secs.trim() && !(Number.isInteger(Number(draft.timeout_secs)) && Number(draft.timeout_secs) >= 1 && Number(draft.timeout_secs) <= 86400) ? 'Whole seconds, 1–86400' : undefined);
 	$effect(() => {
 		const c = toConfig(draft);
-		const ok = !!c.script_id && !timeoutError && !preview?.error;
+		const ok = !!c.script_id && !timeoutError && !preview?.error && !missing(script?.params ?? [], draft.params).length;
 		untrack(() => onchange(c, ok));
 	});
 
@@ -109,6 +116,12 @@
 			<!-- Mounted once the scripts are in: the input shows the selected label from its first render. -->
 			{#if scripts.data}<Combobox id="sc-script" bind:value={draft.script_id} items={scriptItems} placeholder="Pick a saved script" label="Script" onchange={pick} disabled={fixed} />{:else}<Skeleton class="h-8 w-full" />{/if}
 		</PField>
+		{#if script?.params?.length}
+			<fieldset class="space-y-2">
+				<legend class="label">Parameters</legend>
+				<ParamInputs specs={script.params} bind:values={draft.params} {clientId} vaultOnly variables idPrefix="sc-p" {disabled} />
+			</fieldset>
+		{/if}
 		<PField path="args" label="Arguments" id="sc-args" hint="One per line, passed to the script in order.">
 			<Textarea id="sc-args" rows={2} class="font-mono text-[13px]" bind:value={draft.args} />
 		</PField>

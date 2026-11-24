@@ -229,13 +229,21 @@ const jobs = statuses.map((status, i) => {
 });
 const jobDetail = (j: (typeof jobs)[number]) => ({
 	...j, body: 'df -h --output=target,pcent | sort -k2 -rn', args: [], timeout_secs: 300,
+	params: j.id === 'j-1' ? { min_pct: 95, notify: 'ops@acme.example', token: '•••' } : {},
 	stdout: 'Mounted on Use%\n/          96%\n/var       66%\n/boot      12%\n', stderr: j.status === 'failed' ? 'warning: / is above 95%\n' : '',
 	stdout_len: 62, stderr_len: j.status === 'failed' ? 25 : 0
 });
 const scripts = [
-	{ id: 's-disk', name: 'Disk usage report', description: 'Free space per mount, fullest first', interpreter: 'bash', body: 'df -h --output=target,pcent | sort -k2 -rn', timeout_secs: 120, client_id: null, client_name: null, created_at: ago(9000), updated_at: ago(2000) },
-	{ id: 's-spool', name: 'Restart print spooler', description: 'Clears stuck print jobs', interpreter: 'powershell', body: 'Stop-Service Spooler -Force\nRemove-Item C:\\Windows\\System32\\spool\\PRINTERS\\* -Force\nStart-Service Spooler', timeout_secs: 60, client_id: 'c-acme', client_name: 'Acme Corp', created_at: ago(8000), updated_at: ago(300) },
-	{ id: 's-upd', name: 'Pending updates', description: '', interpreter: 'python', body: 'import subprocess\nprint(subprocess.run(["apt", "list", "--upgradable"], capture_output=True, text=True).stdout)', timeout_secs: 300, client_id: null, client_name: null, created_at: ago(7000), updated_at: ago(7000) }
+	{ id: 's-disk', name: 'Disk usage report', description: 'Free space per mount, fullest first', interpreter: 'bash', body: 'df -h --output=target,pcent | sort -k2 -rn', timeout_secs: 120, client_id: null, client_name: null,
+		params: [{ name: 'min_pct', label: 'Warn above (%)', type: 'number', required: false, default: 90, description: 'Mounts fuller than this are listed first' }], created_at: ago(9000), updated_at: ago(2000) },
+	{ id: 's-spool', name: 'Restart print spooler', description: 'Clears stuck print jobs', interpreter: 'powershell', body: 'Stop-Service Spooler -Force\nRemove-Item C:\\Windows\\System32\\spool\\PRINTERS\\* -Force\nStart-Service Spooler', timeout_secs: 60, client_id: 'c-acme', client_name: 'Acme Corp',
+		params: [
+			{ name: 'printer', label: 'Printer', type: 'text', required: true, description: 'Queue to clear, or * for all' },
+			{ name: 'mode', label: 'Mode', type: 'select', required: false, default: 'safe', choices: ['safe', 'force'], description: '' },
+			{ name: 'notify', label: 'Notify when done', type: 'bool', required: false, default: false, description: '' },
+			{ name: 'admin_password', label: 'Print server admin', type: 'secret', required: false, description: 'Only for remote queues' }
+		], created_at: ago(8000), updated_at: ago(300) },
+	{ id: 's-upd', name: 'Pending updates', description: '', interpreter: 'python', body: 'import subprocess\nprint(subprocess.run(["apt", "list", "--upgradable"], capture_output=True, text=True).stdout)', timeout_secs: 300, client_id: null, client_name: null, params: [], created_at: ago(7000), updated_at: ago(7000) }
 ];
 
 const page = <T>(items: T[], limit = 1000) => ({ items: items.slice(0, limit), next: null, prev: null, total: items.length, total_exact: true });
@@ -862,7 +870,7 @@ const items: PItem[] = [
 	...policies.map((p) => ({ id: p.id, set: alertSet[p.id], module: 'alert', name: p.name, enabled: p.enabled, config: alertConfig(p), client_id: p.client_id, site_id: p.site_id, excluded: p.excluded })),
 	{ id: 'p-veeam', set: SET.acmeWin, module: 'alert', name: 'Backup service stopped', enabled: true, client_id: 'c-acme', site_id: null, excluded: [],
 		config: { kind: 'service', params: { services: ['VeeamBackupSvc'], auto_only: false, exclude: [] }, severity: 'critical', channel_ids: ['ch-mail'], notify_resolved: true, renotify_minutes: null, ticket_board_id: 'b-alerts', ticket_priority: 2, ticket_auto_resolve: true, run_script_id: null } },
-	...schedules.map((x) => ({ id: x.id, set: x.set_id, module: 'schedule', name: x.name, enabled: x.enabled, client_id: x.client_id, site_id: x.site_id, excluded: [], config: { script_id: x.script_id, cron: x.cron, timezone: x.timezone, args: x.args, timeout_secs: x.timeout_secs, retain_days: x.retain_days } })),
+	...schedules.map((x) => ({ id: x.id, set: x.set_id, module: 'schedule', name: x.name, enabled: x.enabled, client_id: x.client_id, site_id: x.site_id, excluded: [], config: { script_id: x.script_id, cron: x.cron, timezone: x.timezone, args: x.args, ...(x.id === 'sc-1' ? { params: { min_pct: '95' } } : {}), timeout_secs: x.timeout_secs, retain_days: x.retain_days } })),
 	{ id: 'sw-req', set: SET.acmeWin, module: 'software', name: 'Firefox on Acme Windows devices', enabled: true, client_id: 'c-acme', site_id: null, excluded: [], config: { package_id: 'sw-ff', state: 'latest', bootstrap_choco: false, window: null } },
 	{ id: 'au-welcome', set: SET.root, module: 'automation', name: 'Welcome new devices', enabled: true, client_id: null, site_id: null, excluded: [],
 		config: { trigger: 'enrollment', script_id: 's-disk', args: [], timeout_secs: null, offline_minutes: null, alert_kind: null, retry_failed: true, max_attempts: 3, retry_minutes: 30, cooldown_minutes: 60, max_runs_per_hour: 100, respect_window: false, retain_days: 30 } },
@@ -1079,8 +1087,10 @@ const vaultItems = [
 	{ id: V.m365, name: 'Microsoft 365 global admin', username: 'admin@acmecorp.onmicrosoft.com', url: 'https://admin.microsoft.com', has_password: true, has_totp: true, has_notes: true, docs: 1, password_changed_at: ago(60 * 24 * 12) },
 	{ id: V.wifi, name: 'Staff Wi-Fi key', username: '', url: '', has_password: true, has_totp: false, has_notes: false, docs: 2, password_changed_at: ago(60 * 24 * 160) },
 	{ id: V.sw, name: 'Core switch', username: 'manager', url: '10.0.0.2', has_password: true, has_totp: false, has_notes: false, docs: 0, password_changed_at: ago(60 * 24 * 300) },
-	{ id: V.veeam, name: 'Veeam console', username: 'ACME\\svc-backup', url: 'rdp://acme-backup01', has_password: true, has_totp: false, has_notes: true, docs: 1, password_changed_at: null }
-].map((v, i) => ({ ...v, client_id: 'c-acme', updated_at: ago(60 * (30 + i * 200)), updated_by_name: i % 2 ? 'Terry Tech' : 'Dana Admin' }));
+	{ id: V.veeam, name: 'Veeam console', username: 'ACME\\svc-backup', url: 'rdp://acme-backup01', has_password: true, has_totp: false, has_notes: true, docs: 1, password_changed_at: null },
+	{ id: '6f1c0c1e-9a51-4c0e-b6c9-0a4de1f3a1f0', name: 'BitLocker recovery: acme-dc01 C:', username: '{3F2A6C1D-4B8E-4F0A-9C21-7D5E8B1A0C33}', url: '', has_password: true, has_totp: false, has_notes: false, docs: 0, password_changed_at: ago(60 * 24 * 3),
+		managed_kind: 'disk_recovery', agent_id: 'a-1', agent_hostname: 'acme-dc01', managed_state: null }
+].map((v, i) => ({ managed_kind: null, agent_id: null, agent_hostname: null, managed_state: null, ...v, client_id: 'c-acme', updated_at: ago(60 * (30 + i * 200)), updated_by_name: i % 2 ? 'Terry Tech' : 'Dana Admin' }));
 const vaultDetail = (id: string) => {
 	const v = vaultItems.find((x) => x.id === id)!;
 	return {
@@ -1346,7 +1356,10 @@ export async function mockApi(p: Page, opts: { signedIn?: boolean; ssoRequired?:
 		if (path === '/doc-categories') return json(docCategories.map(categoryOut));
 		if (path === '/doc-templates') return json(docTemplates);
 		if ((m = path.match(/^\/doc-templates\/([^/]+)$/))) return json({ ...docTemplates.find((t) => t.id === m![1])!, body: '# {{client.name}}\n\n```fields\nLabel:\n```\n' });
-		if ((m = path.match(/^\/clients\/([^/]+)\/vault$/))) return json(vaultItems.filter((v) => v.client_id === m![1]));
+		if ((m = path.match(/^\/clients\/([^/]+)\/vault$/))) {
+			const kind = url.searchParams.get('kind');
+			return json(vaultItems.filter((v) => v.client_id === m![1] && (!kind || (kind === 'manual' ? !v.managed_kind : kind === 'managed' ? !!v.managed_kind : v.managed_kind === kind))));
+		}
 		if ((m = path.match(/^\/vault\/([^/]+)$/))) return json(vaultDetail(m![1]));
 		if (path === '/tags') return json(tagsOut());
 		if (path === '/custom-fields') return json(fieldDefs.filter((f) => !q.get('entity') || f.entity === q.get('entity')));

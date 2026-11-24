@@ -278,7 +278,12 @@ async fn run_session(
         let state = state.clone();
         tokio::spawn(async move { crate::automation::on_connect(&state, agent_id, first_connect, last_seen).await });
     }
-    let dispatched = dispatch_queued(&state, agent_id, &tx).await.unwrap_or_else(|e| {
+    // What it supports decides what the queued jobs may carry (patches::on_connect stores it
+    // too, later).
+    if let Err(e) = sqlx::query("UPDATE agents SET capabilities = $2 WHERE id = $1").bind(agent_id).bind(&capabilities).execute(&state.db).await {
+        warn!(%agent_id, "storing capabilities: {e}");
+    }
+    let dispatched = dispatch_queued(&state, agent_id, client_id, &tx).await.unwrap_or_else(|e| {
         warn!(%agent_id, "dispatching queued jobs: {e}");
         0
     });
@@ -369,8 +374,9 @@ pub async fn mark_lost(db: &sqlx::PgPool, agent_id: Uuid, held: &[Uuid]) -> sqlx
     Ok(n)
 }
 
-/// Sends every queued job to a freshly connected agent; returns how many.
-pub async fn dispatch_queued(state: &AppState, agent_id: Uuid, tx: &mpsc::Sender<ServerMsg>) -> anyhow::Result<usize> {
+/// Sends every queued job to a freshly connected agent; returns how many. Each gets its
+/// environment (parameters included) now; one that can't run on this agent ends as `error`.
+pub async fn dispatch_queued(state: &AppState, agent_id: Uuid, client_id: Uuid, tx: &mpsc::Sender<ServerMsg>) -> anyhow::Result<usize> {
     let rows: Vec<(Uuid, String, String, serde_json::Value, i32)> = sqlx::query_as(
         "UPDATE jobs SET status = 'sent', sent_at = now()
           WHERE agent_id = $1 AND status = 'queued'
@@ -380,14 +386,25 @@ pub async fn dispatch_queued(state: &AppState, agent_id: Uuid, tx: &mpsc::Sender
     .fetch_all(&state.db)
     .await?;
     let n = rows.len();
+    let ids: Vec<Uuid> = rows.iter().map(|r| r.0).collect();
+    let mut envs = if ids.is_empty() { Default::default() } else { crate::params::job_env(state, &ids).await? };
     for (job_id, interp, body, args, timeout) in rows {
         let Some(interpreter) = parse_interpreter(&interp) else { continue };
+        let env = match envs.remove(&job_id) {
+            Some(Ok(env)) => env,
+            Some(Err(why)) => {
+                crate::api::end_job_with_error(state, job_id, agent_id, client_id, &why).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+                continue;
+            }
+            None => vec![],
+        };
         let job = ScriptJob {
             job_id,
             interpreter,
             script: body,
             args: serde_json::from_value(args).unwrap_or_default(),
             timeout_secs: timeout.max(1) as u32,
+            env,
         };
         let _ = tx.send(ServerMsg::RunScript(job)).await;
     }

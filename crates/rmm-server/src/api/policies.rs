@@ -792,11 +792,13 @@ async fn check_refs(st: &AppState, u: &User, module: Module, config: &Value, own
             if let Some(s) = uuid(config.get("script_id")) {
                 script_ok(s).await?;
             }
+            vault_params_ok(u, config)?;
         }
         Module::Automation => {
             if let Some(s) = uuid(config.get("script_id")) {
                 script_ok(s).await?;
             }
+            vault_params_ok(u, config)?;
             if let Some(t) = uuid(config.get("tag_id")) {
                 let exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM tags WHERE id = $1)").bind(t).fetch_one(&st.db).await?;
                 if !exists {
@@ -837,6 +839,17 @@ async fn check_refs(st: &AppState, u: &User, module: Module, config: &Value, own
             }
         }
         _ => {}
+    }
+    Ok(())
+}
+
+/// A schedule or automation whose parameters name vault items is written by someone who may use
+/// the vault (and not through an API key: the vault isn't in the public API). Which client the
+/// items belong to is checked with the merged configs (params::check_policy).
+fn vault_params_ok(u: &User, config: &Value) -> ApiResult<()> {
+    let names_vault = config.get("params").and_then(Value::as_object).is_some_and(|m| m.values().any(|v| v.as_str().and_then(crate::params::vault_ref).is_some()));
+    if names_vault && (u.api_key.is_some() || !super::vault::can_read(u)) {
+        return Err(ApiError::Denied("taking a parameter from the vault needs vault access (and two-factor authentication)".into()));
     }
     Ok(())
 }
@@ -933,6 +946,7 @@ pub async fn create_item(State(st): State<Arc<AppState>>, u: User, Path(set_id):
         schedule_state(&mut tx, id, &config).await?;
     }
     policy::rebuild(&mut tx, Some(&[id])).await?;
+    policy::validate_effective(&mut tx, &[id]).await?.map_err(bad)?;
     let agents = policy::agents_reached(&mut tx, &[id]).await?;
     tx.commit().await?;
     auth::audit(

@@ -19,6 +19,7 @@
 //! | `siem_destinations`     | `token`                                        | `token_sealed`      |
 //! | `net_credentials`       | `secret` (SNMP community or passphrases)       | `secret_sealed`     |
 //! | `vault_keys`            | `wrapped_key` (AAD `vault-key:<client id>`)    | always sealed       |
+//! | `jobs`                  | `env_sealed` (AAD `job-env:<job id>`; secret script parameters of a job not yet delivered) | always sealed |
 //!
 //! The vault's items are sealed with the per-client keys, not with `RMM_DATA_KEY`, so
 //! rewrapping `vault_keys` is all the vault needs: no item is touched.
@@ -96,6 +97,7 @@ pub const TABLES: &[Table] = &[
     Table { name: "siem_destinations", pk: "id", pk_type: "uuid", columns: &["token"], flag: Some("token_sealed"), aad_prefix: None },
     Table { name: "net_credentials", pk: "id", pk_type: "uuid", columns: &["secret"], flag: Some("secret_sealed"), aad_prefix: None },
     Table { name: "vault_keys", pk: "client_id", pk_type: "uuid", columns: &["wrapped_key"], flag: None, aad_prefix: Some("vault-key:") },
+    Table { name: "jobs", pk: "id", pk_type: "uuid", columns: &["env_sealed"], flag: None, aad_prefix: Some("job-env:") },
 ];
 
 #[derive(Debug, PartialEq, Eq)]

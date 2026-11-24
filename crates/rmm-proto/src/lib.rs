@@ -707,7 +707,11 @@ impl UpdateState {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Agents listing this in `Auth.capabilities` set [`ScriptJob::env`] on the script's process.
+/// The server doesn't run a job with parameters on an agent without it.
+pub const SCRIPT_ENV_CAPABILITY: &str = "script_env";
+
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ScriptJob {
     pub job_id: Uuid,
     pub interpreter: Interpreter,
@@ -715,6 +719,24 @@ pub struct ScriptJob {
     #[serde(default)]
     pub args: Vec<String>,
     pub timeout_secs: u32,
+    /// Environment variables for the script (`RMM_*`: the built-ins and `RMM_PARAM_<NAME>`
+    /// parameters, some of them secrets). Older agents ignore it; older servers send none.
+    #[serde(default)]
+    pub env: Vec<(String, String)>,
+}
+
+/// Leaves the environment's values out: some are secrets.
+impl std::fmt::Debug for ScriptJob {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScriptJob")
+            .field("job_id", &self.job_id)
+            .field("interpreter", &self.interpreter)
+            .field("script_len", &self.script.len())
+            .field("args", &self.args.len())
+            .field("timeout_secs", &self.timeout_secs)
+            .field("env", &self.env.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>())
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -889,9 +911,39 @@ mod tests {
             script: "Get-Date".into(),
             args: vec![],
             timeout_secs: 30,
+            env: vec![("RMM_PARAM_TOKEN".into(), "s3cret".into())],
         });
         let buf = encode(&msg).unwrap();
-        assert!(matches!(decode::<ServerMsg>(&buf).unwrap(), ServerMsg::RunScript(_)));
+        let ServerMsg::RunScript(job) = decode::<ServerMsg>(&buf).unwrap() else { panic!("not a RunScript") };
+        assert_eq!(job.env, vec![("RMM_PARAM_TOKEN".to_string(), "s3cret".to_string())]);
+        assert!(!format!("{job:?}").contains("s3cret"), "Debug leaves values out");
+    }
+
+    #[test]
+    fn script_job_env_is_optional_both_ways() {
+        // What servers before parameters send: no `env`.
+        #[derive(Serialize)]
+        struct Old {
+            job_id: Uuid,
+            interpreter: Interpreter,
+            script: &'static str,
+            args: Vec<String>,
+            timeout_secs: u32,
+        }
+        let old = rmp_serde::to_vec_named(&Old { job_id: Uuid::nil(), interpreter: Interpreter::Bash, script: "true", args: vec![], timeout_secs: 5 }).unwrap();
+        let job: ScriptJob = decode(&old).unwrap();
+        assert!(job.env.is_empty());
+        // And an old agent's struct reads a new server's job (unknown fields are skipped).
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct OldAgent {
+            job_id: Uuid,
+            script: String,
+            timeout_secs: u32,
+        }
+        let new = encode(&ScriptJob { env: vec![("RMM_JOB_ID".into(), "x".into())], ..job }).unwrap();
+        let o: OldAgent = decode(&new).unwrap();
+        assert_eq!(o.script, "true");
     }
 
     #[test]

@@ -99,6 +99,9 @@ pub struct RunResult {
     pub sent: usize,
     /// Agents still busy with (or waiting for) this schedule's previous run.
     pub skipped: usize,
+    /// Jobs that ended as `error` at once: their parameters couldn't be prepared, or the agent
+    /// is too old for them.
+    pub failed: usize,
 }
 
 /// Starts one run of a schedule now. `by` is the user who pressed Run now, if any.
@@ -134,9 +137,13 @@ pub async fn run_schedule(st: &AppState, id: Uuid, by: Option<Uuid>) -> anyhow::
         let here: ScheduleConfig = serde_json::from_value(config).unwrap_or_else(|_| c.clone());
         let timeout = here.timeout_secs.unwrap_or(script_timeout).clamp(1, 86400);
         let job_id = Uuid::new_v4();
+        let (params, sealed, why) = match crate::params::env_for(st, c.script_id, &here.params, agent_id, agent_client, job_id, "schedule").await? {
+            Ok((p, s)) => (p, s, None),
+            Err(why) => (json!({}), None, Some(why)),
+        };
         sqlx::query(
-            "INSERT INTO jobs (id, agent_id, script_id, interpreter, body, args, timeout_secs, created_by, schedule_id)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+            "INSERT INTO jobs (id, agent_id, script_id, interpreter, body, args, timeout_secs, created_by, schedule_id, params, env_sealed)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
         )
         .bind(job_id)
         .bind(agent_id)
@@ -147,15 +154,23 @@ pub async fn run_schedule(st: &AppState, id: Uuid, by: Option<Uuid>) -> anyhow::
         .bind(timeout)
         .bind(by)
         .bind(id)
+        .bind(params)
+        .bind(sealed)
         .execute(&st.db)
         .await?;
-        let job = ScriptJob { job_id, interpreter, script: body.clone(), args: here.args, timeout_secs: timeout as u32 };
+        if let Some(why) = why {
+            crate::api::end_job_with_error(st, job_id, agent_id, agent_client, &why).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+            result.failed += 1;
+            continue;
+        }
+        let job = ScriptJob { job_id, interpreter, script: body.clone(), args: here.args, timeout_secs: timeout as u32, env: vec![] };
         match crate::api::deliver_job(st, agent_id, agent_client, job).await? {
             "sent" => result.sent += 1,
+            "error" => result.failed += 1,
             _ => result.queued += 1,
         }
     }
-    info!(schedule = %id, %name, sent = result.sent, queued = result.queued, skipped = result.skipped, "schedule ran");
+    info!(schedule = %id, %name, sent = result.sent, queued = result.queued, skipped = result.skipped, failed = result.failed, "schedule ran");
     Ok(result)
 }
 

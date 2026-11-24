@@ -12,6 +12,7 @@
 	import Select from '#lib/ui/Select.svelte';
 	import Textarea from '#lib/ui/Textarea.svelte';
 	import CodeEditor from './CodeEditor.svelte';
+	import ParamInputs, { missing } from './scripts/ParamInputs.svelte';
 
 	let {
 		agents,
@@ -39,6 +40,9 @@
 	let args = $state('');
 	let timeout = $state(300);
 	let busy = $state(false);
+	let values = $state<Record<string, string>>({});
+	// The vault of the devices' one client can fill secrets.
+	const oneClient = $derived(agents.length && agents.every((a) => a.client_id === agents[0].client_id) ? agents[0].client_id : null);
 
 	$effect(() => {
 		interpreter = windowsOnly ? 'powershell' : 'bash';
@@ -51,6 +55,9 @@
 		{ value: ADHOC, label: 'Ad-hoc script', hint: 'type it below' },
 		...scripts.map((s) => ({ value: s.id, label: s.name, hint: `${interpreterLabel(s.interpreter)}${s.client_name ? ` · ${s.client_name}` : ''}` }))
 	]);
+	const specs = $derived(selected?.params ?? []);
+	const lacking = $derived(missing(specs, values));
+	const params = $derived(Object.fromEntries(Object.entries(values).filter(([k, v]) => v !== '' && specs.some((s) => s.name === k))));
 	const argList = $derived(args.split('\n').map((a) => a.trim()).filter(Boolean));
 
 	async function run(e: SubmitEvent) {
@@ -59,7 +66,7 @@
 		try {
 			const ids = agents.map((a) => a.id);
 			const payload = {
-				...(selected ? { agent_ids: ids, script_id: selected.id, args: argList } : { agent_ids: ids, interpreter, body, args: argList, timeout_secs: timeout }),
+				...(selected ? { agent_ids: ids, script_id: selected.id, args: argList, params } : { agent_ids: ids, interpreter, body, args: argList, timeout_secs: timeout }),
 				ticket_id: ticketId ?? null
 			};
 			const res = await api.post<{ jobs: { job_id: string; status: string }[]; skipped: string[] }>('/jobs', payload);
@@ -91,6 +98,12 @@
 				<div class="label">{interpreterLabel(selected.interpreter)} · timeout {selected.timeout_secs}s</div>
 				<pre class="code-block max-h-64">{selected.body}</pre>
 			</div>
+			{#if specs.length}
+				<fieldset class="space-y-3">
+					<legend class="text-sm font-semibold">Parameters</legend>
+					<ParamInputs {specs} bind:values clientId={oneClient} variables idPrefix="rs-p" />
+				</fieldset>
+			{/if}
 		{:else}
 			<div class="grid gap-3 sm:grid-cols-2">
 				<Field label="Interpreter" id="rs-interp">
@@ -110,6 +123,6 @@
 	</form>
 	{#snippet footer()}
 		<Button onclick={onclose}>Cancel</Button>
-		<Button variant="primary" type="submit" form="run-script" loading={busy} disabled={!selected && !body.trim()}>Run</Button>
+		<Button variant="primary" type="submit" form="run-script" loading={busy} disabled={(!selected && !body.trim()) || lacking.length > 0}>Run</Button>
 	{/snippet}
 </Modal>
