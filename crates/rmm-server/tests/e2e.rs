@@ -8409,9 +8409,13 @@ async fn software(url: &str, admin: &Api, db: &sqlx::PgPool, dir: &Path, id1: &s
         (fake_state()["installed"].get("a-only-e2e").is_some()).then_some(())
     })
     .await;
-    let v = admin.get(&format!("/agents/{id1}/software")).await;
-    let row = v["items"].as_array().unwrap().iter().find(|i| i["package_id"] == a_only_id.as_str()).cloned().unwrap();
-    assert_eq!((row["desired"].as_str(), row["compliant"].as_bool()), (Some("present"), Some(true)), "{row}");
+    // The package is in place; the server marks the device compliant once the run's result is in.
+    let row = eventually(30, "the device to be compliant", || async {
+        let v = admin.get(&format!("/agents/{id1}/software")).await;
+        v["items"].as_array().unwrap().iter().find(|i| i["package_id"] == a_only_id.as_str() && i["compliant"] == true).cloned()
+    })
+    .await;
+    assert_eq!(row["desired"].as_str(), Some("present"), "{row}");
     // The policy page of the device lists the requirement.
     let pol = admin.get(&format!("/agents/{id1}/policy")).await;
     assert!(pol["policies"].as_array().unwrap().iter().any(|p| p["module"] == "software"), "{pol}");
