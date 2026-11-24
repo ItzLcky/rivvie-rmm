@@ -21,6 +21,7 @@
 	import Checkbox from '#lib/ui/Checkbox.svelte';
 	import Teams from './Teams.svelte';
 	import Canned from './Canned.svelte';
+	import Templates from './Templates.svelte';
 	import PortalSettings from './PortalSettings.svelte';
 
 	const channels = resource(() => api.get<{ id: string; name: string; kind: string }[]>('/notification-channels'));
@@ -209,6 +210,7 @@
 
 	<Teams onchange={refreshMeta} />
 	<Canned />
+	<Templates meta={meta.data ?? null} />
 	<PortalSettings boards={boards.data ?? []} />
 
 	<section class="card" aria-labelledby="types-h">

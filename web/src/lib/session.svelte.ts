@@ -44,7 +44,9 @@ export type Permission =
 	| 'vault.read'
 	| 'vault.manage'
 	| 'audit.read'
-	| 'oncall.manage';
+	| 'oncall.manage'
+	| 'identity.read'
+	| 'identity.manage';
 
 /** Holds a named permission (the server sends the effective set; older servers: role defaults). */
 export function allowed(perm: Permission): boolean {
@@ -52,5 +54,5 @@ export function allowed(perm: Permission): boolean {
 	if (!u) return false;
 	if (u.permissions) return u.permissions.includes(perm);
 	if (perm === 'security.read') return true;
-	return perm === 'security.respond' || perm === 'vault.read' || perm === 'vault.manage' ? can('technician') : can('admin');
+	return ['security.respond', 'vault.read', 'vault.manage', 'identity.read', 'identity.manage'].includes(perm) ? can('technician') : can('admin');
 }
