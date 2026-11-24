@@ -277,9 +277,9 @@ for (const theme of ['light', 'dark'] as const) {
 			await settle(page);
 			await page.getByRole('button', { name: 'Run script' }).first().click();
 			const dialog = page.getByRole('dialog');
-			await dialog.getByRole('combobox', { name: 'Script' }).click();
+			await dialog.getByRole('button', { name: 'Show options' }).click();
 			await page.getByRole('option', { name: /Restart print spooler/ }).click();
-			await dialog.getByLabel('Printer').fill('PRN-{{agent.hostname}}');
+			await dialog.locator('#rs-p-printer').fill('PRN-{{agent.hostname}}');
 			await expect(dialog.getByText('$RMM_PARAM_ADMIN_PASSWORD')).toBeVisible();
 			await expect(page).toHaveScreenshot(`${theme}-run-script-params.png`);
 			const r = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa']).analyze();

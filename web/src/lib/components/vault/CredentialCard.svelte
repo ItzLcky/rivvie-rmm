@@ -128,7 +128,7 @@
 			{#if item.managed_kind}
 				<p class="mt-0.5 flex flex-wrap items-center gap-1.5 text-xs">
 					<Badge tone="info">Managed</Badge>
-					<span class="text-muted">{managedKindLabel[item.managed_kind]}{#if item.agent_id} · {#if item.agent_hostname}<a class="link" href="/agents/{item.agent_id}">{item.agent_hostname}</a>{:else}device{/if}{/if}{#if item.managed_state} · {item.managed_state}{/if}</span>
+					<span class="text-muted">{managedKindLabel[item.managed_kind]}{#if item.agent_id}{' · '}{#if item.agent_hostname}<a class="link" href="/agents/{item.agent_id}">{item.agent_hostname}</a>{:else}device{/if}{/if}{#if item.managed_state}{` · ${item.managed_state}`}{/if}</span>
 				</p>
 			{/if}
 			{#if item.url}

@@ -103,7 +103,7 @@
 						{/if}
 					</div>
 				{/if}
-				<p class="hint">{#if s.description}{s.description} · {/if}<code class="text-xs">${envName(s.name)}</code></p>
+				<p class="hint">{#if s.description}{`${s.description} · `}{/if}<code class="text-xs">${envName(s.name)}</code></p>
 			</Field>
 		{/each}
 	</div>

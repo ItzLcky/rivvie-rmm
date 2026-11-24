@@ -59,3 +59,8 @@ Built in parallel tracks and merged with full local checks (clippy incl. Windows
 - **Reach:** software deployment (`0032`, [design](design/software.md)); network discovery and SNMP (`0033`, [design](design/network.md)); Windows e2e sections and a [real-host test plan](design/windows-testing.md).
 
 Known gaps: no Windows run of any of it; SSO untested against real IdPs; no alerts for failed deployments; SNMP traps, LLDP and IPv6 scans not built; automations whose `field_value` no longer matches a select field's choices never fire.
+
+## Parity features (in progress)
+
+- **Script parameters** (`0036`, [design](design/script-params.md)): typed parameters on saved scripts, passed as `RMM_PARAM_*` environment variables with per-device placeholders and built-ins; secrets sealed until delivery or taken from the vault.
+- **Managed vault items** (`0037`, [design](design/vault-managed.md)): the system write path (`vault::put_managed`) that disk encryption escrow, LAPS and identity resets use.

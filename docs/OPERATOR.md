@@ -121,7 +121,7 @@ covered in [RELEASING.md](RELEASING.md) and the README's [Agent updates](../READ
 
 `rmm-server rotate-data-key` re-encrypts everything sealed with the key under a new one, in one
 transaction: two-factor secrets, single sign-on client secrets, webhook signing secrets, IMAP and
-SMTP passwords, SIEM tokens, mailbox and accounting credentials, detection context, and the vault's per-client keys (the vault's items
+SMTP passwords, SIEM tokens, mailbox and accounting credentials, detection context, the secret script parameters of jobs not yet delivered, and the vault's per-client keys (the vault's items
 aren't touched). Stop the server first, then:
 
 ```sh

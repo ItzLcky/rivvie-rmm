@@ -12,6 +12,23 @@ back, restore the backup taken before the upgrade (see
 
 ## [Unreleased]
 
+Migrations `0036` and `0037` are new.
+
+### Added
+
+- **Script parameters.** Saved scripts declare typed parameters (text, number, yes/no, choice,
+  secret) that the run dialog, schedules and automations fill in; each reaches the script as the
+  environment variable `RMM_PARAM_<NAME>` (the script text is never rewritten). Text values may
+  use `{{agent.hostname}}`, `{{client.name}}`, `{{site.name}}`, `{{field.<name>}}` and more,
+  expanded per device; every job also gets `RMM_AGENT_*`, `RMM_CLIENT_*`, `RMM_SITE_*` and
+  `RMM_JOB_ID`. Secrets are never shown or kept after the job runs, and policies take them from
+  the client's vault. Needs agents of this release (older ones end such jobs as `error`). See
+  [docs/design/script-params.md](docs/design/script-params.md).
+- **Managed vault items.** The server can keep credentials of its own in a client's vault
+  (`vault::put_managed`, for the coming disk encryption escrow and local admin rotation),
+  shown with a "Managed" badge and filter; their password and username can't be edited by hand.
+  See [docs/design/vault-managed.md](docs/design/vault-managed.md).
+
 ## [0.2.0] - 2026-11-23
 
 The first release since agent self-update shipped. Everything below is new since `v0.1.1`.
