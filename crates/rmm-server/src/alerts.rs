@@ -524,9 +524,29 @@ pub(crate) async fn policies_for(st: &AppState, agent_id: Uuid, kind: &str) -> s
     Ok(rows.into_iter().filter_map(PolicyRow::policy).collect())
 }
 
-/// What an alert's item says for the alert's agent: its channels and whether to announce
-/// clearing (none if the item is gone).
-async fn alert_channels(st: &AppState, policy_id: Option<Uuid>, agent_id: Uuid) -> sqlx::Result<(Vec<Uuid>, bool)> {
+/// Enabled alert items of one kind defined in All devices whose limit covers this client and
+/// site, with their own config: what applies to something without an agent (a monitor the
+/// server runs). Overrides in sets below don't apply (there's no agent to be in a set).
+pub(crate) async fn root_policies_for(st: &AppState, client_id: Uuid, site_id: Uuid, kind: &str) -> sqlx::Result<Vec<Policy>> {
+    let rows: Vec<PolicyRow> = sqlx::query_as(
+        "SELECT i.id, i.name, i.client_id, i.site_id, i.excluded_agents, i.config, ARRAY[i.set_id] AS sets
+           FROM policy_items i
+          WHERE i.set_id = $1 AND i.module = 'alert' AND i.enabled AND i.config ->> 'kind' = $2
+            AND (i.client_id IS NULL OR i.client_id = $3) AND (i.site_id IS NULL OR i.site_id = $4)
+          ORDER BY i.created_at",
+    )
+    .bind(crate::policy::ROOT)
+    .bind(kind)
+    .bind(client_id)
+    .bind(site_id)
+    .fetch_all(&st.db)
+    .await?;
+    Ok(rows.into_iter().filter_map(PolicyRow::policy).collect())
+}
+
+/// What an alert's item says for the alert's agent (the item's own config without one): its
+/// channels and whether to announce clearing (none if the item is gone).
+async fn alert_channels(st: &AppState, policy_id: Option<Uuid>, agent_id: Option<Uuid>) -> sqlx::Result<(Vec<Uuid>, bool)> {
     let Some(pid) = policy_id else { return Ok((vec![], false)) };
     let config: Option<Value> = sqlx::query_scalar("SELECT policy_config($1, $2)").bind(pid).bind(agent_id).fetch_one(&st.db).await?;
     Ok(match config.and_then(|c| serde_json::from_value::<crate::policy::AlertConfig>(c).ok()) {
@@ -546,10 +566,8 @@ pub(crate) async fn announce(st: &AppState, ids: &[Uuid], event: &'static str, c
     if ids.is_empty() {
         return;
     }
-    let rows: Vec<(Uuid, Uuid, Uuid, bool)> = match sqlx::query_as(
-        "SELECT al.id, al.agent_id, s.client_id, al.suppressed FROM alerts al JOIN agents a ON a.id = al.agent_id
-           JOIN sites s ON s.id = a.site_id
-          WHERE al.id = ANY($1)",
+    let rows: Vec<(Uuid, Option<Uuid>, Uuid, bool)> = match sqlx::query_as(
+        "SELECT al.id, al.agent_id, al.client_id, al.suppressed FROM alerts al WHERE al.id = ANY($1)",
     )
     .bind(ids)
     .fetch_all(&st.db)
@@ -591,9 +609,9 @@ pub(crate) async fn announce(st: &AppState, ids: &[Uuid], event: &'static str, c
 
 /// Alerts held back by a mute that has ended and are still open: announce them now.
 pub async fn unsuppress(st: &AppState) -> sqlx::Result<()> {
-    let rows: Vec<(Uuid, Option<Uuid>, Uuid)> = sqlx::query_as(
+    let rows: Vec<(Uuid, Option<Uuid>, Option<Uuid>)> = sqlx::query_as(
         "UPDATE alerts SET suppressed = false, last_notified_at = now()
-          WHERE suppressed AND resolved_at IS NULL AND NOT agent_muted(agent_id, now())
+          WHERE suppressed AND resolved_at IS NULL AND NOT alert_muted(agent_id, client_id, monitor_id, now())
           RETURNING id, policy_id, agent_id",
     )
     .fetch_all(&st.db)
@@ -614,7 +632,7 @@ async fn remind(st: &AppState) -> sqlx::Result<()> {
                   WHERE o.resolved_at IS NULL AND o.acknowledged_at IS NULL AND NOT o.suppressed AND o.policy_id IS NOT NULL) x
           WHERE x.id = al.id AND (x.c ->> 'renotify_minutes') IS NOT NULL
             AND coalesce(al.last_notified_at, al.opened_at) < now() - make_interval(mins => (x.c ->> 'renotify_minutes')::int)
-            AND NOT agent_muted(al.agent_id, now())
+            AND NOT alert_muted(al.agent_id, al.client_id, al.monitor_id, now())
           RETURNING al.id, x.c -> 'channel_ids'",
     )
     .fetch_all(&st.db)
@@ -726,17 +744,42 @@ pub(crate) async fn fire_on(
     details: Value,
     bump: i32,
 ) -> sqlx::Result<()> {
-    let (id, inserted): (Uuid, bool) = sqlx::query_as(
-        "INSERT INTO alerts (id, policy_id, agent_id, key, kind, severity, title, details, occurrences, device_id, monitor_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, greatest($9, 1), $10, $11)
-         ON CONFLICT (policy_id, agent_id, key) WHERE resolved_at IS NULL
+    open(st, p, Subject::Agent(agent_id), device_id, monitor_id, key, title, details, bump).await
+}
+
+/// [`fire`], for an alert without an agent: about an uptime monitor the server runs, under an
+/// item of All devices. It belongs to the client; one is open per (policy, client, key).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn fire_agentless(st: &AppState, p: &Policy, client_id: Uuid, monitor_id: Option<Uuid>, key: &str, title: &str, details: Value, bump: i32) -> sqlx::Result<()> {
+    open(st, p, Subject::Client(client_id), None, monitor_id, key, title, details, bump).await
+}
+
+/// Who an alert belongs to: an agent (the client follows from its site) or, without one, a client.
+#[derive(Debug, Clone, Copy)]
+enum Subject {
+    Agent(Uuid),
+    Client(Uuid),
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn open(st: &AppState, p: &Policy, who: Subject, device_id: Option<Uuid>, monitor_id: Option<Uuid>, key: &str, title: &str, details: Value, bump: i32) -> sqlx::Result<()> {
+    let (agent_id, client_id, conflict) = match who {
+        // The insert trigger fills in the agent's client.
+        Subject::Agent(a) => (Some(a), None, "(policy_id, agent_id, key) WHERE resolved_at IS NULL"),
+        Subject::Client(c) => (None, Some(c), "(policy_id, client_id, key) WHERE resolved_at IS NULL AND agent_id IS NULL"),
+    };
+    let (id, client_id, inserted): (Uuid, Uuid, bool) = sqlx::query_as(AssertSqlSafe(format!(
+        "INSERT INTO alerts (id, policy_id, agent_id, client_id, key, kind, severity, title, details, occurrences, device_id, monitor_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, greatest($10, 1), $11, $12)
+         ON CONFLICT {conflict}
          DO UPDATE SET last_seen_at = now(), title = EXCLUDED.title, details = EXCLUDED.details,
-                       occurrences = alerts.occurrences + $9
-         RETURNING id, (xmax = 0)",
-    )
+                       occurrences = alerts.occurrences + $10
+         RETURNING id, client_id, (xmax = 0)"
+    )))
     .bind(Uuid::new_v4())
     .bind(p.id)
     .bind(agent_id)
+    .bind(client_id)
     .bind(key)
     .bind(&p.kind)
     .bind(&p.severity)
@@ -748,22 +791,13 @@ pub(crate) async fn fire_on(
     .fetch_one(&st.db)
     .await?;
     if inserted {
-        info!(alert = %id, policy = %p.name, %agent_id, key, "alert opened");
+        info!(alert = %id, policy = %p.name, agent_id = ?agent_id, %client_id, key, "alert opened");
         announce(st, &[id], "opened", &p.channel_ids, true).await;
     } else if bump > 0 {
         // Occurrence count changed: let open lists redraw.
-        if let Ok(client_id) = client_of(st, agent_id).await {
-            st.hub.publish(Event::Alert { id, agent_id, client_id, state: "open".into() });
-        }
+        st.hub.publish(Event::Alert { id, agent_id, client_id, state: "open".into() });
     }
     Ok(())
-}
-
-async fn client_of(st: &AppState, agent_id: Uuid) -> sqlx::Result<Uuid> {
-    sqlx::query_scalar("SELECT s.client_id FROM agents a JOIN sites s ON s.id = a.site_id WHERE a.id = $1")
-        .bind(agent_id)
-        .fetch_one(&st.db)
-        .await
 }
 
 /// Resolves the policy's open alerts on this agent whose key is in `keys` (all keys if None),
@@ -786,15 +820,22 @@ pub(crate) async fn clear(st: &AppState, p: &Policy, agent_id: Uuid, keys: Optio
 }
 
 /// After a policy change: closes open alerts whose item no longer applies to their agent (the
-/// item is gone or disabled there, the agent left its reach or its limit), quietly.
+/// item is gone or disabled there, the agent left its reach or its limit), quietly. An alert
+/// without an agent (a server-run monitor's) stays while its item is an enabled `uptime` item of
+/// All devices whose limit covers the monitor.
 pub async fn close_inapplicable(st: &AppState) {
-    let res: sqlx::Result<Vec<Uuid>> = sqlx::query_scalar(
+    let res: sqlx::Result<Vec<Uuid>> = sqlx::query_scalar(AssertSqlSafe(format!(
         "UPDATE alerts al SET resolved_at = now(), resolution = 'policy'
           WHERE al.resolved_at IS NULL
-            AND NOT EXISTS (SELECT 1 FROM agent_policy ap
-                             WHERE ap.agent_id = al.agent_id AND ap.item_id = al.policy_id AND ap.module = 'alert' AND ap.enabled)
+            AND CASE WHEN al.agent_id IS NOT NULL
+                     THEN NOT EXISTS (SELECT 1 FROM agent_policy ap
+                                       WHERE ap.agent_id = al.agent_id AND ap.item_id = al.policy_id AND ap.module = 'alert' AND ap.enabled)
+                     ELSE NOT EXISTS (SELECT 1 FROM uptime_monitors m JOIN policy_items i ON i.id = al.policy_id
+                                       WHERE m.id = al.monitor_id AND {})
+                END
           RETURNING al.id",
-    )
+        crate::uptime::SERVER_ITEM_COVERS
+    )))
     .fetch_all(&st.db)
     .await;
     match res {
@@ -1071,7 +1112,7 @@ pub async fn agent_online(st: &AppState, agent_id: Uuid) {
         .fetch_all(&st.db)
         .await?;
         for (id, policy_id) in cleared {
-            let (channels, notify) = alert_channels(st, policy_id, agent_id).await?;
+            let (channels, notify) = alert_channels(st, policy_id, Some(agent_id)).await?;
             announce(st, &[id], "resolved", &channels, notify).await;
         }
         Ok(())

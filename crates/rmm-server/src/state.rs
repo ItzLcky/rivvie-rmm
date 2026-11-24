@@ -112,6 +112,9 @@ pub struct Settings {
     pub alert_retention_days: u32,
     /// How often polled alert policies (offline, CPU, memory, disk) are checked.
     pub alert_eval_secs: u32,
+    /// Uptime checks run by the server may reach loopback, private, link-local and metadata
+    /// addresses (RMM_UPTIME_ALLOW_PRIVATE=1). Off: only public addresses.
+    pub uptime_allow_private: bool,
     /// Resolved tickets move to Closed after this many days.
     pub ticket_close_days: u32,
     /// Raw inbound email (MIME) is deleted from storage after this many days.

@@ -550,11 +550,10 @@ pub async fn ack(st: &AppState, page_id: Uuid, user_id: Uuid) -> sqlx::Result<bo
     let Some(alert_id) = row else { return Ok(false) };
     cancel_pending(st).await?;
     if let Some(alert_id) = alert_id {
-        let acked: Option<(Uuid, Uuid)> = sqlx::query_as(
+        let acked: Option<(Option<Uuid>, Uuid)> = sqlx::query_as(
             "UPDATE alerts al SET acknowledged_at = now(), acknowledged_by = $2
-               FROM agents a JOIN sites s ON s.id = a.site_id
-              WHERE a.id = al.agent_id AND al.id = $1 AND al.resolved_at IS NULL AND al.acknowledged_at IS NULL
-              RETURNING al.agent_id, s.client_id",
+              WHERE al.id = $1 AND al.resolved_at IS NULL AND al.acknowledged_at IS NULL
+              RETURNING al.agent_id, al.client_id",
         )
         .bind(alert_id)
         .bind(user_id)

@@ -30,7 +30,7 @@ pub struct MonitorRow {
     runner: String,
     /// The agent the monitor names; None: the site's designated agent.
     agent_id: Option<Uuid>,
-    /// The agent that runs it now.
+    /// The agent that runs it now (None when the server does).
     runner_agent_id: Option<Uuid>,
     runner_hostname: Option<String>,
     runner_online: bool,
@@ -59,12 +59,12 @@ pub struct MonitorRow {
 
 const SELECT: &str = "SELECT * FROM (
   SELECT m.id, m.client_id, c.name AS client_name, m.site_id, s.name AS site_name, m.name, m.kind, m.config, m.runner, m.agent_id,
-         coalesce(m.agent_id, sn.agent_id) AS runner_agent_id, a.hostname AS runner_hostname, coalesce(a.online, false) AS runner_online,
+         a.id AS runner_agent_id, a.hostname AS runner_hostname, CASE WHEN m.runner = 'server' THEN true ELSE coalesce(a.online, false) END AS runner_online,
          m.interval_secs, m.timeout_secs, m.enabled, m.state, m.state_since, m.fail_count, m.last_at, m.last_ms, m.last_message, m.last_value,
          m.cert_not_after, m.cert, m.created_at,
          (SELECT count(*) FROM alerts al WHERE al.monitor_id = m.id AND al.resolved_at IS NULL) AS open_alerts
     FROM uptime_monitors m JOIN sites s ON s.id = m.site_id JOIN clients c ON c.id = m.client_id
-         LEFT JOIN site_network sn ON sn.site_id = m.site_id LEFT JOIN agents a ON a.id = coalesce(m.agent_id, sn.agent_id)
+         LEFT JOIN site_network sn ON sn.site_id = m.site_id LEFT JOIN agents a ON a.id = coalesce(m.agent_id, sn.agent_id) AND m.runner = 'agent'
    WHERE ($1::uuid[] IS NULL OR m.client_id = ANY($1)) AND ($2::uuid IS NULL OR m.client_id = $2) AND ($3::uuid IS NULL OR m.site_id = $3)
 ) x";
 
@@ -186,6 +186,8 @@ struct Valid {
     name: String,
     kind: String,
     config: Value,
+    /// `agent` or `server`.
+    runner: String,
     agent_id: Option<Uuid>,
     interval_secs: i32,
     timeout_secs: i32,
@@ -207,14 +209,22 @@ async fn validate(st: &AppState, u: &User, b: MonitorIn, old: Option<Valid>) -> 
     let kind = b.kind.or(old.as_ref().map(|o| o.kind.clone())).unwrap_or_default();
     let config = b.config.or(old.as_ref().map(|o| o.config.clone())).unwrap_or(json!({}));
     let check = uptime::check_kind(&kind, &config).map_err(bad)?;
-    match b.runner.as_deref() {
-        None | Some("agent") => {}
-        Some("server") => return Err(bad("checks run by the server aren't available yet; pick an agent".into())),
-        Some(r) => return Err(bad(format!("unknown runner {r:?}"))),
+    let runner = b.runner.or(old.as_ref().map(|o| o.runner.clone())).unwrap_or_else(|| "agent".into());
+    if !matches!(runner.as_str(), "agent" | "server") {
+        return Err(bad(format!("unknown runner {runner:?}")));
     }
     let agent_id = match b.agent_id {
         Some(a) => a,
         None => old.as_ref().and_then(|o| o.agent_id),
+    };
+    // The server runs it: no agent, and (unless allowed) no address it may not reach.
+    let agent_id = if runner == "server" {
+        if !st.cfg.uptime_allow_private {
+            uptime::refuse_private_literal(&check).map_err(bad)?;
+        }
+        None
+    } else {
+        agent_id
     };
     if let Some(a) = agent_id {
         let c: Option<Uuid> = sqlx::query_scalar("SELECT s.client_id FROM agents a JOIN sites s ON s.id = a.site_id WHERE a.id = $1").bind(a).fetch_optional(&st.db).await?;
@@ -231,7 +241,7 @@ async fn validate(st: &AppState, u: &User, b: MonitorIn, old: Option<Valid>) -> 
         return Err(bad("the timeout must be 1-120 seconds, and no longer than the interval".into()));
     }
     let enabled = b.enabled.or(old.as_ref().map(|o| o.enabled)).unwrap_or(true);
-    Ok(Valid { site_id, client_id, name, kind, config: uptime::clean_config(&check), agent_id, interval_secs, timeout_secs, enabled })
+    Ok(Valid { site_id, client_id, name, kind, config: uptime::clean_config(&check), runner, agent_id, interval_secs, timeout_secs, enabled })
 }
 
 fn conflict(e: sqlx::Error) -> ApiError {
@@ -246,8 +256,8 @@ pub async fn create(State(st): State<Arc<AppState>>, u: User, Json(b): Json<Moni
     let v = validate(&st, &u, b, None).await?;
     let id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO uptime_monitors (id, client_id, site_id, name, kind, config, agent_id, interval_secs, timeout_secs, enabled, created_by)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+        "INSERT INTO uptime_monitors (id, client_id, site_id, name, kind, config, agent_id, interval_secs, timeout_secs, enabled, created_by, runner)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
     )
     .bind(id)
     .bind(v.client_id)
@@ -260,38 +270,49 @@ pub async fn create(State(st): State<Arc<AppState>>, u: User, Json(b): Json<Moni
     .bind(v.timeout_secs)
     .bind(v.enabled)
     .bind(u.id)
+    .bind(&v.runner)
     .execute(&st.db)
     .await
     .map_err(conflict)?;
-    auth::audit(&st.db, Some(u.id), "uptime.create", Some(("uptime_monitor", id)), json!({ "name": v.name, "kind": v.kind, "target": uptime::target(&v.kind, &v.config) })).await;
+    auth::audit(
+        &st.db,
+        Some(u.id),
+        "uptime.create",
+        Some(("uptime_monitor", id)),
+        json!({ "name": v.name, "kind": v.kind, "runner": v.runner, "target": uptime::target(&v.kind, &v.config) }),
+    )
+    .await;
     if let Some(r) = uptime::runner_of(&st, id).await? {
         crate::checks::push(&st, Some(&[r]), &[id]).await;
+    }
+    if v.runner == "server" && v.enabled {
+        uptime::run_server_now(&st, id);
     }
     Ok(Json(json!({ "id": id })))
 }
 
 async fn load(st: &AppState, id: Uuid) -> ApiResult<(Valid, Option<Uuid>)> {
-    type Row = (Uuid, Uuid, String, String, Value, Option<Uuid>, i32, i32, bool);
-    let r: Row = sqlx::query_as("SELECT site_id, client_id, name, kind, config, agent_id, interval_secs, timeout_secs, enabled FROM uptime_monitors WHERE id = $1")
+    type Row = (Uuid, Uuid, String, String, Value, Option<Uuid>, i32, i32, bool, String);
+    let r: Row = sqlx::query_as("SELECT site_id, client_id, name, kind, config, agent_id, interval_secs, timeout_secs, enabled, runner FROM uptime_monitors WHERE id = $1")
         .bind(id)
         .fetch_optional(&st.db)
         .await?
         .ok_or(ApiError::NotFound("monitor"))?;
     let runner = uptime::runner_of(st, id).await?;
-    Ok((Valid { site_id: r.0, client_id: r.1, name: r.2, kind: r.3, config: r.4, agent_id: r.5, interval_secs: r.6, timeout_secs: r.7, enabled: r.8 }, runner))
+    Ok((Valid { site_id: r.0, client_id: r.1, name: r.2, kind: r.3, config: r.4, agent_id: r.5, interval_secs: r.6, timeout_secs: r.7, enabled: r.8, runner: r.9 }, runner))
 }
 
 pub async fn update(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uuid>, Json(b): Json<MonitorIn>) -> ApiResult<Json<Value>> {
     u.require(Role::Technician)?;
     monitor_client(&st, &u, id).await?;
     let (old, old_runner) = load(&st, id).await?;
-    let (was_enabled, old_kind) = (old.enabled, old.kind.clone());
+    let (was_enabled, old_kind, old_runner_kind) = (old.enabled, old.kind.clone(), old.runner.clone());
     let v = validate(&st, &u, b, Some(old)).await?;
     sqlx::query(
         "UPDATE uptime_monitors SET site_id = $2, name = $3, kind = $4, config = $5, agent_id = $6, interval_secs = $7, timeout_secs = $8,
-                enabled = $9, updated_at = now(),
-                state = CASE WHEN $9 AND kind = $4 THEN state ELSE 'unknown' END,
-                fail_count = CASE WHEN $9 AND kind = $4 THEN fail_count ELSE 0 END,
+                enabled = $9, runner = $10, updated_at = now(),
+                state = CASE WHEN $9 AND kind = $4 AND runner = $10 THEN state ELSE 'unknown' END,
+                fail_count = CASE WHEN $9 AND kind = $4 AND runner = $10 THEN fail_count ELSE 0 END,
                 cert_not_after = CASE WHEN kind = $4 THEN cert_not_after END, cert = CASE WHEN kind = $4 THEN cert END
           WHERE id = $1",
     )
@@ -304,17 +325,28 @@ pub async fn update(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uui
     .bind(v.interval_secs)
     .bind(v.timeout_secs)
     .bind(v.enabled)
+    .bind(&v.runner)
     .execute(&st.db)
     .await
     .map_err(conflict)?;
     if (was_enabled && !v.enabled) || old_kind != v.kind {
         uptime::close_monitor(&st, id).await;
     }
-    auth::audit(&st.db, Some(u.id), "uptime.update", Some(("uptime_monitor", id)), json!({ "name": v.name, "kind": v.kind, "enabled": v.enabled })).await;
+    auth::audit(
+        &st.db,
+        Some(u.id),
+        "uptime.update",
+        Some(("uptime_monitor", id)),
+        json!({ "name": v.name, "kind": v.kind, "runner": v.runner, "enabled": v.enabled }),
+    )
+    .await;
     let runner = uptime::runner_of(&st, id).await?;
     let agents: Vec<Uuid> = old_runner.into_iter().chain(runner).collect();
     crate::checks::push(&st, Some(&agents), &[id]).await;
     uptime::evaluate(&st, id).await;
+    if v.runner == "server" && v.enabled && (old_runner_kind != v.runner || !was_enabled || old_kind != v.kind) {
+        uptime::run_server_now(&st, id);
+    }
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -335,8 +367,8 @@ pub async fn remove(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uui
 pub async fn check_now(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uuid>) -> ApiResult<Json<Value>> {
     u.require(Role::Technician)?;
     monitor_client(&st, &u, id).await?;
-    let row: (bool, Option<Uuid>, bool, bool) = sqlx::query_as(
-        "SELECT m.enabled, a.id, coalesce(a.online, false), coalesce($2 = ANY(a.capabilities), false)
+    let row: (bool, Option<Uuid>, bool, bool, bool) = sqlx::query_as(
+        "SELECT m.enabled, a.id, coalesce(a.online, false), coalesce($2 = ANY(a.capabilities), false), m.runner = 'server'
            FROM uptime_monitors m LEFT JOIN site_network sn ON sn.site_id = m.site_id LEFT JOIN agents a ON a.id = coalesce(m.agent_id, sn.agent_id)
           WHERE m.id = $1",
     )
@@ -344,7 +376,12 @@ pub async fn check_now(State(st): State<Arc<AppState>>, u: User, Path(id): Path<
     .bind(rmm_proto::checks::CAPABILITY)
     .fetch_one(&st.db)
     .await?;
-    let agent = match row {
+    if row.0 && row.4 {
+        uptime::run_server_now(&st, id);
+        auth::audit(&st.db, Some(u.id), "uptime.check", Some(("uptime_monitor", id)), json!({})).await;
+        return Ok(Json(json!({ "ok": true })));
+    }
+    let agent = match (row.0, row.1, row.2, row.3) {
         (false, ..) => return Err(ApiError::Conflict("the monitor is switched off".into())),
         (_, None, ..) => return Err(ApiError::Conflict("no agent runs this monitor: pick one, or designate one for the site".into())),
         (_, Some(_), false, _) => return Err(ApiError::Conflict("the agent that runs this monitor is offline".into())),

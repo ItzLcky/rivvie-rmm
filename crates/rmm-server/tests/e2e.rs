@@ -642,7 +642,7 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
         return Ok(());
     }
     if std::env::var("RMM_E2E_ONLY").as_deref() == Ok("uptime") {
-        uptime(&url, &admin, db, dir, &id1, a_id, a_site, b_id).await;
+        uptime(server, &url, &admin, db, dir, &id1, a_id, a_site, b_id).await;
         a1.kill();
         return Ok(());
     }
@@ -1298,7 +1298,7 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
     oncall(&url, &admin, db, &id1, a_id).await;
     push(&url, &admin, db, &id1, a_id, b_id).await;
     if all {
-        uptime(&url, &admin, db, dir, &id1, a_id, a_site, b_id).await;
+        uptime(server, &url, &admin, db, dir, &id1, a_id, a_site, b_id).await;
         backups(&url, &admin, db, dir, &id1, b_id).await;
         disk_encryption(&url, &admin, db, dir, &id1, b_id).await;
         local_admin(&url, &admin, db, dir, &id1, b_id).await;

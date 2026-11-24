@@ -623,8 +623,8 @@ async fn item_views(st: &AppState, u: &User, chain: &[ChainEntry], agent: Option
                    FROM agents xa JOIN sites xs ON xs.id = xa.site_id
                   WHERE xa.id = ANY(i.excluded_agents) AND ($2::uuid[] IS NULL OR xs.client_id = ANY($2))) AS excluded,
                 i.excluded_agents, e.enabled AS eff_enabled, e.config AS eff_config,
-                (SELECT count(*) FROM alerts al JOIN agents aa ON aa.id = al.agent_id JOIN sites sa ON sa.id = aa.site_id
-                  WHERE al.policy_id = i.id AND al.resolved_at IS NULL AND ($2::uuid[] IS NULL OR sa.client_id = ANY($2))
+                (SELECT count(*) FROM alerts al
+                  WHERE al.policy_id = i.id AND al.resolved_at IS NULL AND ($2::uuid[] IS NULL OR al.client_id = ANY($2))
                     AND ($3::uuid IS NULL OR al.agent_id = $3)) AS open_alerts,
                 ss.next_run_at, ss.last_run_at,
                 CASE WHEN i.module = 'automation' THEN (

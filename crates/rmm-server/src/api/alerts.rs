@@ -25,11 +25,13 @@ pub struct AlertRow {
     id: Uuid,
     policy_id: Option<Uuid>,
     policy_name: Option<String>,
-    agent_id: Uuid,
-    hostname: String,
+    /// None: an alert without an agent (a monitor the server runs).
+    agent_id: Option<Uuid>,
+    hostname: Option<String>,
     client_id: Uuid,
     client_name: String,
-    site_name: String,
+    /// The agent's site, or the monitor's.
+    site_name: Option<String>,
     kind: String,
     severity: String,
     title: String,
@@ -51,7 +53,7 @@ pub struct AlertRow {
     /// A monitored network device it is about (`hostname` is the agent that reads it).
     device_id: Option<Uuid>,
     device_name: Option<String>,
-    /// An uptime monitor it is about (`hostname` is the agent that runs it).
+    /// An uptime monitor it is about (`hostname` is the agent that runs it, none when the server does).
     monitor_id: Option<Uuid>,
     monitor_name: Option<String>,
     #[sqlx(default)]
@@ -64,22 +66,22 @@ const SEVERITY_RANK: &str = "(CASE al.severity WHEN 'critical' THEN 3 WHEN 'warn
 
 fn alert_cols() -> String {
     format!(
-        "al.id, al.policy_id, p.name AS policy_name, al.agent_id, a.hostname, s.client_id, c.name AS client_name, s.name AS site_name,
+        "al.id, al.policy_id, p.name AS policy_name, al.agent_id, a.hostname, al.client_id, c.name AS client_name, s.name AS site_name,
          al.kind, al.severity, al.title, al.details, al.occurrences, {STATE} AS state, al.opened_at, al.last_seen_at,
          al.acknowledged_at, ua.name AS acknowledged_by_name, al.resolved_at, ur.name AS resolved_by_name, al.resolution, al.suppressed,
          al.script_job_id, al.device_id, nd.name AS device_name, al.monitor_id, um.name AS monitor_name"
     )
 }
-const ALERT_FROM: &str = "FROM alerts al JOIN agents a ON a.id = al.agent_id JOIN sites s ON s.id = a.site_id
-       JOIN clients c ON c.id = s.client_id LEFT JOIN policy_items p ON p.id = al.policy_id
-       LEFT JOIN users ua ON ua.id = al.acknowledged_by LEFT JOIN users ur ON ur.id = al.resolved_by
-       LEFT JOIN net_devices nd ON nd.id = al.device_id LEFT JOIN uptime_monitors um ON um.id = al.monitor_id";
+const ALERT_FROM: &str = "FROM alerts al JOIN clients c ON c.id = al.client_id LEFT JOIN agents a ON a.id = al.agent_id
+       LEFT JOIN net_devices nd ON nd.id = al.device_id LEFT JOIN uptime_monitors um ON um.id = al.monitor_id
+       LEFT JOIN sites s ON s.id = coalesce(a.site_id, um.site_id) LEFT JOIN policy_items p ON p.id = al.policy_id
+       LEFT JOIN users ua ON ua.id = al.acknowledged_by LEFT JOIN users ur ON ur.id = al.resolved_by";
 
 const SORT_KEYS: &[SortKey] = &[
     SortKey { name: "opened", expr: "al.opened_at", ty: "timestamptz" },
     SortKey { name: "last_seen", expr: "al.last_seen_at", ty: "timestamptz" },
     SortKey { name: "severity", expr: SEVERITY_RANK, ty: "int" },
-    SortKey { name: "hostname", expr: "lower(a.hostname)", ty: "text" },
+    SortKey { name: "hostname", expr: "lower(coalesce(a.hostname, ''))", ty: "text" },
     SortKey { name: "title", expr: "lower(al.title)", ty: "text" },
 ];
 
@@ -114,14 +116,14 @@ pub async fn list(
         q.severity.as_deref().filter(|s| !s.is_empty()).map(|s| s.split(',').map(str::to_string).collect());
     let filters = format!(
         "{ALERT_FROM}
-          WHERE ($1::uuid[] IS NULL OR s.client_id = ANY($1))
+          WHERE ($1::uuid[] IS NULL OR al.client_id = ANY($1))
             AND ($2::text[] IS NULL OR {STATE} = ANY($2))
             AND ($3::text[] IS NULL OR al.severity = ANY($3))
-            AND ($4::uuid IS NULL OR s.client_id = $4)
+            AND ($4::uuid IS NULL OR al.client_id = $4)
             AND ($5::uuid IS NULL OR al.agent_id = $5)
             AND ($6::uuid IS NULL OR al.policy_id = $6)
             AND ($7::text IS NULL OR al.kind = $7)
-            AND ($8::text IS NULL OR a.hostname ILIKE '%' || $8 || '%' OR al.title ILIKE '%' || $8 || '%')"
+            AND ($8::text IS NULL OR a.hostname ILIKE '%' || $8 || '%' OR al.title ILIKE '%' || $8 || '%' OR um.name ILIKE '%' || $8 || '%')"
     );
     let search = q.q.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let kind = q.kind.as_deref().filter(|s| !s.is_empty());
@@ -150,7 +152,7 @@ pub async fn list(
 
 async fn fetch(st: &AppState, u: &User, id: Uuid) -> ApiResult<AlertRow> {
     sqlx::query_as(AssertSqlSafe(format!(
-        "SELECT {} {ALERT_FROM} WHERE al.id = $1 AND ($2::uuid[] IS NULL OR s.client_id = ANY($2))",
+        "SELECT {} {ALERT_FROM} WHERE al.id = $1 AND ($2::uuid[] IS NULL OR al.client_id = ANY($2))",
         alert_cols()
     )))
     .bind(id)
@@ -214,7 +216,7 @@ pub async fn get(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uuid>)
     .await?;
     let ticket: Option<Value> = sqlx::query_scalar(
         "SELECT jsonb_build_object('id', t.id, 'number', t.number) FROM alerts al JOIN tickets t
-             ON t.alert_policy_id = al.policy_id AND t.alert_agent_id = al.agent_id AND t.alert_key = al.key
+             ON t.alert_policy_id = al.policy_id AND t.alert_agent_id IS NOT DISTINCT FROM al.agent_id AND t.alert_key = al.key
           WHERE al.id = $1 AND t.created_at <= coalesce(al.resolved_at, now()) + interval '1 minute'
           ORDER BY t.created_at DESC LIMIT 1",
     )
@@ -241,21 +243,19 @@ async fn act(st: &AppState, u: &User, ids: &[Uuid], action: &str) -> ApiResult<u
     let sql = match action {
         "acknowledge" => {
             "UPDATE alerts al SET acknowledged_at = now(), acknowledged_by = $3
-               FROM agents a JOIN sites s ON s.id = a.site_id
-              WHERE a.id = al.agent_id AND al.id = ANY($1) AND ($2::uuid[] IS NULL OR s.client_id = ANY($2))
+              WHERE al.id = ANY($1) AND ($2::uuid[] IS NULL OR al.client_id = ANY($2))
                 AND al.resolved_at IS NULL AND al.acknowledged_at IS NULL
-              RETURNING al.id, al.agent_id, s.client_id, al.policy_id"
+              RETURNING al.id, al.agent_id, al.client_id, al.policy_id"
         }
         "resolve" => {
             "UPDATE alerts al SET resolved_at = now(), resolved_by = $3, resolution = 'manual'
-               FROM agents a JOIN sites s ON s.id = a.site_id
-              WHERE a.id = al.agent_id AND al.id = ANY($1) AND ($2::uuid[] IS NULL OR s.client_id = ANY($2))
+              WHERE al.id = ANY($1) AND ($2::uuid[] IS NULL OR al.client_id = ANY($2))
                 AND al.resolved_at IS NULL
-              RETURNING al.id, al.agent_id, s.client_id, al.policy_id"
+              RETURNING al.id, al.agent_id, al.client_id, al.policy_id"
         }
         other => return Err(ApiError::BadRequest(format!("unknown action {other}"))),
     };
-    let rows: Vec<(Uuid, Uuid, Uuid, Option<Uuid>)> =
+    let rows: Vec<(Uuid, Option<Uuid>, Uuid, Option<Uuid>)> =
         sqlx::query_as(sql).bind(ids).bind(u.scope()).bind(u.id).fetch_all(&st.db).await?;
     let state = if action == "resolve" { "resolved" } else { "acknowledged" };
     let mut woke = false;
@@ -314,8 +314,8 @@ pub async fn bulk(State(st): State<Arc<AppState>>, u: User, Json(b): Json<Bulk>)
 pub async fn summary(st: &AppState, scope: Option<&[Uuid]>) -> ApiResult<Value> {
     Ok(sqlx::query_scalar(
         "SELECT coalesce(jsonb_object_agg(severity, n), '{}') FROM (
-            SELECT al.severity, count(*) n FROM alerts al JOIN agents a ON a.id = al.agent_id JOIN sites s ON s.id = a.site_id
-             WHERE al.resolved_at IS NULL AND ($1::uuid[] IS NULL OR s.client_id = ANY($1)) GROUP BY 1) t",
+            SELECT al.severity, count(*) n FROM alerts al
+             WHERE al.resolved_at IS NULL AND ($1::uuid[] IS NULL OR al.client_id = ANY($1)) GROUP BY 1) t",
     )
     .bind(scope)
     .fetch_one(&st.db)
@@ -335,7 +335,7 @@ pub async fn summary_handler(State(st): State<Arc<AppState>>, u: User, Query(q):
 /// The latest open alerts, worst first, for the dashboard.
 pub async fn recent_open(st: &AppState, scope: Option<&[Uuid]>) -> ApiResult<Vec<AlertRow>> {
     Ok(sqlx::query_as(AssertSqlSafe(format!(
-        "SELECT {} {ALERT_FROM} WHERE al.resolved_at IS NULL AND ($1::uuid[] IS NULL OR s.client_id = ANY($1))
+        "SELECT {} {ALERT_FROM} WHERE al.resolved_at IS NULL AND ($1::uuid[] IS NULL OR al.client_id = ANY($1))
           ORDER BY {SEVERITY_RANK} DESC, al.opened_at DESC LIMIT 10",
         alert_cols()
     )))

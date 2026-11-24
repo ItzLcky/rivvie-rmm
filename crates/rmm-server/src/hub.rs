@@ -41,7 +41,8 @@ pub enum Event {
     /// An alert opened, changed (acknowledged, fired again) or resolved.
     Alert {
         id: Uuid,
-        agent_id: Uuid,
+        /// None for an alert without an agent (a server-run uptime monitor's).
+        agent_id: Option<Uuid>,
         #[serde(skip)]
         client_id: Uuid,
         /// open / acknowledged / resolved

@@ -337,10 +337,13 @@ pub struct Message {
 #[derive(sqlx::FromRow)]
 struct AlertCtx {
     id: Uuid,
-    agent_id: Uuid,
-    hostname: String,
+    agent_id: Option<Uuid>,
+    hostname: Option<String>,
+    client_id: Uuid,
     client_name: String,
-    site_name: String,
+    site_name: Option<String>,
+    monitor_id: Option<Uuid>,
+    monitor_name: Option<String>,
     policy_name: Option<String>,
     kind: String,
     severity: String,
@@ -378,9 +381,10 @@ fn detail_lines(details: &Value) -> Vec<(String, String)> {
 
 async fn render(st: &AppState, alert_id: Uuid, event: &str) -> Result<Message, String> {
     let a: AlertCtx = sqlx::query_as(
-        "SELECT al.id, al.agent_id, a.hostname, c.name AS client_name, s.name AS site_name, p.name AS policy_name, al.kind,
-                al.severity, al.title, al.details, al.occurrences, al.opened_at, al.resolved_at, al.resolution
-           FROM alerts al JOIN agents a ON a.id = al.agent_id JOIN sites s ON s.id = a.site_id JOIN clients c ON c.id = s.client_id
+        "SELECT al.id, al.agent_id, a.hostname, al.client_id, c.name AS client_name, s.name AS site_name, al.monitor_id, um.name AS monitor_name,
+                p.name AS policy_name, al.kind, al.severity, al.title, al.details, al.occurrences, al.opened_at, al.resolved_at, al.resolution
+           FROM alerts al JOIN clients c ON c.id = al.client_id LEFT JOIN agents a ON a.id = al.agent_id
+           LEFT JOIN uptime_monitors um ON um.id = al.monitor_id LEFT JOIN sites s ON s.id = coalesce(a.site_id, um.site_id)
            LEFT JOIN policy_items p ON p.id = al.policy_id
           WHERE al.id = $1",
     )
@@ -391,7 +395,11 @@ async fn render(st: &AppState, alert_id: Uuid, event: &str) -> Result<Message, S
     .ok_or_else(|| "alert was deleted".to_string())?;
 
     let resolved = event == "resolved";
-    let url = format!("{}/agents/{}?tab=alerts", st.cfg.public_url, a.agent_id);
+    // An alert without an agent links to itself.
+    let url = match a.agent_id {
+        Some(agent) => format!("{}/agents/{agent}?tab=alerts", st.cfg.public_url),
+        None => format!("{}/alerts/{}", st.cfg.public_url, a.id),
+    };
     let reminder = event == "reminder";
     let status = if resolved {
         "Resolved".to_string()
@@ -400,11 +408,21 @@ async fn render(st: &AppState, alert_id: Uuid, event: &str) -> Result<Message, S
     } else {
         a.severity.to_uppercase()
     };
-    let headline = format!("{}: {} on {}", status, a.title, a.hostname);
+    let headline = match &a.hostname {
+        Some(h) => format!("{}: {} on {h}", status, a.title),
+        None => format!("{}: {}", status, a.title),
+    };
     let subject = format!("[{}] {headline}", brand(st));
     let mut facts = vec![
-        ("Agent".to_string(), a.hostname.clone()),
-        ("Client".to_string(), format!("{} › {}", a.client_name, a.site_name)),
+        match (&a.hostname, &a.monitor_name) {
+            (Some(h), _) => ("Agent".to_string(), h.clone()),
+            (None, Some(m)) => ("Monitor".to_string(), format!("{m} (checked by the server)")),
+            (None, None) => ("Agent".to_string(), "none".to_string()),
+        },
+        ("Client".to_string(), match &a.site_name {
+            Some(site) => format!("{} › {site}", a.client_name),
+            None => a.client_name.clone(),
+        }),
         ("Severity".to_string(), a.severity.clone()),
         ("Opened".to_string(), a.opened_at.format("%Y-%m-%d %H:%M:%S UTC").to_string()),
     ];
@@ -437,7 +455,10 @@ async fn render(st: &AppState, alert_id: Uuid, event: &str) -> Result<Message, S
             "occurrences": a.occurrences, "opened_at": a.opened_at, "resolved_at": a.resolved_at, "resolution": a.resolution,
             "policy": a.policy_name,
         },
+        // Without an agent, `id` and `hostname` are null; `client` and `site` are still there.
         "agent": { "id": a.agent_id, "hostname": a.hostname, "client": a.client_name, "site": a.site_name },
+        "client": { "id": a.client_id, "name": a.client_name },
+        "monitor": a.monitor_id.map(|id| json!({ "id": id, "name": a.monitor_name })),
         "url": url,
     });
     Ok(Message { event: event.into(), subject, text, headline, severity: a.severity, facts, url, payload, alert_id: Some(a.id), ticket_id: None })

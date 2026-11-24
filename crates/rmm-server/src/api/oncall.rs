@@ -637,7 +637,7 @@ const PAGE_SELECT: &str = "SELECT p.id, p.alert_id, p.ticket_id, p.title, p.seve
             FROM page_deliveries d LEFT JOIN users du ON du.id = d.user_id LEFT JOIN notification_channels ch ON ch.id = d.channel_id
            WHERE d.page_id = p.id), '[]') AS deliveries
    FROM pages p LEFT JOIN escalation_policies ep ON ep.id = p.policy_id LEFT JOIN users ua ON ua.id = p.acked_by
-   LEFT JOIN alerts al ON al.id = p.alert_id LEFT JOIN agents ag ON ag.id = al.agent_id LEFT JOIN sites s ON s.id = ag.site_id
+   LEFT JOIN alerts al ON al.id = p.alert_id
    LEFT JOIN tickets t ON t.id = p.ticket_id";
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -666,7 +666,7 @@ pub async fn pages(State(st): State<Arc<AppState>>, u: User, Query(q): Query<Pag
     Ok(Json(
         sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "{PAGE_SELECT}
-              WHERE ($1::uuid[] IS NULL OR coalesce(s.client_id, t.client_id) = ANY($1))
+              WHERE ($1::uuid[] IS NULL OR coalesce(al.client_id, t.client_id) = ANY($1))
                 AND ($2::uuid IS NULL OR p.alert_id = $2) AND ($3::uuid IS NULL OR p.ticket_id = $3)
                 AND (NOT $4 OR p.status IN ('held', 'triggered'))
               ORDER BY p.created_at DESC LIMIT 100"
@@ -683,7 +683,7 @@ pub async fn pages(State(st): State<Arc<AppState>>, u: User, Query(q): Query<Pag
 pub async fn ack_page(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uuid>) -> ApiResult<Json<PageRow>> {
     u.require(Role::Technician)?;
     let fetch_one = || async {
-        sqlx::query_as::<_, PageRow>(sqlx::AssertSqlSafe(format!("{PAGE_SELECT} WHERE p.id = $1 AND ($2::uuid[] IS NULL OR coalesce(s.client_id, t.client_id) = ANY($2))")))
+        sqlx::query_as::<_, PageRow>(sqlx::AssertSqlSafe(format!("{PAGE_SELECT} WHERE p.id = $1 AND ($2::uuid[] IS NULL OR coalesce(al.client_id, t.client_id) = ANY($2))")))
             .bind(id)
             .bind(u.scope())
             .fetch_optional(&st.db)

@@ -7,11 +7,15 @@
 //! `mon:<id>` (down), `mon:<id>:cert` (certificate), `mon:<id>:latency` (slow). A monitor whose
 //! runner is offline, or has gone quiet, is `unknown`, not down ([`run`]).
 //!
-//! Step C1b of the parity plan adds monitors run by the server (`runner = 'server'`); they are
-//! refused for now.
+//! Monitors can also be run by the server (`runner = 'server'`, step C1b of the parity plan):
+//! [`run`] runs those that are due with [`rmm_checks::run`], refusing loopback, private,
+//! link-local and metadata addresses after resolution and on every redirect unless
+//! `RMM_UPTIME_ALLOW_PRIVATE=1`. Their alerts have no agent: they come from the `uptime` items
+//! defined in All devices whose limit covers the monitor's client and site, and belong to the
+//! monitor's client.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -21,7 +25,7 @@ use sqlx::Row;
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::alerts::{Policy, Rule, UptimeRule, announce, fire_on, policies_for};
+use crate::alerts::{Policy, Rule, UptimeRule, announce, fire_agentless, fire_on, policies_for, root_policies_for};
 use crate::state::AppState;
 
 pub const KINDS: &[&str] = &["ping", "tcp", "http", "tls", "dns"];
@@ -137,6 +141,25 @@ pub fn target(kind: &str, c: &Value) -> String {
     }
 }
 
+/// For a monitor the server runs (without `RMM_UPTIME_ALLOW_PRIVATE`): refuses an address
+/// literal it may not reach, so the form says so at once. Names are checked when the check runs,
+/// after they resolve.
+pub fn refuse_private_literal(kind: &CheckKind) -> Result<(), String> {
+    let ip = |h: &str| h.trim_matches(['[', ']']).parse::<std::net::IpAddr>().ok();
+    let literal = match kind {
+        CheckKind::Ping { host } | CheckKind::Tcp { host, .. } | CheckKind::Tls { host, .. } => ip(host),
+        CheckKind::Http { url, .. } => ip(&rmm_checks::http::Url::parse(url)?.host),
+        CheckKind::Dns { server, .. } => {
+            server.as_deref().and_then(|s| s.parse::<std::net::SocketAddr>().map(|a| a.ip()).ok().or_else(|| ip(s)))
+        }
+        CheckKind::Backup { .. } => None,
+    };
+    match literal {
+        Some(a) => rmm_checks::addr::public_only(a),
+        None => Ok(()),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // What the runner runs
 // ---------------------------------------------------------------------------
@@ -194,47 +217,12 @@ pub async fn ingest(st: &AppState, agent_id: Uuid, mut results: Vec<CheckResult>
     let client: HashMap<Uuid, Uuid> = mine.into_iter().collect();
     results.retain(|r| client.contains_key(&r.check_id));
     results.sort_by_key(|r| r.at);
-    let now = Utc::now();
     let mut touched = Vec::new();
     for r in results {
-        // Agent clocks drift: keep its time only when it's plausible.
-        let at = if r.at > now || r.at < now - chrono::Duration::hours(24) { now } else { r.at };
-        let message: String = r.message.chars().take(500).collect();
-        let cert = match &r.data {
-            Some(CheckData::Cert(c)) => Some(c.clone()),
-            _ => None,
-        };
-        let mut tx = st.db.begin().await?;
-        sqlx::query("INSERT INTO uptime_results (monitor_id, ts, ok, ms, message) VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING")
-            .bind(r.check_id)
-            .bind(at)
-            .bind(r.ok)
-            .bind(r.latency_ms.map(|m| m.min(i32::MAX as u32) as i32))
-            .bind(&message)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query(
-            "UPDATE uptime_monitors SET
-                    fail_count = CASE WHEN $2 THEN 0 ELSE fail_count + 1 END,
-                    state_since = CASE WHEN state = (CASE WHEN $2 THEN 'up' ELSE 'down' END) THEN state_since ELSE $3 END,
-                    state = CASE WHEN $2 THEN 'up' ELSE 'down' END,
-                    last_at = $3, last_ms = $4, last_message = $5, last_value = $6,
-                    cert_not_after = coalesce($7, cert_not_after), cert = coalesce($8, cert)
-              WHERE id = $1 AND (last_at IS NULL OR last_at <= $3)",
-        )
-        .bind(r.check_id)
-        .bind(r.ok)
-        .bind(at)
-        .bind(r.latency_ms.map(|m| m.min(i32::MAX as u32) as i32))
-        .bind(&message)
-        .bind(r.value)
-        .bind(cert.as_ref().map(|c| c.not_after))
-        .bind(cert.as_ref().map(|c| json!({ "subject": c.subject, "issuer": c.issuer, "sans": c.sans, "not_before": c.not_before, "not_after": c.not_after, "untrusted": c.untrusted })))
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        if !touched.contains(&r.check_id) {
-            touched.push(r.check_id);
+        let id = r.check_id;
+        store(st, r).await?;
+        if !touched.contains(&id) {
+            touched.push(id);
         }
     }
     for id in touched {
@@ -242,6 +230,47 @@ pub async fn ingest(st: &AppState, agent_id: Uuid, mut results: Vec<CheckResult>
         evaluate(st, id).await;
     }
     Ok(())
+}
+
+/// Stores one result and moves the monitor's state.
+async fn store(st: &AppState, r: CheckResult) -> sqlx::Result<()> {
+    let now = Utc::now();
+    // Agent clocks drift: keep its time only when it's plausible.
+    let at = if r.at > now || r.at < now - chrono::Duration::hours(24) { now } else { r.at };
+    let message: String = r.message.chars().take(500).collect();
+    let cert = match &r.data {
+        Some(CheckData::Cert(c)) => Some(c.clone()),
+        _ => None,
+    };
+    let mut tx = st.db.begin().await?;
+    sqlx::query("INSERT INTO uptime_results (monitor_id, ts, ok, ms, message) VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING")
+        .bind(r.check_id)
+        .bind(at)
+        .bind(r.ok)
+        .bind(r.latency_ms.map(|m| m.min(i32::MAX as u32) as i32))
+        .bind(&message)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "UPDATE uptime_monitors SET
+                fail_count = CASE WHEN $2 THEN 0 ELSE fail_count + 1 END,
+                state_since = CASE WHEN state = (CASE WHEN $2 THEN 'up' ELSE 'down' END) THEN state_since ELSE $3 END,
+                state = CASE WHEN $2 THEN 'up' ELSE 'down' END,
+                last_at = $3, last_ms = $4, last_message = $5, last_value = $6,
+                cert_not_after = coalesce($7, cert_not_after), cert = coalesce($8, cert)
+          WHERE id = $1 AND (last_at IS NULL OR last_at <= $3)",
+    )
+    .bind(r.check_id)
+    .bind(r.ok)
+    .bind(at)
+    .bind(r.latency_ms.map(|m| m.min(i32::MAX as u32) as i32))
+    .bind(&message)
+    .bind(r.value)
+    .bind(cert.as_ref().map(|c| c.not_after))
+    .bind(cert.as_ref().map(|c| json!({ "subject": c.subject, "issuer": c.issuer, "sans": c.sans, "not_before": c.not_before, "not_after": c.not_after, "untrusted": c.untrusted })))
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await
 }
 
 // ---------------------------------------------------------------------------
@@ -261,7 +290,12 @@ pub struct Monitor {
     pub last_message: Option<String>,
     pub last_ms: Option<i32>,
     pub cert_not_after: Option<DateTime<Utc>>,
+    /// The agent that runs it; None when the server does (or no agent is there to).
     pub runner: Option<Uuid>,
+    /// The server runs it: its alerts have no agent.
+    pub server: bool,
+    pub client_id: Uuid,
+    pub site_id: Uuid,
 }
 
 /// What one item finds about one monitor: `(key, title, details)` to open, and whether the
@@ -308,10 +342,12 @@ pub fn findings(m: &Monitor, r: &UptimeRule, recent_ms: &[Option<i32>], now: Dat
     (fire, hold)
 }
 
-async fn clear_monitor(st: &AppState, p: &Policy, agent_id: Uuid, monitor_id: Uuid, keep: &[String]) -> sqlx::Result<()> {
+/// Resolves the item's open alerts about the monitor, through this agent (None: the server's,
+/// without one), except those in `keep`.
+async fn clear_monitor(st: &AppState, p: &Policy, agent_id: Option<Uuid>, monitor_id: Uuid, keep: &[String]) -> sqlx::Result<()> {
     let ids: Vec<Uuid> = sqlx::query_scalar(
         "UPDATE alerts SET resolved_at = now(), resolution = 'cleared'
-          WHERE policy_id = $1 AND agent_id = $2 AND monitor_id = $3 AND resolved_at IS NULL AND NOT (key = ANY($4))
+          WHERE policy_id = $1 AND agent_id IS NOT DISTINCT FROM $2::uuid AND monitor_id = $3 AND resolved_at IS NULL AND NOT (key = ANY($4))
           RETURNING id",
     )
     .bind(p.id)
@@ -338,10 +374,18 @@ pub async fn close_monitor(st: &AppState, monitor_id: Uuid) {
 }
 
 const MONITOR_SELECT: &str = "SELECT m.id, m.name, m.kind, m.config, m.enabled, m.state, m.state_since, m.fail_count, m.last_message, m.last_ms,
-        m.cert_not_after, coalesce(m.agent_id, sn.agent_id) AS runner
+        m.cert_not_after, CASE WHEN m.runner = 'agent' THEN coalesce(m.agent_id, sn.agent_id) END AS runner, m.runner = 'server' AS server,
+        m.client_id, m.site_id
    FROM uptime_monitors m LEFT JOIN site_network sn ON sn.site_id = m.site_id";
 
-/// Checks one monitor against every `uptime` item that reaches its runner.
+/// The SQL condition that the `uptime` item `i` applies to the monitor `m` the server runs:
+/// enabled, defined in All devices, and its limit covers the monitor's client and site.
+pub const SERVER_ITEM_COVERS: &str = "i.set_id = '00000000-0000-4000-8001-000000000000' AND i.module = 'alert' AND i.enabled
+        AND i.config ->> 'kind' = 'uptime' AND m.runner = 'server'
+        AND (i.client_id IS NULL OR i.client_id = m.client_id) AND (i.site_id IS NULL OR i.site_id = m.site_id)";
+
+/// Checks one monitor against every `uptime` item that reaches its runner (for a monitor the
+/// server runs: every one in All devices that covers it).
 pub async fn evaluate(st: &AppState, monitor_id: Uuid) {
     if let Err(e) = eval(st, monitor_id).await {
         warn!(%monitor_id, "uptime alerts: {e}");
@@ -352,17 +396,30 @@ async fn eval(st: &AppState, monitor_id: Uuid) -> sqlx::Result<()> {
     let Some(m): Option<Monitor> = sqlx::query_as(sqlx::AssertSqlSafe(format!("{MONITOR_SELECT} WHERE m.id = $1"))).bind(monitor_id).fetch_optional(&st.db).await? else {
         return Ok(());
     };
-    let Some(runner) = m.runner.filter(|_| m.enabled) else { return Ok(()) };
-    // Alerts opened under an earlier runner close: that agent's items don't own them any more.
+    if !m.enabled {
+        return Ok(());
+    }
+    // None: the server runs it. An agent-run monitor without an agent has nothing to go on.
+    let runner = match (m.server, m.runner) {
+        (true, _) => None,
+        (false, Some(a)) => Some(a),
+        (false, None) => return Ok(()),
+    };
+    // Alerts opened under an earlier runner close: that agent's (or the server's) items don't
+    // own them any more.
     let moved: Vec<Uuid> = sqlx::query_scalar(
-        "UPDATE alerts SET resolved_at = now(), resolution = 'policy' WHERE monitor_id = $1 AND agent_id <> $2 AND resolved_at IS NULL RETURNING id",
+        "UPDATE alerts SET resolved_at = now(), resolution = 'policy'
+          WHERE monitor_id = $1 AND agent_id IS DISTINCT FROM $2::uuid AND resolved_at IS NULL RETURNING id",
     )
     .bind(m.id)
     .bind(runner)
     .fetch_all(&st.db)
     .await?;
     announce(st, &moved, "resolved", &[], false).await;
-    let policies = policies_for(st, runner, "uptime").await?;
+    let policies = match runner {
+        Some(a) => policies_for(st, a, "uptime").await?,
+        None => root_policies_for(st, m.client_id, m.site_id, "uptime").await?,
+    };
     if policies.is_empty() {
         return Ok(());
     }
@@ -372,7 +429,10 @@ async fn eval(st: &AppState, monitor_id: Uuid) -> sqlx::Result<()> {
         let Some(Rule::Uptime(r)) = p.rule() else { continue };
         let (fire, mut keep) = findings(&m, &r, &recent, Utc::now());
         for (key, title, details) in fire {
-            fire_on(st, &p, runner, None, Some(m.id), &key, &title, details, 0).await?;
+            match runner {
+                Some(a) => fire_on(st, &p, a, None, Some(m.id), &key, &title, details, 0).await?,
+                None => fire_agentless(st, &p, m.client_id, Some(m.id), &key, &title, details, 0).await?,
+            }
             keep.push(key);
         }
         clear_monitor(st, &p, runner, m.id, &keep).await?;
@@ -380,8 +440,20 @@ async fn eval(st: &AppState, monitor_id: Uuid) -> sqlx::Result<()> {
     Ok(())
 }
 
-/// An alert item changed: check the monitors run by the agents it reaches.
+/// An alert item changed: check the monitors run by the agents it reaches, and (an item of All
+/// devices) those the server runs.
 pub async fn recheck_item(st: &AppState, item_id: Uuid) {
+    let server: sqlx::Result<Vec<Uuid>> = sqlx::query_scalar(
+        "SELECT m.id FROM uptime_monitors m JOIN policy_items i ON i.id = $1
+          WHERE m.enabled AND m.runner = 'server' AND i.set_id = '00000000-0000-4000-8001-000000000000'
+            AND (i.client_id IS NULL OR i.client_id = m.client_id) AND (i.site_id IS NULL OR i.site_id = m.site_id)",
+    )
+    .bind(item_id)
+    .fetch_all(&st.db)
+    .await;
+    for id in server.unwrap_or_default() {
+        evaluate(st, id).await;
+    }
     let rows: sqlx::Result<Vec<Uuid>> =
         sqlx::query_scalar("SELECT ap.agent_id FROM agent_policy ap WHERE ap.item_id = $1 AND ap.module = 'alert' AND ap.enabled AND ap.config ->> 'kind' = 'uptime'")
             .bind(item_id)
@@ -410,15 +482,16 @@ pub async fn recheck_agent(st: &AppState, agent_id: Uuid) {
 // ---------------------------------------------------------------------------
 
 /// Monitors nobody is checking become `unknown`: the runner is offline, can't run checks, there
-/// is no runner, or it hasn't reported for three intervals.
+/// is no runner, or it hasn't reported for three intervals. One the server runs only when it's
+/// switched off or hasn't been checked for three intervals (the server was down).
 pub async fn mark_unknown(st: &AppState) -> sqlx::Result<()> {
     let ids: Vec<(Uuid, Uuid)> = sqlx::query_as(
         "UPDATE uptime_monitors m SET state = 'unknown', state_since = now(), fail_count = 0
            FROM uptime_monitors x LEFT JOIN site_network sn ON sn.site_id = x.site_id
                 LEFT JOIN agents a ON a.id = coalesce(x.agent_id, sn.agent_id)
-          WHERE m.id = x.id AND m.state <> 'unknown' AND m.runner = 'agent'
-            AND (NOT m.enabled OR a.id IS NULL OR NOT a.online OR NOT ($1 = ANY(a.capabilities))
-                 OR m.last_at IS NULL OR m.last_at < now() - make_interval(secs => m.interval_secs * 3 + 90))
+          WHERE m.id = x.id AND m.state <> 'unknown'
+            AND (NOT m.enabled OR m.last_at IS NULL OR m.last_at < now() - make_interval(secs => m.interval_secs * 3 + 90)
+                 OR (m.runner = 'agent' AND (a.id IS NULL OR NOT a.online OR NOT ($1 = ANY(a.capabilities)))))
           RETURNING m.id, m.client_id",
     )
     .bind(rmm_proto::checks::CAPABILITY)
@@ -432,6 +505,7 @@ pub async fn mark_unknown(st: &AppState) -> sqlx::Result<()> {
 }
 
 pub async fn run(st: Arc<AppState>) {
+    tokio::spawn(run_server_checks(st.clone()));
     let every = Duration::from_secs(st.cfg.alert_eval_secs.clamp(2, 60).into());
     let mut tick = tokio::time::interval(every);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -441,6 +515,97 @@ pub async fn run(st: Arc<AppState>) {
             warn!("uptime: marking unchecked monitors unknown: {e}");
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Checks the server runs
+// ---------------------------------------------------------------------------
+
+/// Monitors the server is checking right now: never two runs of one at once.
+static IN_FLIGHT: LazyLock<Mutex<HashSet<Uuid>>> = LazyLock::new(Default::default);
+/// At most this many server checks at a time (the agent's limit too).
+static SLOTS: LazyLock<tokio::sync::Semaphore> = LazyLock::new(|| tokio::sync::Semaphore::new(rmm_proto::checks::MAX_IN_FLIGHT));
+
+fn in_flight() -> std::sync::MutexGuard<'static, HashSet<Uuid>> {
+    IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The address guard for checks the server runs.
+fn guard(st: &AppState) -> rmm_checks::Guard {
+    if st.cfg.uptime_allow_private { rmm_checks::allow_all } else { rmm_checks::addr::public_only }
+}
+
+/// Every two seconds, starts the server's monitors that are due (never checked, or last checked
+/// an interval ago).
+async fn run_server_checks(st: Arc<AppState>) {
+    let mut tick = tokio::time::interval(Duration::from_secs(2));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        let due: sqlx::Result<Vec<Uuid>> = sqlx::query_scalar(
+            "SELECT id FROM uptime_monitors
+              WHERE enabled AND runner = 'server' AND (last_at IS NULL OR last_at <= now() - make_interval(secs => interval_secs))
+              ORDER BY last_at NULLS FIRST LIMIT 200",
+        )
+        .fetch_all(&st.db)
+        .await;
+        match due {
+            Ok(ids) => {
+                for id in ids {
+                    run_server_now(&st, id);
+                }
+            }
+            Err(e) => warn!("uptime: finding due server checks: {e}"),
+        }
+    }
+}
+
+/// Runs a monitor the server checks, now, in the background (unless it's running already).
+pub fn run_server_now(st: &Arc<AppState>, id: Uuid) {
+    if !in_flight().insert(id) {
+        return;
+    }
+    let st = st.clone();
+    tokio::spawn(async move {
+        let res = async {
+            let _slot = SLOTS.acquire().await.ok();
+            check_on_server(&st, id).await
+        }
+        .await;
+        in_flight().remove(&id);
+        if let Err(e) = res {
+            warn!(monitor = %id, "uptime: server check: {e}");
+        }
+    });
+}
+
+async fn check_on_server(st: &AppState, id: Uuid) -> sqlx::Result<()> {
+    let row: Option<(Uuid, String, Value, i32, i32)> = sqlx::query_as(
+        "SELECT client_id, kind, config, interval_secs, timeout_secs FROM uptime_monitors WHERE id = $1 AND enabled AND runner = 'server'",
+    )
+    .bind(id)
+    .fetch_optional(&st.db)
+    .await?;
+    let Some((client_id, kind, config, interval, timeout)) = row else { return Ok(()) };
+    let started = Utc::now();
+    let mut r = match check_kind(&kind, &config) {
+        Ok(k) => {
+            let spec = CheckSpec { id, interval_secs: interval as u32, timeout_secs: timeout as u32, kind: k };
+            // The check keeps to its timeout; this only guards against one that doesn't.
+            let limit = Duration::from_secs(timeout.clamp(1, 300) as u64 * 2 + 5);
+            match tokio::time::timeout(limit, rmm_checks::run::run(&spec, guard(st))).await {
+                Ok(r) => r,
+                Err(_) => CheckResult { check_id: id, at: Utc::now(), ok: false, latency_ms: None, value: None, message: "the check timed out".into(), data: None },
+            }
+        }
+        Err(e) => CheckResult { check_id: id, at: Utc::now(), ok: false, latency_ms: None, value: None, message: e, data: None },
+    };
+    // Stamped when it started, so the next run is due an interval after this one began.
+    r.at = started;
+    store(st, r).await?;
+    st.hub.publish(crate::hub::Event::Monitor { id, client_id });
+    evaluate(st, id).await;
+    Ok(())
 }
 
 pub async fn rollup(db: &sqlx::PgPool) -> sqlx::Result<()> {
@@ -506,6 +671,9 @@ mod tests {
             last_ms: Some(900),
             cert_not_after: None,
             runner: None,
+            server: false,
+            client_id: Uuid::nil(),
+            site_id: Uuid::nil(),
         }
     }
 
