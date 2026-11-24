@@ -108,8 +108,9 @@ impl Target {
 #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
 pub(crate) fn consent_text(c: &Consent, host: &str) -> (String, String) {
     let who = if c.company.trim().is_empty() { c.requester.clone() } else { format!("{} ({})", c.requester, c.company) };
+    let product = c.product.trim();
     (
-        "Remote support request".into(),
+        if product.is_empty() { "Remote support request".into() } else { format!("{product}: remote support request") },
         format!(
             "{who} wants to view and control this computer ({host}).\n\nAllow the remote session? It is refused if nobody answers within {} seconds.",
             c.timeout_secs

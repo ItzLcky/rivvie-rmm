@@ -83,9 +83,13 @@ pub async fn handler(
     if !capable {
         return Err(ApiError::Conflict("this agent version doesn't support remote desktop; update the agent".into()));
     }
+    let client: Option<Uuid> =
+        sqlx::query_scalar("SELECT s.client_id FROM agents a JOIN sites s ON s.id = a.site_id WHERE a.id = $1").bind(agent_id).fetch_optional(&st.db).await?;
+    let product = crate::branding::resolve(&st, client).product_name.unwrap_or_default();
     let consent = ask.then(|| Consent {
         requester: if user.name.trim().is_empty() { user.email.clone() } else { user.name.clone() },
         company: st.company().company_name,
+        product,
         timeout_secs: CONSENT_TIMEOUT_SECS,
     });
     let settings = Settings { monitor: p.monitor, quality: p.quality };

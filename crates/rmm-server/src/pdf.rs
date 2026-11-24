@@ -108,11 +108,34 @@ fn escape(s: &str) -> String {
     out
 }
 
+/// An image XObject: JPEG bytes as they are (`dct`), or Flate-compressed 8-bit RGB (or grey)
+/// samples with an optional Flate-compressed 8-bit alpha channel as a soft mask.
+/// [`crate::branding::pdf_image`] makes one from an uploaded logo.
+#[derive(Debug, Clone)]
+pub struct Image {
+    pub width: u32,
+    pub height: u32,
+    pub data: Vec<u8>,
+    pub dct: bool,
+    pub gray: bool,
+    pub smask: Option<Vec<u8>>,
+}
+
+impl Image {
+    /// The size that fits in `max_w` by `max_h` points, keeping the aspect ratio.
+    pub fn fit(&self, max_w: f32, max_h: f32) -> (f32, f32) {
+        let (w, h) = (self.width.max(1) as f32, self.height.max(1) as f32);
+        let k = (max_w / w).min(max_h / h);
+        (w * k, h * k)
+    }
+}
+
 /// A document under construction. Coordinates are points from the top-left corner.
 #[derive(Default)]
 pub struct Doc {
     pages: Vec<String>,
     cur: String,
+    images: Vec<Image>,
 }
 
 impl Doc {
@@ -157,6 +180,17 @@ impl Doc {
         let _ = writeln!(self.cur, "{:.3} {:.3} {:.3} rg {x:.2} {:.2} {w:.2} {h:.2} re f", rgb.0, rgb.1, rgb.2, PAGE_H - y - h);
     }
 
+    /// Adds an image to the document; draw it with [`Doc::image`].
+    pub fn add_image(&mut self, img: Image) -> usize {
+        self.images.push(img);
+        self.images.len() - 1
+    }
+
+    /// Draws an added image with its top-left corner at (`x`, `y`), `w` by `h` points.
+    pub fn image(&mut self, idx: usize, x: f32, y: f32, w: f32, h: f32) {
+        let _ = writeln!(self.cur, "q {w:.2} 0 0 {h:.2} {x:.2} {:.2} cm /Im{idx} Do Q", PAGE_H - y - h);
+    }
+
     /// The finished file.
     pub fn finish(mut self, title: &str) -> Vec<u8> {
         self.new_page();
@@ -164,7 +198,20 @@ impl Doc {
             self.pages.push(String::new());
         }
         let n = self.pages.len();
-        // Objects: 1 catalog, 2 pages, 3 F1, 4 F2, 5 info, then (page, content) pairs.
+        // Objects: 1 catalog, 2 pages, 3 F1, 4 F2, 5 info, then (page, content) pairs, then
+        // each image followed by its soft mask, if it has one.
+        let mut image_ids = vec![];
+        let mut next = 6 + n * 2;
+        for img in &self.images {
+            image_ids.push(next);
+            next += if img.smask.is_some() { 2 } else { 1 };
+        }
+        let xobjects = if self.images.is_empty() {
+            String::new()
+        } else {
+            let refs: Vec<String> = image_ids.iter().enumerate().map(|(i, id)| format!("/Im{i} {id} 0 R")).collect();
+            format!(" /XObject << {} >>", refs.join(" "))
+        };
         let mut objs: Vec<Vec<u8>> = vec![];
         objs.push(b"<< /Type /Catalog /Pages 2 0 R >>".to_vec());
         let kids: Vec<String> = (0..n).map(|i| format!("{} 0 R", 6 + i * 2)).collect();
@@ -175,7 +222,7 @@ impl Doc {
         for (i, content) in self.pages.iter().enumerate() {
             objs.push(
                 format!(
-                    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {PAGE_W} {PAGE_H}] /Resources << /Font << /F1 3 0 R /F2 4 0 R >> >> /Contents {} 0 R >>",
+                    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {PAGE_W} {PAGE_H}] /Resources << /Font << /F1 3 0 R /F2 4 0 R >>{xobjects} >> /Contents {} 0 R >>",
                     7 + i * 2
                 )
                 .into_bytes(),
@@ -184,6 +231,29 @@ impl Doc {
             stream.extend_from_slice(content.as_bytes());
             stream.extend_from_slice(b"\nendstream");
             objs.push(stream);
+        }
+        for (img, id) in self.images.iter().zip(&image_ids) {
+            let stream = |dict: String, data: &[u8]| {
+                let mut s = format!("{dict} /Length {} >>\nstream\n", data.len()).into_bytes();
+                s.extend_from_slice(data);
+                s.extend_from_slice(b"\nendstream");
+                s
+            };
+            let colour = if img.gray { "/DeviceGray" } else { "/DeviceRGB" };
+            let filter = if img.dct { "/DCTDecode" } else { "/FlateDecode" };
+            let smask = if img.smask.is_some() { format!(" /SMask {} 0 R", id + 1) } else { String::new() };
+            let dict = format!(
+                "<< /Type /XObject /Subtype /Image /Width {} /Height {} /ColorSpace {colour} /BitsPerComponent 8 /Filter {filter}{smask}",
+                img.width, img.height
+            );
+            objs.push(stream(dict, &img.data));
+            if let Some(mask) = &img.smask {
+                let dict = format!(
+                    "<< /Type /XObject /Subtype /Image /Width {} /Height {} /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode",
+                    img.width, img.height
+                );
+                objs.push(stream(dict, mask));
+            }
         }
         let mut out = b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n".to_vec();
         let mut offsets = vec![];
@@ -230,6 +300,8 @@ pub struct Invoice {
     pub footer: String,
     /// Shown across the top (VOID, a credit note's reference).
     pub banner: Option<String>,
+    /// The branding logo, above the company name.
+    pub logo: Option<Image>,
 }
 
 pub fn invoice(inv: &Invoice) -> Vec<u8> {
@@ -237,7 +309,14 @@ pub fn invoice(inv: &Invoice) -> Vec<u8> {
     let right = PAGE_W - MARGIN;
     let col_qty = right - 210.0;
     let col_unit = right - 100.0;
+    let logo = inv.logo.clone().map(|img| {
+        let size = img.fit(160.0, 40.0);
+        (d.add_image(img), size)
+    });
     let header = |d: &mut Doc| -> f32 {
+        if let Some((idx, (w, h))) = logo {
+            d.image(idx, MARGIN, 14.0 + (40.0 - h), w, h);
+        }
         d.text(MARGIN, 70.0, 16.0, true, 0.1, &inv.company);
         let mut y = 86.0;
         for l in inv.company_address.lines().filter(|l| !l.trim().is_empty()) {
@@ -341,12 +420,26 @@ pub enum Block {
     Bars(Vec<(String, f64, String)>),
 }
 
+// Kept for callers without a logo (scheduled reports are built in parallel to this).
+#[allow(dead_code)]
 pub fn report(title: &str, subtitle: &str, company: &str, blocks: &[Block]) -> Vec<u8> {
+    report_with_logo(title, subtitle, company, None, blocks)
+}
+
+/// [`report`] with the branding logo at the top right of every page.
+pub fn report_with_logo(title: &str, subtitle: &str, company: &str, logo: Option<Image>, blocks: &[Block]) -> Vec<u8> {
     let mut d = Doc::new();
     let right = PAGE_W - MARGIN;
+    let logo = logo.map(|img| {
+        let size = img.fit(140.0, 30.0);
+        (d.add_image(img), size)
+    });
     let top = |d: &mut Doc| {
         d.rect_rgb(0.0, 0.0, PAGE_W, 8.0, (0.11, 0.17, 0.33));
         d.text(MARGIN, 40.0, 8.0, true, 0.45, &company.to_uppercase());
+        if let Some((idx, (w, h))) = logo {
+            d.image(idx, right - w, 16.0 + (30.0 - h), w, h);
+        }
         64.0
     };
     let mut y = top(&mut d);
@@ -473,6 +566,7 @@ mod tests {
             notes: "Thanks".into(),
             footer: "Pay by bank transfer".into(),
             banner: None,
+            logo: None,
         };
         let pdf = invoice(&inv);
         let text = String::from_utf8_lossy(&pdf);
@@ -487,5 +581,29 @@ mod tests {
         assert!(pdf[first..].starts_with(b"1 0 obj"));
         let r = report("QBR", "Q4 2026", "Acme", &[Block::Heading("Tickets".into()), Block::Bars(vec![("Oct".into(), 3.0, "3".into())])]);
         assert!(String::from_utf8_lossy(&r).contains("/Count 1"));
+        assert!(!String::from_utf8_lossy(&r).contains("/XObject"));
+    }
+
+    #[test]
+    fn embeds_a_logo() {
+        let logo = crate::branding::pdf_image(&crate::branding::tests::sample_png(40, 10)).unwrap();
+        let blocks: Vec<Block> = (0..120).map(|i| Block::Paragraph(format!("Paragraph {i}"))).collect();
+        let pdf = report_with_logo("QBR", "Q4", "Acme", Some(logo), &blocks);
+        let text = String::from_utf8_lossy(&pdf);
+        let pages = text.matches("/Type /Page ").count();
+        assert!(pages > 1);
+        assert_eq!(text.matches("/XObject << /Im0 ").count(), pages, "every page can draw it");
+        assert_eq!(text.matches("/Im0 Do").count(), pages, "and does, in the header");
+        assert_eq!(text.matches("/Subtype /Image").count(), 2, "the image and its soft mask, once");
+        let id: usize = text.split("/XObject << /Im0 ").nth(1).unwrap().split_whitespace().next().unwrap().parse().unwrap();
+        assert!(text.contains(&format!("{id} 0 obj\n<< /Type /XObject /Subtype /Image /Width 40 /Height 10 /ColorSpace /DeviceRGB")));
+        assert!(text.contains(&format!("/SMask {} 0 R", id + 1)));
+        // The xref still points at every object.
+        let xref_at: usize = text.rsplit("startxref\n").next().unwrap().lines().next().unwrap().parse().unwrap();
+        let tail = String::from_utf8_lossy(&pdf[xref_at..]).to_string();
+        for (i, line) in tail.lines().skip(3).take_while(|l| l.ends_with(" n ")).enumerate() {
+            let off: usize = line[..10].parse().unwrap();
+            assert!(pdf[off..].starts_with(format!("{} 0 obj", i + 1).as_bytes()), "object {}", i + 1);
+        }
     }
 }

@@ -1233,6 +1233,7 @@ async fn render_pdf(st: &AppState, id: Uuid) -> ApiResult<Vec<u8>> {
         (_, Some(n)) => Some(format!("Credit for {n}")),
         _ => None,
     };
+    let logo = crate::branding::pdf_logo(st, Some(h.client_id)).await;
     let pdf = crate::pdf::invoice(&crate::pdf::Invoice {
         title: if credit { "Credit note".into() } else { "Invoice".into() },
         number: h.number.unwrap_or_else(|| "Draft".into()),
@@ -1258,6 +1259,7 @@ async fn render_pdf(st: &AppState, id: Uuid) -> ApiResult<Vec<u8>> {
         notes: h.notes,
         footer,
         banner,
+        logo,
     });
     Ok(pdf)
 }
@@ -1376,7 +1378,7 @@ pub async fn send(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uuid>
         money(i.total, &i.currency),
         if i.kind == "invoice" { format!(", due {}", i.due_date.format("%-d %B %Y")) } else { String::new() },
     );
-    crate::email::queue_invoice(&st, to.clone(), format!("{what} {number} from {brand}"), body, (format!("{number}.pdf"), key)).await?;
+    crate::email::queue_invoice(&st, i.client_id, to.clone(), format!("{what} {number} from {brand}"), body, (format!("{number}.pdf"), key)).await?;
     sqlx::query("UPDATE invoices SET status = CASE WHEN status = 'finalised' THEN 'sent' ELSE status END, sent_at = now(), updated_at = now() WHERE id = $1")
         .bind(id)
         .execute(&st.db)

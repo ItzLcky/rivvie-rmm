@@ -65,7 +65,7 @@ pub async fn enroll(server_url: &str, token: &str, previous: Option<&Config>) ->
     match recv(&mut ws).await? {
         ServerMsg::Enrolled { agent_id, secret } => {
             let _ = ws.close(None).await;
-            Ok(Config { server_url: server_url.trim_end_matches('/').to_string(), agent_id, secret })
+            Ok(Config { server_url: server_url.trim_end_matches('/').to_string(), agent_id, secret, product_name: None })
         }
         ServerMsg::AuthFailed { reason } => bail!("enrollment rejected: {reason}"),
         other => bail!("unexpected reply to enrollment: {other:?}"),

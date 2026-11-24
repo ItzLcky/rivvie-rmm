@@ -130,8 +130,8 @@ async fn start_session(st: &AppState, contact_id: Uuid, headers: &HeaderMap) -> 
 
 /// Sends a sign-in link (or an invitation) to a contact with portal access.
 pub async fn send_link(st: &AppState, contact_id: Uuid, invite: bool) -> ApiResult<()> {
-    let (name, email): (String, String) =
-        sqlx::query_as("SELECT name, email FROM contacts WHERE id = $1 AND portal_enabled AND email <> ''")
+    let (name, email, client_id): (String, String, Uuid) =
+        sqlx::query_as("SELECT name, email, client_id FROM contacts WHERE id = $1 AND portal_enabled AND email <> ''")
             .bind(contact_id)
             .fetch_optional(&st.db)
             .await?
@@ -145,7 +145,7 @@ pub async fn send_link(st: &AppState, contact_id: Uuid, invite: bool) -> ApiResu
         .execute(&st.db)
         .await?;
     let url = format!("{}/portal/login?token={token}", st.cfg.public_url);
-    crate::email::queue_portal_link(st, &email, &name, &url, invite).await?;
+    crate::email::queue_portal_link(st, client_id, &email, &name, &url, invite).await?;
     Ok(())
 }
 
@@ -321,7 +321,12 @@ pub async fn logout(State(st): State<Arc<AppState>>, headers: HeaderMap) -> ApiR
 /// Company name and the portal's welcome text, for the sign-in page.
 pub async fn public_info(State(st): State<Arc<AppState>>) -> ApiResult<Json<Value>> {
     let welcome: String = sqlx::query_scalar("SELECT portal_welcome FROM company_settings").fetch_one(&st.db).await?;
-    Ok(Json(json!({ "company_name": st.company().company_name, "welcome": welcome, "attachment_max_mb": st.cfg.attachment_max_mb })))
+    Ok(Json(json!({
+        "company_name": st.company().company_name,
+        "welcome": welcome,
+        "attachment_max_mb": st.cfg.attachment_max_mb,
+        "branding": crate::branding::resolve(&st, None),
+    })))
 }
 
 pub async fn me(State(st): State<Arc<AppState>>, c: Contact) -> ApiResult<Json<Value>> {
@@ -344,6 +349,8 @@ pub async fn me(State(st): State<Arc<AppState>>, c: Contact) -> ApiResult<Json<V
         "has_password": has_password,
         "totp_enabled": totp,
         "attachment_max_mb": st.cfg.attachment_max_mb,
+        // The client's own branding over the instance's.
+        "branding": crate::branding::resolve(&st, Some(c.client_id)),
     })))
 }
 
