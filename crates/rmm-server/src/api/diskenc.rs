@@ -107,7 +107,7 @@ pub async fn list(State(st): State<Arc<AppState>>, u: User, Query(q): Query<List
     if let Some(c) = q.client_id {
         super::access::client(&u, c)?;
     }
-    let plan = Plan::new(SORT_KEYS, ("status", false), &page, "(v.agent_id::text || '/' || v.volume_id)", "text", 9)?;
+    let plan = Plan::new(SORT_KEYS, ("status", false), &page, "(v.agent_id::text || '/' || v.volume_id)", "text", 8)?;
     let statuses: Option<Vec<String>> = q.status.as_deref().filter(|s| !s.is_empty()).map(|s| s.split(',').map(|r| r.trim().to_string()).collect());
     if let Some(bad) = statuses.iter().flatten().find(|r| !STATUSES.contains(&r.as_str())) {
         return Err(ApiError::BadRequest(format!("unknown status {bad}")));

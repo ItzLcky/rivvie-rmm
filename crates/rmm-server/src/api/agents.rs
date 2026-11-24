@@ -165,7 +165,7 @@ pub async fn list(
     Query(q): Query<ListQuery>,
     Query(page): Query<PageQuery>,
 ) -> ApiResult<Json<Page<AgentSummary>>> {
-    let plan = Plan::new(SORT_KEYS, ("hostname", false), &page, "a.id", "uuid", 15)?;
+    let plan = Plan::new(SORT_KEYS, ("hostname", false), &page, "a.id", "uuid", 16)?;
     let tags = super::tags::parse_filter(q.tag.as_deref())?;
     let cf = super::fields::filter(&st, &u, q.cf, q.cfv.as_deref()).await?;
     let health: Option<Vec<String>> =

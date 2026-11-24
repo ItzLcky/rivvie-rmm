@@ -118,6 +118,15 @@ async fn disk_encryption(url: &str, admin: &Api, db: &sqlx::PgPool, dir: &Path, 
     assert!(!admin.get("/agents?encryption=encrypted").await["items"].as_array().unwrap().iter().any(|x| x["id"] == id1));
     let (s, _) = admin.call(Method::GET, "/agents?encryption=sideways", None).await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
+    // Paged with a cursor (the keyset binds come after the filters).
+    let first = admin.get("/disk-encryption?limit=1").await;
+    assert!(first["total"].as_i64().unwrap() >= 2, "{first}");
+    let next = admin.get(&format!("/disk-encryption?limit=1&after={}", first["next"].as_str().unwrap())).await;
+    assert_eq!(next["items"].as_array().unwrap().len(), 1, "{next}");
+    assert_ne!(next["items"][0]["volume_id"], first["items"][0]["volume_id"]);
+    let paged = admin.get("/agents?limit=1&encryption=none,unknown").await;
+    assert!(paged["next"].is_string(), "{paged}");
+    admin.get(&format!("/agents?limit=1&encryption=none,unknown&after={}", paged["next"].as_str().unwrap())).await;
     let fleet = admin.get("/disk-encryption?status=unencrypted&os_only=true").await;
     assert!(fleet["items"].as_array().unwrap().iter().any(|v| v["agent_id"] == id1 && v["alerting"] == true), "{fleet}");
 
