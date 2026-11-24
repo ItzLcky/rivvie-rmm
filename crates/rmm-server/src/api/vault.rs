@@ -390,6 +390,8 @@ pub async fn reveal(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uui
         json!({ "client_id": client, "name": name, "field": field, "history_id": b.history }),
     )
     .await;
+    // A revealed local admin password is rotated a while later (docs/design/local-admin.md).
+    crate::localadmin::revealed(&st, id).await;
     Ok(no_store(json!({ "value": value })))
 }
 

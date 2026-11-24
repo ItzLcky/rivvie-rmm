@@ -28,6 +28,9 @@ pub const ROOT: Uuid = Uuid::from_u128(0x00000000_0000_4000_8001_000000000000);
 /// MSP-wide rows they replaced; the views in 0022_policies.sql name them).
 pub const REMOTE_ITEM: Uuid = Uuid::from_u128(0x00000000_0000_4000_8000_000000000003);
 pub const AGENT_ITEM: Uuid = Uuid::from_u128(0x00000000_0000_4000_8000_000000000004);
+/// Disk encryption (escrow), and the managed local admin account (0038, 0039).
+pub const DISKENC_ITEM: Uuid = Uuid::from_u128(0x00000000_0000_4000_8000_000000000005);
+pub const LOCAL_ADMIN_ITEM: Uuid = Uuid::from_u128(0x00000000_0000_4000_8000_000000000006);
 /// Levels below All devices a set may sit at (the built-in OS and platform levels count).
 pub const MAX_DEPTH: i32 = 8;
 
@@ -42,6 +45,8 @@ pub enum Module {
     Agent,
     Software,
     Automation,
+    DiskEncryption,
+    LocalAdmin,
 }
 
 impl Module {
@@ -55,6 +60,8 @@ impl Module {
             "agent" => Module::Agent,
             "software" => Module::Software,
             "automation" => Module::Automation,
+            "disk_encryption" => Module::DiskEncryption,
+            "local_admin" => Module::LocalAdmin,
             _ => return None,
         })
     }
@@ -69,6 +76,8 @@ impl Module {
             Module::Agent => "agent",
             Module::Software => "software",
             Module::Automation => "automation",
+            Module::DiskEncryption => "disk_encryption",
+            Module::LocalAdmin => "local_admin",
         }
     }
 
@@ -95,6 +104,8 @@ impl Module {
             Module::Software => SOFTWARE_FIELDS.contains(&field),
             // One trigger and one script per item; the rest tunes how it runs.
             Module::Automation => AUTOMATION_OVERRIDABLE.contains(&field),
+            Module::DiskEncryption => DISKENC_FIELDS.contains(&field),
+            Module::LocalAdmin => LOCAL_ADMIN_FIELDS.contains(&field),
         }
     }
 }
@@ -130,6 +141,8 @@ const SECURITY_FIELDS: &[&str] = &[
 ];
 const SOFTWARE_FIELDS: &[&str] = &["state", "bootstrap_choco", "window"];
 const REMOTE_FIELDS: &[&str] = &["desktop_enabled", "desktop_consent", "shell_enabled", "files_enabled"];
+const DISKENC_FIELDS: &[&str] = &["escrow_recovery_keys", "add_recovery_protector"];
+const LOCAL_ADMIN_FIELDS: &[&str] = &["enabled", "account", "create", "rotate_days", "length", "rotate_after_reveal_hours"];
 
 // ---------------------------------------------------------------------------
 // Module configs
@@ -286,7 +299,7 @@ fn hundred() -> i32 {
 }
 
 /// The alert kinds `alert_opened` can name (the `kind` of an alert item).
-pub const ALERT_KINDS: &[&str] = &["offline", "cpu", "memory", "disk", "service", "job_failed", "log", "security", "patch", "backup"];
+pub const ALERT_KINDS: &[&str] = &["offline", "cpu", "memory", "disk", "service", "job_failed", "log", "security", "patch", "backup", "disk_encryption", "local_admin"];
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -563,6 +576,58 @@ impl SoftwareConfig {
     }
 }
 
+/// What the server does with BitLocker recovery passwords (docs/design/disk-encryption.md).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiskEncryptionConfig {
+    /// Pull each volume's recovery password into the client's vault.
+    pub escrow_recovery_keys: bool,
+    /// Add a recovery password protector to an encrypted volume that has none.
+    pub add_recovery_protector: bool,
+}
+
+/// The managed local admin account (docs/design/local-admin.md).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalAdminConfig {
+    pub enabled: bool,
+    pub account: String,
+    /// Create the account when it doesn't exist.
+    pub create: bool,
+    pub rotate_days: i32,
+    /// Generated password length.
+    pub length: i32,
+    /// Rotate this long after someone reveals the password (0: don't).
+    pub rotate_after_reveal_hours: i32,
+}
+
+impl Default for LocalAdminConfig {
+    fn default() -> Self {
+        LocalAdminConfig { enabled: false, account: "rmmadmin".into(), create: true, rotate_days: 30, length: 20, rotate_after_reveal_hours: 24 }
+    }
+}
+
+impl LocalAdminConfig {
+    fn validate(&self) -> Result<(), String> {
+        if !rmm_proto::localadmin::valid_account(&self.account) {
+            return Err("the account is 1-20 lower-case letters, digits, '-' or '_', starting with a letter".into());
+        }
+        if ["administrator", "admin", "root", "guest", "defaultaccount", "wdagutilityaccount"].contains(&self.account.as_str()) {
+            return Err(format!("{} is a built-in account; pick a name of its own", self.account));
+        }
+        if !(1..=365).contains(&self.rotate_days) {
+            return Err("rotate every 1-365 days".into());
+        }
+        if !(crate::localadmin::MIN_LENGTH..=crate::localadmin::MAX_LENGTH).contains(&self.length) {
+            return Err(format!("the password is {}-{} characters", crate::localadmin::MIN_LENGTH, crate::localadmin::MAX_LENGTH));
+        }
+        if !(0..=720).contains(&self.rotate_after_reveal_hours) {
+            return Err("rotate 0-720 hours after a reveal (0: don't)".into());
+        }
+        Ok(())
+    }
+}
+
 fn parse<T: serde::de::DeserializeOwned>(v: &Value) -> Result<T, String> {
     serde_json::from_value(v.clone()).map_err(|e| e.to_string())
 }
@@ -601,6 +666,12 @@ pub fn validate(module: Module, config: &Value) -> Result<Value, String> {
         }
         Module::Automation => {
             let c: AutomationConfig = parse(config)?;
+            c.validate()?;
+            serde_json::to_value(c)
+        }
+        Module::DiskEncryption => serde_json::to_value(parse::<DiskEncryptionConfig>(config)?),
+        Module::LocalAdmin => {
+            let c: LocalAdminConfig = parse(config)?;
             c.validate()?;
             serde_json::to_value(c)
         }
@@ -751,6 +822,38 @@ pub async fn auto_update(st: &AppState, agent_id: Uuid) -> sqlx::Result<bool> {
     Ok(v.flatten().unwrap_or(false))
 }
 
+/// The effective config of a single-instance item for an agent (None: no such agent).
+async fn single_config(st: &AppState, agent_id: Uuid, item: Uuid) -> sqlx::Result<Option<(bool, Value)>> {
+    sqlx::query_as(
+        "SELECT e.enabled, e.config FROM agents a JOIN policy_effective e ON e.set_id = a.policy_set_id AND e.item_id = $2 WHERE a.id = $1",
+    )
+    .bind(agent_id)
+    .bind(item)
+    .fetch_optional(&st.db)
+    .await
+}
+
+/// The agent's disk encryption policy; escrow and protectors off when the item is disabled.
+pub async fn disk_encryption(st: &AppState, agent_id: Uuid) -> sqlx::Result<DiskEncryptionConfig> {
+    let off = DiskEncryptionConfig { escrow_recovery_keys: false, add_recovery_protector: false };
+    Ok(match single_config(st, agent_id, DISKENC_ITEM).await? {
+        Some((true, c)) => serde_json::from_value(c).unwrap_or(off),
+        _ => off,
+    })
+}
+
+/// The agent's local admin policy; `enabled` false when the item is disabled.
+pub async fn local_admin(st: &AppState, agent_id: Uuid) -> sqlx::Result<LocalAdminConfig> {
+    Ok(match single_config(st, agent_id, LOCAL_ADMIN_ITEM).await? {
+        Some((on, c)) => {
+            let mut c: LocalAdminConfig = serde_json::from_value(c).unwrap_or_default();
+            c.enabled &= on;
+            c
+        }
+        None => LocalAdminConfig::default(),
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Writes
 // ---------------------------------------------------------------------------
@@ -895,6 +998,8 @@ pub async fn changed(st: &Arc<AppState>, ch: Change) {
     crate::alerts::push_watchers(st, agents).await;
     crate::checks::push(st, agents, &[]).await;
     crate::security::push_policies_to(st, agents).await;
+    crate::diskenc::policy_changed(st, agents).await;
+    crate::localadmin::policy_changed(st, agents).await;
     let res = async { crate::patches::apply_policies(&mut *st.db.acquire().await?, agents).await }.await;
     if let Err(e) = res {
         warn!("re-applying patch approvals: {e}");
@@ -1012,6 +1117,29 @@ mod tests {
         assert!(clean_override(Module::Automation, &json!({ "trigger": "run_once" })).is_err());
         assert!(clean_override(Module::Automation, &json!({ "script_id": id })).is_err());
         assert!(!Module::Automation.single(), "defined in any set, like alerts and schedules");
+    }
+
+    #[test]
+    fn device_security_modules() {
+        assert!(Module::DiskEncryption.single() && Module::LocalAdmin.single());
+        assert_eq!(Module::parse("disk_encryption"), Some(Module::DiskEncryption));
+        assert!(validate(Module::DiskEncryption, &json!({ "escrow_recovery_keys": true, "add_recovery_protector": false })).is_ok());
+        assert!(validate(Module::DiskEncryption, &json!({ "escrow_recovery_keys": true })).is_err(), "missing field");
+        let la = serde_json::to_value(LocalAdminConfig::default()).unwrap();
+        assert!(validate(Module::LocalAdmin, &la).is_ok());
+        for bad in [json!({ "account": "Administrator" }), json!({ "account": "administrator" }), json!({ "length": 8 }), json!({ "rotate_days": 0 }), json!({ "rotate_after_reveal_hours": -1 })] {
+            assert!(validate(Module::LocalAdmin, &merge(&la, &bad)).is_err(), "{bad}");
+        }
+        assert!(clean_override(Module::LocalAdmin, &json!({ "enabled": true, "rotate_days": 7 })).is_ok());
+        assert!(clean_override(Module::LocalAdmin, &json!({ "password": "x" })).is_err());
+        // The seed items in the migrations are valid configs.
+        for (sql, module) in [(include_str!("../migrations/0038_disk_encryption.sql"), Module::DiskEncryption), (include_str!("../migrations/0039_local_admin.sql"), Module::LocalAdmin)] {
+            let start = sql.find("'{\"").unwrap() + 1;
+            let end = sql[start..].find("}'").unwrap() + start + 1;
+            let v: Value = serde_json::from_str(&sql[start..end].replace('\n', " ")).unwrap();
+            assert!(validate(module, &v).is_ok(), "{v}");
+            assert!(sql.contains(&format!("'{}'", module.as_str())));
+        }
     }
 
     #[test]

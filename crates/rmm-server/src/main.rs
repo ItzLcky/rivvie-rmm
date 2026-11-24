@@ -11,6 +11,7 @@ mod automation;
 mod apikeys;
 mod webhooks;
 mod desktop_ws;
+mod diskenc;
 mod api;
 mod auth;
 mod email;
@@ -18,6 +19,7 @@ mod error;
 mod events;
 mod fields;
 mod hub;
+mod localadmin;
 mod metrics;
 mod netalerts;
 mod netmon;
@@ -406,6 +408,8 @@ async fn serve(db: sqlx::PgPool, args: ServeArgs) -> Result<()> {
     tokio::spawn(oncall::run(state.clone()));
     tokio::spawn(push::run(state.clone()));
     tokio::spawn(uptime::run(state.clone()));
+    tokio::spawn(diskenc::run(state.clone()));
+    tokio::spawn(localadmin::run(state.clone()));
     if state.cfg.metrics_token.is_some() {
         info!("metrics: GET /metrics (bearer token required)");
     }

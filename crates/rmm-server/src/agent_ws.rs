@@ -300,6 +300,7 @@ async fn run_session(
         warn!(%agent_id, "security state on connect: {e:#}");
     }
     crate::checks::on_connect(&state, agent_id, &capabilities, &tx).await;
+    crate::localadmin::on_connect(&state, agent_id, &capabilities).await;
     // Replies to this connection only (job acks). Weak, so the writer still ends when the
     // hub drops the agent (kick) and every other sender is gone.
     let reply = tx.downgrade();
@@ -617,6 +618,14 @@ async fn on_message(
         AgentMsg::SnmpPollResult { poll_id, results } => crate::netmon::ingest_poll(state, agent_id, poll_id, results).await,
         AgentMsg::WakeOnLanResult { request_id, sent, error } => crate::wol::complete(agent_id, request_id, sent, error),
         AgentMsg::CheckResults { results } => crate::checks::ingest(state, agent_id, results).await?,
+        AgentMsg::DiskEncryption(report) => crate::diskenc::ingest_report(state, agent_id, client_id, report).await?,
+        AgentMsg::DiskRecoveryKey { request_id, volume_id, protector_id, key, error } => {
+            crate::diskenc::ingest_key(state, agent_id, request_id, volume_id, protector_id, key.map(|k| k.0), error).await?
+        }
+        AgentMsg::DiskProtectorResult { request_id, ok, message } => crate::diskenc::ingest_protector_result(state, agent_id, request_id, ok, message).await,
+        AgentMsg::LocalAdminResult { request_id, ok, created, status, message } => {
+            crate::localadmin::ingest_result(state, agent_id, request_id, ok, created, status, message).await?
+        }
         AgentMsg::Pong { .. } => {}
         AgentMsg::Enroll { .. } | AgentMsg::Auth { .. } => {}
     }
@@ -664,6 +673,10 @@ fn message_type(m: &AgentMsg) -> usize {
         AgentMsg::SnmpPollResult { .. } => 35,
         AgentMsg::WakeOnLanResult { .. } => 36,
         AgentMsg::CheckResults { .. } => 37,
+        AgentMsg::DiskEncryption(_) => 38,
+        AgentMsg::DiskRecoveryKey { .. } => 39,
+        AgentMsg::DiskProtectorResult { .. } => 40,
+        AgentMsg::LocalAdminResult { .. } => 41,
     }
 }
 

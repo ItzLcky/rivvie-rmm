@@ -31,8 +31,11 @@ fn may_edit(u: &User, owner: Option<Uuid>) -> ApiResult<()> {
 
 fn may_edit_module(u: &User, owner: Option<Uuid>, module: Module) -> ApiResult<()> {
     may_edit(u, owner)?;
-    if module == Module::Security {
-        u.need(Perm::SecurityManage)?;
+    match module {
+        Module::Security | Module::DiskEncryption => u.need(Perm::SecurityManage)?,
+        // It decides which accounts get passwords the vault keeps.
+        Module::LocalAdmin => u.need(Perm::VaultManage)?,
+        _ => {}
     }
     Ok(())
 }

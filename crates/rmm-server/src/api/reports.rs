@@ -432,6 +432,43 @@ async fn backup_blocks(st: &AppState, client: Uuid, from: NaiveDate, to: NaiveDa
     Ok(())
 }
 
+/// QBR "Disk encryption coverage": the client's devices whose system volume is encrypted, and
+/// how many BitLocker recovery passwords are escrowed.
+async fn diskenc_blocks(st: &AppState, client: Uuid, blocks: &mut Vec<Block>) -> ApiResult<()> {
+    let (devices, reported, os_encrypted, bitlocker, escrowed): (i64, i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT count(*), count(*) FILTER (WHERE a.diskenc_at IS NOT NULL),
+                count(*) FILTER (WHERE EXISTS (SELECT 1 FROM disk_volumes v WHERE v.agent_id = a.id AND v.role = 'os' AND v.status = 'encrypted')),
+                (SELECT count(*) FROM disk_volumes v JOIN agents b ON b.id = v.agent_id JOIN sites t ON t.id = b.site_id
+                  WHERE t.client_id = $1 AND v.kind = 'bitlocker'),
+                (SELECT count(*) FROM disk_volumes v JOIN agents b ON b.id = v.agent_id JOIN sites t ON t.id = b.site_id
+                  WHERE t.client_id = $1 AND v.kind = 'bitlocker' AND v.recovery_protector_id IS NOT NULL AND v.recovery_protector_id = v.escrowed_protector_id)
+           FROM agents a JOIN sites s ON s.id = a.site_id WHERE s.client_id = $1",
+    )
+    .bind(client)
+    .fetch_one(&st.db)
+    .await?;
+    if reported == 0 {
+        return Ok(());
+    }
+    blocks.push(Block::Heading("Disk encryption coverage".into()));
+    blocks.push(Block::Figures(vec![
+        ("Devices reporting".into(), format!("{reported} of {devices}")),
+        ("System volume encrypted".into(), pct(os_encrypted, reported).map_or("–".into(), |p| format!("{p}%"))),
+        ("BitLocker recovery keys escrowed".into(), if bitlocker == 0 { "–".into() } else { format!("{escrowed} of {bitlocker}") }),
+    ]));
+    let plain: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT a.hostname, v.volume_id, v.status FROM disk_volumes v JOIN agents a ON a.id = v.agent_id JOIN sites s ON s.id = a.site_id
+          WHERE s.client_id = $1 AND v.role = 'os' AND v.status IN ('unencrypted', 'suspended', 'decrypting') ORDER BY lower(a.hostname) LIMIT 10",
+    )
+    .bind(client)
+    .fetch_all(&st.db)
+    .await?;
+    if !plain.is_empty() {
+        blocks.push(Block::Table(vec!["Device".into(), "System volume".into()], plain.into_iter().map(|(h, v, st)| vec![h, format!("{v} {st}")]).collect()));
+    }
+    Ok(())
+}
+
 pub async fn qbr(State(st): State<Arc<AppState>>, u: User, Path(client): Path<Uuid>, Query(q): Query<Range>) -> ApiResult<Response> {
     let (from, to) = match (q.from, q.to) {
         (Some(_), Some(_)) => range(&q)?,
@@ -575,6 +612,7 @@ pub(crate) async fn build_qbr(st: &AppState, u: &User, client: Uuid, from: Naive
     )));
     availability_blocks(st, client, from, to, &mut blocks).await?;
     backup_blocks(st, client, from, to, &mut blocks).await?;
+    diskenc_blocks(st, client, &mut blocks).await?;
     let subtitle = format!("{name} · {}", period(from, to));
     let file = format!("QBR-{}-{}", file_part(&name), from.format("%Y-%m"));
     Ok(Rendered { title: "Quarterly business review".into(), subtitle, blocks, file, client: Some(client) })

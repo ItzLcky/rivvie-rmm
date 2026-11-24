@@ -211,7 +211,6 @@ impl Source {
     }
 
     /// Written because `user` asked for it (a reset they started).
-    #[allow(dead_code)] // the API disk encryption, LAPS and identity build on
     pub fn user(feature: &'static str, user: Uuid) -> Self {
         Self { feature, user: Some(user) }
     }
@@ -222,7 +221,6 @@ impl Source {
 /// rules. Errors: [`ApiError::Conflict`] ([`NEEDS_KEY`]) without `RMM_DATA_KEY`,
 /// [`ApiError::NotFound`] for an unknown client or agent, [`ApiError::BadRequest`] for a field
 /// out of bounds (never echoing the password).
-#[allow(dead_code)] // the API disk encryption, LAPS and identity build on
 pub async fn put_managed(st: &AppState, client_id: Uuid, m: Managed, password: &str, source: Source) -> ApiResult<Uuid> {
     let master = st.cfg.data_key.as_ref().ok_or_else(|| ApiError::Conflict(NEEDS_KEY.into()))?;
     put_managed_with(&st.db, master, client_id, m, password, source).await
@@ -384,7 +382,6 @@ pub async fn put_managed_with(db: &PgPool, master: &DataKey, client_id: Uuid, m:
 
 /// Sets the managed state of item `id` (a managed item of `client`), e.g. `ok` once the agent
 /// confirmed a rotated password. Not audited: the password didn't change.
-#[allow(dead_code)] // the API disk encryption, LAPS and identity build on
 pub async fn set_managed_state(db: &PgPool, client: Uuid, id: Uuid, state: &str) -> ApiResult<()> {
     let state = state.trim();
     if state.is_empty() || state.chars().count() > 40 {

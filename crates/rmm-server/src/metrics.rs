@@ -71,7 +71,7 @@ impl Histogram {
 
 /// Agent message types, in the order of [`Metrics::agent_messages`]. Must match
 /// `agent_ws::message_type`.
-pub const AGENT_MESSAGE_TYPES: [&str; 38] = [
+pub const AGENT_MESSAGE_TYPES: [&str; 42] = [
     "enroll",
     "auth",
     "heartbeat",
@@ -110,6 +110,10 @@ pub const AGENT_MESSAGE_TYPES: [&str; 38] = [
     "snmp_poll_result",
     "wake_on_lan_result",
     "check_results",
+    "disk_encryption",
+    "disk_recovery_key",
+    "disk_protector_result",
+    "local_admin_result",
 ];
 
 /// Why a message for an agent or a browser session was thrown away.
