@@ -16,6 +16,7 @@
 		metric: 'cpu' | 'memory' | 'interface_util' | 'supply'; net_kinds: string; net_names: string;
 		up_failures: number; up_kinds: string; up_cert: boolean; up_cert_days: number; up_latency: boolean; up_latency_ms: number;
 		bk_providers: string[]; bk_sources: BackupSource[]; bk_jobs: string; bk_max_age: number; bk_warning: boolean; bk_require: boolean;
+		de_volumes: 'os' | 'all_fixed'; de_escrow: boolean; de_grace: number; la_overdue: number;
 	};
 	export type BackupSource = { provider: 'restic' | 'borg' | 'file_age'; env_file: string; repo: string; path: string; glob: string };
 	const defaults: Record<PolicyKind, Partial<Draft>> = {
@@ -32,7 +33,9 @@
 		net_interface: { minutes: 5 },
 		net_threshold: { threshold: 90, minutes: 10, metric: 'cpu' },
 		uptime: {},
-		backup: {}
+		backup: {},
+		disk_encryption: {},
+		local_admin: {}
 	};
 	const blank = (kind: PolicyKind): Draft => ({
 		kind, severity: 'warning', channel_ids: [], notify_resolved: true, ticket_board_id: null, ticket_priority: 3, ticket_auto_resolve: true, run_script_id: '',
@@ -41,6 +44,7 @@
 		stale_check: false, stale_hours: 24, patch_failed: true, reboot_check: true, reboot_hours: 72, renotify: false, renotify_minutes: 240, metric: 'cpu', net_kinds: '', net_names: '',
 		up_failures: 2, up_kinds: '', up_cert: true, up_cert_days: 14, up_latency: false, up_latency_ms: 1000,
 		bk_providers: ['auto'], bk_sources: [], bk_jobs: '*', bk_max_age: 26, bk_warning: false, bk_require: false,
+		de_volumes: 'os', de_escrow: true, de_grace: 24, la_overdue: 7,
 		...defaults[kind]
 	});
 	const list = (s: string) => s.split(/[\n,]/).map((x) => x.trim()).filter(Boolean);
@@ -70,7 +74,9 @@
 			bk_sources: Array.isArray(q.sources)
 				? (q.sources as Record<string, string | null>[]).map((s) => ({ provider: (s.provider as BackupSource['provider']) ?? 'restic', env_file: s.env_file ?? '', repo: s.repo ?? '', path: s.path ?? '', glob: s.glob ?? '' }))
 				: [],
-			bk_jobs: Array.isArray(q.jobs) ? (q.jobs as string[]).join('\n') : '*', bk_max_age: Number(q.max_age_hours ?? 26), bk_warning: !!q.warning_is_failure, bk_require: !!q.require
+			bk_jobs: Array.isArray(q.jobs) ? (q.jobs as string[]).join('\n') : '*', bk_max_age: Number(q.max_age_hours ?? 26), bk_warning: !!q.warning_is_failure, bk_require: !!q.require,
+			de_volumes: q.volumes === 'all_fixed' ? 'all_fixed' : 'os', de_escrow: q.require_escrow !== false, de_grace: Number(q.grace_hours ?? 24),
+			la_overdue: Number(q.overdue_days ?? 7)
 		};
 	}
 	function params(d: Draft): Record<string, unknown> {
@@ -106,6 +112,10 @@
 				return { failed: d.patch_failed, reboot_hours: d.reboot_check ? Number(d.reboot_hours) : null };
 			case 'uptime':
 				return { failures: Number(d.up_failures), kinds: list(d.up_kinds), cert_days: d.up_cert ? Number(d.up_cert_days) : 0, latency_ms: d.up_latency ? Number(d.up_latency_ms) : null };
+			case 'disk_encryption':
+				return { volumes: d.de_volumes, require_escrow: d.de_escrow, grace_hours: Number(d.de_grace) };
+			case 'local_admin':
+				return { overdue_days: Number(d.la_overdue) };
 			case 'backup': {
 				const opt = (s: string) => s.trim() || null;
 				return {
@@ -417,6 +427,22 @@
 			<PField path="params.warning_is_failure" name="Warnings"><Switch bind:checked={draft.bk_warning}>A job that finished with warnings counts as failed</Switch></PField>
 			<PField path="params.require" name="Required" hint="For server sets, where a backup must exist."><Switch bind:checked={draft.bk_require}>Alert when no backup job is found at all</Switch></PField>
 			<p class="hint -mt-1">The device reads its backups every hour. The <a class="link" href="/backups">Backups</a> page lists every job.</p>
+		{:else if draft.kind === 'disk_encryption'}
+			<PField path="params.volumes" label="Volumes" id="p-devol">
+				<Segmented label="Volumes" size="md" value={draft.de_volumes} onchange={(v) => (draft.de_volumes = v)} options={[{ value: 'os', label: 'System volume' }, { value: 'all_fixed', label: 'Every fixed volume' }]} />
+			</PField>
+			<PField path="params.require_escrow" name="Recovery keys" hint="BitLocker only: FileVault and LUKS keys can't be read back to escrow.">
+				<Switch bind:checked={draft.de_escrow}>Alert when a BitLocker recovery key isn't in the vault</Switch>
+			</PField>
+			<PField path="params.grace_hours" label="Suspended for more than (hours)" id="p-degrace" hint="Updates suspend BitLocker for a restart; 0 alerts at once.">
+				<Input id="p-degrace" type="number" min="0" max="720" class="max-w-40" bind:value={draft.de_grace} />
+			</PField>
+			<p class="hint -mt-1">One alert per volume. Encrypting isn't a finding. Escrow itself is set in the set's <em>Disk encryption</em> section.</p>
+		{:else if draft.kind === 'local_admin'}
+			<PField path="params.overdue_days" label="Overdue after (days)" id="p-laover" hint="Counted from when the rotation was due.">
+				<Input id="p-laover" type="number" min="1" max="365" class="max-w-40" bind:value={draft.la_overdue} />
+			</PField>
+			<p class="hint -mt-1">Also opens when a rotation fails or Windows LAPS manages the same account. Rotation itself is set in the set's <em>Local admin</em> section.</p>
 		{:else if draft.kind === 'patch'}
 			<div class="space-y-3">
 				<PField path="params.failed" name="Failed installs" hint="One alert per agent, listing the updates. It clears once they install, or once someone declines them.">

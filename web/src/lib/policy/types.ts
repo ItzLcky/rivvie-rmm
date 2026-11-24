@@ -1,6 +1,6 @@
 /** Policy management (docs/design/policies.md, docs/design/policies-api.md). */
 
-export type Module = 'alert' | 'schedule' | 'software' | 'automation' | 'patch' | 'security' | 'remote_access' | 'agent';
+export type Module = 'alert' | 'schedule' | 'software' | 'automation' | 'patch' | 'security' | 'remote_access' | 'agent' | 'disk_encryption' | 'local_admin';
 export type Platform = 'workstation' | 'server';
 /** Why a device uses its set. */
 export type Reason = 'pin' | 'site' | 'client' | 'default';

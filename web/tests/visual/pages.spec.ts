@@ -133,7 +133,13 @@ const pages: [string, string][] = [
 	['uptime-monitor', '/uptime/um-vpn'],
 	['uptime-monitor-down', '/uptime/um-erp'],
 	['backups', '/backups'],
-	['agent-backups', '/agents/a-2']
+	['agent-backups', '/agents/a-2'],
+	['agent-disk-encryption', '/agents/a-2?tab=inventory'],
+	['agent-local-admin-failed', '/agents/a-1'],
+	['security-disk-encryption', '/security?tab=encryption'],
+	['policy-set-disk-encryption', '/policies/sets/00000000-0000-4000-8001-000000000000?section=encryption'],
+	['policy-set-local-admin', '/policies/sets/00000000-0000-4000-8001-000000000001?section=localadmin'],
+	['policy-new-disk-encryption', '/policies/sets/00000000-0000-4000-8001-000000000000?section=alerts&item=new&kind=disk_encryption']
 ];
 const phone: [string, string][] = [
 	['dashboard', '/'],
@@ -173,7 +179,9 @@ const phone: [string, string][] = [
 	['network-device', '/network/devices/nd-1'],
 	['uptime', '/uptime'],
 	['uptime-monitor', '/uptime/um-web'],
-	['backups', '/backups']
+	['backups', '/backups'],
+	['security-disk-encryption', '/security?tab=encryption'],
+	['agent-disk-encryption', '/agents/a-2?tab=inventory']
 ];
 
 const jpeg = readFileSync(new URL('./fixtures/desktop.jpg', import.meta.url));

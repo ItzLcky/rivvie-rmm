@@ -1,5 +1,7 @@
 <script lang="ts">
 	import AgentBackups from '#lib/components/agent/AgentBackups.svelte';
+	import AgentDiskEncryption from '#lib/components/agent/AgentDiskEncryption.svelte';
+	import AgentLocalAdmin from '#lib/components/agent/AgentLocalAdmin.svelte';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import { BellOff, CloudDownload, Copy, LifeBuoy, MonitorUp, Pencil, Pin, Play, Power, RefreshCw, Search, SquareTerminal, Tag, Trash2 } from '@lucide/svelte';
@@ -356,6 +358,7 @@
 				</section>
 				{#key a.id}<FieldsCard entity="agent" id={a.id} />{/key}
 				{#key a.id}<AgentBackups agentId={a.id} />{/key}
+				{#key a.id}<AgentLocalAdmin agentId={a.id} online={a.online} hostname={a.hostname} />{/key}
 				</div>
 
 				<div class="min-w-0 space-y-4">
@@ -453,6 +456,7 @@
 						</tbody>
 					</table>
 				</section>
+				<div class="xl:col-span-2">{#key a.id}<AgentDiskEncryption agentId={a.id} online={a.online} hostname={a.hostname} />{/key}</div>
 			</div>
 		{:else if tab === 'software'}
 			{#snippet nameCell(s: Software)}<span class="font-medium">{s.name}</span>{/snippet}
