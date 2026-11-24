@@ -133,7 +133,10 @@ const pages: [string, string][] = [
 	['uptime-monitor', '/uptime/um-vpn'],
 	['uptime-monitor-down', '/uptime/um-erp'],
 	['backups', '/backups'],
-	['agent-backups', '/agents/a-2']
+	['agent-backups', '/agents/a-2'],
+	['client-users', '/clients/c-acme?tab=users'],
+	['client-user', '/clients/c-acme?tab=users&iu=iu-03'],
+	['client-mobile', '/clients/c-acme?tab=mobile']
 ];
 const phone: [string, string][] = [
 	['dashboard', '/'],
@@ -173,7 +176,8 @@ const phone: [string, string][] = [
 	['network-device', '/network/devices/nd-1'],
 	['uptime', '/uptime'],
 	['uptime-monitor', '/uptime/um-web'],
-	['backups', '/backups']
+	['backups', '/backups'],
+	['client-users', '/clients/c-acme?tab=users']
 ];
 
 const jpeg = readFileSync(new URL('./fixtures/desktop.jpg', import.meta.url));
@@ -230,6 +234,23 @@ for (const theme of ['light', 'dark'] as const) {
 			await expect(drawer.getByLabel('URL')).toHaveValue('https://www.acme.example/');
 			await settle(page);
 			await expect(page).toHaveScreenshot(`${theme}-uptime-form.png`);
+		});
+
+		test('identity reset dialog', async ({ page }) => {
+			await mockApi(page);
+			await page.goto('/clients/c-acme?tab=users&iu=iu-02');
+			await settle(page);
+			await page.getByRole('button', { name: 'Reset password' }).click();
+			const dialog = page.getByRole('dialog', { name: 'Reset Raj Patel’s password' });
+			await dialog.getByRole('radio', { name: /Show it to me once/ }).click();
+			await settle(page);
+			await expect(page).toHaveScreenshot(`${theme}-identity-reset.png`);
+			const r = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa']).analyze();
+			expect(r.violations.filter((v) => v.impact === 'serious' || v.impact === 'critical').map((v) => v.id)).toEqual([]);
+			await dialog.getByRole('button', { name: 'Reset password' }).click();
+			await expect(dialog.getByTestId('shown-password')).toHaveText('Kq7#vRm2xP9-tLw4');
+			await settle(page);
+			await expect(page).toHaveScreenshot(`${theme}-identity-reset-shown.png`);
 		});
 
 		test('gallery', async ({ page }) => {

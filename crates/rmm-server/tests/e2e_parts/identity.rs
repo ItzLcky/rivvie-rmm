@@ -190,6 +190,10 @@ fn by_username<'a>(users: &'a [Value], name: &str) -> &'a Value {
     users.iter().find(|u| u["username"] == name).unwrap_or_else(|| panic!("{name} in {users:?}"))
 }
 
+async fn act(api: &Api, user: &Value, action: &str, body: Value) -> (StatusCode, Value) {
+    api.call(reqwest::Method::POST, &format!("/identity/users/{}/{action}", user["id"].as_str().unwrap()), Some(body)).await
+}
+
 const SID: &str = "S-1-5-21-1004336348-1177238915-682003330";
 
 /// Identity management: Active Directory through a fake on a second agent, Entra ID and Intune
@@ -268,10 +272,6 @@ async fn identity(url: &str, admin: &Api, db: &sqlx::PgPool, dir: &Path, token: 
     assert!(groups.as_array().unwrap().iter().any(|g| g["name"] == "Domain Admins" && g["privileged"] == true));
 
     // --- AD actions ----------------------------------------------------------------------
-    let act = |api: &Api, user: &Value, action: &str, body: Value| {
-        let path = format!("/identity/users/{}/{action}", user["id"].as_str().unwrap());
-        async move { api.call(Method::POST, &path, Some(body)).await }
-    };
     let (s, v) = act(&tech, &jdoe, "unlock", json!({})).await;
     assert!(s.is_success(), "{s} {v}");
     assert_eq!(directory_ops(dir).last().unwrap()["op"], "unlock");
@@ -443,7 +443,8 @@ async fn identity(url: &str, admin: &Api, db: &sqlx::PgPool, dir: &Path, token: 
     let devices = tech.get(&format!("/clients/{a_id}/mdm/devices")).await;
     assert_eq!(devices["total"], 2, "{devices}");
     let d1 = devices["items"].as_array().unwrap().iter().find(|d| d["external_id"] == "d1").unwrap();
-    assert_eq!(d1["agent_id"], id1, "{d1}");
+    // Both test agents run on this machine, so either has its host name.
+    assert!(d1["agent_id"] == id1 || d1["agent_id"] == dc_id.as_str(), "{d1}");
     assert_eq!((d1["compliance"].as_str(), d1["encrypted"].as_bool()), (Some("compliant"), Some(true)));
     let unmatched = tech.get(&format!("/clients/{a_id}/mdm/devices?unmatched=true")).await;
     assert_eq!(unmatched["items"][0]["name"], "Adele's iPhone");

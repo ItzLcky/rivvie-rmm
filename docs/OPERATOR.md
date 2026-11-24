@@ -240,7 +240,7 @@ that fails to parse falls back to its default.
 |---|---|---|
 | `RMM_QBO_API_URL`, `RMM_QBO_AUTH_URL`, `RMM_QBO_TOKEN_URL` | Intuit production | `RMM_QBO_API_URL=https://sandbox-quickbooks.api.intuit.com` for the QuickBooks sandbox |
 | `RMM_XERO_API_URL`, `RMM_XERO_AUTH_URL`, `RMM_XERO_TOKEN_URL` | Xero production | |
-| `RMM_GRAPH_URL`, `RMM_GRAPH_LOGIN_URL`, `RMM_GRAPH_SCOPE` | Microsoft public cloud | Microsoft 365 mailboxes through Graph |
+| `RMM_GRAPH_URL`, `RMM_GRAPH_LOGIN_URL`, `RMM_GRAPH_SCOPE` | Microsoft public cloud | Microsoft Graph: Microsoft 365 mailboxes, and the Entra ID and Intune connections of identity management |
 | `RMM_PAGERDUTY_URL` | `https://events.pagerduty.com` | PagerDuty Events API v2 (PagerDuty channels) |
 | `RMM_OPSGENIE_URL` | the channel's region (`api.opsgenie.com`, `api.eu.opsgenie.com`) | Opsgenie channels; replaces both regions |
 | `RMM_PUSH_ALLOW_HOSTS` | empty | Extra host names, comma-separated, Web Push subscriptions may point at (http allowed). Tests only: by default only Google, Mozilla, Microsoft and Apple push services are accepted |
