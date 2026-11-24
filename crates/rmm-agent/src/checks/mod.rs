@@ -1,8 +1,9 @@
 //! Runs the checks the server sends ([`ServerMsg::Checks`]): uptime monitors and backup
 //! jobs. Each check runs at its interval, at most [`MAX_IN_FLIGHT`] at a time and never two of
 //! the same check at once. Results are sent in batches every [`FLUSH_SECS`], and at once when a
-//! check's outcome flips (or it reports for the first time). Checks keep running while the agent
-//! is disconnected; meanwhile only each check's latest result is kept. Nothing is written down.
+//! check's outcome flips, it reports for the first time, or the server asked for the run.
+//! Checks keep running while the agent is disconnected; meanwhile only each check's latest
+//! result is kept. Nothing is written down.
 //!
 //! [`ServerMsg::Checks`]: rmm_proto::ServerMsg::Checks
 
@@ -39,8 +40,9 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 impl Shared {
-    fn record(&self, r: CheckResult) {
-        let flipped = lock(&self.last_ok).insert(r.check_id, r.ok) != Some(r.ok);
+    /// `asked`: the server asked for this run ("check now"), so someone is waiting for it.
+    fn record(&self, r: CheckResult, asked: bool) {
+        let flipped = lock(&self.last_ok).insert(r.check_id, r.ok) != Some(r.ok) || asked;
         {
             let mut p = lock(&self.pending);
             p.push(r);
@@ -151,6 +153,7 @@ async fn schedule(specs: Vec<CheckSpec>, mut run_now: mpsc::UnboundedReceiver<Uu
     // Spread the first runs over a few seconds rather than starting everything at once.
     let start = Instant::now();
     let mut due: Vec<Instant> = (0..specs.len()).map(|i| start + Duration::from_millis(50 * i as u64)).collect();
+    let mut asked: HashSet<Uuid> = HashSet::new();
     loop {
         let next = due.iter().min().copied().unwrap_or(start + Duration::from_secs(3600));
         tokio::select! {
@@ -158,6 +161,7 @@ async fn schedule(specs: Vec<CheckSpec>, mut run_now: mpsc::UnboundedReceiver<Uu
             Some(id) = run_now.recv() => {
                 if let Some(i) = specs.iter().position(|s| s.id == id) {
                     due[i] = Instant::now();
+                    asked.insert(id);
                 }
             }
         }
@@ -171,12 +175,13 @@ async fn schedule(specs: Vec<CheckSpec>, mut run_now: mpsc::UnboundedReceiver<Uu
             if !lock(&busy).insert(spec.id) {
                 continue; // still running from last time
             }
+            let urgent = asked.remove(&spec.id);
             let (spec, sem, busy, shared) = (spec.clone(), sem.clone(), busy.clone(), shared.clone());
             tokio::spawn(async move {
                 let Ok(_permit) = sem.acquire().await else { return };
                 let r = run(&spec).await;
                 lock(&busy).remove(&spec.id);
-                shared.record(r);
+                shared.record(r, urgent);
             });
         }
     }
@@ -365,7 +370,7 @@ mod tests {
         // Disconnected: only the latest result per check is kept.
         checks.detach();
         for ok in [true, false, true] {
-            checks.shared.record(CheckResult { check_id: id, at: Utc::now(), ok, latency_ms: None, value: None, message: String::new(), data: None });
+            checks.shared.record(CheckResult { check_id: id, at: Utc::now(), ok, latency_ms: None, value: None, message: String::new(), data: None }, false);
         }
         checks.shared.flush().await;
         assert_eq!(lock(&checks.shared.pending).len(), 1);
