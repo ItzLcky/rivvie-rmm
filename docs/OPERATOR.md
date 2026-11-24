@@ -248,8 +248,9 @@ that fails to parse falls back to its default.
 QuickBooks and Xero redirect to `<RMM_PUBLIC_URL>/api/billing/accounting/qbo/callback` (and
 `/xero/callback`): register that in the provider's developer portal.
 
-`RMM_SLA_SWEEP_SECS` (default 30) and `RMM_ONCALL_MINUTE_SECS` (default 60: how many seconds
-one minute of escalation delay lasts) exist for tests; leave them alone.
+`RMM_SLA_SWEEP_SECS` (default 30), `RMM_ONCALL_MINUTE_SECS` (default 60: how many seconds
+one minute of escalation delay lasts) and `RMM_LOCALADMIN_TICK_SECS` (default 60: how often due
+local admin rotations are sent) exist for tests; leave them alone.
 
 **Compose-only** (`deploy/.env`): `RMM_DOMAIN`, `POSTGRES_PASSWORD`, `BACKUP_KEEP_DAYS`,
 `BACKUP_INTERVAL_HOURS`. The Arcane stack also takes `RMM_TAG` (image tag), `RMM_PORT` (published

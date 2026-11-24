@@ -130,6 +130,19 @@ The e2e test only proves the packet bytes reach a socket on loopback. On a real 
 4. A `file_age` source on a UNC path (`\\nas\backups`) as SYSTEM: what the service account can and can't read.
 5. macOS (not Windows, but nowhere else to note it): Time Machine to a local disk and to a network destination, `tmutil latestbackup` and `tmutil status` while a backup runs.
 
+## 7b. Disk encryption and local admin rotation
+
+The CI runner has no BitLocker and isn't domain-joined; these need real hosts ([disk-encryption](disk-encryption.md), [local-admin](local-admin.md)).
+
+1. BitLocker on a TPM laptop (Windows 11 Pro): `C:` reports `encrypted` with TPM and a recovery password; with escrow on, the vault gets `BitLocker recovery: HOST C:` and its reveal matches `manage-bde -protectors -get C:`. Rotate from the Inventory tab: a new numerical password replaces the old one on the machine and in the vault (the old one in its history). Suspend (`manage-bde -protectors -disable C:`): `suspended`, and the alert after the grace period; resume clears it.
+2. A data drive with only a startup key and `add_recovery_protector` on: a recovery password is added and escrowed. With the GPO "Do not allow 48-digit recovery password" set: the refusal shows on the volume and isn't retried for a day.
+3. Encryption in progress (`manage-bde -on D:`): `encrypting` with a percentage, no alert. A USB disk with BitLocker To Go: not listed.
+4. Windows Home and Server without the BitLocker feature: fixed drives listed as unencrypted, no error. A non-English Windows where CIM is blocked: the `manage-bde` fallback (English parser) returns nothing; note what it shows.
+5. Local admin rotation on a domain-joined workstation: the account is local, rotation works, and a domain account of the same name is untouched. On a domain controller: `unsupported`.
+6. Windows LAPS on the same machine managing `rmmadmin` (`AdministratorAccountName`): `conflict` and the alert; managing only the built-in Administrator: no conflict.
+7. A localised Windows (German, French): the account joins *Administratoren*/*Administrateurs* (looked up by SID). A local password policy stricter than the default (length 24): the failure message names the policy, the device keeps its previous password.
+8. Linux as root (Ubuntu with `sudo`, Rocky with `wheel`): the account is created, can `sudo`, and `chpasswd` sets the vault's password; on a host without `chpasswd`: `unsupported`.
+
 ## 8. Fix what breaks, record versions
 
 For each failed step, fix it with a test that reproduces it (unit tests against recorded output where the failure is parsing, the e2e where it is behaviour). Record in the README's Windows line which versions passed.
