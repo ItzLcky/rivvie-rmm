@@ -1,9 +1,9 @@
-//! Just enough DNS for names: PTR lookups against the system's resolvers and mDNS. The
-//! standard library can't do a reverse lookup, and a resolver library is a lot of code for
-//! this.
+//! Just enough DNS: PTR lookups against the system's resolvers and mDNS (network discovery),
+//! and A, AAAA, CNAME, MX and TXT lookups for DNS monitors. The standard library can't do a
+//! reverse lookup or ask for a record type, and a resolver library is a lot of code for this.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 use tokio::net::UdpSocket;
@@ -11,6 +11,10 @@ use tokio::net::UdpSocket;
 pub const PTR: u16 = 12;
 pub const A: u16 = 1;
 pub const SRV: u16 = 33;
+pub const AAAA: u16 = 28;
+pub const CNAME: u16 = 5;
+pub const MX: u16 = 15;
+pub const TXT: u16 = 16;
 
 /// `4.3.2.1.in-addr.arpa` for 1.2.3.4.
 pub fn reverse_name(ip: Ipv4Addr) -> String {
@@ -45,7 +49,25 @@ pub enum Data {
     Ptr(String),
     A(Ipv4Addr),
     Srv(String),
+    Aaaa(Ipv6Addr),
+    Cname(String),
+    Mx(u16, String),
+    Txt(String),
     Other,
+}
+
+impl Data {
+    /// The answer as a monitor shows and compares it.
+    pub fn text(&self) -> Option<String> {
+        Some(match self {
+            Data::A(ip) => ip.to_string(),
+            Data::Aaaa(ip) => ip.to_string(),
+            Data::Cname(n) | Data::Ptr(n) | Data::Srv(n) => n.trim_end_matches('.').to_ascii_lowercase(),
+            Data::Mx(pref, n) => format!("{pref} {}", n.trim_end_matches('.').to_ascii_lowercase()),
+            Data::Txt(t) => t.clone(),
+            Data::Other => return None,
+        })
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -57,9 +79,10 @@ pub struct Record {
 #[derive(Debug)]
 pub struct Message {
     pub id: u16,
-    /// Response code; only the tests look at it (an error answer has no records anyway).
-    #[allow(dead_code)]
+    /// Response code: 0 no error, 2 server failure, 3 no such name.
     pub rcode: u8,
+    /// Records in the answer section (they come first in `records`).
+    pub answers: usize,
     pub records: Vec<Record>,
 }
 
@@ -103,7 +126,8 @@ pub fn parse(buf: &[u8]) -> Option<Message> {
     let id = u16::from_be_bytes([buf[0], buf[1]]);
     let rcode = buf[3] & 0x0f;
     let qd = u16::from_be_bytes([buf[4], buf[5]]) as usize;
-    let rr = u16::from_be_bytes([buf[6], buf[7]]) as usize + u16::from_be_bytes([buf[8], buf[9]]) as usize + u16::from_be_bytes([buf[10], buf[11]]) as usize;
+    let answers = u16::from_be_bytes([buf[6], buf[7]]) as usize;
+    let rr = answers + u16::from_be_bytes([buf[8], buf[9]]) as usize + u16::from_be_bytes([buf[10], buf[11]]) as usize;
     let mut pos = 12;
     for _ in 0..qd {
         pos = name_at(buf, pos)?.1 + 4;
@@ -120,12 +144,28 @@ pub fn parse(buf: &[u8]) -> Option<Message> {
             A if rdlen == 4 => Data::A(Ipv4Addr::new(buf[rdata], buf[rdata + 1], buf[rdata + 2], buf[rdata + 3])),
             // Priority, weight, port, target.
             SRV if rdlen > 6 => name_at(buf, rdata + 6).map_or(Data::Other, |(n, _)| Data::Srv(n)),
+            AAAA if rdlen == 16 => {
+                let b: [u8; 16] = buf[rdata..rdata + 16].try_into().unwrap_or([0; 16]);
+                Data::Aaaa(Ipv6Addr::from(b))
+            }
+            CNAME => name_at(buf, rdata).map_or(Data::Other, |(n, _)| Data::Cname(n)),
+            MX if rdlen > 2 => name_at(buf, rdata + 2).map_or(Data::Other, |(n, _)| Data::Mx(u16::from_be_bytes([buf[rdata], buf[rdata + 1]]), n)),
+            TXT => {
+                // One or more length-prefixed strings, joined.
+                let (mut t, mut p, end) = (Vec::new(), rdata, rdata + rdlen);
+                while p < end {
+                    let l = buf[p] as usize;
+                    t.extend_from_slice(buf.get(p + 1..(p + 1 + l).min(end)).unwrap_or(&[]));
+                    p += 1 + l;
+                }
+                Data::Txt(String::from_utf8_lossy(&t).into_owned())
+            }
             _ => Data::Other,
         };
         records.push(Record { name, data });
         pos = rdata + rdlen;
     }
-    Some(Message { id, rcode, records })
+    Some(Message { id, rcode, answers: answers.min(records.len()), records })
 }
 
 /// The resolvers the system uses.
@@ -229,6 +269,85 @@ pub async fn mdns_browse(window: Duration) -> HashMap<Ipv4Addr, String> {
     found
 }
 
+/// The record type for a name: `A`, `AAAA`, `CNAME`, `MX` or `TXT`.
+pub fn record_type(name: &str) -> Option<u16> {
+    Some(match name.to_ascii_uppercase().as_str() {
+        "A" => A,
+        "AAAA" => AAAA,
+        "CNAME" => CNAME,
+        "MX" => MX,
+        "TXT" => TXT,
+        _ => return None,
+    })
+}
+
+/// Asks `server` (or the system's resolvers in turn) for `name`'s records of type `rtype`.
+/// Returns the answers of that type as text, and the time the answer took. No such name, or a
+/// server failure, is an error; a name with no records of the type is an empty list.
+pub async fn lookup(name: &str, rtype: u16, server: Option<SocketAddr>, timeout: Duration) -> Result<(Vec<String>, u32), String> {
+    let name = name.trim().trim_end_matches('.');
+    if name.is_empty() || name.len() > 253 || name.split('.').any(|l| l.is_empty() || l.len() > 63) {
+        return Err(format!("{name:?} isn't a valid name"));
+    }
+    let servers = match server {
+        Some(s) => vec![s],
+        None => nameservers(),
+    };
+    if servers.is_empty() {
+        return Err("this machine has no DNS servers configured".into());
+    }
+    let per = timeout / servers.len() as u32;
+    let mut last = String::from("no answer");
+    for s in servers {
+        match ask(s, name, rtype, per).await {
+            Ok(r) => return Ok(r),
+            Err(e) => last = format!("{s}: {e}"),
+        }
+    }
+    Err(last)
+}
+
+async fn ask(server: SocketAddr, name: &str, rtype: u16, timeout: Duration) -> Result<(Vec<String>, u32), String> {
+    let sock = UdpSocket::bind(if server.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" }).await.map_err(|e| e.to_string())?;
+    let id = u16::from_be_bytes([uuid::Uuid::new_v4().as_bytes()[0], uuid::Uuid::new_v4().as_bytes()[1]]);
+    let started = std::time::Instant::now();
+    sock.send_to(&query(id, &[(name, rtype)], false), server).await.map_err(|e| e.to_string())?;
+    let mut buf = vec![0u8; 4096];
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let (n, from) = match tokio::time::timeout_at(deadline, sock.recv_from(&mut buf)).await {
+            Err(_) => return Err("timed out".into()),
+            Ok(Err(e)) => return Err(e.to_string()),
+            Ok(Ok(r)) => r,
+        };
+        if from.ip() != server.ip() {
+            continue;
+        }
+        let Some(m) = parse(&buf[..n]) else { return Err("unreadable answer".into()) };
+        if m.id != id {
+            continue;
+        }
+        let ms = crate::millis(started.elapsed());
+        return match m.rcode {
+            0 => Ok((answers_of(&m, rtype), ms)),
+            3 => Err(format!("{name} doesn't exist (NXDOMAIN)")),
+            2 => Err("the server failed (SERVFAIL)".into()),
+            5 => Err("the server refused the query".into()),
+            c => Err(format!("the server answered with error {c}")),
+        };
+    }
+}
+
+/// The answer-section records of the type asked for, as text. A CNAME chain the server
+/// followed for an `A` question gives the addresses at its end.
+pub fn answers_of(m: &Message, rtype: u16) -> Vec<String> {
+    m.records[..m.answers]
+        .iter()
+        .filter(|r| matches!((&r.data, rtype), (Data::A(_), A) | (Data::Aaaa(_), AAAA) | (Data::Cname(_), CNAME) | (Data::Mx(..), MX) | (Data::Txt(_), TXT)))
+        .filter_map(|r| r.data.text())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -295,6 +414,53 @@ mod tests {
         p.extend_from_slice(&[0, 1, 0x80, 1, 0, 0, 0, 120, 0, 4, 192, 168, 1, 30]);
         let m = parse(&p).unwrap();
         assert_eq!(m.records[0], Record { name: "printer.local".into(), data: Data::A(Ipv4Addr::new(192, 168, 1, 30)) });
+    }
+
+    #[test]
+    fn record_types_for_monitors() {
+        // An answer to `example.com MX` with one MX and one TXT (which isn't what was asked).
+        let mut p = query(9, &[("example.com", MX)], false);
+        p[2] = 0x81;
+        p[3] = 0x80;
+        p[7] = 2;
+        p.extend_from_slice(&[0xc0, 12, 0, 15, 0, 1, 0, 0, 0, 60, 0, 9, 0, 10, 4, b'm', b'a', b'i', b'l', 0xc0, 12]);
+        p.extend_from_slice(&[0xc0, 12, 0, 16, 0, 1, 0, 0, 0, 60, 0, 6, 2, b'h', b'i', 2, b'y', b'o']);
+        let m = parse(&p).unwrap();
+        assert_eq!(m.answers, 2);
+        assert_eq!(answers_of(&m, MX), ["10 mail.example.com"]);
+        assert_eq!(answers_of(&m, TXT), ["hiyo"], "strings of a TXT record are joined");
+        assert!(answers_of(&m, A).is_empty());
+        assert_eq!(record_type("aaaa"), Some(AAAA));
+        assert_eq!(record_type("SOA"), None);
+    }
+
+    #[tokio::test]
+    async fn lookups_against_a_local_server() {
+        let srv = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = srv.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            loop {
+                let (n, from) = srv.recv_from(&mut buf).await.unwrap();
+                let mut r = buf[..n].to_vec();
+                r[2] = 0x81;
+                let missing = r[12..].starts_with(&[7, b'm', b'i', b's', b's', b'i', b'n', b'g']);
+                if missing {
+                    r[3] = 0x83; // NXDOMAIN
+                } else {
+                    r[3] = 0x80;
+                    r[7] = 1;
+                    r.extend_from_slice(&[0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 10, 0, 0, 7]);
+                }
+                srv.send_to(&r, from).await.unwrap();
+            }
+        });
+        let (got, ms) = lookup("host.example", A, Some(addr), Duration::from_secs(2)).await.unwrap();
+        assert_eq!(got, ["10.0.0.7"]);
+        assert!(ms < 2000);
+        let e = lookup("missing.example", A, Some(addr), Duration::from_secs(2)).await.unwrap_err();
+        assert!(e.contains("NXDOMAIN"), "{e}");
+        assert!(lookup("bad..name", A, Some(addr), Duration::from_secs(1)).await.is_err());
     }
 
     #[test]
