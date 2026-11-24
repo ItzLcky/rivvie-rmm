@@ -1,11 +1,11 @@
 <script lang="ts">
-	import { Hash, Mail, MessageSquare, Pencil, Plus, Send, Trash2, Webhook } from '@lucide/svelte';
+	import { BellRing, Hash, Mail, MessageSquare, Pencil, PhoneCall, Plus, Send, Siren, Smartphone, Trash2, Webhook } from '@lucide/svelte';
 	import { api } from '#lib/api.js';
 	import { confirmAction } from '#lib/confirm.svelte.js';
 	import { ago, datetime } from '#lib/format.js';
 	import { resource } from '#lib/resource.svelte.js';
 	import { attempt, toast } from '#lib/toast.svelte.js';
-	import type { Channel, ChannelKind, DeliveryRow, Smtp } from '#lib/types.js';
+	import type { Channel, ChannelKind, DeliveryRow, EscalationPolicy, Smtp, SmsSettings } from '#lib/types.js';
 	import Async from '#lib/ui/Async.svelte';
 	import Badge from '#lib/ui/Badge.svelte';
 	import Button from '#lib/ui/Button.svelte';
@@ -22,8 +22,42 @@
 		email: { label: 'Email', icon: Mail, hint: 'Sent through the mail server below.' },
 		webhook: { label: 'Webhook', icon: Webhook, hint: 'POSTs the alert as JSON. With a secret, X-RMM-Signature carries sha256=HMAC of the body.' },
 		slack: { label: 'Slack', icon: Hash, hint: 'A Slack incoming webhook URL (hooks.slack.com/services/…).' },
-		teams: { label: 'Microsoft Teams', icon: MessageSquare, hint: 'A Teams Workflows webhook URL (“When a Teams webhook request is received”). Messages are Adaptive Cards.' }
+		teams: { label: 'Microsoft Teams', icon: MessageSquare, hint: 'A Teams Workflows webhook URL (“When a Teams webhook request is received”). Messages are Adaptive Cards.' },
+		sms: { label: 'Text message', icon: Smartphone, hint: 'Texts each number through the SMS provider below. Messages are at most 300 characters.' },
+		pagerduty: { label: 'PagerDuty', icon: Siren, hint: 'An Events API v2 integration on a PagerDuty service. Alerts trigger incidents; resolving the alert resolves them.' },
+		opsgenie: { label: 'Opsgenie', icon: BellRing, hint: 'An API integration in Opsgenie. Alerts create Opsgenie alerts; resolving closes them.' },
+		oncall: { label: 'On-call', icon: PhoneCall, hint: 'Pages whoever is on call through an escalation policy (Settings → On-call), instead of telling everyone.' }
 	};
+	const policies = resource(() => api.get<EscalationPolicy[]>('/oncall/escalation-policies'));
+	const calendars = resource(() => api.get<{ id: string; name: string }[]>('/sla/calendars'));
+
+	// --- SMS provider -------------------------------------------------------------------------
+	let sms = $state({ account_sid: '', from: '', base_url: '', token: '' });
+	let smsTokenSet = $state(false);
+	let smsSaved = $state('');
+	let smsTo = $state('');
+	function applySms(v: SmsSettings) {
+		sms = { account_sid: v.account_sid, from: v.from, base_url: v.base_url, token: '' };
+		smsTokenSet = v.token_set;
+		smsSaved = JSON.stringify(sms);
+		return v;
+	}
+	const smsRes = resource(() => api.get<SmsSettings>('/settings/sms').then(applySms));
+	const smsDirty = $derived(JSON.stringify(sms) !== smsSaved);
+	async function saveSms(e: SubmitEvent) {
+		e.preventDefault();
+		const { token, ...rest } = sms;
+		await attempt(() => api.put<SmsSettings>('/settings/sms', { ...rest, ...(token ? { token } : {}) }).then(applySms), 'SMS provider saved.');
+	}
+	async function testSms() {
+		try {
+			const r = await api.post<{ ok: boolean; error?: string }>('/settings/sms/test', { to: smsTo });
+			if (r.ok) toast.success(`Test text sent to ${smsTo}.`);
+			else toast.error(r.error ?? 'Failed');
+		} catch (err) {
+			toast.error(err);
+		}
+	}
 
 	// --- mail server --------------------------------------------------------------------------
 	let smtp = $state({ host: '', port: 587, security: 'starttls' as Smtp['security'], username: '', password: '', from: '' });
@@ -59,23 +93,39 @@
 	const channels = resource(() => api.get<Channel[]>('/notification-channels'));
 	const deliveries = resource(() => api.get<DeliveryRow[]>('/notifications'));
 
-	type Form = { id: string | null; name: string; kind: ChannelKind; to: string; url: string; secret: string; hasSecret: boolean; clearSecret: boolean; enabled: boolean };
+	type Form = {
+		id: string | null; name: string; kind: ChannelKind; to: string; url: string; secret: string; hasSecret: boolean; clearSecret: boolean; enabled: boolean;
+		region: 'us' | 'eu'; policy: string; when: 'always' | 'outside_hours'; calendar: string;
+	};
 	let editing = $state<Form | null>(null);
 	let saving = $state(false);
 	let testing = $state<string | null>(null);
 
 	function edit(c?: Channel) {
 		editing = c
-			? { id: c.id, name: c.name, kind: c.kind, to: (c.config?.to ?? []).join('\n'), url: c.config?.url ?? '', secret: '', hasSecret: c.has_secret, clearSecret: false, enabled: c.enabled }
-			: { id: null, name: '', kind: 'email', to: '', url: '', secret: '', hasSecret: false, clearSecret: false, enabled: true };
+			? {
+					id: c.id, name: c.name, kind: c.kind, to: (c.config?.to ?? []).join('\n'), url: c.config?.url ?? '', secret: '', hasSecret: c.has_secret, clearSecret: false, enabled: c.enabled,
+					region: c.config?.region ?? 'us', policy: c.config?.escalation_policy_id ?? '', when: c.config?.when ?? 'always', calendar: c.config?.calendar_id ?? ''
+				}
+			: { id: null, name: '', kind: 'email', to: '', url: '', secret: '', hasSecret: false, clearSecret: false, enabled: true, region: 'us', policy: '', when: 'always', calendar: '' };
 	}
 	async function saveChannel(e: SubmitEvent) {
 		e.preventDefault();
 		const f = editing!;
+		const list = f.to.split(/[\n,;]/).map((t) => t.trim()).filter(Boolean);
 		const config: Record<string, unknown> =
-			f.kind === 'email' ? { to: f.to.split(/[\n,;]/).map((t) => t.trim()).filter(Boolean) } : { url: f.url.trim() };
-		// A webhook secret left blank is kept; tick "remove" to drop it.
+			f.kind === 'email' || f.kind === 'sms'
+				? { to: list }
+				: f.kind === 'pagerduty'
+					? {}
+					: f.kind === 'opsgenie'
+						? { region: f.region }
+						: f.kind === 'oncall'
+							? { escalation_policy_id: f.policy, when: f.when, ...(f.when === 'outside_hours' ? { calendar_id: f.calendar } : {}) }
+							: { url: f.url.trim() };
+		// A secret (or key) left blank is kept; tick "remove" to drop a webhook's.
 		if (f.kind === 'webhook' && (f.secret || f.clearSecret || !f.id)) config.secret = f.clearSecret ? '' : f.secret;
+		if ((f.kind === 'pagerduty' || f.kind === 'opsgenie') && f.secret) config.secret = f.secret;
 		saving = true;
 		try {
 			const body = { name: f.name, kind: f.kind, config, enabled: f.enabled };
@@ -111,7 +161,16 @@
 		});
 		if (ok && (await attempt(() => api.del(`/notification-channels/${c.id}`), `${c.name} deleted.`))) channels.reload();
 	}
-	const target = (c: Channel) => (c.kind === 'email' ? (c.config?.to ?? []).join(', ') : (c.config?.url ?? '').replace(/^https?:\/\//, '').slice(0, 60));
+	const target = (c: Channel) =>
+		c.kind === 'email' || c.kind === 'sms'
+			? (c.config?.to ?? []).join(', ')
+			: c.kind === 'pagerduty'
+				? 'Events API v2'
+				: c.kind === 'opsgenie'
+					? `${(c.config?.region ?? 'us').toUpperCase()} region`
+					: c.kind === 'oncall'
+						? `${policies.data?.find((p) => p.id === c.config?.escalation_policy_id)?.name ?? 'Escalation policy'}${c.config?.when === 'outside_hours' ? ', outside business hours' : ''}`
+						: (c.config?.url ?? '').replace(/^https?:\/\//, '').slice(0, 60);
 </script>
 
 <div class="max-w-4xl space-y-5">
@@ -133,7 +192,7 @@
 								<K.icon class="text-muted size-4 shrink-0" aria-hidden="true" />
 								<div class="min-w-0 flex-1">
 									<div class="font-medium">{c.name} {#if !c.enabled}<Badge>Disabled</Badge>{/if}</div>
-									<div class="text-muted truncate text-xs">{K.label} · {target(c)}{c.has_secret ? ' · signed' : ''} · {c.policies} polic{c.policies === 1 ? 'y' : 'ies'}</div>
+									<div class="text-muted truncate text-xs">{K.label} · {target(c)}{c.kind === 'webhook' && c.has_secret ? ' · signed' : ''} · {c.policies} polic{c.policies === 1 ? 'y' : 'ies'}</div>
 								</div>
 								<Button size="sm" icon={Send} loading={testing === c.id} onclick={() => test(c)}>Test</Button>
 								<IconButton icon={Pencil} size="sm" label="Edit {c.name}" onclick={() => edit(c)} />
@@ -178,6 +237,31 @@
 					{#if passwordSet}<Button size="sm" variant="ghost" onclick={clearPassword}>Remove password</Button>{/if}
 					{#if smtpDirty}<span class="text-warning text-xs">Unsaved changes</span>{/if}
 					<Button variant="primary" type="submit" loading={smtpBusy} disabled={!smtpDirty}>Save</Button>
+				</div>
+			</form>
+		{/snippet}
+	</Async>
+
+	<Async res={smsRes}>
+		{#snippet children()}
+			<form class="card space-y-4 p-5" onsubmit={saveSms} aria-labelledby="sms-h">
+				<div>
+					<h2 id="sms-h" class="font-semibold">SMS provider</h2>
+					<p class="text-muted text-xs">Text messages for pages and text-message channels, through Twilio’s Messages API (or a compatible one). Registering the sender (A2P 10DLC in the US) is up to you.</p>
+				</div>
+				<div class="grid gap-3 sm:grid-cols-2">
+					<Field label="Account SID" id="sms-sid"><Input id="sms-sid" bind:value={sms.account_sid} autocomplete="off" placeholder="AC…" /></Field>
+					<Field label="Auth token" id="sms-token" hint={smsTokenSet ? 'Saved. Leave empty to keep it.' : undefined}>
+						<Input id="sms-token" type="password" bind:value={sms.token} autocomplete="new-password" placeholder={smsTokenSet ? '••••••••' : ''} />
+					</Field>
+					<Field label="From" id="sms-from" hint="A number in international form, or a messaging service SID."><Input id="sms-from" bind:value={sms.from} placeholder="+15005550006" /></Field>
+					<Field label="API URL" id="sms-url"><Input id="sms-url" bind:value={sms.base_url} placeholder="https://api.twilio.com" /></Field>
+				</div>
+				<div class="flex flex-wrap items-end justify-end gap-3">
+					<Field label="Send a test to" id="sms-test" class="mr-auto"><Input id="sms-test" bind:value={smsTo} placeholder="+447700900123" /></Field>
+					<Button icon={Send} disabled={!smsTo || smsDirty || !smsTokenSet} onclick={testSms}>Send test</Button>
+					{#if smsDirty}<span class="text-warning text-xs">Unsaved changes</span>{/if}
+					<Button variant="primary" type="submit" disabled={!smsDirty}>Save</Button>
 				</div>
 			</form>
 		{/snippet}
@@ -231,6 +315,27 @@
 			<p class="hint -mt-2">{kinds[editing.kind].hint}</p>
 			{#if editing.kind === 'email'}
 				<Field label="Recipients" id="ch-to" hint="One address per line." required><Textarea id="ch-to" rows={3} bind:value={editing.to} placeholder="ops@example.com" /></Field>
+			{:else if editing.kind === 'sms'}
+				<Field label="Mobile numbers" id="ch-to" hint="One per line, in international form." required><Textarea id="ch-to" rows={3} bind:value={editing.to} placeholder="+447700900123" /></Field>
+			{:else if editing.kind === 'pagerduty' || editing.kind === 'opsgenie'}
+				{#if editing.kind === 'opsgenie'}
+					<Field label="Region" id="ch-region"><Select id="ch-region" bind:value={editing.region} options={[{ value: 'us', label: 'US (api.opsgenie.com)' }, { value: 'eu', label: 'EU (api.eu.opsgenie.com)' }]} /></Field>
+				{/if}
+				<Field label={editing.kind === 'pagerduty' ? 'Integration key' : 'API key'} id="ch-secret" hint={editing.hasSecret ? 'Saved. Leave empty to keep it.' : undefined} required={!editing.hasSecret}>
+					<Input id="ch-secret" type="password" bind:value={editing.secret} autocomplete="new-password" required={!editing.hasSecret} />
+				</Field>
+			{:else if editing.kind === 'oncall'}
+				<Field label="Escalation policy" id="ch-policy" required>
+					<Select id="ch-policy" bind:value={editing.policy} required options={[{ value: '', label: 'Choose…' }, ...(policies.data ?? []).map((p) => ({ value: p.id, label: p.name }))]} />
+				</Field>
+				<Field label="When" id="ch-when">
+					<Select id="ch-when" bind:value={editing.when} options={[{ value: 'always', label: 'Always page' }, { value: 'outside_hours', label: 'Only outside business hours' }]} />
+				</Field>
+				{#if editing.when === 'outside_hours'}
+					<Field label="Business hours" id="ch-cal" hint="Inside these hours the page waits until they end (and is dropped if the alert is dealt with first)." required>
+						<Select id="ch-cal" bind:value={editing.calendar} required options={[{ value: '', label: 'Choose…' }, ...(calendars.data ?? []).map((c) => ({ value: c.id, label: c.name }))]} />
+					</Field>
+				{/if}
 			{:else}
 				<Field label="Webhook URL" id="ch-url" required><Input id="ch-url" type="url" bind:value={editing.url} required placeholder="https://" /></Field>
 				{#if editing.kind === 'webhook'}

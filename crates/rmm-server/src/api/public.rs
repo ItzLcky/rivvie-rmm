@@ -235,6 +235,11 @@ pub static OPS: &[Op] = &[
         note: "", query: NONE, paged: false, body: None, response: Resp::One("Alert"),
     },
     Op {
+        id: "getOnCallNow", method: "GET", path: "/oncall/now", group: "alerts", summary: "Who is on call now, per schedule",
+        note: "Each entry: `schedule_id`, `schedule_name`, `user_id` and `user_name` (null when nobody is on), `until` (when their stretch ends, if within two weeks) and `source` (`layer` or `override`).",
+        query: NONE, paged: false, body: None, response: Resp::Object,
+    },
+    Op {
         id: "acknowledgeAlert", method: "POST", path: "/alerts/{id}/acknowledge", group: "alerts", summary: "Acknowledge an alert",
         note: "", query: NONE, paged: false, body: None, response: Resp::One("Alert"),
     },

@@ -2,7 +2,7 @@
 	import { Monitor, Moon, Sun } from '@lucide/svelte';
 	import { api } from '#lib/api.js';
 	import { prefs, setPref, type Density, type Theme } from '#lib/prefs.svelte.js';
-	import { brand, company, session } from '#lib/session.svelte.js';
+	import { brand, can, company, session } from '#lib/session.svelte.js';
 	import SourceLink from '#lib/components/branding/SourceLink.svelte';
 	import { toast } from '#lib/toast.svelte.js';
 	import { cx } from '#lib/format.js';
@@ -15,6 +15,8 @@
 	import Passkeys from '#lib/components/Passkeys.svelte';
 	import Sessions from '#lib/components/Sessions.svelte';
 	import TwoFactor from '#lib/components/TwoFactor.svelte';
+	import ContactMethods from '#lib/oncall/ContactMethods.svelte';
+	import DeviceNotifications from '#lib/oncall/DeviceNotifications.svelte';
 
 	let form = $state({ current: '', next: '', confirm: '' });
 	let error = $state('');
@@ -66,6 +68,20 @@
 	</section>
 
 	{#if !setup}
+		<section id="notifications" class="card scroll-mt-4 p-5">
+			<h2 class="font-semibold">Notifications</h2>
+			<p class="text-muted mt-0.5 mb-4 text-sm">Alerts, pages and ticket updates on this phone or computer, through the browser or the installed app.</p>
+			<DeviceNotifications />
+		</section>
+
+		{#if can('technician')}
+			<section id="reach-me" class="card scroll-mt-4 p-5">
+				<h2 class="font-semibold">How to reach me</h2>
+				<p class="text-muted mt-0.5 mb-4 text-sm">When you’re on call and paged. Acknowledging stops the rest.</p>
+				<ContactMethods />
+			</section>
+		{/if}
+
 		<section class="card p-5">
 			<h2 class="font-semibold">Appearance</h2>
 			<p class="text-muted mt-0.5 mb-4 text-sm">Saved to your account, so it follows you to other browsers.</p>

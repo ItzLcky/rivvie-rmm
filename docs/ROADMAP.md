@@ -31,6 +31,7 @@ Follow the [manual plan](design/windows-testing.md) on Windows 10/11 and Server 
 
 - [ ] **Security review** by someone outside the project: agent/server protocol, enrollment, the update and content signing chain, session handling, per-client scoping, the shell and desktop relays, the client portal, the password vault (envelope encryption, reveal auditing, rate limits), API keys and SSO.
 - [ ] **Try the integrations against the real services**, not stand-ins: AWS S3 (MinIO is done and in CI), Microsoft 365 over Graph, QuickBooks Online (sandbox company), Xero (demo organisation), OIDC with real Entra ID and Google tenants, and how real mail clients render our emails (including the branded sender name and footer, and scheduled report emails with their PDF attachments).
+- [ ] **Paging and push on real services** ([oncall](design/oncall.md), [pwa](design/pwa.md)): texts through a real Twilio number (and A2P 10DLC registration), PagerDuty and Opsgenie incidents opened and closed, Web Push delivered by Chrome, Firefox, Edge and Safari, the Acknowledge action from a lock screen, and the installed app on iOS 16.4+ and Android.
 
 ### 3. Gaps left by `v0.2.0`
 

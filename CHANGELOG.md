@@ -12,7 +12,7 @@ back, restore the backup taken before the upgrade (see
 
 ## [Unreleased]
 
-Migrations `0036`, `0037`, `0043`, `0044` and `0045` are new.
+Migrations `0036`, `0037` and `0043` to `0047` are new.
 
 ### Added
 
@@ -42,6 +42,21 @@ Migrations `0036`, `0037`, `0043`, `0044` and `0045` are new.
   the time it's sent, and fails with the reason if that's gone. History with the PDFs (kept 400
   days) and "send now" under Reports → Scheduled. Migration `0045`. See
   [docs/design/scheduled-reports.md](docs/design/scheduled-reports.md).
+- **On-call and paging.** Schedules with rotation layers (handovers keep their local time across
+  DST), restrictions and overrides; escalation policies with steps, delays and repeats; a
+  notification channel kind `oncall` that pages through a policy (always, or only outside a
+  business calendar's hours) instead of telling everyone; pages acknowledged from the console,
+  a push notification or the short link in a text message, and acknowledging or resolving the
+  alert stops them. New channel kinds: text message (Twilio-compatible), PagerDuty (Events API
+  v2, resolved with the alert) and Opsgenie. Per-user contact rules and a verified mobile
+  number; optional paging for new P1 tickets; an "On call now" chip and a paging timeline on
+  alerts; `GET /api/v1/oncall/now`. New permission `oncall.manage`. See
+  [docs/design/oncall.md](docs/design/oncall.md).
+- **The dashboard as an installable app.** A web app manifest, a service worker for the app
+  shell (API responses are never cached), Web Push for alerts, pages and ticket events with an
+  Acknowledge action, per-event notification preferences (push and email) and a lock-screen
+  privacy switch, and a tab bar at the bottom when installed on a phone. See
+  [docs/design/pwa.md](docs/design/pwa.md).
 
 ## [0.2.0] - 2026-11-23
 

@@ -67,3 +67,5 @@ Known gaps: no Windows run of any of it; SSO untested against real IdPs; no aler
 - **White-labelling** (`0044`, [design](design/branding.md)): instance branding with per-client overrides; product name, logos, icon, contrast-checked accent, support card, email sender and footer; branded MSI, packages, service name, consent prompt and PDF headers; an always-present AGPL source link.
 - **Script parameters** (`0036`, [design](design/script-params.md)): typed parameters on saved scripts, passed as `RMM_PARAM_*` environment variables with per-device placeholders and built-ins; secrets sealed until delivery or taken from the vault.
 - **Managed vault items** (`0037`, [design](design/vault-managed.md)): the system write path (`vault::put_managed`) that disk encryption escrow, LAPS and identity resets use.
+- **On-call and paging** (`0046`, [design](design/oncall.md)): schedules, escalation policies, the `oncall` channel kind, text message, PagerDuty and Opsgenie channels.
+- **Installable app and Web Push** (`0047`, [design](design/pwa.md)): manifest, service worker, push for alerts, pages and tickets, phone tab bar.

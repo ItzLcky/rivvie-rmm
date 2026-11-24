@@ -187,11 +187,11 @@ export interface Process {
 export interface DirEntry { name: string; path: string; dir: boolean; symlink: boolean; size: number; modified: string | null; error: string | null }
 export interface DirListing { path: string; parent: string | null; entries: DirEntry[]; truncated: boolean }
 
-export type ChannelKind = 'email' | 'webhook' | 'slack' | 'teams';
+export type ChannelKind = 'email' | 'webhook' | 'slack' | 'teams' | 'sms' | 'pagerduty' | 'opsgenie' | 'oncall';
 export interface Channel {
 	id: string; name: string; kind: ChannelKind; enabled: boolean; policies: number; created_at: string; has_secret: boolean;
 	/** Admins only. */
-	config?: { to?: string[]; url?: string };
+	config?: { to?: string[]; url?: string; region?: 'us' | 'eu'; escalation_policy_id?: string; when?: 'always' | 'outside_hours'; calendar_id?: string };
 }
 export interface DeliveryRow extends Delivery { channel_id: string; alert_id: string | null; alert_title: string | null; hostname: string | null; next_attempt_at: string }
 export interface Smtp { host: string; port: number; security: 'starttls' | 'tls' | 'none'; username: string; password_set: boolean; from: string }
@@ -555,3 +555,28 @@ export interface RareProgram {
 }
 /** What the server's reputation set holds: `db:<version>` (the newest database) or `list:<name>`. */
 export interface ReputationSource { source: string; hashes: number; added_at: string }
+
+// --- on-call and paging ---------------------------------------------------------------------
+export interface OncallWindow { days: number[]; start: number; end: number }
+export interface OncallLayer { id?: string; position?: number; name: string; user_ids: string[]; start_at: string; shift_hours: number; restrict: OncallWindow[] }
+export interface OncallOverride { id: string; schedule_id: string; user_id: string; user_name: string; starts_at: string; ends_at: string }
+export interface OnCallNow { schedule_id: string; schedule_name: string; user_id: string | null; user_name: string | null; until: string | null; source: 'override' | 'layer' | null }
+export interface OncallSchedule { id: string; name: string; timezone: string; layers: OncallLayer[]; overrides: OncallOverride[]; now: OnCallNow }
+export interface ShiftSegment { user_id: string; user_name: string; start: string; end: string }
+export interface OncallShifts { from: string; to: string; timezone: string; layers: { id: string; name: string; position: number; segments: ShiftSegment[] }[]; overrides: ShiftSegment[]; final: ShiftSegment[] }
+export type EscalationTarget = { schedule: string } | { user: string } | { channel: string };
+export interface EscalationPolicy { id: string; name: string; repeat: number; steps: { delay_minutes: number; targets: EscalationTarget[] }[]; channels: { id: string; name: string }[] }
+export interface OncallPerson { id: string; name: string; email: string; phone_verified: boolean }
+export interface PageDelivery {
+	id: string; user_name: string | null; channel_name: string | null; method: 'sms' | 'email' | 'push' | 'channel'; step: number; round: number;
+	status: 'pending' | 'sent' | 'failed' | 'cancelled'; attempts: number; error: string | null; created_at: string; sent_at: string | null; next_attempt_at: string;
+}
+export interface OncallPage {
+	id: string; alert_id: string | null; ticket_id: string | null; title: string; severity: string; status: 'held' | 'triggered' | 'acknowledged' | 'resolved';
+	step: number; round: number; policy_name: string | null; acked_by_name: string | null; acked_at: string | null; resolved_at: string | null; created_at: string;
+	next_escalation_at: string | null; deliveries: PageDelivery[];
+}
+export interface ContactMethods { phone: string | null; phone_verified: boolean; sms_available: boolean; devices: number; rules: { method: 'sms' | 'email' | 'push'; delay_minutes: number }[] }
+export interface SmsSettings { account_sid: string; from: string; base_url: string; token_set: boolean }
+export interface NotificationPrefs { hide_details: boolean; events: { event: string; label: string; push: boolean; email: boolean; email_applies: boolean }[] }
+export interface PushDevice { id: string; user_agent: string; created_at: string; last_ok_at: string | null; endpoint: string }

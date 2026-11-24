@@ -262,6 +262,9 @@ async fn act(st: &AppState, u: &User, ids: &[Uuid], action: &str) -> ApiResult<u
         if action == "resolve" {
             crate::tickets::alert_resolved(st, *id).await;
         }
+        // Pages stop either way; PagerDuty and Opsgenie close on resolve (after the outbox
+        // rows queued below, so a channel that notifies on resolve isn't sent it twice).
+        crate::oncall::alert_changed(st, *id).await;
         if action == "resolve"
             && let Some(pid) = policy_id
         {
@@ -271,6 +274,11 @@ async fn act(st: &AppState, u: &User, ids: &[Uuid], action: &str) -> ApiResult<u
                 crate::notify::enqueue(st, *id, "resolved", &channels).await;
                 woke |= !channels.is_empty();
             }
+        }
+    }
+    if action == "resolve" {
+        for (id, ..) in &rows {
+            crate::notify::close_incidents(st, *id).await;
         }
     }
     if woke {

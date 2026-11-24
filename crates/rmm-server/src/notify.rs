@@ -66,8 +66,32 @@ struct ChannelConfig {
     to: Vec<String>,
     #[serde(default)]
     url: String,
+    /// Webhook signing secret, PagerDuty routing key, Opsgenie API key (sealed in its own column).
     #[serde(default)]
     secret: Option<String>,
+    /// Opsgenie: `us` or `eu`.
+    #[serde(default)]
+    region: String,
+    /// `oncall`: the escalation policy, `always` or `outside_hours`, and the business calendar.
+    #[serde(default)]
+    escalation_policy_id: Option<Uuid>,
+    #[serde(default)]
+    when: String,
+    #[serde(default)]
+    calendar_id: Option<Uuid>,
+}
+
+/// Kinds whose `secret` is required (and kept when an update leaves it out).
+pub fn takes_secret(kind: &str) -> bool {
+    matches!(kind, "webhook" | "pagerduty" | "opsgenie")
+}
+
+pub fn needs_secret(kind: &str) -> bool {
+    matches!(kind, "pagerduty" | "opsgenie")
+}
+
+fn secret_of(c: &ChannelConfig) -> Option<&str> {
+    c.secret.as_deref().map(str::trim).filter(|s| !s.is_empty())
 }
 
 /// Checks a channel's config before it's saved. Returns the normalised config.
@@ -98,7 +122,72 @@ pub fn validate_config(kind: &str, config: &Value) -> Result<Value, String> {
             }
             Ok(out)
         }
+        "sms" => {
+            let to: Vec<String> = c.to.iter().map(|t| t.chars().filter(|c| !c.is_whitespace()).collect::<String>()).filter(|t| !t.is_empty()).collect();
+            if to.is_empty() || to.len() > 10 {
+                return Err("add 1-10 mobile numbers".into());
+            }
+            if let Some(bad) = to.iter().find(|t| !crate::oncall::valid_e164(t)) {
+                return Err(format!("{bad} is not a number in international form, like +447700900123"));
+            }
+            Ok(json!({ "to": to }))
+        }
+        "pagerduty" => {
+            let mut out = json!({});
+            if let Some(s) = secret_of(&c) {
+                if s.len() > 64 || !s.bytes().all(|b| b.is_ascii_alphanumeric()) {
+                    return Err("the integration (routing) key is the 32 letters and digits from the service's Events API v2 integration".into());
+                }
+                out["secret"] = s.into();
+            }
+            Ok(out)
+        }
+        "opsgenie" => {
+            let region = if c.region.is_empty() { "us" } else { c.region.as_str() };
+            if !matches!(region, "us" | "eu") {
+                return Err("the region is us or eu".into());
+            }
+            let mut out = json!({ "region": region });
+            if let Some(s) = secret_of(&c) {
+                if s.len() > 100 || s.contains(char::is_whitespace) {
+                    return Err("enter the API key of an Opsgenie API integration".into());
+                }
+                out["secret"] = s.into();
+            }
+            Ok(out)
+        }
+        "oncall" => {
+            let policy = c.escalation_policy_id.ok_or("choose an escalation policy")?;
+            let when = if c.when.is_empty() { "always" } else { c.when.as_str() };
+            match when {
+                "always" => Ok(json!({ "escalation_policy_id": policy, "when": "always" })),
+                "outside_hours" => {
+                    let cal = c.calendar_id.ok_or("choose the business hours to page outside of")?;
+                    Ok(json!({ "escalation_policy_id": policy, "when": "outside_hours", "calendar_id": cal }))
+                }
+                _ => Err("when is always or outside_hours".into()),
+            }
+        }
         _ => Err(format!("unknown channel type {kind}")),
+    }
+}
+
+/// An alert resolved: PagerDuty incidents and Opsgenie alerts opened for it are closed, whether
+/// or not its item notifies on resolve (they'd stay open otherwise).
+pub async fn close_incidents(st: &AppState, alert_id: Uuid) {
+    let res = sqlx::query(
+        "INSERT INTO notifications (channel_id, alert_id, event)
+         SELECT DISTINCT n.channel_id, n.alert_id, 'resolved' FROM notifications n JOIN notification_channels ch ON ch.id = n.channel_id
+          WHERE n.alert_id = $1 AND ch.kind IN ('pagerduty', 'opsgenie') AND n.event IN ('opened', 'reminder')
+            AND NOT EXISTS (SELECT 1 FROM notifications r WHERE r.alert_id = $1 AND r.channel_id = n.channel_id AND r.event = 'resolved')",
+    )
+    .bind(alert_id)
+    .execute(&st.db)
+    .await;
+    match res {
+        Ok(r) if r.rows_affected() > 0 => st.notify_wake.notify_one(),
+        Ok(_) => {}
+        Err(e) => warn!(%alert_id, "closing incidents: {e}"),
     }
 }
 
@@ -240,6 +329,9 @@ pub struct Message {
     pub url: String,
     /// The webhook body.
     pub payload: Value,
+    /// What it is about: an alert or a ticket (PagerDuty's dedup key, Opsgenie's alias, pages).
+    pub alert_id: Option<Uuid>,
+    pub ticket_id: Option<Uuid>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -348,7 +440,7 @@ async fn render(st: &AppState, alert_id: Uuid, event: &str) -> Result<Message, S
         "agent": { "id": a.agent_id, "hostname": a.hostname, "client": a.client_name, "site": a.site_name },
         "url": url,
     });
-    Ok(Message { event: event.into(), subject, text, headline, severity: a.severity, facts, url, payload })
+    Ok(Message { event: event.into(), subject, text, headline, severity: a.severity, facts, url, payload, alert_id: Some(a.id), ticket_id: None })
 }
 
 #[derive(sqlx::FromRow)]
@@ -426,6 +518,8 @@ async fn render_ticket(st: &AppState, ticket_id: Uuid, event: &str, data: &Value
         facts,
         url,
         payload,
+        alert_id: None,
+        ticket_id: Some(ticket_id),
     })
 }
 
@@ -440,11 +534,23 @@ fn test_message(st: &AppState) -> Message {
         facts: vec![],
         url: st.cfg.public_url.clone(),
         payload: json!({ "event": "test", "url": st.cfg.public_url }),
+        alert_id: None,
+        ticket_id: None,
     }
 }
 
-/// Sends a test message now and reports what happened.
+/// Sends a test message now and reports what happened. An on-call channel pages nobody: the
+/// test checks its policy has steps.
 pub async fn send_test(st: &AppState, channel: &Channel) -> Result<(), String> {
+    if channel.kind == "oncall" {
+        let policy = channel.config["escalation_policy_id"].as_str().and_then(|p| p.parse::<Uuid>().ok()).ok_or("no escalation policy")?;
+        let steps: i64 = sqlx::query_scalar("SELECT count(*) FROM escalation_steps WHERE policy_id = $1")
+            .bind(policy)
+            .fetch_one(&st.db)
+            .await
+            .map_err(|e| e.to_string())?;
+        return if steps > 0 { Ok(()) } else { Err("the escalation policy has no steps".into()) };
+    }
     deliver(st, channel, &test_message(st)).await
 }
 
@@ -465,12 +571,108 @@ async fn deliver(st: &AppState, channel: &Channel, msg: &Message) -> Result<(), 
         }
         "slack" => post(st.http.post(&cfg.url).json(&slack_body(msg))).await,
         "teams" => post(st.http.post(&cfg.url).json(&teams_body(msg))).await,
+        "sms" => {
+            let text = crate::oncall::sms_text(&brand(st), &msg.severity, &msg.headline, &msg.url);
+            for to in &cfg.to {
+                crate::oncall::send_sms(st, to, &text).await.map_err(|e| format!("{to}: {e}"))?;
+            }
+            Ok(())
+        }
+        "pagerduty" => {
+            let key = cfg.secret.as_deref().ok_or("the routing key is missing")?;
+            post(st.http.post(format!("{}/v2/enqueue", pagerduty_base())).json(&pagerduty_body(key, msg, &brand(st)))).await
+        }
+        "opsgenie" => {
+            let key = cfg.secret.as_deref().ok_or("the API key is missing")?;
+            let base = opsgenie_base(&cfg.region);
+            let auth = format!("GenieKey {key}");
+            let alias = dedup_key(msg);
+            if msg.event == "resolved" {
+                let url = format!("{base}/v2/alerts/{alias}/close?identifierType=alias");
+                post(st.http.post(url).header("authorization", auth).json(&json!({ "source": brand(st), "note": msg.headline }))).await
+            } else {
+                post(st.http.post(format!("{base}/v2/alerts")).header("authorization", auth).json(&opsgenie_body(msg, &brand(st)))).await
+            }
+        }
+        "oncall" => match (msg.alert_id, msg.ticket_id) {
+            (Some(a), _) => crate::oncall::trigger_alert(st, &channel.config, a, &msg.event).await,
+            (None, Some(t)) if msg.event != "resolved" => {
+                let policy = cfg.escalation_policy_id.ok_or("the channel has no escalation policy")?;
+                crate::oncall::trigger_ticket(st, t, policy, Some(&channel.config)).await.map_err(|e| format!("{e:#}"))
+            }
+            _ => Ok(()),
+        },
         other => Err(format!("unknown channel type {other}")),
     };
     if res.is_ok() {
         info!(channel = %channel.name, channel_id = %channel.id, event = %msg.event, "notification sent");
     }
     res
+}
+
+fn pagerduty_base() -> String {
+    std::env::var("RMM_PAGERDUTY_URL").unwrap_or_else(|_| "https://events.pagerduty.com".into()).trim_end_matches('/').to_string()
+}
+
+fn opsgenie_base(region: &str) -> String {
+    match std::env::var("RMM_OPSGENIE_URL") {
+        Ok(u) => u.trim_end_matches('/').to_string(),
+        Err(_) if region == "eu" => "https://api.eu.opsgenie.com".into(),
+        Err(_) => "https://api.opsgenie.com".into(),
+    }
+}
+
+/// One incident per alert (or ticket): PagerDuty's `dedup_key`, Opsgenie's `alias`.
+fn dedup_key(m: &Message) -> String {
+    match (m.alert_id, m.ticket_id) {
+        (Some(a), _) => a.to_string(),
+        (None, Some(t)) => format!("ticket-{t}"),
+        _ => "rmm-test".into(),
+    }
+}
+
+/// An Events API v2 event: `trigger` on open (and reminders, which PagerDuty folds into the
+/// same incident), `resolve` on resolved.
+fn pagerduty_body(routing_key: &str, m: &Message, source: &str) -> Value {
+    if m.event == "resolved" {
+        return json!({ "routing_key": routing_key, "event_action": "resolve", "dedup_key": dedup_key(m) });
+    }
+    let severity = match m.severity.as_str() {
+        "critical" => "critical",
+        "warning" => "warning",
+        _ => "info",
+    };
+    let details: serde_json::Map<String, Value> = m.facts.iter().map(|(k, v)| (k.clone(), Value::String(v.clone()))).collect();
+    json!({
+        "routing_key": routing_key,
+        "event_action": "trigger",
+        "dedup_key": dedup_key(m),
+        "payload": {
+            "summary": m.headline.chars().take(1024).collect::<String>(),
+            "source": source,
+            "severity": severity,
+            "custom_details": details,
+        },
+        "links": [{ "href": m.url, "text": "Open in RMM" }],
+    })
+}
+
+/// Opsgenie's create-alert request.
+fn opsgenie_body(m: &Message, source: &str) -> Value {
+    let priority = match m.severity.as_str() {
+        "critical" => "P1",
+        "warning" => "P3",
+        _ => "P5",
+    };
+    let details: serde_json::Map<String, Value> = m.facts.iter().map(|(k, v)| (k.clone(), Value::String(v.chars().take(500).collect()))).collect();
+    json!({
+        "message": m.headline.chars().take(130).collect::<String>(),
+        "alias": dedup_key(m),
+        "description": format!("{}\n\n{}", m.text, m.url).chars().take(15000).collect::<String>(),
+        "priority": priority,
+        "source": source,
+        "details": details,
+    })
 }
 
 /// HMAC-SHA256 of the body with the channel secret, hex: the `X-RMM-Signature` header.
@@ -582,6 +784,49 @@ mod tests {
         let w = validate_config("webhook", &json!({ "url": "https://h.example/x", "secret": " s " })).unwrap();
         assert_eq!(w, json!({ "url": "https://h.example/x", "secret": "s" }));
         assert!(validate_config("pager", &json!({})).is_err());
+        assert_eq!(validate_config("sms", &json!({ "to": ["+44 7700 900123"] })).unwrap(), json!({ "to": ["+447700900123"] }));
+        assert!(validate_config("sms", &json!({ "to": ["07700900123"] })).is_err());
+        assert_eq!(validate_config("pagerduty", &json!({ "secret": "abc123" })).unwrap(), json!({ "secret": "abc123" }));
+        assert!(validate_config("pagerduty", &json!({ "secret": "has spaces" })).is_err());
+        assert_eq!(validate_config("opsgenie", &json!({})).unwrap(), json!({ "region": "us" }));
+        assert!(validate_config("opsgenie", &json!({ "region": "ap" })).is_err());
+        let p = Uuid::from_u128(1);
+        assert_eq!(validate_config("oncall", &json!({ "escalation_policy_id": p })).unwrap(), json!({ "escalation_policy_id": p, "when": "always" }));
+        assert!(validate_config("oncall", &json!({ "escalation_policy_id": p, "when": "outside_hours" })).is_err(), "needs a calendar");
+        assert!(validate_config("oncall", &json!({})).is_err());
+    }
+
+    fn message(event: &str) -> Message {
+        Message {
+            event: event.into(),
+            subject: "[N] CRITICAL: Disk full on fs01".into(),
+            text: "Disk full".into(),
+            headline: "CRITICAL: Disk full on fs01".into(),
+            severity: "critical".into(),
+            facts: vec![("Agent".into(), "fs01".into())],
+            url: "https://rmm.example/agents/x".into(),
+            payload: json!({}),
+            alert_id: Some(Uuid::from_u128(9)),
+            ticket_id: None,
+        }
+    }
+
+    #[test]
+    fn pagerduty_and_opsgenie_payloads() {
+        let id = Uuid::from_u128(9).to_string();
+        let t = pagerduty_body("rk", &message("opened"), "Northwind");
+        assert_eq!((t["event_action"].as_str(), t["dedup_key"].as_str(), t["routing_key"].as_str()), (Some("trigger"), Some(id.as_str()), Some("rk")));
+        assert_eq!(t["payload"]["severity"], "critical");
+        assert_eq!(t["payload"]["source"], "Northwind");
+        assert_eq!(t["payload"]["custom_details"]["Agent"], "fs01");
+        let r = pagerduty_body("rk", &message("resolved"), "Northwind");
+        assert_eq!(r, json!({ "routing_key": "rk", "event_action": "resolve", "dedup_key": id }));
+        let o = opsgenie_body(&message("opened"), "Northwind");
+        assert_eq!((o["alias"].as_str(), o["priority"].as_str()), (Some(id.as_str()), Some("P1")));
+        assert!(o["message"].as_str().unwrap().chars().count() <= 130);
+        let mut long = message("opened");
+        long.headline = "x".repeat(400);
+        assert_eq!(opsgenie_body(&long, "N")["message"].as_str().unwrap().len(), 130);
     }
 
     #[test]

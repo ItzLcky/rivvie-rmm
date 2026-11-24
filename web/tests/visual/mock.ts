@@ -145,8 +145,79 @@ const channels = [
 	{ id: 'ch-mail', name: 'NOC mailbox', kind: 'email', enabled: true, policies: 2, has_secret: false, config: { to: ['noc@northwind.example', 'oncall@northwind.example'] } },
 	{ id: 'ch-teams', name: 'Teams: Escalations', kind: 'teams', enabled: true, policies: 1, has_secret: false, config: { url: 'https://northwind.webhook.office.com/webhookb2/abc' } },
 	{ id: 'ch-slack', name: 'Slack #alerts', kind: 'slack', enabled: true, policies: 1, has_secret: false, config: { url: 'https://hooks.slack.com/services/T000/B000/XXXX' } },
-	{ id: 'ch-hook', name: 'PSA webhook', kind: 'webhook', enabled: false, policies: 1, has_secret: true, config: { url: 'https://psa.northwind.example/hooks/rmm' } }
+	{ id: 'ch-hook', name: 'PSA webhook', kind: 'webhook', enabled: false, policies: 1, has_secret: true, config: { url: 'https://psa.northwind.example/hooks/rmm' } },
+	{ id: 'ch-page', name: 'Page on-call', kind: 'oncall', enabled: true, policies: 1, has_secret: false, config: { escalation_policy_id: 'ep-servers', when: 'outside_hours', calendar_id: 'cal-office' } },
+	{ id: 'ch-pd', name: 'PagerDuty: Infrastructure', kind: 'pagerduty', enabled: true, policies: 0, has_secret: true, config: {} }
 ].map((c, i) => ({ ...c, created_at: ago(60 * 24 * (20 - i)) }));
+// --- on-call and paging --------------------------------------------------------------------
+const day0 = new Date(Date.UTC(2026, 5, 15)).getTime();
+const at = (days: number, hours = 0) => new Date(day0 + (days * 24 + hours) * 3_600_000).toISOString();
+const oncallPeople = [
+	{ id: 'u-1', name: 'Dana Admin', email: 'dana@northwind.example', phone_verified: true },
+	{ id: 'u-2', name: 'Terry Tech', email: 'terry@northwind.example', phone_verified: true },
+	{ id: 'u-4', name: 'Priya Nair', email: 'priya@northwind.example', phone_verified: false }
+];
+const oncallSchedules = [
+	{
+		id: 'os-1', name: 'Out of hours', timezone: 'Europe/London',
+		layers: [
+			{ id: 'ol-1', position: 0, name: 'Weekly', user_ids: ['u-2', 'u-4'], start_at: at(-7, 9), shift_hours: 168, restrict: [] },
+			{ id: 'ol-2', position: 1, name: 'Weekdays', user_ids: ['u-1'], start_at: at(-7, 0), shift_hours: 24, restrict: [{ days: [0, 1, 2, 3, 4], start: 540, end: 1020 }] }
+		],
+		overrides: [{ id: 'oo-1', schedule_id: 'os-1', user_id: 'u-4', user_name: 'Priya Nair', starts_at: at(2, 17), ends_at: at(3, 9) }],
+		now: { schedule_id: 'os-1', schedule_name: 'Out of hours', user_id: 'u-1', user_name: 'Dana Admin', until: at(0, 17), source: 'layer' }
+	},
+	{ id: 'os-2', name: 'Security', timezone: 'UTC', layers: [], overrides: [], now: { schedule_id: 'os-2', schedule_name: 'Security', user_id: null, user_name: null, until: null, source: null } }
+];
+const seg = (user_id: string, start: string, end: string) => ({ user_id, user_name: oncallPeople.find((p) => p.id === user_id)!.name, start, end });
+const weekdays = [0, 1, 2, 3, 4].map((d) => seg('u-1', at(d, 9), at(d, 17)));
+const oncallShifts = {
+	from: at(0), to: at(7), timezone: 'Europe/London',
+	layers: [
+		{ id: 'ol-1', name: 'Weekly', position: 0, segments: [seg('u-2', at(0), at(0, 9)), seg('u-4', at(0, 9), at(7))] },
+		{ id: 'ol-2', name: 'Weekdays', position: 1, segments: weekdays }
+	],
+	overrides: [seg('u-4', at(2, 17), at(3, 9))],
+	final: [
+		seg('u-2', at(0), at(0, 9)), seg('u-1', at(0, 9), at(0, 17)), seg('u-4', at(0, 17), at(1, 9)), seg('u-1', at(1, 9), at(1, 17)), seg('u-4', at(1, 17), at(2, 9)),
+		seg('u-1', at(2, 9), at(2, 17)), seg('u-4', at(2, 17), at(3, 9)), seg('u-1', at(3, 9), at(3, 17)), seg('u-4', at(3, 17), at(4, 9)), seg('u-1', at(4, 9), at(4, 17)), seg('u-4', at(4, 17), at(7))
+	]
+};
+const escalationPolicies = [
+	{
+		id: 'ep-servers', name: 'Servers, out of hours', repeat: 1,
+		steps: [
+			{ delay_minutes: 10, targets: [{ schedule: 'os-1' }] },
+			{ delay_minutes: 15, targets: [{ user: 'u-1' }, { channel: 'ch-teams' }] }
+		],
+		channels: [{ id: 'ch-page', name: 'Page on-call' }]
+	}
+];
+const oncallPages = [
+	{
+		id: 'pg-1', alert_id: 'al-5', ticket_id: null, title: 'Job failed: Disk usage report on acme-web01', severity: 'warning', status: 'acknowledged', step: 1, round: 0,
+		policy_name: 'Servers, out of hours', acked_by_name: 'Dana Admin', acked_at: ago(140), resolved_at: null, created_at: ago(160), next_escalation_at: null,
+		deliveries: [
+			{ id: 'pd-1', user_name: 'Terry Tech', channel_name: null, method: 'push', step: 0, round: 0, status: 'sent', attempts: 1, error: null, created_at: ago(160), sent_at: ago(160), next_attempt_at: ago(160) },
+			{ id: 'pd-2', user_name: 'Terry Tech', channel_name: null, method: 'sms', step: 0, round: 0, status: 'sent', attempts: 1, error: null, created_at: ago(160), sent_at: ago(160), next_attempt_at: ago(160) },
+			{ id: 'pd-3', user_name: 'Dana Admin', channel_name: null, method: 'sms', step: 1, round: 0, status: 'sent', attempts: 1, error: null, created_at: ago(150), sent_at: ago(150), next_attempt_at: ago(150) },
+			{ id: 'pd-4', user_name: null, channel_name: 'Teams: Escalations', method: 'channel', step: 1, round: 0, status: 'sent', attempts: 0, error: null, created_at: ago(150), sent_at: ago(150), next_attempt_at: ago(150) },
+			{ id: 'pd-5', user_name: 'Dana Admin', channel_name: null, method: 'email', step: 1, round: 0, status: 'cancelled', attempts: 0, error: null, created_at: ago(150), sent_at: null, next_attempt_at: ago(145) }
+		]
+	}
+];
+const notificationPrefs = {
+	hide_details: false,
+	events: [
+		{ event: 'page', label: "I'm paged", push: true, email: true, email_applies: false },
+		{ event: 'alert_critical', label: 'Critical alerts', push: true, email: true, email_applies: false },
+		{ event: 'alert_warning', label: 'Warnings', push: false, email: true, email_applies: false },
+		{ event: 'ticket_assigned', label: 'A ticket is assigned to me', push: true, email: true, email_applies: true },
+		{ event: 'ticket_reply', label: 'A client replies on my ticket', push: false, email: true, email_applies: true },
+		{ event: 'sla_warning', label: 'SLA warnings and breaches on my tickets', push: false, email: false, email_applies: true }
+	]
+};
+
 const deliveries = [
 	{ id: 9, channel_id: 'ch-mail', channel_name: 'NOC mailbox', alert_id: 'al-4', alert_title: 'Service failed: nginx.service', hostname: 'acme-web01', event: 'opened', status: 'sent', attempts: 1, last_error: null, created_at: ago(22), sent_at: ago(22), next_attempt_at: ago(12) },
 	{ id: 8, channel_id: 'ch-hook', channel_name: 'PSA webhook', alert_id: 'al-5', alert_title: 'Job failed: Disk usage report', hostname: 'acme-web01', event: 'opened', status: 'failed', attempts: 5, last_error: 'HTTP 502 Bad Gateway: upstream unavailable', created_at: ago(160), sent_at: null, next_attempt_at: ago(10) },
@@ -1650,6 +1721,17 @@ export async function mockApi(p: Page, opts: { signedIn?: boolean; ssoRequired?:
 		if ((m = path.match(/^\/agents\/([^/]+)\/processes$/))) return json({ processes });
 		if ((m = path.match(/^\/agents\/([^/]+)\/files$/))) return json(listing(q.get('path') ?? ''));
 		if (path === '/notification-channels') return json(channels);
+		if (path === '/oncall/now') return json(oncallSchedules.map((s) => s.now));
+		if (path === '/oncall/schedules') return json(oncallSchedules);
+		if ((m = path.match(/^\/oncall\/schedules\/([^/]+)\/shifts$/))) return json(m[1] === 'os-1' ? oncallShifts : { ...oncallShifts, layers: [], overrides: [], final: [] });
+		if (path === '/oncall/people') return json(oncallPeople);
+		if (path === '/oncall/escalation-policies') return json(escalationPolicies);
+		if (path === '/oncall/settings') return json({ p1_escalation_policy_id: 'ep-servers' });
+		if (path === '/oncall/pages') return json(oncallPages.filter((p) => !q.get('alert_id') || p.alert_id === q.get('alert_id')));
+		if (path === '/settings/sms') return json({ account_sid: 'AC5f1e0c2b9d', from: '+15005550006', base_url: 'https://api.twilio.com', token_set: true });
+		if (path === '/account/contact-methods') return json({ phone: '+447700900123', phone_verified: true, sms_available: true, devices: 1, rules: [{ method: 'push', delay_minutes: 0 }, { method: 'sms', delay_minutes: 5 }] });
+		if (path === '/account/notification-prefs') return json(notificationPrefs);
+		if (path === '/push/subscriptions') return json([]);
 		if (path === '/notifications') return json(deliveries);
 		if (path === '/settings/smtp') return json({ host: 'smtp.office365.com', port: 587, security: 'starttls', username: 'rmm@northwind.example', password_set: true, from: 'Northwind RMM <rmm@northwind.example>' });
 		if (path === '/api-keys') return json(q.get('all') ? allApiKeys : apiKeys);
@@ -1691,7 +1773,8 @@ export async function mockApi(p: Page, opts: { signedIn?: boolean; ssoRequired?:
 		if (path === '/mailboxes') return json(mailboxes);
 		if (path === '/mailboxes/inbound') return json(inboundMail);
 		if (path === '/search') return json({ agents: agents.filter((a) => a.hostname.includes(q.get('q') ?? '')).slice(0, 5).map((a) => ({ id: a.id, hostname: a.hostname, os_family: a.os_family, online: a.online, client_name: a.client_name, site_name: a.site_name })), clients: [], sites: [], scripts: [], tickets: [] });
-		if (path === '/canned-responses' || path === '/teams' || path === '/charges' || path === '/products' || path === '/sla/policies' || path === '/sla/calendars') return json([]);
+		if (path === '/canned-responses' || path === '/teams' || path === '/charges' || path === '/products' || path === '/sla/policies') return json([]);
+		if (path === '/sla/calendars') return json([{ id: 'cal-office', name: 'Office hours', timezone: 'Europe/London', hours: [] }]);
 		if (path === '/time/timer') return json(null);
 		if (path === '/work-types')
 			return json([

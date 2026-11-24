@@ -424,8 +424,11 @@ pub(crate) async fn announce(st: &AppState, ids: &[Uuid], event: &'static str, c
                 warn!(alert = %id, "running the alert's script: {e:#}");
             }
             crate::automation::alert_opened(st, id).await;
+            crate::push::alert_opened(st, id).await;
         } else {
             crate::tickets::alert_resolved(st, id).await;
+            crate::oncall::alert_changed(st, id).await;
+            crate::notify::close_incidents(st, id).await;
         }
     }
     if woke {
