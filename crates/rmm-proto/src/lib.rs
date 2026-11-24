@@ -10,6 +10,7 @@
 
 pub mod checks;
 pub mod desktop;
+pub mod identity;
 pub mod net;
 pub mod patch;
 pub mod security;
@@ -304,6 +305,11 @@ pub enum AgentMsg {
     CheckResults {
         results: Vec<checks::CheckResult>,
     },
+    /// Answer to [`ServerMsg::Identity`].
+    IdentityReply {
+        request_id: Uuid,
+        reply: identity::Reply,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -543,6 +549,12 @@ pub enum ServerMsg {
         checks: Vec<checks::CheckSpec>,
         #[serde(default)]
         run_now: Vec<Uuid>,
+    },
+    /// An Active Directory operation (only to agents listing [`identity::CAPABILITY`]);
+    /// answered with [`AgentMsg::IdentityReply`].
+    Identity {
+        request_id: Uuid,
+        op: identity::Op,
     },
 }
 
