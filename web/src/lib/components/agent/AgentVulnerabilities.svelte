@@ -45,20 +45,18 @@
 					{#if f.epss != null}<div class="text-muted mt-0.5 text-xs" title="EPSS: probability of exploitation in the next 30 days">EPSS {epssPct(f.epss)}</div>{/if}
 				{/snippet}
 				{#snippet pkgCell(f: AgentFinding)}
-					<span class="font-medium">{f.software_name}</span>{#if f.software_name !== f.package}<span class="text-muted text-xs"> ({f.package})</span>{/if}
-					<div class="text-muted font-mono text-xs">{f.installed_version}</div>
+					<span class="font-medium break-all">{f.software_name}</span>{#if f.software_name !== f.package}<span class="text-muted text-xs"> ({f.package})</span>{/if}
+					<div class="text-muted font-mono text-xs break-all">{f.installed_version}</div>
 				{/snippet}
 				{#snippet fixCell(f: AgentFinding)}
 					{#if f.accepted}
 						<Badge>Accepted</Badge>
 					{:else}
 						<RemediationAction {agentId} remediation={f.remediation} fixed={f.fixed_version} ondone={() => data.reload()} />
+						{#if allowed('security.respond')}<div><button type="button" class="text-muted hover:text-fg mt-1 text-xs font-medium whitespace-nowrap" onclick={() => (accepting = f.key)}>Accept risk</button></div>{/if}
 					{/if}
 				{/snippet}
 				{#snippet seenCell(f: AgentFinding)}<span class="text-muted whitespace-nowrap" title={datetime(f.first_seen)}>{ago(f.first_seen)}</span>{/snippet}
-				{#snippet acceptCell(f: AgentFinding)}
-					{#if !f.accepted && allowed('security.respond')}<button type="button" class="text-muted hover:text-fg text-xs font-medium whitespace-nowrap" onclick={() => (accepting = f.key)}>Accept risk</button>{/if}
-				{/snippet}
 				<DataTable
 					id="agent-vulns"
 					caption="Vulnerabilities on {hostname}"
@@ -69,8 +67,7 @@
 						{ id: 'severity', label: 'Severity', cell: sevCell },
 						{ id: 'package', label: 'Package', cell: pkgCell, from: 'sm' },
 						{ id: 'fix', label: 'Fix', cell: fixCell },
-						{ id: 'seen', label: 'Found', cell: seenCell, from: 'lg' },
-						{ id: 'accept', label: 'Actions', cell: acceptCell, from: 'md' }
+						{ id: 'seen', label: 'Found', cell: seenCell, from: 'xl' }
 					] satisfies Column<AgentFinding>[]}
 				>
 					{#snippet empty()}<EmptyState compact icon={ShieldCheck} title="No known vulnerabilities" description="Nothing installed matches an advisory with a fix, a high or critical rating, or a known exploit." />{/snippet}
