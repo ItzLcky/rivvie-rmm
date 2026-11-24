@@ -271,7 +271,12 @@ async fn vulnerabilities(server: &mut Server, url: &str, admin: &Api, db: &sqlx:
     // Lists, filters, the CVE page.
     let by_cve = admin.get("/vulnerabilities?limit=50").await;
     let row = by_cve["items"].as_array().unwrap().iter().find(|r| r["key"] == cve1).cloned().unwrap_or_else(|| panic!("{by_cve}"));
-    assert_eq!((row["devices"].as_i64(), row["severity"].as_str()), (Some(1), Some("critical")), "{row}");
+    // Other sections may leave more agents on this machine, with the same real package.
+    let devices = admin.get(&format!("/vulnerabilities/{cve1}/devices")).await;
+    let devices = devices.as_array().unwrap();
+    assert!(devices.iter().any(|d| d["agent_id"] == id1), "{devices:?}");
+    let n_devices = devices.len() as u64;
+    assert_eq!((row["devices"].as_u64(), row["severity"].as_str()), (Some(devices.len() as u64), Some("critical")), "{row}");
     let kev_only = admin.get("/vulnerabilities?kev=true").await;
     let keys: Vec<&str> = kev_only["items"].as_array().unwrap().iter().filter_map(|r| r["key"].as_str()).collect();
     assert_eq!(keys, [cve_kev], "{kev_only}");
@@ -283,9 +288,6 @@ async fn vulnerabilities(server: &mut Server, url: &str, admin: &Api, db: &sqlx:
     let detail = admin.get(&format!("/vulnerabilities/{cve1}")).await;
     assert!(detail["epss"].as_f64().is_some() && detail["kev"] == false && detail["advisories"].as_array().unwrap().len() == 1, "{detail}");
     assert_eq!(admin.get(&format!("/vulnerabilities/{cve_kev}")).await["kev"], true);
-    let devices = admin.get(&format!("/vulnerabilities/{cve1}/devices")).await;
-    assert_eq!(devices.as_array().unwrap().len(), 1, "{devices}");
-    assert_eq!(devices[0]["agent_id"], id1);
     let (s, _) = admin.call(Method::GET, "/vulnerabilities/CVE-2099-9999", None).await;
     assert_eq!(s, StatusCode::NOT_FOUND);
     let summary = admin.get(&format!("/vulnerabilities/summary?client_id={a_id}")).await;
@@ -348,7 +350,13 @@ async fn vulnerabilities(server: &mut Server, url: &str, admin: &Api, db: &sqlx:
     let v = vuln_findings(admin, id1).await;
     assert!(v["findings"].as_array().unwrap().iter().any(|f| f["key"] == cve1 && f["accepted"] == true), "{v}");
     assert_eq!(v["critical"], 0, "accepted findings don't count");
-    assert!(admin.get("/vulnerabilities").await["items"].as_array().unwrap().iter().all(|r| r["key"] != cve1), "accepted CVEs leave the list");
+    let open = admin.get("/vulnerabilities").await;
+    let still = open["items"].as_array().unwrap().iter().find(|r| r["key"] == cve1).map(|r| r["devices"].as_u64());
+    if n_devices == 1 {
+        assert!(still.is_none(), "accepted CVEs leave the list: {open}");
+    } else {
+        assert_eq!(still, Some(Some(n_devices - 1)), "only the other devices still count: {open}");
+    }
     assert!(admin.get("/vulnerabilities?accepted=true").await["items"].as_array().unwrap().iter().any(|r| r["key"] == cve1 && r["accepted_devices"] == 1));
     assert_eq!(audit_count(db, "vuln.accept").await, 1);
     let reopened = eventually(40, "the alert to come back once the acceptance expires", || async {
