@@ -1,0 +1,67 @@
+{
+   "blockdevices": [
+      {
+         "name": "sda",
+         "type": "disk",
+         "fstype": null,
+         "mountpoints": [],
+         "uuid": null,
+         "pkname": null,
+         "rm": false,
+         "children": [
+            {
+               "name": "sda1",
+               "type": "part",
+               "fstype": "vfat",
+               "mountpoints": [
+                   "/boot"
+               ],
+               "uuid": "1232-1E64",
+               "pkname": "sda",
+               "rm": false
+            },{
+               "name": "sda2",
+               "type": "part",
+               "fstype": "btrfs",
+               "mountpoints": [
+                   "/var/tmp", "/var/log", "/var/cache", "/srv", "/home", "/root", "/"
+               ],
+               "uuid": "a51d1609-cb51-42fb-b124-c20ef6654e95",
+               "pkname": "sda",
+               "rm": false
+            }
+         ]
+      },{
+         "name": "sdb",
+         "type": "disk",
+         "fstype": null,
+         "mountpoints": [],
+         "uuid": null,
+         "pkname": null,
+         "rm": false,
+         "children": [
+            {
+               "name": "sdb1",
+               "type": "part",
+               "fstype": "ext4",
+               "mountpoints": [
+                   "/run/media/user/Data"
+               ],
+               "uuid": "447b6a63-6ed8-4fc2-9e15-5a4dcdd42d6f",
+               "pkname": "sdb",
+               "rm": false
+            }
+         ]
+      },{
+         "name": "zram0",
+         "type": "disk",
+         "fstype": "swap",
+         "mountpoints": [
+             "[SWAP]"
+         ],
+         "uuid": "01b414d9-026c-4d47-9d92-1d7810a821fe",
+         "pkname": null,
+         "rm": false
+      }
+   ]
+}

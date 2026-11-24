@@ -87,6 +87,7 @@ pub async fn run_forever(cfg: Config, config_path: std::path::PathBuf, mut shutd
     tokio::spawn(sensor.clone().run());
     tokio::spawn(keep_isolation(cfg.server_url.clone()));
     let security = Arc::new(security::Manager::new(sensor, cfg.server_url.clone()));
+    let diskenc = Arc::new(crate::diskenc::Manager::new());
     let updater = Arc::new(Updater::new(config_path, tracker.clone(), patches.clone()));
     let collector = match Collector::new() {
         Ok(c) => Arc::new(Mutex::new(c)),
@@ -99,7 +100,7 @@ pub async fn run_forever(cfg: Config, config_path: std::path::PathBuf, mut shutd
     loop {
         let started = std::time::Instant::now();
         tokio::select! {
-            res = session(&cfg, collector.clone(), tracker.clone(), updater.clone(), watchers.clone(), checks.clone(), patches.clone(), software.clone(), security.clone()) => match res {
+            res = session(&cfg, collector.clone(), tracker.clone(), updater.clone(), watchers.clone(), checks.clone(), patches.clone(), software.clone(), security.clone(), diskenc.clone()) => match res {
                 Ok(()) => info!("connection closed"),
                 Err(e) => warn!("connection error: {e:#}"),
             },
@@ -135,6 +136,7 @@ async fn session(
     patches: Arc<patch::Manager>,
     software: Arc<deploy::Manager>,
     security: Arc<security::Manager>,
+    diskenc: Arc<crate::diskenc::Manager>,
 ) -> Result<()> {
     let mut ws = connect(&cfg.ws_url()).await?;
     send(
@@ -186,13 +188,15 @@ async fn session(
     security.attach(tx.clone()).await;
     security.sensor().attach(tx.clone());
     let security_watch = tokio::spawn(security.clone().watch(tx.clone()));
+    diskenc.attach(tx.clone());
+    let diskenc_watch = tokio::spawn(diskenc.clone().watch(tx.clone()));
     let heartbeat = tokio::spawn(periodic(tx.clone(), collector.clone(), heartbeat_secs.max(5), false));
     let inventory = tokio::spawn(periodic(tx.clone(), collector.clone(), inventory_secs.max(300), true));
     watchers.attach(tx.clone());
     checks.attach(tx.clone());
     let (services_refresh, refresh_rx) = mpsc::channel(4);
     let services = tokio::spawn(services::watch(tx.clone(), refresh_rx));
-    let ctx = Ctx { tx: tx.clone(), collector, tracker: tracker.clone(), updater: updater.clone(), watchers: watchers.clone(), checks: checks.clone(), patches: patches.clone(), software: software.clone(), security: security.clone(), services_refresh };
+    let ctx = Ctx { tx: tx.clone(), collector, tracker: tracker.clone(), updater: updater.clone(), watchers: watchers.clone(), checks: checks.clone(), patches: patches.clone(), software: software.clone(), security: security.clone(), diskenc: diskenc.clone(), services_refresh };
 
     let mut shells: HashMap<Uuid, ShellSession> = HashMap::new();
     let mut desktops: HashMap<Uuid, DesktopSession> = HashMap::new();
@@ -224,6 +228,8 @@ async fn session(
     checks.detach();
     services.abort();
     security_watch.abort();
+    diskenc_watch.abort();
+    diskenc.detach();
     security.detach();
     security.sensor().detach();
     drop(ctx);
@@ -253,6 +259,7 @@ struct Ctx {
     patches: Arc<patch::Manager>,
     software: Arc<deploy::Manager>,
     security: Arc<security::Manager>,
+    diskenc: Arc<crate::diskenc::Manager>,
     /// Makes the service watcher send its list now.
     services_refresh: mpsc::Sender<()>,
 }
@@ -402,6 +409,35 @@ async fn handle(msg: ServerMsg, ctx: &Ctx, shells: &mut HashMap<Uuid, ShellSessi
                 info!(%session_id, "desktop closed by server");
             }
         }
+        ServerMsg::DiskEncryptionRefresh => ctx.diskenc.refresh(),
+        ServerMsg::DiskRecoveryRequest { request_id, volume_id, protector_id } => {
+            tokio::spawn(ctx.diskenc.clone().recovery_key(request_id, volume_id, protector_id));
+        }
+        ServerMsg::DiskProtector { request_id, volume_id, op } => {
+            tokio::spawn(ctx.diskenc.clone().protector(request_id, volume_id, op));
+        }
+        ServerMsg::LocalAdminSet { request_id, account, password, create } => {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                // One at a time: a retry must not race the set it repeats.
+                static ONE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+                let _one = ONE.lock().await;
+                let acct = account.clone();
+                let res = tokio::task::spawn_blocking(move || crate::localadmin::set(&acct, password.expose(), create)).await;
+                let msg = match res {
+                    Ok(Ok(created)) => {
+                        info!(%request_id, %account, created, "local admin password set");
+                        AgentMsg::LocalAdminResult { request_id, ok: true, created, status: rmm_proto::localadmin::Outcome::Ok, message: String::new() }
+                    }
+                    Ok(Err((status, message))) => {
+                        warn!(%request_id, %account, status = status.as_str(), "local admin password not set: {message}");
+                        AgentMsg::LocalAdminResult { request_id, ok: false, created: false, status, message }
+                    }
+                    Err(e) => AgentMsg::LocalAdminResult { request_id, ok: false, created: false, status: rmm_proto::localadmin::Outcome::Failed, message: format!("crashed: {e}") },
+                };
+                let _ = tx.send(msg).await;
+            });
+        }
         ServerMsg::Enrolled { .. } | ServerMsg::AuthOk { .. } | ServerMsg::AuthFailed { .. } => {}
     }
 }
@@ -422,6 +458,8 @@ fn capabilities() -> Vec<String> {
         rmm_proto::net::WOL_CAPABILITY.to_string(),
         rmm_proto::SCRIPT_ENV_CAPABILITY.to_string(),
         rmm_proto::checks::CAPABILITY.to_string(),
+        rmm_proto::diskenc::CAPABILITY.to_string(),
+        rmm_proto::localadmin::CAPABILITY.to_string(),
     ];
     if cfg!(any(target_os = "linux", windows)) || std::env::var_os("RMM_DESKTOP_FAKE").is_some() {
         caps.push(rmm_proto::desktop::CAPABILITY.to_string());

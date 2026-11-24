@@ -1,0 +1,10 @@
+{"system":"C:","fixed":["C:","D:","E:"],"error":null,"missing":false,"tpm_error":null,
+ "tpm":{"enabled":true,"activated":true,"spec":"2.0, 0, 1.38","maker":"INTC","ready":true},
+ "volumes":[
+  {"drive":"C:","device":"\\\\?\\Volume{1b2c3d4e-0000-0000-0000-100000000000}\\","volume_type":0,"protection":1,"conversion":1,"percent":100,"method":6,"lock":0,
+   "protectors":[{"id":"{0F1E2D3C-4B5A-6978-8796-A5B4C3D2E1F0}","type":1},{"id":"{6C2F8A31-1D3B-4E5A-9F0C-7B8D9E0A1B2C}","type":3}]},
+  {"drive":"D:","device":"\\\\?\\Volume{1b2c3d4e-0000-0000-0000-200000000000}\\","volume_type":1,"protection":0,"conversion":1,"percent":100,"method":7,"lock":0,
+   "protectors":{"id":"{11111111-2222-3333-4444-555555555555}","type":2}},
+  {"drive":"E:","device":"\\\\?\\Volume{1b2c3d4e-0000-0000-0000-300000000000}\\","volume_type":1,"protection":0,"conversion":0,"percent":0,"method":0,"lock":0,"protectors":null},
+  {"drive":"F:","device":"\\\\?\\Volume{1b2c3d4e-0000-0000-0000-400000000000}\\","volume_type":1,"protection":0,"conversion":0,"percent":0,"method":0,"lock":0,"protectors":[]}
+ ]}

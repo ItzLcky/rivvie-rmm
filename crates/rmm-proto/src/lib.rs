@@ -10,6 +10,8 @@
 
 pub mod checks;
 pub mod desktop;
+pub mod diskenc;
+pub mod localadmin;
 pub mod net;
 pub mod patch;
 pub mod security;
@@ -304,6 +306,36 @@ pub enum AgentMsg {
     CheckResults {
         results: Vec<checks::CheckResult>,
     },
+    /// The encryption state of the fixed volumes (see [`diskenc`]).
+    DiskEncryption(diskenc::Report),
+    /// Answer to [`ServerMsg::DiskRecoveryRequest`]: the recovery password, or why not.
+    DiskRecoveryKey {
+        request_id: Uuid,
+        volume_id: String,
+        protector_id: String,
+        #[serde(default)]
+        key: Option<localadmin::Secret>,
+        #[serde(default)]
+        error: Option<String>,
+    },
+    /// Answer to [`ServerMsg::DiskProtector`].
+    DiskProtectorResult {
+        request_id: Uuid,
+        ok: bool,
+        #[serde(default)]
+        message: String,
+    },
+    /// Answer to [`ServerMsg::LocalAdminSet`].
+    LocalAdminResult {
+        request_id: Uuid,
+        ok: bool,
+        /// The account didn't exist and was created.
+        #[serde(default)]
+        created: bool,
+        status: localadmin::Outcome,
+        #[serde(default)]
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -543,6 +575,29 @@ pub enum ServerMsg {
         checks: Vec<checks::CheckSpec>,
         #[serde(default)]
         run_now: Vec<Uuid>,
+    },
+    /// Report the disk encryption state now (only to agents listing [`diskenc::CAPABILITY`]).
+    DiskEncryptionRefresh,
+    /// Send the recovery password of this protector ([`AgentMsg::DiskRecoveryKey`]).
+    DiskRecoveryRequest {
+        request_id: Uuid,
+        volume_id: String,
+        protector_id: String,
+    },
+    /// Add or rotate a volume's recovery password ([`AgentMsg::DiskProtectorResult`]); a new
+    /// report follows, from which the server escrows the new key.
+    DiskProtector {
+        request_id: Uuid,
+        volume_id: String,
+        op: diskenc::ProtectorOp,
+    },
+    /// Set the managed local account's password, creating the account if `create` and it is
+    /// missing (only to agents listing [`localadmin::CAPABILITY`]).
+    LocalAdminSet {
+        request_id: Uuid,
+        account: String,
+        password: localadmin::Secret,
+        create: bool,
     },
 }
 
@@ -1153,6 +1208,46 @@ mod tests {
         }
         // An unknown result from a newer agent reads as unknown.
         assert_eq!(serde_json::from_str::<BackupResult>("\"partial\"").unwrap(), BackupResult::Unknown);
+    }
+
+    #[test]
+    fn device_security_messages_round_trip() {
+        let report = diskenc::Report {
+            volumes: vec![diskenc::Volume {
+                volume_id: "C:".into(),
+                mount: "C:\\".into(),
+                kind: diskenc::Kind::Bitlocker,
+                role: diskenc::Role::Os,
+                status: diskenc::Status::Encrypted,
+                protectors: vec!["tpm".into(), "recovery_password".into()],
+                protection_on: true,
+                recovery_protector_id: Some("{AAAA}".into()),
+                ..Default::default()
+            }],
+            tpm: Some(diskenc::Tpm { present: true, ..Default::default() }),
+            error: None,
+        };
+        match decode::<AgentMsg>(&encode(&AgentMsg::DiskEncryption(report.clone())).unwrap()).unwrap() {
+            AgentMsg::DiskEncryption(r) => assert_eq!(r, report),
+            other => panic!("{other:?}"),
+        }
+        let id = Uuid::new_v4();
+        let key = AgentMsg::DiskRecoveryKey { request_id: id, volume_id: "C:".into(), protector_id: "{AAAA}".into(), key: Some(localadmin::Secret("111111-222222".into())), error: None };
+        assert!(!format!("{key:?}").contains("111111"), "keys stay out of logs");
+        match decode::<AgentMsg>(&encode(&key).unwrap()).unwrap() {
+            AgentMsg::DiskRecoveryKey { key: Some(k), .. } => assert_eq!(k.expose(), "111111-222222"),
+            other => panic!("{other:?}"),
+        }
+        let set = ServerMsg::LocalAdminSet { request_id: id, account: "rmmadmin".into(), password: localadmin::Secret("Pw-1".into()), create: true };
+        assert!(!format!("{set:?}").contains("Pw-1"));
+        match decode::<ServerMsg>(&encode(&set).unwrap()).unwrap() {
+            ServerMsg::LocalAdminSet { password, create: true, .. } => assert_eq!(password.expose(), "Pw-1"),
+            other => panic!("{other:?}"),
+        }
+        let res = AgentMsg::LocalAdminResult { request_id: id, ok: false, created: false, status: localadmin::Outcome::Conflict, message: "Windows LAPS".into() };
+        assert!(matches!(decode::<AgentMsg>(&encode(&res).unwrap()).unwrap(), AgentMsg::LocalAdminResult { status: localadmin::Outcome::Conflict, .. }));
+        let op = ServerMsg::DiskProtector { request_id: id, volume_id: "C:".into(), op: diskenc::ProtectorOp::RotateRecovery };
+        assert!(matches!(decode::<ServerMsg>(&encode(&op).unwrap()).unwrap(), ServerMsg::DiskProtector { op: diskenc::ProtectorOp::RotateRecovery, .. }));
     }
 
     #[test]
