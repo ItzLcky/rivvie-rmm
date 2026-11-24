@@ -355,8 +355,8 @@ mod tests {
         let data = ar_member_data(&pkg, "data.tar.gz");
         let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(&data[..]));
         let paths: Vec<String> = tar.entries().unwrap().map(|e| e.unwrap().path().unwrap().to_string_lossy().into_owned()).collect();
-        assert!(paths.iter().any(|p| p == "./usr/share/applications/rmm-tray.desktop"), "{paths:?}");
-        assert!(paths.iter().any(|p| p == "./etc/xdg/autostart/rmm-tray.desktop"), "{paths:?}");
+        assert!(paths.iter().any(|p| p.trim_start_matches("./") == "usr/share/applications/rmm-tray.desktop"), "{paths:?}");
+        assert!(paths.iter().any(|p| p.trim_start_matches("./") == "etc/xdg/autostart/rmm-tray.desktop"), "{paths:?}");
         assert!(TRAY_AUTOSTART.contains("Exec=/usr/bin/rmm-agent tray --background\n"));
     }
 
