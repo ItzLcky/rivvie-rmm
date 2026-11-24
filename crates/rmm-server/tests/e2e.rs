@@ -43,7 +43,8 @@
 //! private address such as the Docker bridge's) for the network section: scan, monitor, rates,
 //! device-down alerts. The container name, if given, is paused and unpaused to make it go
 //! quiet. Without it that section checks everything that doesn't need a device.
-//! `RMM_E2E_ONLY=network` runs only that section (after the enrollment it needs).
+//! `RMM_E2E_ONLY=network` runs only that section (after the enrollment it needs), and so do
+//! `RMM_E2E_ONLY=oncall` (paging, with a stand-in Twilio, PagerDuty and Opsgenie) and `push`.
 //!
 //! `RMM_E2E_ONLY=desk` runs only the core and service desk sections (faster while working on
 //! tickets, the portal and billing); `RMM_E2E_ONLY=api` only enrollment and the API keys and webhooks.
@@ -134,6 +135,11 @@ impl Server {
             .env("RMM_QBO_API_URL", format!("{}/qbo/api", ACCT_URL.get().map(String::as_str).unwrap_or("http://127.0.0.1:9")))
             .env("RMM_GRAPH_LOGIN_URL", GRAPH_URL.get().map(String::as_str).unwrap_or("http://127.0.0.1:9"))
             .env("RMM_GRAPH_URL", GRAPH_URL.get().map(String::as_str).unwrap_or("http://127.0.0.1:9"))
+            .env("RMM_PAGERDUTY_URL", format!("{}/pd", PAGING_URL.get().map(String::as_str).unwrap_or("http://127.0.0.1:9")))
+            .env("RMM_OPSGENIE_URL", format!("{}/og", PAGING_URL.get().map(String::as_str).unwrap_or("http://127.0.0.1:9")))
+            .env("RMM_PUSH_ALLOW_HOSTS", "127.0.0.1")
+            // A "minute" of escalation delay is a second here.
+            .env("RMM_ONCALL_MINUTE_SECS", "1")
             // Offline time counts in full right after the server starts (the restart grace would
             // hide the hours the automations e2e makes an agent absent for).
             .env("RMM_AUTOMATION_RESTART_GRACE_MINUTES", "0")
@@ -486,6 +492,9 @@ async fn end_to_end() {
     let (graph_url, graph) = graph_mock().await;
     let _ = GRAPH_URL.set(graph_url);
     let _ = GRAPH.set(graph);
+    let (paging_url, paging) = paging_sink().await;
+    let _ = PAGING_URL.set(paging_url);
+    let _ = PAGING.set(paging);
     let (acct_url, acct) = accounting_mock().await;
     let _ = ACCT_URL.set(acct_url);
     let _ = ACCT.set(acct);
@@ -585,6 +594,18 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
         api_keys_and_webhooks(&url, &admin, db, &id1, a_id, b_id).await;
         fields_tags_notes_views(&url, &admin, db, dir, &id1, a_id, b_id).await;
     automation_tags_and_fields(&url, &admin, db, &id1, &id3, a_id, b_id).await;
+        a1.kill();
+        return Ok(());
+    }
+
+    // RMM_E2E_ONLY=oncall / push: on-call and paging, or Web Push, on the enrolled agent.
+    if std::env::var("RMM_E2E_ONLY").as_deref() == Ok("oncall") {
+        oncall(&url, &admin, db, &id1, a_id).await;
+        a1.kill();
+        return Ok(());
+    }
+    if std::env::var("RMM_E2E_ONLY").as_deref() == Ok("push") {
+        push(&url, &admin, db, &id1, a_id, b_id).await;
         a1.kill();
         return Ok(());
     }
@@ -1207,6 +1228,8 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
     api_keys_and_webhooks(&url, &admin, db, &id1, a_id, b_id).await;
     fields_tags_notes_views(&url, &admin, db, dir, &id1, a_id, b_id).await;
     network(&url, &admin, db, &id1, a_id, a_site, b_id).await;
+    oncall(&url, &admin, db, &id1, a_id).await;
+    push(&url, &admin, db, &id1, a_id, b_id).await;
     sso_and_passkeys(server, db, dir, &secret).await;
 
     // --- rate limits ------------------------------------------------------------------------------
@@ -1332,6 +1355,8 @@ const SEALED: &[(&str, &str, &str)] = &[
     ("notification_channels", "secret", "secret_sealed"),
     ("siem_destinations", "token", "token_sealed"),
     ("net_credentials", "secret", "secret_sealed"),
+    ("company_settings", "sms_token_enc", "sms_token_sealed"),
+    ("push_keys", "private", "private_sealed"),
 ];
 
 async fn sealed_values(db: &sqlx::PgPool) -> Vec<(&'static str, Vec<u8>)> {
@@ -8287,4 +8312,349 @@ async fn fields_tags_notes_views(url: &str, admin: &Api, db: &sqlx::PgPool, dir:
     let (s, spec, _) = key_call(&key, &v1, Method::GET, "/openapi.json", None).await;
     assert!(s.is_success() && spec["paths"]["/agents/{id}/fields"]["put"]["operationId"] == "setAgentFields", "documented in the OpenAPI document");
     println!("tags, custom fields, notes, saved views: ok");
+}
+
+// ---------------------------------------------------------------------------------------------
+// On-call and paging, Web Push
+// ---------------------------------------------------------------------------------------------
+
+/// One request the paging sink received: method, path (with query), headers, body.
+#[derive(Clone, Debug)]
+struct Received {
+    path: String,
+    headers: std::collections::HashMap<String, String>,
+    body: Vec<u8>,
+}
+
+type Sink = std::sync::Arc<std::sync::Mutex<Vec<Received>>>;
+
+static PAGING_URL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static PAGING: std::sync::OnceLock<Sink> = std::sync::OnceLock::new();
+
+/// A stand-in for Twilio (`/twilio/...`), PagerDuty (`/pd/v2/enqueue`), Opsgenie (`/og/v2/...`)
+/// and push services (`/push/<id>`; `/push/gone` answers 410). Records everything.
+async fn paging_sink() -> (String, Sink) {
+    let got: Sink = Default::default();
+    let store = got.clone();
+    let app = axum::Router::new().fallback(move |uri: axum::http::Uri, headers: axum::http::HeaderMap, body: axum::body::Bytes| {
+        let store = store.clone();
+        async move {
+            let path = uri.path_and_query().map(|p| p.to_string()).unwrap_or_default();
+            let headers = headers.iter().map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or_default().to_string())).collect();
+            store.lock().unwrap().push(Received { path: path.clone(), headers, body: body.to_vec() });
+            use axum::response::IntoResponse;
+            if path.starts_with("/twilio/") {
+                (StatusCode::CREATED, axum::Json(json!({ "sid": format!("SM{}", uuid::Uuid::new_v4().simple()) }))).into_response()
+            } else if path == "/push/gone" {
+                StatusCode::GONE.into_response()
+            } else if path.starts_with("/push/") {
+                StatusCode::CREATED.into_response()
+            } else {
+                (StatusCode::ACCEPTED, axum::Json(json!({ "status": "success" }))).into_response()
+            }
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (url, got)
+}
+
+fn received(pred: impl Fn(&Received) -> bool) -> Vec<Received> {
+    PAGING.get().unwrap().lock().unwrap().iter().filter(|r| pred(r)).cloned().collect()
+}
+
+/// Text messages to `to` (the form fields of Twilio's Messages API).
+fn texts_to(to: &str) -> Vec<String> {
+    received(|r| r.path.starts_with("/twilio/"))
+        .into_iter()
+        .filter_map(|r| {
+            let form: std::collections::HashMap<String, String> = serde_urlencoded::from_bytes(&r.body).unwrap();
+            (form.get("To").map(String::as_str) == Some(to)).then(|| form["Body"].clone())
+        })
+        .collect()
+}
+
+fn json_to(prefix: &str) -> Vec<(String, Value)> {
+    received(|r| r.path.starts_with(prefix)).into_iter().map(|r| (r.path, serde_json::from_slice(&r.body).unwrap_or(Value::Null))).collect()
+}
+
+/// A technician with a verified mobile number, texted only.
+async fn paged_tech(url: &str, admin: &Api, email: &str, phone: &str, client: Option<&str>) -> (Api, String) {
+    let api = signed_in(url, admin, email, "technician", client, false).await;
+    let id = api.get("/auth/me").await["id"].as_str().unwrap().to_string();
+    let c = api.put("/account/contact-methods", json!({ "phone": phone, "rules": [{ "method": "sms", "delay_minutes": 0 }] })).await;
+    assert_eq!((c["phone"].as_str(), c["phone_verified"].as_bool()), (Some(phone), Some(false)));
+    api.post("/account/phone/verify", json!({})).await;
+    eventually(20, "the verification code", || async { texts_to(phone).into_iter().find(|t| t.contains("verification code")) }).await;
+    let (s, _) = api.call(reqwest::Method::POST, "/account/phone/verify", Some(json!({ "code": "000000" }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "a wrong code fails (and uses the code up)");
+    api.post("/account/phone/verify", json!({})).await;
+    let text = eventually(20, "a second code", || async { texts_to(phone).into_iter().filter(|t| t.contains("verification code")).nth(1) }).await;
+    let code: String = text.split(|c: char| !c.is_ascii_digit()).find(|w| w.len() == 6).unwrap().to_string();
+    api.post("/account/phone/verify", json!({ "code": code })).await;
+    assert_eq!(api.get("/account/contact-methods").await["phone_verified"], true);
+    (api, id)
+}
+
+/// On-call: a critical alert texts whoever is on call; no acknowledgement pages step two; an
+/// acknowledgement stops it; resolving sends PagerDuty's resolve and Opsgenie's close;
+/// `outside_hours` holds a page inside business hours; the SMS token is sealed at rest.
+async fn oncall(url: &str, admin: &Api, db: &sqlx::PgPool, id1: &str, a_id: &str) {
+    use reqwest::Method;
+    let sink = PAGING_URL.get().unwrap().clone();
+
+    // --- the SMS provider, token sealed ---------------------------------------------------
+    let s = admin.put("/settings/sms", json!({ "account_sid": "AC0e2e", "from": "+15005550006", "base_url": format!("{sink}/twilio"), "token": "twilio-token-e2e" })).await;
+    assert_eq!((s["token_set"].as_bool(), s.get("token")), (Some(true), None), "the token is never shown");
+    let (stored, sealed): (Vec<u8>, bool) = sqlx::query_as("SELECT sms_token_enc, sms_token_sealed FROM company_settings").fetch_one(db).await.unwrap();
+    assert!(sealed && stored != b"twilio-token-e2e", "the SMS token is sealed");
+    let t = admin.post("/settings/sms/test", json!({ "to": "+447700900999" })).await;
+    assert_eq!(t["ok"], true, "{t}");
+    let req = eventually(10, "the test text", || async { received(|r| r.path == "/twilio/2010-04-01/Accounts/AC0e2e/Messages.json").into_iter().next() }).await;
+    let basic = data_encoding::BASE64.encode(b"AC0e2e:twilio-token-e2e");
+    assert_eq!(req.headers["authorization"], format!("Basic {basic}"), "the opened token authenticates");
+
+    // --- people, a schedule, a policy -----------------------------------------------------
+    let (_t1, u1) = paged_tech(url, admin, "oncall-1@e2e.test", "+447700900111", None).await;
+    let (t2, u2) = paged_tech(url, admin, "oncall-2@e2e.test", "+447700900222", None).await;
+    let hour_ago = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+    let sched = admin
+        .post("/oncall/schedules", json!({ "name": "E2E primary", "timezone": "Europe/London", "layers": [{ "name": "Week", "user_ids": [u1], "start_at": hour_ago, "shift_hours": 168 }] }))
+        .await;
+    let sched_id = sched["id"].as_str().unwrap().to_string();
+    assert_eq!(sched["now"]["user_id"], u1.as_str(), "{sched}");
+    let now = admin.get("/oncall/now").await;
+    assert!(now.as_array().unwrap().iter().any(|n| n["schedule_id"] == sched_id.as_str() && n["user_id"] == u1.as_str()), "{now}");
+    let shifts = admin.get(&format!("/oncall/schedules/{sched_id}/shifts")).await;
+    assert_eq!(shifts["final"][0]["user_id"], u1.as_str(), "{shifts}");
+    // Technicians may only put themselves on call.
+    let soon = |h: i64| (chrono::Utc::now() + chrono::Duration::hours(h)).to_rfc3339();
+    let (s, _) = t2.call(Method::POST, "/oncall/overrides", Some(json!({ "schedule_id": sched_id, "user_id": u1, "starts_at": soon(1), "ends_at": soon(2) }))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    let o = t2.post("/oncall/overrides", json!({ "schedule_id": sched_id, "user_id": u2, "starts_at": soon(24), "ends_at": soon(25) })).await;
+    let (s, _) = t2.call(Method::POST, "/oncall/schedules", Some(json!({ "name": "Mine", "layers": [] }))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "schedules need oncall.manage");
+    t2.call(Method::DELETE, &format!("/oncall/overrides/{}", o["id"].as_str().unwrap()), None).await;
+
+    let policy = admin
+        .post("/oncall/escalation-policies", json!({ "name": "E2E servers", "repeat": 0, "steps": [
+            { "delay_minutes": 4, "targets": [{ "schedule": sched_id }] },
+            { "delay_minutes": 4, "targets": [{ "user": u2 }] },
+        ] }))
+        .await;
+    let policy_id = policy["id"].as_str().unwrap().to_string();
+    let (s, _) = admin.call(Method::POST, "/oncall/escalation-policies", Some(json!({ "name": "Bad", "steps": [{ "delay_minutes": 1, "targets": [{ "team": u1 }] }] }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+
+    let page_ch = admin.post("/notification-channels", json!({ "name": "E2E page", "kind": "oncall", "config": { "escalation_policy_id": policy_id } })).await;
+    let (s, _) = admin.call(Method::POST, "/notification-channels", Some(json!({ "name": "E2E PD bad", "kind": "pagerduty", "config": {} }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "PagerDuty needs its key");
+    let pd = admin.post("/notification-channels", json!({ "name": "E2E PD", "kind": "pagerduty", "config": { "secret": "pdroutingkey0e2e" } })).await;
+    assert_eq!((pd["has_secret"].as_bool(), pd["config"].get("secret")), (Some(true), None));
+    let og = admin.post("/notification-channels", json!({ "name": "E2E Opsgenie", "kind": "opsgenie", "config": { "region": "eu", "secret": "og-key-e2e" } })).await;
+    let (s, _) = admin.call(Method::DELETE, &format!("/oncall/escalation-policies/{policy_id}"), None).await;
+    assert_eq!(s, StatusCode::CONFLICT, "an on-call channel uses it");
+    let channels = [&page_ch, &pd, &og].map(|c| c["id"].as_str().unwrap().to_string());
+    let item = admin
+        .alert_policy(json!({ "name": "Paging (e2e)", "kind": "job_failed", "params": {}, "severity": "critical", "client_id": a_id, "channel_ids": channels }))
+        .await;
+    let item_id = item["id"].as_str().unwrap().to_string();
+
+    // --- a critical alert pages the person on call ----------------------------------------
+    let job = admin.run_script(id1, "exit 4", 30).await;
+    admin.wait_job(&job, 30).await;
+    let alert = eventually(30, "the paging alert", || async {
+        alerts_for(admin, &format!("agent_id={id1}&kind=job_failed&state=active")).await.into_iter().find(|a| a["policy_id"] == item_id.as_str())
+    })
+    .await;
+    let alert_id = alert["id"].as_str().unwrap().to_string();
+    let text = eventually(30, "the page's text to the on-call tech", || async { texts_to("+447700900111").into_iter().find(|t| t.contains("/a/")) }).await;
+    assert!(text.starts_with("[") && text.contains("CRITICAL") && text.chars().count() <= 300, "{text}");
+    let pd_trigger = eventually(30, "PagerDuty trigger", || async { json_to("/pd/v2/enqueue").into_iter().find(|(_, b)| b["event_action"] == "trigger").map(|x| x.1) }).await;
+    assert_eq!((pd_trigger["dedup_key"].as_str(), pd_trigger["routing_key"].as_str()), (Some(alert_id.as_str()), Some("pdroutingkey0e2e")));
+    assert_eq!(pd_trigger["payload"]["severity"], "critical");
+    let og_req = eventually(30, "Opsgenie create", || async { received(|r| r.path == "/og/v2/alerts").into_iter().next() }).await;
+    assert_eq!(og_req.headers["authorization"], "GenieKey og-key-e2e");
+    assert_eq!(serde_json::from_slice::<Value>(&og_req.body).unwrap()["alias"], alert_id.as_str());
+
+    // The short link opens the alert, once.
+    let link = text.rsplit(' ').next().unwrap().to_string();
+    assert!(link.starts_with(&format!("{url}/a/")), "{link}");
+    let raw = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
+    let res = raw.get(&link).send().await.unwrap();
+    assert!(res.status().is_redirection(), "{}", res.status());
+    assert_eq!(res.headers()["location"], format!("/alerts/{alert_id}").as_str());
+    assert_eq!(raw.get(&link).send().await.unwrap().status(), StatusCode::GONE, "single use");
+
+    // --- nobody acknowledges: step two texts the second tech ------------------------------
+    eventually(30, "step two's text", || async { texts_to("+447700900222").into_iter().find(|t| t.contains("/a/")) }).await;
+    let pages = admin.get(&format!("/oncall/pages?alert_id={alert_id}")).await;
+    let page = &pages[0];
+    assert_eq!((page["status"].as_str(), page["step"].as_i64()), (Some("triggered"), Some(1)), "{pages}");
+    let page_id = page["id"].as_str().unwrap().to_string();
+
+    // --- an acknowledgement stops it, and acknowledges the alert ---------------------------
+    let acked = t2.post(&format!("/oncall/pages/{page_id}/ack"), json!({})).await;
+    assert_eq!(acked["status"], "acknowledged", "{acked}");
+    let a = admin.get(&format!("/alerts/{alert_id}")).await;
+    assert_eq!(a["state"], "acknowledged", "the alert follows the page");
+    let before = texts_to("+447700900111").len() + texts_to("+447700900222").len();
+    tokio::time::sleep(Duration::from_secs(9)).await;
+    assert_eq!(texts_to("+447700900111").len() + texts_to("+447700900222").len(), before, "no more pages after the acknowledgement");
+    // The audit log has it.
+    let (n,): (i64,) = sqlx::query_as("SELECT count(*) FROM audit_log WHERE action = 'page.ack' AND target_id = $1::uuid").bind(&page_id).fetch_one(db).await.unwrap();
+    assert_eq!(n, 1);
+
+    // --- resolving closes the PagerDuty incident and the Opsgenie alert --------------------
+    let ok = admin.run_script(id1, "true", 30).await;
+    admin.wait_job(&ok, 30).await;
+    let resolve = eventually(30, "PagerDuty resolve", || async { json_to("/pd/v2/enqueue").into_iter().find(|(_, b)| b["event_action"] == "resolve").map(|x| x.1) }).await;
+    assert_eq!(resolve["dedup_key"], alert_id.as_str());
+    eventually(30, "Opsgenie close", || async { received(|r| r.path == format!("/og/v2/alerts/{alert_id}/close?identifierType=alias")).into_iter().next() }).await;
+    let pages = admin.get(&format!("/oncall/pages?alert_id={alert_id}")).await;
+    assert_eq!(pages[0]["status"], "resolved", "{pages}");
+
+    // --- `outside_hours` holds a page inside business hours --------------------------------
+    let open_all_week: Vec<Value> = (0..7).map(|_| json!([[0, 1440]])).collect();
+    let cal = admin.post("/sla/calendars", json!({ "name": "E2E always open", "timezone": "UTC", "hours": open_all_week })).await;
+    let held_ch = admin
+        .post("/notification-channels", json!({ "name": "E2E page out of hours", "kind": "oncall", "config": { "escalation_policy_id": policy_id, "when": "outside_hours", "calendar_id": cal["id"] } }))
+        .await;
+    let (s, v) = admin
+        .update_alert_policy(&item_id, json!({ "name": "Paging (e2e)", "kind": "job_failed", "params": {}, "severity": "critical", "client_id": a_id, "channel_ids": [held_ch["id"]] }))
+        .await;
+    assert!(s.is_success(), "{v}");
+    let texts = texts_to("+447700900111").len();
+    let job = admin.run_script(id1, "exit 5", 30).await;
+    admin.wait_job(&job, 30).await;
+    let held = eventually(30, "the held page", || async {
+        let a = alerts_for(admin, &format!("agent_id={id1}&kind=job_failed&state=active")).await.into_iter().find(|a| a["policy_id"] == item_id.as_str())?;
+        let p = admin.get(&format!("/oncall/pages?alert_id={}", a["id"].as_str().unwrap())).await;
+        p.as_array().unwrap().first().cloned()
+    })
+    .await;
+    assert_eq!(held["status"], "held", "{held}");
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    assert_eq!(texts_to("+447700900111").len(), texts, "nobody is texted inside business hours");
+    let ok = admin.run_script(id1, "true", 30).await;
+    admin.wait_job(&ok, 30).await;
+    eventually(30, "the held page resolves with its alert", || async {
+        let p = admin.get(&format!("/oncall/pages?alert_id={}", held["alert_id"].as_str().unwrap())).await;
+        (p[0]["status"] == "resolved").then_some(())
+    })
+    .await;
+
+    // Read-only users can't acknowledge.
+    let ro = signed_in(url, admin, "oncall-ro@e2e.test", "readonly", None, false).await;
+    let (s, _) = ro.call(Method::POST, &format!("/oncall/pages/{page_id}/ack"), Some(json!({}))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    admin.delete_policy(&item_id).await;
+}
+
+/// Web Push: a subscription on a test endpoint receives an encrypted, VAPID-signed push for a
+/// critical alert (the test decrypts it); a 410 removes the subscription; someone who can't see
+/// the client gets nothing.
+async fn push(url: &str, admin: &Api, db: &sqlx::PgPool, id1: &str, a_id: &str, b_id: &str) {
+    use data_encoding::BASE64URL_NOPAD as B64;
+    use ring::{aead, agreement, hkdf};
+    let sink = PAGING_URL.get().unwrap().clone();
+
+    // The manifest, for installing.
+    let m: Value = reqwest::get(format!("{url}/manifest.webmanifest")).await.unwrap().json().await.unwrap();
+    assert_eq!(m["display"], "standalone");
+    assert!(m["icons"].as_array().unwrap().iter().any(|i| i["sizes"] == "512x512"), "{m}");
+
+    let tech = signed_in(url, admin, "push-a@e2e.test", "technician", Some(a_id), false).await;
+    let other = signed_in(url, admin, "push-b@e2e.test", "technician", Some(b_id), false).await;
+    let key = tech.get("/push/key").await;
+    let vapid_public = B64.decode(key["public_key"].as_str().unwrap().as_bytes()).unwrap();
+    assert_eq!(vapid_public.len(), 65);
+    let (stored, sealed): (Vec<u8>, bool) = sqlx::query_as("SELECT private, private_sealed FROM push_keys").fetch_one(db).await.unwrap();
+    assert!(sealed && stored.len() > 60, "the VAPID private key is sealed");
+
+    // A browser's keys.
+    let rng = ring::rand::SystemRandom::new();
+    let ua = agreement::EphemeralPrivateKey::generate(&agreement::ECDH_P256, &rng).unwrap();
+    let ua_public = ua.compute_public_key().unwrap().as_ref().to_vec();
+    let auth = [42u8; 16];
+    let sub = |endpoint: String| json!({ "endpoint": endpoint, "keys": { "p256dh": B64.encode(&ua_public), "auth": B64.encode(&auth) } });
+    let (s, v) = tech.call(reqwest::Method::POST, "/push/subscriptions", Some(sub("https://evil.example/push".into()))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "only known push services: {v}");
+    tech.post("/push/subscriptions", sub(format!("{sink}/push/a"))).await;
+    tech.post("/push/subscriptions", sub(format!("{sink}/push/gone"))).await;
+    other.post("/push/subscriptions", sub(format!("{sink}/push/b"))).await;
+    assert_eq!(tech.get("/push/subscriptions").await.as_array().unwrap().len(), 2);
+
+    let item = admin.alert_policy(json!({ "name": "Push (e2e)", "kind": "job_failed", "params": {}, "severity": "critical", "client_id": a_id })).await;
+    let job = admin.run_script(id1, "exit 6", 30).await;
+    admin.wait_job(&job, 30).await;
+    let req = eventually(30, "the push to the technician's device", || async { received(|r| r.path == "/push/a").into_iter().next() }).await;
+    assert_eq!(req.headers["content-encoding"], "aes128gcm");
+    let authz = req.headers["authorization"].clone();
+    let (jwt, k) = authz.strip_prefix("vapid t=").unwrap().split_once(", k=").unwrap();
+    assert_eq!(B64.decode(k.as_bytes()).unwrap(), vapid_public);
+    let (input, sig) = jwt.rsplit_once('.').unwrap();
+    ring::signature::UnparsedPublicKey::new(&ring::signature::ECDSA_P256_SHA256_FIXED, &vapid_public)
+        .verify(input.as_bytes(), &B64.decode(sig.as_bytes()).unwrap())
+        .expect("the VAPID JWT verifies");
+    let claims: Value = serde_json::from_slice(&B64.decode(input.split_once('.').unwrap().1.as_bytes()).unwrap()).unwrap();
+    assert_eq!(claims["aud"], sink.as_str());
+
+    // Decrypt it as the browser would (RFC 8291).
+    let body = &req.body;
+    let (salt, rest) = body.split_at(16);
+    let idlen = rest[4] as usize;
+    let as_public = &rest[5..5 + idlen];
+    let record = &rest[5 + idlen..];
+    let secret = agreement::agree_ephemeral(ua, &agreement::UnparsedPublicKey::new(&agreement::ECDH_P256, as_public), |s| s.to_vec()).unwrap();
+    struct L(usize);
+    impl hkdf::KeyType for L {
+        fn len(&self) -> usize {
+            self.0
+        }
+    }
+    let expand = |prk: &hkdf::Prk, info: &[&[u8]], n: usize| {
+        let mut out = vec![0u8; n];
+        prk.expand(info, L(n)).unwrap().fill(&mut out).unwrap();
+        out
+    };
+    let prk_key = hkdf::Salt::new(hkdf::HKDF_SHA256, &auth).extract(&secret);
+    let ikm = expand(&prk_key, &[b"WebPush: info\0", &ua_public, as_public], 32);
+    let prk = hkdf::Salt::new(hkdf::HKDF_SHA256, salt).extract(&ikm);
+    let cek = expand(&prk, &[b"Content-Encoding: aes128gcm\0"], 16);
+    let nonce: [u8; 12] = expand(&prk, &[b"Content-Encoding: nonce\0"], 12).try_into().unwrap();
+    let key = aead::LessSafeKey::new(aead::UnboundKey::new(&aead::AES_128_GCM, &cek).unwrap());
+    let mut buf = record.to_vec();
+    let plain = key.open_in_place(aead::Nonce::assume_unique_for_key(nonce), aead::Aad::empty(), &mut buf).unwrap();
+    assert_eq!(plain.last(), Some(&2), "the last-record delimiter");
+    let payload: Value = serde_json::from_slice(&plain[..plain.len() - 1]).unwrap();
+    assert!(payload["title"].as_str().unwrap().starts_with("CRITICAL: Job failed"), "{payload}");
+    assert!(payload["url"].as_str().unwrap().starts_with("/alerts/"), "{payload}");
+    assert!(payload["alert_id"].is_string());
+
+    // 410: the subscription is gone. The other client's technician got nothing.
+    eventually(20, "the expired subscription to be removed", || async {
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM push_subscriptions WHERE endpoint LIKE '%/push/gone'").fetch_one(db).await.unwrap();
+        (n == 0).then_some(())
+    })
+    .await;
+    assert!(received(|r| r.path == "/push/b").is_empty(), "no push for a client they can't see");
+
+    // Preferences: alerts off, and nothing more arrives.
+    let prefs = tech.get("/account/notification-prefs").await;
+    assert!(prefs["events"].as_array().unwrap().iter().any(|e| e["event"] == "alert_critical" && e["push"] == true), "{prefs}");
+    tech.put("/account/notification-prefs", json!({ "hide_details": true, "events": [{ "event": "alert_critical", "push": false, "email": true }] })).await;
+    let ok = admin.run_script(id1, "true", 30).await;
+    admin.wait_job(&ok, 30).await;
+    let n = received(|r| r.path == "/push/a").len();
+    let job = admin.run_script(id1, "exit 7", 30).await;
+    admin.wait_job(&job, 30).await;
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert_eq!(received(|r| r.path == "/push/a").len(), n, "opted out of critical alerts");
+    let t = tech.post("/push/test", json!({})).await;
+    assert_eq!(t["sent"], 1, "{t}");
+    tech.call(reqwest::Method::DELETE, "/push/subscriptions", Some(json!({ "endpoint": format!("{sink}/push/a") }))).await;
+    assert_eq!(tech.get("/push/subscriptions").await.as_array().unwrap().len(), 0);
+    admin.delete_policy(item["id"].as_str().unwrap()).await;
 }

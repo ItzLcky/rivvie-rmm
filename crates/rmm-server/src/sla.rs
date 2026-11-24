@@ -138,6 +138,30 @@ impl Calendar {
         start + Duration::seconds(secs)
     }
 
+    /// When the opening hours `at` falls in end (across back-to-back windows), or `None` when
+    /// closed at `at`.
+    pub fn open_until(&self, at: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        let mut t = at;
+        let mut open = false;
+        for _ in 0..400 {
+            let day = t.with_timezone(&self.tz).date_naive();
+            let mut moved = false;
+            for d in [day.pred_opt().unwrap_or(day), day] {
+                for (a, b) in self.windows(d) {
+                    if a <= t && t < b {
+                        t = b;
+                        open = true;
+                        moved = true;
+                    }
+                }
+            }
+            if !moved {
+                break;
+            }
+        }
+        open.then_some(t)
+    }
+
     /// Business seconds in `[a, b)`.
     pub fn between(&self, a: DateTime<Utc>, b: DateTime<Utc>) -> i64 {
         if b <= a {
@@ -524,6 +548,15 @@ mod tests {
         let t = utc("2026-11-13T23:30:00Z");
         assert_eq!(c.add(t, 3600), utc("2026-11-14T00:30:00Z"));
         assert_eq!(c.between(t, utc("2026-11-15T23:30:00Z")), 2 * 86400);
+    }
+
+    #[test]
+    fn open_until_the_hours_end() {
+        let c = office(Tz::UTC);
+        assert_eq!(c.open_until(utc("2026-11-13T10:00:00Z")), Some(utc("2026-11-13T17:00:00Z")));
+        assert_eq!(c.open_until(utc("2026-11-13T17:00:00Z")), None, "closed at closing time");
+        assert_eq!(c.open_until(utc("2026-11-14T10:00:00Z")), None, "Saturday");
+        assert_eq!(Calendar::always().open_until(utc("2026-11-13T10:00:00Z")).map(|t| t > utc("2027-01-01T00:00:00Z")), Some(true));
     }
 
     #[test]

@@ -189,10 +189,12 @@ pub enum Perm {
     VaultManage,
     /// Read and export the audit log (the dashboard page and `/api/v1/audit*`).
     AuditRead,
+    /// On-call schedules and escalation policies (anyone may put themselves on call).
+    OncallManage,
 }
 
 impl Perm {
-    pub const ALL: [Perm; 9] = [
+    pub const ALL: [Perm; 10] = [
         Perm::SecurityRead,
         Perm::SecurityRespond,
         Perm::SecurityManage,
@@ -202,6 +204,7 @@ impl Perm {
         Perm::VaultRead,
         Perm::VaultManage,
         Perm::AuditRead,
+        Perm::OncallManage,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -215,6 +218,7 @@ impl Perm {
             Perm::VaultRead => "vault.read",
             Perm::VaultManage => "vault.manage",
             Perm::AuditRead => "audit.read",
+            Perm::OncallManage => "oncall.manage",
         }
     }
 
@@ -232,7 +236,9 @@ impl Perm {
             Perm::SecurityRead => true,
             Perm::SecurityRespond | Perm::VaultRead | Perm::VaultManage => role >= Role::Technician,
             // Money stays with admins unless someone is given it explicitly.
-            Perm::SecurityManage | Perm::BillingRead | Perm::BillingManage | Perm::TimeApprove | Perm::AuditRead => role >= Role::Admin,
+            Perm::SecurityManage | Perm::BillingRead | Perm::BillingManage | Perm::TimeApprove | Perm::AuditRead | Perm::OncallManage => {
+                role >= Role::Admin
+            }
         }
     }
 }

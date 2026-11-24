@@ -49,6 +49,15 @@ pub struct Company {
     pub csat_enabled: bool,
     /// Password sign-in is refused for everyone but break-glass accounts.
     pub sso_required: bool,
+    /// Text messages (pages, `sms` channels): a Twilio-compatible Messages API.
+    pub sms_account_sid: String,
+    pub sms_from: String,
+    pub sms_base_url: String,
+    /// The auth token, sealed with RMM_DATA_KEY when the server has one (`sms_token_sealed`).
+    pub sms_token_enc: Option<Vec<u8>>,
+    pub sms_token_sealed: bool,
+    /// New P1 tickets page through this escalation policy.
+    pub p1_escalation_policy_id: Option<uuid::Uuid>,
 }
 
 impl Company {
@@ -59,7 +68,8 @@ impl Company {
     }
 
     pub const COLUMNS: &str = "company_name, session_idle_hours, require_2fa_all,
-        smtp_host, smtp_port, smtp_security, smtp_username, smtp_password_enc, smtp_password_sealed, smtp_from, csat_enabled, sso_required";
+        smtp_host, smtp_port, smtp_security, smtp_username, smtp_password_enc, smtp_password_sealed, smtp_from, csat_enabled, sso_required,
+        sms_account_sid, sms_from, sms_base_url, sms_token_enc, sms_token_sealed, p1_escalation_policy_id";
 
     pub async fn load(db: &PgPool) -> sqlx::Result<Self> {
         sqlx::query_as(sqlx::AssertSqlSafe(format!("SELECT {} FROM company_settings", Self::COLUMNS))).fetch_one(db).await

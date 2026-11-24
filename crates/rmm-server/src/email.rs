@@ -669,6 +669,15 @@ async fn queue_acknowledgement(st: &AppState, ticket_id: Uuid, to: &str, in_repl
 /// Emails a technician about a ticket: `subject` and `lead` get the ticket's number and
 /// subject appended, and the body links to it. A no-op without a mail server.
 async fn queue_staff(st: &AppState, ticket_id: Uuid, user_id: Uuid, subject: &str, lead: &str, purpose: &str) -> Result<()> {
+    // The person's devices, and whether they still want the email (Account → Notifications).
+    let event = match purpose {
+        "assigned" => "ticket_assigned",
+        "client_message" => "ticket_reply",
+        _ => "sla_warning",
+    };
+    if !crate::push::ticket_event(st, user_id, event, ticket_id, subject).await {
+        return Ok(());
+    }
     if !smtp_configured(st) {
         return Ok(()); // nothing to do without a mail server, and no point recording failures
     }

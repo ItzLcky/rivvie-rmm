@@ -19,6 +19,8 @@
 //! | `siem_destinations`     | `token`                                        | `token_sealed`      |
 //! | `net_credentials`       | `secret` (SNMP community or passphrases)       | `secret_sealed`     |
 //! | `vault_keys`            | `wrapped_key` (AAD `vault-key:<client id>`)    | always sealed       |
+//! | `company_settings` (SMS)| `sms_token_enc`                                | `sms_token_sealed`  |
+//! | `push_keys`             | `private` (the VAPID signing key)              | `private_sealed`    |
 //!
 //! The vault's items are sealed with the per-client keys, not with `RMM_DATA_KEY`, so
 //! rewrapping `vault_keys` is all the vault needs: no item is touched.
@@ -96,6 +98,15 @@ pub const TABLES: &[Table] = &[
     Table { name: "siem_destinations", pk: "id", pk_type: "uuid", columns: &["token"], flag: Some("token_sealed"), aad_prefix: None },
     Table { name: "net_credentials", pk: "id", pk_type: "uuid", columns: &["secret"], flag: Some("secret_sealed"), aad_prefix: None },
     Table { name: "vault_keys", pk: "client_id", pk_type: "uuid", columns: &["wrapped_key"], flag: None, aad_prefix: Some("vault-key:") },
+    Table {
+        name: "company_settings",
+        pk: "id",
+        pk_type: "boolean",
+        columns: &["sms_token_enc"],
+        flag: Some("sms_token_sealed"),
+        aad_prefix: None,
+    },
+    Table { name: "push_keys", pk: "id", pk_type: "boolean", columns: &["private"], flag: Some("private_sealed"), aad_prefix: None },
 ];
 
 #[derive(Debug, PartialEq, Eq)]

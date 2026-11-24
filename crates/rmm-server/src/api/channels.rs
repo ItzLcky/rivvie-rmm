@@ -101,7 +101,11 @@ pub async fn create(State(st): State<Arc<AppState>>, u: User, Json(b): Json<Chan
     u.require(Role::Admin)?;
     let name = check_name(&b.name)?;
     let mut config = notify::validate_config(&b.kind, &b.config).map_err(ApiError::BadRequest)?;
+    check_references(&st, &b.kind, &config).await?;
     let secret = take_secret(&mut config).map(|s| crate::crypto::store(st.cfg.data_key.as_ref(), s.as_bytes()));
+    if notify::needs_secret(&b.kind) && secret.is_none() {
+        return Err(ApiError::BadRequest(if b.kind == "pagerduty" { "enter the integration (routing) key" } else { "enter the API key" }.into()));
+    }
     let id = Uuid::new_v4();
     sqlx::query("INSERT INTO notification_channels (id, name, kind, config, enabled, created_by, secret, secret_sealed) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)")
         .bind(id)
@@ -119,6 +123,25 @@ pub async fn create(State(st): State<Arc<AppState>>, u: User, Json(b): Json<Chan
     Ok(Json(view(fetch(&st, id).await?, true)))
 }
 
+/// An on-call channel's escalation policy and business calendar must exist.
+async fn check_references(st: &AppState, kind: &str, config: &Value) -> ApiResult<()> {
+    if kind != "oncall" {
+        return Ok(());
+    }
+    let id = |k: &str| config[k].as_str().and_then(|s| s.parse::<Uuid>().ok());
+    let policy: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM escalation_policies WHERE id = $1)").bind(id("escalation_policy_id")).fetch_one(&st.db).await?;
+    if !policy {
+        return Err(ApiError::BadRequest("that escalation policy doesn't exist".into()));
+    }
+    if let Some(cal) = id("calendar_id") {
+        let ok: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM business_calendars WHERE id = $1)").bind(cal).fetch_one(&st.db).await?;
+        if !ok {
+            return Err(ApiError::BadRequest("those business hours don't exist".into()));
+        }
+    }
+    Ok(())
+}
+
 /// Moves the webhook secret out of a validated config (it lives sealed in its own column).
 fn take_secret(config: &mut Value) -> Option<String> {
     config.as_object_mut()?.remove("secret")?.as_str().map(str::to_string).filter(|s| !s.is_empty())
@@ -129,10 +152,14 @@ pub async fn update(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uui
     u.require(Role::Admin)?;
     let current = fetch(&st, id).await?;
     let name = check_name(&b.name)?;
-    // The secret: left out = kept (when it stays a webhook channel), "" = removed, else replaced.
-    let keep = b.kind == "webhook" && current.kind == "webhook" && b.config.get("secret").is_none();
+    // The secret: left out = kept (when it stays the same kind of channel), "" = removed, else replaced.
+    let keep = notify::takes_secret(&b.kind) && current.kind == b.kind && b.config.get("secret").is_none();
     let mut config = notify::validate_config(&b.kind, &b.config).map_err(ApiError::BadRequest)?;
+    check_references(&st, &b.kind, &config).await?;
     let secret = take_secret(&mut config).map(|s| crate::crypto::store(st.cfg.data_key.as_ref(), s.as_bytes()));
+    if notify::needs_secret(&b.kind) && secret.is_none() && !(keep && current.has_secret) {
+        return Err(ApiError::BadRequest("enter the key".into()));
+    }
     sqlx::query(
         "UPDATE notification_channels SET name = $2, kind = $3, config = $4, enabled = $5, updated_at = now(),
                 secret = CASE WHEN $6 THEN secret ELSE $7 END, secret_sealed = CASE WHEN $6 THEN secret_sealed ELSE $8 END

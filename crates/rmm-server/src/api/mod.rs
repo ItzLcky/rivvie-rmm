@@ -22,6 +22,8 @@ mod kb;
 mod jobs;
 mod msi;
 mod notes;
+mod oncall;
+mod push;
 mod mutes;
 mod network;
 mod packages;
@@ -238,6 +240,28 @@ pub fn router(attachment_max: u64) -> Router<Arc<AppState>> {
         .route("/notification-channels/{id}", axum::routing::put(channels::update).delete(channels::remove))
         .route("/notification-channels/{id}/test", post(channels::test))
         .route("/notifications", get(channels::deliveries))
+        // On-call and paging.
+        .route("/oncall/people", get(oncall::people))
+        .route("/oncall/schedules", get(oncall::list_schedules).post(oncall::create_schedule))
+        .route("/oncall/schedules/{id}", get(oncall::get_schedule).put(oncall::update_schedule).delete(oncall::delete_schedule))
+        .route("/oncall/schedules/{id}/shifts", get(oncall::shifts))
+        .route("/oncall/now", get(oncall::now))
+        .route("/oncall/overrides", post(oncall::create_override))
+        .route("/oncall/overrides/{id}", delete(oncall::delete_override))
+        .route("/oncall/escalation-policies", get(oncall::list_policies).post(oncall::create_policy))
+        .route("/oncall/escalation-policies/{id}", get(oncall::get_policy).put(oncall::update_policy).delete(oncall::delete_policy))
+        .route("/oncall/settings", get(oncall::get_settings).put(oncall::update_settings))
+        .route("/oncall/pages", get(oncall::pages))
+        .route("/oncall/pages/{id}/ack", post(oncall::ack_page))
+        .route("/account/contact-methods", get(oncall::get_contact).put(oncall::update_contact))
+        .route("/account/phone/verify", post(oncall::verify_phone))
+        .route("/settings/sms", get(oncall::get_sms).put(oncall::update_sms))
+        .route("/settings/sms/test", post(oncall::test_sms))
+        // Web Push (the installed app).
+        .route("/push/key", get(push::key))
+        .route("/push/subscriptions", get(push::list).post(push::subscribe).delete(push::unsubscribe))
+        .route("/push/test", post(push::test))
+        .route("/account/notification-prefs", get(push::get_prefs).put(push::update_prefs))
         .route("/alerts", get(alerts::list))
         .route("/alerts/summary", get(alerts::summary_handler))
         .route("/alerts/bulk", post(alerts::bulk))

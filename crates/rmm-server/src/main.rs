@@ -19,6 +19,9 @@ mod metrics;
 mod netalerts;
 mod netmon;
 mod notify;
+mod oncall;
+mod push;
+mod pwa;
 mod oui;
 mod oidc;
 mod paging;
@@ -350,6 +353,8 @@ async fn serve(db: sqlx::PgPool, args: ServeArgs) -> Result<()> {
     tokio::spawn(updates::run(state.clone()));
     tokio::spawn(siem::run(state.clone()));
     tokio::spawn(netmon::run(state.clone()));
+    tokio::spawn(oncall::run(state.clone()));
+    tokio::spawn(push::run(state.clone()));
     if state.cfg.metrics_token.is_some() {
         info!("metrics: GET /metrics (bearer token required)");
     }
@@ -369,6 +374,9 @@ async fn serve(db: sqlx::PgPool, args: ServeArgs) -> Result<()> {
         .route("/api/agent/ws", get(agent_ws::handler))
         .route("/healthz", get(|| async { "ok" }))
         .route("/metrics", get(metrics::handler))
+        // The installable app's manifest, and the short link in on-call text messages.
+        .route("/manifest.webmanifest", get(pwa::handler))
+        .route("/a/{token}", get(oncall::short_link))
         .nest("/api", api::router(state.cfg.attachment_max_bytes()))
         // The same routes under a version: what API keys and integrations should use.
         .nest("/api/v1", api::router(state.cfg.attachment_max_bytes()))
