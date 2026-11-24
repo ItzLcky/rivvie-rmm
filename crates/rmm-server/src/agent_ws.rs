@@ -300,6 +300,7 @@ async fn run_session(
         warn!(%agent_id, "security state on connect: {e:#}");
     }
     crate::checks::on_connect(&state, agent_id, &capabilities, &tx).await;
+    crate::helpdesk_agent::on_connect(&state, agent_id, client_id, &capabilities, &tx).await;
     // Replies to this connection only (job acks). Weak, so the writer still ends when the
     // hub drops the agent (kick) and every other sender is gone.
     let reply = tx.downgrade();
@@ -617,6 +618,14 @@ async fn on_message(
         AgentMsg::SnmpPollResult { poll_id, results } => crate::netmon::ingest_poll(state, agent_id, poll_id, results).await,
         AgentMsg::WakeOnLanResult { request_id, sent, error } => crate::wol::complete(agent_id, request_id, sent, error),
         AgentMsg::CheckResults { results } => crate::checks::ingest(state, agent_id, results).await?,
+        AgentMsg::HelpRequest { request_id, user, session, subject, body, context, screenshot_len } => {
+            let req = crate::helpdesk_agent::Request { request_id, user, session, subject, body, context, screenshot_len };
+            crate::helpdesk_agent::on_request(state, agent_id, client_id, reply, req).await
+        }
+        AgentMsg::HelpAttachment { request_id, offset, data, done } => {
+            let piece = crate::helpdesk_agent::Piece { request_id, offset, data, done };
+            crate::helpdesk_agent::on_attachment(state, agent_id, client_id, reply, piece).await
+        }
         AgentMsg::Pong { .. } => {}
         AgentMsg::Enroll { .. } | AgentMsg::Auth { .. } => {}
     }
@@ -664,6 +673,8 @@ fn message_type(m: &AgentMsg) -> usize {
         AgentMsg::SnmpPollResult { .. } => 35,
         AgentMsg::WakeOnLanResult { .. } => 36,
         AgentMsg::CheckResults { .. } => 37,
+        AgentMsg::HelpRequest { .. } => 43,
+        AgentMsg::HelpAttachment { .. } => 44,
     }
 }
 

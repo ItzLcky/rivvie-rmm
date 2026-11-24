@@ -38,6 +38,7 @@ mod scheduler;
 mod crypto;
 mod csat;
 mod graph;
+mod helpdesk_agent;
 mod security;
 mod sla;
 mod shell_ws;
