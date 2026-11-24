@@ -108,7 +108,7 @@
 					<dt class="text-muted">State since</dt><dd title={datetime(m.state_since)}>{ago(m.state_since)}</dd>
 					<dt class="text-muted">Every</dt><dd>{m.interval_secs} s, timeout {m.timeout_secs} s</dd>
 					<dt class="text-muted">Checked by</dt>
-					<dd>{#if m.runner_agent_id}<a class="link" href="/agents/{m.runner_agent_id}">{m.runner_hostname}</a>{m.agent_id ? '' : ' (designated agent)'}{:else}–{/if}</dd>
+					<dd>{#if m.runner === 'server'}The server{:else if m.runner_agent_id}<a class="link" href="/agents/{m.runner_agent_id}">{m.runner_hostname}</a>{m.agent_id ? '' : ' (designated agent)'}{:else}–{/if}</dd>
 				</dl>
 			</section>
 
@@ -138,7 +138,7 @@
 						{/each}
 					</ul>
 				{:else}
-					<p class="text-muted text-sm">None. Alerts come from an <em>Uptime monitor</em> item under <a class="link" href="/policies">Policies</a>, in the checking agent’s policy set.</p>
+					<p class="text-muted text-sm">None. Alerts come from an <em>Uptime monitor</em> item under <a class="link" href="/policies">Policies</a>, {m.runner === 'server' ? 'in All devices, covering this client and site' : 'in the checking agent’s policy set'}.</p>
 				{/if}
 			</section>
 		</div>

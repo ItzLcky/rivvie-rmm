@@ -133,9 +133,11 @@ async fn check_now(admin: &Api, db: &sqlx::PgPool, id: &str) {
 }
 
 #[allow(clippy::too_many_arguments)]
-/// Uptime monitors run by agents (docs/design/uptime.md): every kind against local listeners,
-/// the consecutive-failure rule, certificate alerts, a runner that goes away, scoping, health.
-async fn uptime(url: &str, admin: &Api, db: &sqlx::PgPool, dir: &Path, id1: &str, a_id: &str, a_site: &str, b_id: &str) {
+/// Uptime monitors (docs/design/uptime.md): every kind against local listeners from an agent,
+/// the consecutive-failure rule, certificate alerts, a runner that goes away, scoping, health;
+/// then monitors the server runs, refused private addresses, and their alerts without an agent
+/// (the server restarts with RMM_UPTIME_ALLOW_PRIVATE=1 for that, and keeps it afterwards).
+async fn uptime(server: &mut Server, url: &str, admin: &Api, db: &sqlx::PgPool, dir: &Path, id1: &str, a_id: &str, a_site: &str, b_id: &str) {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -172,7 +174,11 @@ async fn uptime(url: &str, admin: &Api, db: &sqlx::PgPool, dir: &Path, id1: &str
         ("credentials in the URL", json!({ "site_id": a_site, "name": "x", "kind": "http", "config": { "url": "https://user:pw@example.com/" } })),
         ("not http", json!({ "site_id": a_site, "name": "x", "kind": "http", "config": { "url": "ftp://example.com/" } })),
         ("an unknown kind", json!({ "site_id": a_site, "name": "x", "kind": "smtp", "config": {} })),
-        ("run by the server (step C1b)", json!({ "site_id": a_site, "name": "x", "kind": "ping", "runner": "server", "config": { "host": "10.0.0.1" } })),
+        ("a runner that doesn't exist", json!({ "site_id": a_site, "name": "x", "kind": "ping", "runner": "elsewhere", "config": { "host": "10.0.0.1" } })),
+        ("a private address, run by the server", json!({ "site_id": a_site, "name": "x", "kind": "ping", "runner": "server", "config": { "host": "10.0.0.1" } })),
+        ("loopback, run by the server", json!({ "site_id": a_site, "name": "x", "kind": "http", "runner": "server", "config": { "url": format!("http://127.0.0.1:{http_port}/health") } })),
+        ("a metadata address, run by the server", json!({ "site_id": a_site, "name": "x", "kind": "http", "runner": "server", "config": { "url": "http://169.254.169.254/latest/" } })),
+        ("a private DNS server, run by the server", json!({ "site_id": a_site, "name": "x", "kind": "dns", "runner": "server", "config": { "name": "example.com", "server": "192.168.1.1" } })),
         ("an interval that's too short", json!({ "site_id": a_site, "name": "x", "kind": "ping", "interval_secs": 5, "config": { "host": "10.0.0.1" } })),
         ("another client's agent", json!({ "site_id": a_site, "name": "x", "kind": "ping", "agent_id": uuid::Uuid::new_v4(), "config": { "host": "10.0.0.1" } })),
         ("a bad DNS record", json!({ "site_id": a_site, "name": "x", "kind": "dns", "config": { "name": "example.com", "record": "SOA" } })),
@@ -310,6 +316,61 @@ async fn uptime(url: &str, admin: &Api, db: &sqlx::PgPool, dir: &Path, id1: &str
     assert!(s == StatusCode::CONFLICT && v.to_string().contains("offline"), "{s} {v}");
     tokio::time::sleep(Duration::from_secs(5)).await;
     assert!(monitor_alerts(db, &own_id).await.is_empty(), "no alert for a monitor nobody is checking");
+
+    // --- run by the server --------------------------------------------------------------------------------------
+    // A name that resolves to loopback is refused when the check runs (after resolution).
+    let srv = admin
+        .post("/uptime/monitors", json!({ "site_id": a_site, "name": "E2E server web", "kind": "http", "runner": "server", "agent_id": id1,
+            "config": { "url": format!("http://localhost:{http_port}/health"), "keyword": "uptime ok" }, "interval_secs": 30, "timeout_secs": 5 }))
+        .await;
+    let srv_id = srv["id"].as_str().unwrap().to_string();
+    let m = monitor_where(admin, &srv_id, "the server's first check", 30, |m| m["last_at"].is_string()).await;
+    assert!(m["state"] == "down" && m["last_message"].as_str().unwrap().contains("loopback"), "refused without RMM_UPTIME_ALLOW_PRIVATE: {m}");
+    assert!(m["runner"] == "server" && m["agent_id"].is_null() && m["runner_agent_id"].is_null() && m["runner_online"] == true, "no agent: {m}");
+    // Allowed, after a restart with RMM_UPTIME_ALLOW_PRIVATE=1.
+    // SAFETY: set before the restart below; nothing else in the test reads this variable.
+    unsafe { std::env::set_var("RMM_UPTIME_ALLOW_PRIVATE", "1") };
+    server.restart().await;
+    admin.wait_online(id1, true).await;
+    check_now(admin, db, &srv_id).await;
+    let m = monitor_where(admin, &srv_id, "the server's monitor up", 30, |m| m["state"] == "up").await;
+    assert_eq!(m["last_message"], "HTTP 200", "{m}");
+    // Down twice: an alert of the All devices item, with no agent, for the monitor's client.
+    healthy.store(false, Ordering::SeqCst);
+    check_now(admin, db, &srv_id).await;
+    check_now(admin, db, &srv_id).await;
+    let down = eventually(30, "the server monitor's down alert", || async {
+        let a = monitor_alerts(db, &srv_id).await;
+        (!a.is_empty()).then_some(a)
+    })
+    .await;
+    assert_eq!(down[0].1, "Monitor down: E2E server web");
+    let (agent, client, policy): (Option<uuid::Uuid>, uuid::Uuid, Option<uuid::Uuid>) =
+        sqlx::query_as("SELECT agent_id, client_id, policy_id FROM alerts WHERE monitor_id = $1::uuid AND resolved_at IS NULL").bind(&srv_id).fetch_one(db).await.unwrap();
+    assert_eq!((agent, client.to_string(), policy.map(|p| p.to_string())), (None, a_id.to_string(), Some(item_id.clone())));
+    let listed = alerts_for(admin, "kind=uptime").await;
+    let row = listed.iter().find(|a| a["monitor_id"] == srv_id.as_str()).expect("an alert without an agent is listed");
+    assert!(row["agent_id"].is_null() && row["hostname"].is_null() && row["client_id"] == a_id && row["site_name"].is_string(), "{row}");
+    let alert_id = row["id"].as_str().unwrap().to_string();
+    let found = alerts_for(admin, "q=E2E%20server").await;
+    assert!(found.iter().any(|a| a["id"] == alert_id.as_str()), "found by its monitor's name");
+    assert_eq!(admin.get(&format!("/alerts/{alert_id}")).await["monitor_name"], "E2E server web");
+    let open: i32 = sqlx::query_scalar("SELECT open_alerts FROM agents WHERE id = $1::uuid").bind(id1).fetch_one(db).await.unwrap();
+    assert_eq!(open, alerts_before, "nobody's health");
+    let (s, _) = other.call(Method::GET, &format!("/alerts/{alert_id}"), None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "another client's technician can't see it");
+    let (s, v) = other.call(Method::POST, &format!("/alerts/{alert_id}/acknowledge"), None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "nor acknowledge it: {v}");
+    let acked = admin.post(&format!("/alerts/{alert_id}/acknowledge"), json!({})).await;
+    assert_eq!(acked["state"], "acknowledged", "{acked}");
+    healthy.store(true, Ordering::SeqCst);
+    check_now(admin, db, &srv_id).await;
+    eventually(20, "the server monitor's alert to clear", || async { monitor_alerts(db, &srv_id).await.is_empty().then_some(()) }).await;
+    // Back to an agent: no agentless alert survives the move.
+    admin.put(&format!("/uptime/monitors/{srv_id}"), json!({ "runner": "agent" })).await;
+    let m = admin.get(&format!("/uptime/monitors/{srv_id}")).await;
+    assert_eq!((m["runner"].as_str(), m["runner_agent_id"].as_str()), (Some("agent"), Some(id1)), "{m}");
+    ids.insert("E2E server web", srv_id.clone());
 
     // --- switched off: its alerts close; deleted: gone ----------------------------------------------------------
     admin.put(&format!("/uptime/monitors/{}", ids["E2E cert soon"]), json!({ "enabled": false })).await;

@@ -397,8 +397,8 @@ async fn backup_blocks(st: &AppState, client: Uuid, from: NaiveDate, to: NaiveDa
     .fetch_one(&st.db)
     .await?;
     let alerts: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM alerts al JOIN agents a ON a.id = al.agent_id JOIN sites s ON s.id = a.site_id
-          WHERE s.client_id = $1 AND al.kind = 'backup' AND al.opened_at >= $2 AND al.opened_at < $3::date + 1",
+        "SELECT count(*) FROM alerts al
+          WHERE al.client_id = $1 AND al.kind = 'backup' AND al.opened_at >= $2 AND al.opened_at < $3::date + 1",
     )
     .bind(client)
     .bind(from)
@@ -534,8 +534,8 @@ pub(crate) async fn build_qbr(st: &AppState, u: &User, client: Uuid, from: Naive
     .fetch_all(&st.db)
     .await?;
     let alerts: Vec<(String, i64)> = sqlx::query_as(
-        "SELECT al.severity, count(*) FROM alerts al JOIN agents a ON a.id = al.agent_id JOIN sites s ON s.id = a.site_id
-          WHERE s.client_id = $1 AND al.opened_at >= $2 AND al.opened_at < $3::date + 1 GROUP BY 1 ORDER BY 2 DESC",
+        "SELECT al.severity, count(*) FROM alerts al
+          WHERE al.client_id = $1 AND al.opened_at >= $2 AND al.opened_at < $3::date + 1 GROUP BY 1 ORDER BY 2 DESC",
     )
     .bind(client)
     .bind(from)
@@ -546,8 +546,8 @@ pub(crate) async fn build_qbr(st: &AppState, u: &User, client: Uuid, from: Naive
     // so without the cast this failed only for clients with an offline alert in the period.
     let offline: (i64, Option<f64>) = sqlx::query_as(
         "SELECT count(*), (sum(extract(epoch FROM coalesce(al.resolved_at, now()) - al.opened_at)) / 3600)::float8
-           FROM alerts al JOIN agents a ON a.id = al.agent_id JOIN sites s ON s.id = a.site_id
-          WHERE s.client_id = $1 AND al.kind = 'offline' AND al.opened_at >= $2 AND al.opened_at < $3::date + 1",
+           FROM alerts al
+          WHERE al.client_id = $1 AND al.kind = 'offline' AND al.opened_at >= $2 AND al.opened_at < $3::date + 1",
     )
     .bind(client)
     .bind(from)

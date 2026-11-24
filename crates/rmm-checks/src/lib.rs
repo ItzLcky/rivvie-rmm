@@ -14,6 +14,7 @@ pub mod addr;
 pub mod dns;
 pub mod http;
 pub mod ping;
+pub mod run;
 pub mod tcp;
 pub mod tls;
 pub mod x509;

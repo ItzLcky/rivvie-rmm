@@ -391,6 +391,9 @@ async fn serve(db: sqlx::PgPool, args: ServeArgs) -> Result<()> {
             metrics_raw_days: args.metrics_raw_days.max(1),
             alert_retention_days: args.alert_retention_days.max(1),
             alert_eval_secs: args.alert_eval_secs,
+            // Read here rather than as a flag, like RMM_SOURCE_URL: a server on the public internet
+            // must not let monitors probe its own network, so it's off unless asked for.
+            uptime_allow_private: std::env::var("RMM_UPTIME_ALLOW_PRIVATE").is_ok_and(|v| matches!(v.trim(), "1" | "true" | "yes")),
             ticket_close_days: args.ticket_close_days.max(1),
             email_raw_days: args.email_raw_days.max(1),
             content_soak_minutes: args.content_soak_minutes,

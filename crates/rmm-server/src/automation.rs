@@ -88,7 +88,7 @@ pub async fn on_connect(st: &AppState, agent_id: Uuid, first: bool, last_seen: O
 /// no script runs on the poller for it, the same as `run_script_id`.
 pub async fn alert_opened(st: &AppState, alert_id: Uuid) {
     let row: sqlx::Result<Option<(Uuid, String, String)>> =
-        sqlx::query_as("SELECT agent_id, kind, title FROM alerts WHERE id = $1 AND device_id IS NULL").bind(alert_id).fetch_optional(&st.db).await;
+        sqlx::query_as("SELECT agent_id, kind, title FROM alerts WHERE id = $1 AND device_id IS NULL AND agent_id IS NOT NULL").bind(alert_id).fetch_optional(&st.db).await;
     match row {
         Ok(Some((agent_id, kind, title))) => {
             fire(st, agent_id, Trigger::AlertOpened, Event { alert_kind: Some(kind.clone()), ..Default::default() }, json!({ "alert_id": alert_id, "alert_kind": kind, "title": title }))

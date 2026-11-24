@@ -210,6 +210,7 @@ that fails to parse falls back to its default.
 | `RMM_JOB_QUEUE_DAYS` | `7` | Jobs queued for an offline agent expire after this |
 | `RMM_AUTOMATION_RESTART_GRACE_MINUTES` | `10` | After the server starts, an agent's offline time (for the *comes back online* automation trigger) is counted from the start for this long, so a restart doesn't fire every automation |
 | `RMM_ALERT_EVAL_SECS` | `60` | How often polled alert policies (offline, CPU, memory, disk) are evaluated |
+| `RMM_UPTIME_ALLOW_PRIVATE` | off | `1`: uptime monitors run by the server may reach loopback, private (RFC 1918, CGNAT, ULA), link-local and cloud metadata addresses. Off, they are refused after the name resolves and on every redirect, so a monitor can't be pointed at the server's own network. Turn it on only when everyone who can add monitors may probe that network; checks that need private space belong on an agent |
 | `RMM_CONTENT_SOAK_MINUTES` | `1440` | How long new detection content stays on canary clients before everyone gets it |
 | `RMM_UPDATE_PUBKEY` | empty | The release public key (hex); when set, uploaded detection content is verified against it too. Build-time for agents (see [RELEASING.md](RELEASING.md)) |
 

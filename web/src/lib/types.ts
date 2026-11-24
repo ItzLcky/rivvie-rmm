@@ -156,9 +156,12 @@ export type PolicyKind = 'offline' | 'cpu' | 'memory' | 'disk' | 'service' | 'jo
 export type LogLevel = 'critical' | 'error' | 'warning' | 'info';
 
 export interface Alert {
-	id: string; policy_id: string | null; policy_name: string | null; agent_id: string; hostname: string; client_id: string;
-	client_name: string; site_name: string; kind: PolicyKind; severity: Severity; title: string; details: Record<string, unknown>;
-	occurrences: number; state: AlertState; device_id?: string | null; device_name?: string | null; opened_at: string; last_seen_at: string; acknowledged_at: string | null;
+	/** agent_id and hostname are null for an alert without an agent (a monitor the server runs). */
+	id: string; policy_id: string | null; policy_name: string | null; agent_id: string | null; hostname: string | null; client_id: string;
+	/** The agent's site, or the monitor's. */
+	client_name: string; site_name: string | null; kind: PolicyKind; severity: Severity; title: string; details: Record<string, unknown>;
+	occurrences: number; state: AlertState; device_id?: string | null; device_name?: string | null;
+	monitor_id?: string | null; monitor_name?: string | null; opened_at: string; last_seen_at: string; acknowledged_at: string | null;
 	acknowledged_by_name: string | null; resolved_at: string | null; resolved_by_name: string | null;
 	/** cleared (condition went away), manual, policy (policy changed or deleted) */
 	resolution: 'cleared' | 'manual' | 'policy' | null;

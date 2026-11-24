@@ -176,7 +176,8 @@ pub struct NewTicket {
     pub mailbox_id: Option<Uuid>,
     pub created_by: Option<Uuid>,
     pub author: Author,
-    pub alert: Option<(Uuid, Uuid, String)>,
+    /// (policy, agent, key) of the alert that filed it; no agent for an alert without one.
+    pub alert: Option<(Uuid, Option<Uuid>, String)>,
     pub agent_ids: Vec<Uuid>,
 }
 
@@ -192,7 +193,7 @@ pub async fn create(db: &mut PgConnection, t: NewTicket) -> sqlx::Result<Created
     let status = status_of(db, t.board_id, "new").await?.ok_or(sqlx::Error::RowNotFound)?;
     let id = Uuid::new_v4();
     let (alert_policy, alert_agent, alert_key) = match &t.alert {
-        Some((p, a, k)) => (Some(*p), Some(*a), Some(k.as_str())),
+        Some((p, a, k)) => (Some(*p), *a, Some(k.as_str())),
         None => (None, None, None),
     };
     let number: i64 = sqlx::query_scalar(
@@ -279,14 +280,16 @@ pub async fn announce(st: &AppState, ticket_id: Uuid) {
 #[derive(sqlx::FromRow)]
 struct AlertTicketCtx {
     policy_id: Uuid,
-    agent_id: Uuid,
+    /// None for an alert without an agent; `hostname` is then None too.
+    agent_id: Option<Uuid>,
     key: String,
     title: String,
     severity: String,
     details: Value,
-    hostname: String,
+    hostname: Option<String>,
     client_id: Uuid,
-    site_id: Uuid,
+    /// The agent's site, or the monitor's.
+    site_id: Option<Uuid>,
     board_id: Option<Uuid>,
     priority: i16,
     auto_resolve: bool,
@@ -295,10 +298,11 @@ struct AlertTicketCtx {
 
 async fn alert_ctx(db: &PgPool, alert_id: Uuid) -> sqlx::Result<Option<AlertTicketCtx>> {
     sqlx::query_as(
-        "SELECT al.policy_id, al.agent_id, al.key, al.title, al.severity, al.details, a.hostname, s.client_id, a.site_id,
+        "SELECT al.policy_id, al.agent_id, al.key, al.title, al.severity, al.details, a.hostname, al.client_id,
+                coalesce(a.site_id, um.site_id) AS site_id,
                 (c ->> 'ticket_board_id')::uuid AS board_id, coalesce((c ->> 'ticket_priority')::smallint, 3::smallint) AS priority,
                 coalesce((c ->> 'ticket_auto_resolve')::boolean, false) AS auto_resolve, al.resolution
-           FROM alerts al JOIN agents a ON a.id = al.agent_id JOIN sites s ON s.id = a.site_id
+           FROM alerts al LEFT JOIN agents a ON a.id = al.agent_id LEFT JOIN uptime_monitors um ON um.id = al.monitor_id
            CROSS JOIN LATERAL policy_config(al.policy_id, al.agent_id) c
           WHERE al.id = $1 AND al.policy_id IS NOT NULL",
     )
@@ -308,10 +312,10 @@ async fn alert_ctx(db: &PgPool, alert_id: Uuid) -> sqlx::Result<Option<AlertTick
 }
 
 /// The newest not-closed ticket for an alert's (policy, agent, key), with its category.
-async fn alert_ticket(db: &mut PgConnection, policy: Uuid, agent: Uuid, key: &str) -> sqlx::Result<Option<(Uuid, String, i32)>> {
+async fn alert_ticket(db: &mut PgConnection, policy: Uuid, agent: Option<Uuid>, key: &str) -> sqlx::Result<Option<(Uuid, String, i32)>> {
     sqlx::query_as(
         "SELECT t.id, s.category, t.alert_reopens FROM tickets t JOIN board_statuses s ON s.id = t.status_id
-          WHERE t.alert_policy_id = $1 AND t.alert_agent_id = $2 AND t.alert_key = $3 AND t.merged_into IS NULL
+          WHERE t.alert_policy_id = $1 AND t.alert_agent_id IS NOT DISTINCT FROM $2::uuid AND t.alert_key = $3 AND t.merged_into IS NULL
             AND s.category <> 'closed'
           ORDER BY t.created_at DESC LIMIT 1 FOR UPDATE OF t",
     )
@@ -322,8 +326,16 @@ async fn alert_ticket(db: &mut PgConnection, policy: Uuid, agent: Uuid, key: &st
     .await
 }
 
+/// "<title> on <host>", or the title alone without an agent.
+fn alert_subject(c: &AlertTicketCtx) -> String {
+    match &c.hostname {
+        Some(h) => format!("{} on {h}", c.title),
+        None => c.title.clone(),
+    }
+}
+
 fn alert_facts(c: &AlertTicketCtx) -> String {
-    let mut lines = vec![format!("{} on {}", c.title, c.hostname), format!("Severity: {}", c.severity)];
+    let mut lines = vec![alert_subject(c), format!("Severity: {}", c.severity)];
     if let Some(obj) = c.details.as_object() {
         for (k, v) in obj {
             let v = match v {
@@ -370,16 +382,16 @@ pub async fn alert_opened(st: &AppState, alert_id: Uuid) {
                     &mut tx,
                     NewTicket {
                         client_id: Some(c.client_id),
-                        site_id: Some(c.site_id),
+                        site_id: c.site_id,
                         board_id: board,
                         type_id,
                         priority: c.priority,
-                        subject: format!("{} on {}", c.title, c.hostname).chars().take(300).collect(),
+                        subject: alert_subject(&c).chars().take(300).collect(),
                         body: alert_facts(&c),
                         source: "alert",
                         author: author.clone(),
                         alert: Some((c.policy_id, c.agent_id, c.key.clone())),
-                        agent_ids: vec![c.agent_id],
+                        agent_ids: c.agent_id.into_iter().collect(),
                         ..Default::default()
                     },
                 )

@@ -39,7 +39,9 @@
 	let record = $state<string>(c('record') ?? 'A');
 	let dnsServer = $state<string>(c('server') ?? '');
 	let expect = $state<string>(((c('expect') as string[] | null) ?? []).join('\n'));
-	let agent = $state<string>(m?.agent_id ?? '');
+	/** An agent id, '' for the site's designated agent, or SERVER. */
+	const SERVER = 'server';
+	let agent = $state<string>(m?.runner === 'server' ? SERVER : (m?.agent_id ?? ''));
 	let interval = $state(m?.interval_secs ?? 60);
 	let timeout = $state(m?.timeout_secs ?? 10);
 	let enabled = $state(m?.enabled ?? true);
@@ -61,7 +63,8 @@
 	});
 	const runnerOptions = $derived([
 		{ value: '', label: designated.data?.agent_hostname ? `The site’s designated agent (${designated.data.agent_hostname})` : 'The site’s designated agent (none chosen yet)' },
-		...(agents.data?.items ?? []).map((a) => ({ value: a.id, label: `${a.hostname} · ${a.site_name}${a.online ? '' : ' (offline)'}` }))
+		...(agents.data?.items ?? []).map((a) => ({ value: a.id, label: `${a.hostname} · ${a.site_name}${a.online ? '' : ' (offline)'}` })),
+		{ value: SERVER, label: 'The server (public addresses only)' }
 	]);
 
 	function config(): Record<string, unknown> {
@@ -91,7 +94,7 @@
 		e.preventDefault();
 		saving = true;
 		try {
-			const body = { site_id: site, name, kind, config: config(), agent_id: agent || null, interval_secs: Number(interval), timeout_secs: Number(timeout), enabled };
+			const body = { site_id: site, name, kind, config: config(), runner: agent === SERVER ? 'server' : 'agent', agent_id: agent && agent !== SERVER ? agent : null, interval_secs: Number(interval), timeout_secs: Number(timeout), enabled };
 			if (m) {
 				await api.put(`/uptime/monitors/${m.id}`, body);
 				toast.success(`${name} saved.`);
@@ -166,7 +169,7 @@
 			{/if}
 		{/if}
 
-		<Field label="Checked by" id="um-agent" hint="Any agent of the client. The designated agent is chosen under Network → Settings.">
+		<Field label="Checked by" id="um-agent" hint={agent === SERVER ? 'From the server, over the internet: it can’t reach private, loopback or link-local addresses.' : 'Any agent of the client, or the server. The designated agent is chosen under Network → Settings.'}>
 			<Select id="um-agent" class="w-full" bind:value={agent} options={runnerOptions} />
 		</Field>
 		<div class="grid gap-3 sm:grid-cols-2">
@@ -174,7 +177,7 @@
 			<Field label="Timeout (seconds)" id="um-to" hint="1 to 120."><Input id="um-to" type="number" min="1" max="120" bind:value={timeout} /></Field>
 		</div>
 		<Switch bind:checked={enabled}>Check it (switched off: no checks and no alerts)</Switch>
-		<p class="hint">Alerts come from an <em>Uptime monitor</em> item in the checking agent’s policy set.</p>
+		<p class="hint">{#if agent === SERVER}Alerts come from <em>Uptime monitor</em> items in All devices that cover this client and site.{:else}Alerts come from an <em>Uptime monitor</em> item in the checking agent’s policy set.{/if}</p>
 		<div class="flex justify-end gap-2 pt-2">
 			<Button variant="ghost" onclick={() => ((open = false), onclose())}>Cancel</Button>
 			<Button variant="primary" type="submit" loading={saving} disabled={!site || !name.trim()}>{m ? 'Save' : 'Add monitor'}</Button>

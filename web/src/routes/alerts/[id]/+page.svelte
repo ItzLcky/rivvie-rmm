@@ -4,7 +4,7 @@
 	import { api } from '#lib/api.js';
 	import { ago, datetime, num } from '#lib/format.js';
 	import { liveReload } from '#lib/live.svelte.js';
-	import { kindLabels, levelTone } from '#lib/monitoring/labels.js';
+	import { alertPlace, kindLabels, levelTone } from '#lib/monitoring/labels.js';
 	import { resource } from '#lib/resource.svelte.js';
 	import { can } from '#lib/session.svelte.js';
 	import { attempt, toast } from '#lib/toast.svelte.js';
@@ -54,7 +54,11 @@
 	{#snippet children(a)}
 		<PageHeader
 			title={a.title}
-			crumbs={[{ label: 'Alerts', href: '/alerts' }, { label: a.hostname, href: `/agents/${a.agent_id}?tab=alerts` }, { label: kindLabels[a.kind] }]}
+			crumbs={[
+				{ label: 'Alerts', href: '/alerts' },
+				a.agent_id ? { label: a.hostname ?? 'Device', href: `/agents/${a.agent_id}?tab=alerts` } : a.monitor_id ? { label: a.monitor_name ?? 'Uptime monitor', href: `/uptime/${a.monitor_id}` } : { label: a.client_name },
+				{ label: kindLabels[a.kind] }
+			]}
 			menu={[
 				...(a.policy_id ? [{ label: 'Edit policy', icon: Pencil, href: `/policies/items/${a.policy_id}` }] : []),
 				{ label: 'Copy alert ID', icon: Copy, onSelect: () => navigator.clipboard?.writeText(a.id).then(() => toast.success('Alert ID copied.')) }
@@ -63,7 +67,11 @@
 			{#snippet subtitle()}
 				<SeverityBadge severity={a.severity} />
 				<AlertStateBadge alert={a} />
-				<span><a class="link" href="/agents/{a.agent_id}">{a.hostname}</a> · {a.client_name} › {a.site_name}</span>
+				<span>
+					{#if a.monitor_id}<a class="link" href="/uptime/{a.monitor_id}">{a.monitor_name ?? 'Uptime monitor'}</a> ·{/if}
+					{#if a.agent_id}<a class="link" href="/agents/{a.agent_id}">{a.hostname}</a>{:else}<span class="text-muted">{a.monitor_id ? 'checked by the server' : 'no device'}</span>{/if}
+					· {alertPlace(a)}
+				</span>
 			{/snippet}
 			{#snippet actions()}
 				{#if can('technician') && a.state !== 'resolved'}
@@ -96,7 +104,7 @@
 
 			<div class="min-w-0 space-y-4">
 				<PageTimeline alertId={a.id} version={res.data ? Date.parse(a.acknowledged_at ?? a.resolved_at ?? a.opened_at) : 0} />
-				{#if a.kind === 'log'}
+				{#if a.kind === 'log' && a.agent_id}
 					<section class="card" aria-label="Matched log entries">
 						<header class="border-border flex items-center justify-between min-h-12 border-b px-4 py-3">
 							<h2 class="panel-title">Matched entries</h2>

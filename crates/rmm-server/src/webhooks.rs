@@ -171,16 +171,19 @@ pub async fn alert_event(st: &AppState, alert_id: Uuid, event: &str) {
 
 async fn queue_alert(st: &AppState, alert_id: Uuid, event: &str) -> sqlx::Result<()> {
     let row: Option<(Uuid, Value)> = sqlx::query_as(
-        "SELECT s.client_id, jsonb_build_object(
+        "SELECT al.client_id, jsonb_build_object(
                 'alert', jsonb_build_object(
                     'id', al.id, 'kind', al.kind, 'severity', al.severity, 'title', al.title, 'details', al.details,
                     'occurrences', al.occurrences, 'policy', p.name, 'opened_at', al.opened_at, 'acknowledged_at', al.acknowledged_at,
                     'resolved_at', al.resolved_at, 'resolution', al.resolution,
                     'state', CASE WHEN al.resolved_at IS NOT NULL THEN 'resolved' WHEN al.acknowledged_at IS NOT NULL THEN 'acknowledged' ELSE 'open' END),
-                'agent', jsonb_build_object('id', a.id, 'hostname', a.hostname),
+                -- null for an alert without an agent (a monitor the server runs)
+                'agent', CASE WHEN a.id IS NOT NULL THEN jsonb_build_object('id', a.id, 'hostname', a.hostname) END,
+                'monitor', CASE WHEN um.id IS NOT NULL THEN jsonb_build_object('id', um.id, 'name', um.name) END,
                 'client', jsonb_build_object('id', c.id, 'name', c.name),
-                'site', jsonb_build_object('id', s.id, 'name', s.name))
-           FROM alerts al JOIN agents a ON a.id = al.agent_id JOIN sites s ON s.id = a.site_id JOIN clients c ON c.id = s.client_id
+                'site', CASE WHEN s.id IS NOT NULL THEN jsonb_build_object('id', s.id, 'name', s.name) END)
+           FROM alerts al JOIN clients c ON c.id = al.client_id LEFT JOIN agents a ON a.id = al.agent_id
+           LEFT JOIN uptime_monitors um ON um.id = al.monitor_id LEFT JOIN sites s ON s.id = coalesce(a.site_id, um.site_id)
            LEFT JOIN policy_items p ON p.id = al.policy_id
           WHERE al.id = $1",
     )
@@ -237,6 +240,10 @@ fn envelope(st: &AppState, d: &Due) -> Vec<u8> {
     }
     if let Some(id) = data["agent"]["id"].as_str().map(str::to_string) {
         data["url"] = format!("{}/agents/{id}?tab=alerts", st.cfg.public_url).into();
+    } else if d.event.starts_with("alert.")
+        && let Some(id) = data["alert"]["id"].as_str().map(str::to_string)
+    {
+        data["url"] = format!("{}/alerts/{id}", st.cfg.public_url).into();
     }
     serde_json::to_vec(&json!({ "id": d.delivery_id, "event": d.event, "created_at": d.created_at, "data": data })).unwrap_or_default()
 }

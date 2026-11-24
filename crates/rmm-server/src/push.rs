@@ -299,9 +299,10 @@ async fn queue(st: &AppState, user: Uuid, payload: Value, urgent: bool) {
 /// severity.
 pub async fn alert_opened(st: &AppState, alert_id: Uuid) {
     let res: sqlx::Result<()> = async {
-        let row: Option<(String, String, String, Uuid, String)> = sqlx::query_as(
-            "SELECT al.severity, al.title, a.hostname, s.client_id, c.name FROM alerts al JOIN agents a ON a.id = al.agent_id
-               JOIN sites s ON s.id = a.site_id JOIN clients c ON c.id = s.client_id WHERE al.id = $1",
+        // Without an agent, the monitor's name stands in for the host.
+        let row: Option<(String, String, Option<String>, Uuid, String)> = sqlx::query_as(
+            "SELECT al.severity, al.title, coalesce(a.hostname, um.name), al.client_id, c.name FROM alerts al JOIN clients c ON c.id = al.client_id
+               LEFT JOIN agents a ON a.id = al.agent_id LEFT JOIN uptime_monitors um ON um.id = al.monitor_id WHERE al.id = $1",
         )
         .bind(alert_id)
         .fetch_optional(&st.db)
@@ -327,7 +328,10 @@ pub async fn alert_opened(st: &AppState, alert_id: Uuid) {
             let (t, b) = if hide {
                 (format!("New {severity} alert"), "Open the app to see it.".to_string())
             } else {
-                (format!("{}: {title}", severity.to_uppercase()), format!("{host} · {client}"))
+                (format!("{}: {title}", severity.to_uppercase()), match &host {
+                    Some(h) => format!("{h} · {client}"),
+                    None => client.clone(),
+                })
             };
             let payload = json!({ "title": t, "body": b, "url": format!("/alerts/{alert_id}"), "alert_id": alert_id, "tag": format!("alert-{alert_id}"), "kind": "alert" });
             queue(st, user, payload, severity == "critical").await;

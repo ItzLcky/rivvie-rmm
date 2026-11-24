@@ -179,3 +179,8 @@ export function describeMute(m: { ends_at: string | null; starts_at: string | nu
 	const len = mins % 60 === 0 ? `${mins / 60} h` : `${mins} min`;
 	return `${days} ${(m.start_time ?? '').slice(0, 5)} for ${len} (${m.tz})`;
 }
+
+/** Where an alert is: "Client › Site", or the client alone without a site. */
+export function alertPlace(a: { client_name: string; site_name: string | null }): string {
+	return a.site_name ? `${a.client_name} › ${a.site_name}` : a.client_name;
+}
