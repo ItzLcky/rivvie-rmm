@@ -3606,6 +3606,7 @@ dependencies = [
  "chrono",
  "libc",
  "rcgen",
+ "rmm-proto",
  "rmm-snmp",
  "rustls",
  "rustls-native-certs",

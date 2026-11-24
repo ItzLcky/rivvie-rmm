@@ -10,14 +10,13 @@
 pub mod backup;
 
 use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::Utc;
-use rmm_checks::{allow_all, dns, http, ping, tcp, tls};
+use rmm_checks::allow_all;
 use rmm_proto::AgentMsg;
-use rmm_proto::checks::{CertInfo, CheckData, CheckKind, CheckResult, CheckSpec, FLUSH_SECS, HttpMethod, MAX_CHECKS, MAX_IN_FLIGHT};
+use rmm_proto::checks::{CheckData, CheckKind, CheckResult, CheckSpec, FLUSH_SECS, MAX_CHECKS, MAX_IN_FLIGHT};
 use tokio::sync::{Notify, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -187,119 +186,22 @@ async fn schedule(specs: Vec<CheckSpec>, mut run_now: mpsc::UnboundedReceiver<Uu
     }
 }
 
-fn cert_info(c: &rmm_checks::x509::Cert, untrusted: Option<String>) -> CertInfo {
-    CertInfo { not_before: c.not_before, not_after: c.not_after, subject: c.subject.clone(), issuer: c.issuer.clone(), sans: c.sans.clone(), untrusted }
-}
-
-/// One run of one check.
+/// One run of one check: backups here, network checks in [`rmm_checks::run`] (reaching
+/// private space is the agent's purpose, so every address is allowed).
 pub async fn run(spec: &CheckSpec) -> CheckResult {
-    let timeout = Duration::from_secs(u64::from(spec.timeout_secs.clamp(1, 300)));
+    let CheckKind::Backup { providers, sources } = &spec.kind else { return rmm_checks::run::run(spec, allow_all).await };
     let mut r = CheckResult { check_id: spec.id, at: Utc::now(), ok: false, latency_ms: None, value: None, message: String::new(), data: None };
-    match &spec.kind {
-        CheckKind::Ping { host } => match ping::echo(host, allow_all, timeout, 3).await {
-            Ok(ms) => (r.ok, r.latency_ms, r.message) = (true, Some(ms), format!("reply in {ms} ms")),
-            Err(e) => r.message = e,
-        },
-        CheckKind::Tcp { host, port } => match tcp::connect(host, *port, allow_all, timeout).await {
-            Ok((ms, peer)) => (r.ok, r.latency_ms, r.message) = (true, Some(ms), format!("{peer} accepted the connection")),
-            Err(e) => r.message = e,
-        },
-        CheckKind::Http { url, method, statuses, keyword, keyword_absent, verify_tls } => {
-            let req = http::Request { url: url.clone(), head: *method == HttpMethod::Head, timeout };
-            match http::fetch(&req, allow_all).await {
-                Ok(res) => {
-                    r.latency_ms = Some(res.latency_ms);
-                    r.value = Some(f64::from(res.status));
-                    let status_ok = if statuses.is_empty() { (200..400).contains(&res.status) } else { statuses.contains(&res.status) };
-                    let mut msg = format!("HTTP {}", res.status);
-                    if res.redirects > 0 {
-                        msg.push_str(&format!(" after {} redirect{}", res.redirects, if res.redirects == 1 { "" } else { "s" }));
-                    }
-                    let mut ok = status_ok;
-                    if !status_ok {
-                        msg.push_str(if statuses.is_empty() { " (expected 2xx or 3xx)" } else { " (not an expected status)" });
-                    }
-                    if let Some(k) = keyword.as_deref().filter(|k| !k.trim().is_empty()) {
-                        let found = http::keyword_found(&res.body, k);
-                        if found == *keyword_absent {
-                            ok = false;
-                            msg.push_str(if found { ", keyword found" } else { ", keyword not found" });
-                        }
-                    }
-                    if let Some(seen) = res.tls {
-                        if *verify_tls && let Some(why) = &seen.untrusted {
-                            ok = false;
-                            msg.push_str(&format!(", certificate not trusted: {why}"));
-                        }
-                        if let Some(c) = &seen.cert {
-                            r.data = Some(CheckData::Cert(cert_info(c, seen.untrusted.clone())));
-                        }
-                    }
-                    r.ok = ok;
-                    r.message = msg;
-                }
-                Err(e) => r.message = e,
-            }
-        }
-        CheckKind::Tls { host, port, server_name } => match tls::inspect(host, *port, server_name.as_deref(), allow_all, timeout).await {
-            Ok((ms, seen)) => {
-                r.latency_ms = Some(ms);
-                match &seen.cert {
-                    Some(c) => {
-                        let days = c.days_left(Utc::now());
-                        r.ok = true;
-                        r.value = Some(days as f64);
-                        r.message = if days >= 0 { format!("certificate valid for {days} more days") } else { format!("certificate expired {} days ago", -days) };
-                        if let Some(p) = &seen.protocol {
-                            r.message.push_str(&format!(" ({p})"));
-                        }
-                        r.data = Some(CheckData::Cert(cert_info(c, seen.untrusted.clone())));
-                    }
-                    None => r.message = "the certificate couldn't be read".into(),
-                }
-            }
-            Err(e) => r.message = e,
-        },
-        CheckKind::Dns { name, record, server, expect } => {
-            let server = match server.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-                None => Ok(None),
-                Some(s) => s.parse::<SocketAddr>().or_else(|_| s.trim_matches(['[', ']']).parse::<std::net::IpAddr>().map(|ip| SocketAddr::new(ip, 53))).map(Some).map_err(|_| format!("{s:?} isn't a DNS server address")),
-            };
-            match (server, dns::record_type(record)) {
-                (Err(e), _) => r.message = e,
-                (_, None) => r.message = format!("{record:?} isn't a record type this agent asks for"),
-                (Ok(server), Some(rtype)) => match dns::lookup(name, rtype, server, timeout).await {
-                    Ok((answers, ms)) => {
-                        r.latency_ms = Some(ms);
-                        let norm = |s: &str| s.trim().trim_end_matches('.').to_ascii_lowercase();
-                        let shown: String = answers.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
-                        if answers.is_empty() {
-                            r.message = format!("no {} records", record.to_ascii_uppercase());
-                        } else if !expect.is_empty() && !answers.iter().any(|a| expect.iter().any(|e| norm(e) == norm(a))) {
-                            r.message = format!("{shown} (not what was expected)");
-                        } else {
-                            r.ok = true;
-                            r.message = shown;
-                        }
-                    }
-                    Err(e) => r.message = e,
-                },
-            }
-        }
-        CheckKind::Backup { providers, sources } => {
-            let found = backup::collect(providers, sources).await;
-            let failed = found.jobs.iter().filter(|j| j.last_result == rmm_proto::checks::BackupResult::Failed).count();
-            r.ok = found.errors.is_empty() || !found.jobs.is_empty();
-            r.value = Some(found.jobs.len() as f64);
-            r.message = match (found.jobs.len(), failed, found.errors.first()) {
-                (0, _, Some((p, e))) => format!("{p}: {e}"),
-                (0, _, None) => "no backup jobs found".into(),
-                (n, 0, _) => format!("{n} job{}", if n == 1 { "" } else { "s" }),
-                (n, f, _) => format!("{n} job{}, {f} failed", if n == 1 { "" } else { "s" }),
-            };
-            r.data = Some(CheckData::Backups { jobs: found.jobs, errors: found.errors });
-        }
-    }
+    let found = backup::collect(providers, sources).await;
+    let failed = found.jobs.iter().filter(|j| j.last_result == rmm_proto::checks::BackupResult::Failed).count();
+    r.ok = found.errors.is_empty() || !found.jobs.is_empty();
+    r.value = Some(found.jobs.len() as f64);
+    r.message = match (found.jobs.len(), failed, found.errors.first()) {
+        (0, _, Some((p, e))) => format!("{p}: {e}"),
+        (0, _, None) => "no backup jobs found".into(),
+        (n, 0, _) => format!("{n} job{}", if n == 1 { "" } else { "s" }),
+        (n, f, _) => format!("{n} job{}, {f} failed", if n == 1 { "" } else { "s" }),
+    };
+    r.data = Some(CheckData::Backups { jobs: found.jobs, errors: found.errors });
     r.at = Utc::now();
     r
 }
@@ -307,6 +209,7 @@ pub async fn run(spec: &CheckSpec) -> CheckResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rmm_proto::checks::HttpMethod;
 
     fn spec(kind: CheckKind) -> CheckSpec {
         CheckSpec { id: Uuid::new_v4(), interval_secs: 30, timeout_secs: 10, kind }
