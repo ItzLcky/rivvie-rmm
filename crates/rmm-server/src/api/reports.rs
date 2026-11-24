@@ -345,7 +345,8 @@ pub async fn qbr(State(st): State<Arc<AppState>>, u: User, Path(client): Path<Uu
         offline.1.unwrap_or(0.0)
     )));
     let subtitle = format!("{name} · {} – {}", from.format("%-d %B %Y"), to.format("%-d %B %Y"));
-    let pdf = crate::pdf::report("Quarterly business review", &subtitle, &crate::email::brand(&st), &blocks);
+    let logo = crate::branding::pdf_logo(&st, Some(client)).await;
+    let pdf = crate::pdf::report_with_logo("Quarterly business review", &subtitle, &crate::email::brand(&st), logo, &blocks);
     let file = format!("QBR-{}-{}", name.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>(), from.format("%Y-%m"));
     super::billing::pdf_bytes_response(pdf, &file)
 }

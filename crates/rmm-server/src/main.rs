@@ -1,6 +1,7 @@
 mod accounting;
 mod agent_ws;
 mod billing;
+mod branding;
 mod pdf;
 mod policy;
 mod alerts;
@@ -300,8 +301,10 @@ async fn serve(db: sqlx::PgPool, args: ServeArgs) -> Result<()> {
             warn!("{n} client vault(s) are encrypted with RMM_DATA_KEY, which isn't set: the vault is unavailable until it is");
         }
     }
+    let branding = branding::Cache::load(&db).await.context("loading branding")?;
     let state = Arc::new(AppState {
         storage,
+        branding,
         company: company.into(),
         db,
         hub: Default::default(),
@@ -330,6 +333,13 @@ async fn serve(db: sqlx::PgPool, args: ServeArgs) -> Result<()> {
             data_key,
             attachment_max_mb: args.attachment_max_mb.max(1),
             metrics_token: args.metrics_token.clone().map(|t| t.trim().to_string()).filter(|t| !t.is_empty()),
+            // Where the console and portal offer this server's source code (AGPL-3.0 §13). Read
+            // here rather than as a flag: it only matters to operators running modified code.
+            source_url: std::env::var("RMM_SOURCE_URL")
+                .ok()
+                .map(|u| u.trim().to_string())
+                .filter(|u| !u.is_empty())
+                .unwrap_or_else(|| branding::DEFAULT_SOURCE_URL.to_string()),
         },
         triage: Default::default(),
         oidc: oidc::Cache::new(),

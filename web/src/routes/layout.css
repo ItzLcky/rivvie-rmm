@@ -10,6 +10,9 @@
  * cards with a hairline border and no shadow on a soft off-white page, and one teal accent
  * family. Amber is only for "needs attention"; red only for real failures. No gradients.
  * Teal fills (--cta) carry ink text; teal as text uses the deep shade (--accent) on light.
+ * Branding (Settings → Branding) can replace the accent family: the app sets --brand-light-* and
+ * --brand-dark-* on <html> (static/theme.js before paint, from the cached copy), and the values
+ * here are the fallbacks. The server derives that palette so every pair stays at 4.5:1.
  * Shape rule: controls, buttons and menu items 8px (rounded-md); badges are pills; panels
  * 14px (.card, rounded-panel); menus and popovers 10px (rounded-lg); dialogs 20px.
  */
@@ -23,14 +26,14 @@
 	--fg: #10222a;
 	--muted: #4a5e63; /* secondary text: 6.6:1 on white */
 	--subtle: #7f9295; /* placeholders and decoration only, not for meaningful text */
-	--accent: #0f766e; /* teal deep: links, icons, selected states on light */
-	--accent-hover: #0b4f4a;
-	--accent-soft: #e3f3f0; /* light mint: deep-teal text on it stays above 4.5:1 */
-	--on-accent: #ffffff;
-	--accent-ink: #0b4f4a; /* text on mint */
-	--cta: #14b8a6; /* the main call to action */
-	--cta-hover: #2cc5b4;
-	--on-cta: #0c1b21;
+	--accent: var(--brand-light-accent, #0f766e); /* teal deep: links, icons, selected states on light */
+	--accent-hover: var(--brand-light-accent-hover, #0b4f4a);
+	--accent-soft: var(--brand-light-accent-soft, #e3f3f0); /* light mint: deep-teal text on it stays above 4.5:1 */
+	--on-accent: var(--brand-light-on-accent, #ffffff);
+	--accent-ink: var(--brand-light-accent-ink, #0b4f4a); /* text on mint */
+	--cta: var(--brand-light-cta, #14b8a6); /* the main call to action */
+	--cta-hover: var(--brand-light-cta-hover, #2cc5b4);
+	--on-cta: var(--brand-light-on-cta, #0c1b21);
 	--success: #0f766e;
 	--success-soft: #dcefeb;
 	--warning: #985700;
@@ -41,7 +44,7 @@
 	--danger-soft: #fbe7e5;
 	--info: #2f5562;
 	--info-soft: #e6eeec;
-	--focus: #0f766e;
+	--focus: var(--brand-light-focus, #0f766e);
 	--overlay: rgb(12 27 33 / 0.55);
 	/* Cards are flat. Only floating layers (menus, dialogs) cast an ink-tinted shadow. */
 	--shadow: 0 0 #0000;
@@ -54,7 +57,7 @@
 	--nav-label: #8fa7a6;
 	--nav-hover: rgb(255 255 255 / 0.06);
 	--nav-active: #13272f;
-	--nav-indicator: #5eead4;
+	--nav-indicator: var(--brand-light-nav-indicator, #5eead4);
 	/* Charts get their own roles so series stay distinguishable in both themes. */
 	--chart-1: #0f766e;
 	--chart-2: #6d5bd0;
@@ -81,14 +84,14 @@
 	--fg: #eef3f2;
 	--muted: #b7c7c5;
 	--subtle: #7f9897;
-	--accent: #5eead4; /* teal light: links and active states on dark */
-	--accent-hover: #99f6e4;
-	--accent-soft: #123a3a;
-	--on-accent: #0c1b21;
-	--accent-ink: #5eead4;
-	--cta: #14b8a6;
-	--cta-hover: #2dd4bf;
-	--on-cta: #0c1b21;
+	--accent: var(--brand-dark-accent, #5eead4); /* teal light: links and active states on dark */
+	--accent-hover: var(--brand-dark-accent-hover, #99f6e4);
+	--accent-soft: var(--brand-dark-accent-soft, #123a3a);
+	--on-accent: var(--brand-dark-on-accent, #0c1b21);
+	--accent-ink: var(--brand-dark-accent-ink, #5eead4);
+	--cta: var(--brand-dark-cta, #14b8a6);
+	--cta-hover: var(--brand-dark-cta-hover, #2dd4bf);
+	--on-cta: var(--brand-dark-on-cta, #0c1b21);
 	--success: #5eead4;
 	--success-soft: #10302f;
 	--warning: #fcd34d;
@@ -99,7 +102,7 @@
 	--danger-soft: #331b1b;
 	--info: #a9c6cf;
 	--info-soft: #17303a;
-	--focus: #5eead4;
+	--focus: var(--brand-dark-focus, #5eead4);
 	--overlay: rgb(3 10 13 / 0.7);
 	--shadow: 0 0 #0000;
 	--shadow-lg: 0 30px 60px rgb(0 0 0 / 0.35), 0 4px 10px -4px rgb(0 0 0 / 0.4);
@@ -110,7 +113,7 @@
 	--nav-label: #86a09f;
 	--nav-hover: rgb(255 255 255 / 0.05);
 	--nav-active: #13272f;
-	--nav-indicator: #5eead4;
+	--nav-indicator: var(--brand-dark-nav-indicator, #5eead4);
 	--chart-1: #5eead4;
 	--chart-2: #b3a6f5;
 	--chart-3: #7cb8e0;

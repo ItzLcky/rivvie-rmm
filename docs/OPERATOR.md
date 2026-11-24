@@ -224,6 +224,7 @@ that fails to parse falls back to its default.
 | `RMM_TICKET_CLOSE_DAYS` | `7` | Resolved tickets move to Closed after this |
 | `RMM_SESSION_IDLE_HOURS` | `12` | Idle dashboard sessions are signed out (overridable in Company settings; 7 days at most) |
 | `RMM_MAIL_POLL_SECS` | `60` | How often IMAP support mailboxes are checked |
+| `RMM_SOURCE_URL` | the upstream repository | Where the console and portal's "Licence and source" link points (AGPL-3.0 §13). Set it to your own copy if you run modified code |
 
 **Observability**
 

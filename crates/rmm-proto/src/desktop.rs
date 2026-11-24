@@ -63,6 +63,10 @@ pub struct Consent {
     pub requester: String,
     /// Shown in the prompt: the MSP's name (Company settings).
     pub company: String,
+    /// The branded product name for the prompt's title; empty when unbranded (and from older
+    /// servers).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub product: String,
     /// Deny when nobody answers within this many seconds.
     pub timeout_secs: u32,
 }

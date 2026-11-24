@@ -24,6 +24,7 @@
 	onchange={(v) => goto(v)}
 	items={billingOnly ? [{ value: '/settings/billing', label: 'Billing' }] : [
 		{ value: '/settings', label: 'General' },
+		{ value: '/settings/branding', label: 'Branding' },
 		{ value: '/settings/users', label: 'Users' },
 		{ value: '/settings/sso', label: 'Single sign-on' },
 		{ value: '/settings/notifications', label: 'Notifications' },

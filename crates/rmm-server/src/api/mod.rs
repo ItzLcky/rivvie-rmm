@@ -11,6 +11,7 @@ mod attachments;
 mod alerts;
 mod apikeys;
 mod billing;
+mod branding;
 mod channels;
 mod auth;
 mod clients;
@@ -228,6 +229,18 @@ pub fn router(attachment_max: u64) -> Router<Arc<AppState>> {
         .route("/audit/export", get(audit::export))
         .route("/settings", get(settings::get).put(settings::update))
         .route("/settings/public", get(settings::public))
+        .route("/settings/branding", get(branding::get).put(branding::update))
+        .route(
+            "/settings/branding/{variant}",
+            get(branding::instance_image).post(branding::upload_instance).delete(branding::remove_instance_image),
+        )
+        .route("/clients/{id}/branding", get(branding::get_client).put(branding::update_client).delete(branding::delete_client))
+        .route(
+            "/clients/{id}/branding/{variant}",
+            get(branding::client_image).post(branding::upload_client).delete(branding::remove_client_image),
+        )
+        .route("/branding/{variant}", get(branding::public_image))
+        .route("/portal/branding/{variant}", get(branding::portal_image))
         .route("/settings/sso", get(sso::settings).put(sso::set_required))
         .route("/settings/sso/providers", post(sso::create_provider))
         .route("/settings/sso/providers/{id}", axum::routing::put(sso::update_provider).delete(sso::delete_provider))

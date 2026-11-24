@@ -3,6 +3,7 @@
  * NOW (the page clock is frozen there), so every screenshot is the same on every run.
  */
 import type { Page, Route } from '@playwright/test';
+import { readFileSync } from 'node:fs';
 
 export const NOW = new Date('2026-06-15T14:30:00Z');
 const ago = (mins: number) => new Date(NOW.getTime() - mins * 60_000).toISOString();
@@ -1315,7 +1316,76 @@ const openapi = {
 	components: { schemas: { NewTicket: { type: 'object', required: ['subject'], properties: { subject: { type: 'string' }, client_id: { type: 'string', format: 'uuid' }, priority: { type: 'integer' } } } } }
 };
 
-export async function mockApi(p: Page, opts: { signedIn?: boolean; ssoRequired?: boolean } = {}) {
+// White-labelling (branding.rs): a branded instance, and a client (Acme) with its own override.
+// The palette is what branding::theme derives for #1d4ed8.
+const brandImages: Record<string, Buffer> = Object.fromEntries(
+	['logo_light', 'logo_dark', 'icon'].map((v) => [v, readFileSync(new URL(`./fixtures/brand-${v.replace('_', '-')}.png`, import.meta.url))])
+);
+const brandTheme = {
+	light: { accent: '#1d4ed8', accent_hover: '#183fa1', accent_soft: '#e4eafa', on_accent: '#ffffff', accent_ink: '#1d4ed8', cta: '#1d4ed8', cta_hover: '#1b48c2', on_cta: '#ffffff', focus: '#1d4ed8', nav_indicator: '#6183e4' },
+	dark: { accent: '#6c8ce6', accent_hover: '#98afee', accent_soft: '#102649', on_accent: '#0c1b21', accent_ink: '#6c8ce6', cta: '#1d4ed8', cta_hover: '#1b48c2', on_cta: '#ffffff', focus: '#6c8ce6', nav_indicator: '#6183e4' }
+};
+const branding = {
+	product_name: 'Northwind Remote',
+	name: 'Northwind Remote',
+	logo_light: '/api/branding/logo_light?v=1a2b3c4d',
+	logo_dark: '/api/branding/logo_dark?v=1a2b3c4d',
+	icon: '/api/branding/icon?v=1a2b3c4d',
+	accent: '#1d4ed8',
+	theme: brandTheme,
+	support: { email: 'help@northwind.example', phone: '+1 555 0100', url: 'https://northwind.example/support', hours: 'Mon–Fri 8:00–18:00' },
+	source_url: 'https://github.com/ItzLcky/rivvie-rmm'
+};
+const brandingView = {
+	exists: true,
+	product_name: 'Northwind Remote',
+	accent: '#1d4ed8',
+	support_email: 'help@northwind.example',
+	support_phone: '+1 555 0100',
+	support_url: 'https://northwind.example/support',
+	support_hours: 'Mon–Fri 8:00–18:00',
+	email_from_name: 'Northwind Help Desk',
+	email_footer: 'Northwind IT · 12 Harbour Rd · +1 555 0100',
+	logo_light: '/api/settings/branding/logo_light?v=1a2b3c4d',
+	logo_dark: '/api/settings/branding/logo_dark?v=1a2b3c4d',
+	icon: '/api/settings/branding/icon?v=1a2b3c4d',
+	updated_at: ago(60 * 24 * 3),
+	resolved: branding
+};
+const acmeBranding = { ...branding, support: { ...branding.support, email: 'acme-desk@northwind.example', hours: '24/7' } };
+const acmeBrandingView = {
+	exists: true,
+	product_name: null,
+	accent: null,
+	support_email: 'acme-desk@northwind.example',
+	support_phone: null,
+	support_url: null,
+	support_hours: '24/7',
+	email_from_name: 'Northwind for Acme',
+	email_footer: null,
+	logo_light: null,
+	logo_dark: null,
+	icon: null,
+	updated_at: ago(60 * 24),
+	resolved: acmeBranding
+};
+const portalMe = {
+	contact: { id: 'ct-ann', client_id: 'c-acme', client_name: 'Acme Corp', site_id: 's-acme-hq', name: 'Ann Lopez', email: 'ann@acme.example', is_primary: true, portal_all_tickets: false },
+	company_name: 'Northwind IT',
+	welcome: 'Tell us what is wrong and we will get back to you.',
+	devices: true,
+	sees_all_tickets: true,
+	invoices: false,
+	has_password: true,
+	totp_enabled: false,
+	attachment_max_mb: 100
+};
+const portalTickets = [
+	{ id: 'pt-1', number: 1042, subject: 'Printer on the second floor jams', status_name: 'In progress', status_category: 'open', priority: 3, contact_name: 'Ann Lopez', created_at: ago(60 * 26), last_activity_at: ago(45), merged_into: null },
+	{ id: 'pt-2', number: 1031, subject: 'New starter laptop for Raj', status_name: 'Resolved', status_category: 'resolved', priority: 3, contact_name: 'Ann Lopez', created_at: ago(60 * 24 * 6), last_activity_at: ago(60 * 24 * 2), merged_into: null }
+];
+
+export async function mockApi(p: Page, opts: { signedIn?: boolean; ssoRequired?: boolean; branded?: boolean } = {}) {
 	const signedIn = opts.signedIn ?? true;
 	await p.clock.setFixedTime(NOW);
 	await p.route('**/api/**', async (route: Route) => {
@@ -1333,7 +1403,15 @@ export async function mockApi(p: Page, opts: { signedIn?: boolean; ssoRequired?:
 		if (route.request().method() === 'POST' && /^\/vault\/[^/]+\/totp$/.test(path)) return json({ code: '492039', digits: 6, period: 30, remaining: 17 });
 		if (route.request().method() !== 'GET') return json({ ok: true });
 		let m: RegExpMatchArray | null;
-		if (path === '/settings/public') return json({ company_name: 'Northwind IT' });
+		if (path === '/settings/public') return json({ company_name: 'Northwind IT', ...(opts.branded ? { branding } : {}) });
+		if ((m = path.match(/^\/(?:portal\/|settings\/|clients\/[^/]+\/)?branding\/(logo_light|logo_dark|icon)$/)) && brandImages[m[1]]) {
+			return route.fulfill({ status: 200, contentType: 'image/png', body: brandImages[m[1]] });
+		}
+		if (path === '/settings/branding') return json(brandingView);
+		if (path === '/clients/c-acme/branding') return json(acmeBrandingView);
+		if (path === '/portal/info') return json({ company_name: 'Northwind IT', welcome: portalMe.welcome, ...(opts.branded ? { branding } : {}) });
+		if (path === '/portal/me') return json({ ...portalMe, ...(opts.branded ? { branding: acmeBranding } : {}) });
+		if (path === '/portal/tickets') return json(portalTickets);
 		if (path === '/auth/me') return signedIn ? json(admin) : json({ error: 'not authenticated' }, 401);
 		if (path === '/dashboard') return json(dashboard(q.get('client_id')));
 		if (path === '/clients') return json(clients.map(clientOut));

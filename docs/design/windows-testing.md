@@ -54,7 +54,8 @@ saw, `C:\ProgramData\RMM\logs\*.log`, and the Event Viewer entry if there is one
 3. Repair: delete `C:\Program Files\RMM\rmm-agent.exe` while the service is stopped, run `msiexec /fa rmm-agent.msi /qn`: the file returns and the service runs. Then clear the recovery actions (`sc failure RmmAgent reset= 0 actions= ""`) and repair again; note whether they come back (only the binary is a repaired component, so probably not) and, if not, that re-running the MSI install (not repair) restores them.
 4. Install with the MSI while a user has a PowerShell terminal open through the console (shell relay): the install completes, the terminal ends, nothing is left running from the old binary.
 5. Uninstall (`msiexec /x`): service gone, `rmm-agent.exe`, `rmm-agent.old.exe` and `rmm-agent.new.exe` gone from Program Files, `C:\ProgramData\RMM\agent.toml` kept, agent shows offline. Reinstall: it re-enrolls under the same identity.
-6. An install with no network to the server: the install itself succeeds (`install.log` says enrollment failed), the service is installed, and enrolling later with `rmm-agent enroll` works.
+6. Branding (Settings → Branding, [design](branding.md)): with a product name and a square icon set, download the MSI. *Apps and features* lists "<product> Agent" with the icon; `services.msc` shows the display name "<product> Agent" (service id still `RmmAgent`); `agent.toml` has `product_name`. Install it over an unbranded install: one entry, renamed. Clear the branding and upgrade again: note whether the service keeps the branded name (it does until `product_name` is removed from `agent.toml`). The remote-desktop consent prompt's title starts with the product name.
+7. An install with no network to the server: the install itself succeeds (`install.log` says enrollment failed), the service is installed, and enrolling later with `rmm-agent enroll` works.
 
 ## 3. Self-update
 

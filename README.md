@@ -327,6 +327,7 @@ The settings most installs touch; [docs/OPERATOR.md](docs/OPERATOR.md#environmen
 | `RMM_TRUSTED_PROXIES` | empty | Reverse proxies whose `X-Forwarded-For` gives the client IP (for rate limiting and the audit log): comma-separated addresses/CIDRs, or `private` for loopback + RFC 1918 + IPv6 ULA. The bundled compose stack sets `private` for Caddy |
 | `RMM_ATTACHMENT_MAX_MB` | `100` | Largest ticket or portal attachment, per file. Uploads and downloads stream to and from storage (S3 multipart over 8 MB), so this bounds disk use, not server memory. Replies email attachments up to 15 MB in total; larger files go as links (the portal for contacts who can sign in, otherwise a download link valid for 30 days) |
 | `RMM_METRICS_TOKEN` | empty | Turns on `GET /metrics` (see [Monitoring the server](#monitoring-the-server)); without it the route answers 404 |
+| `RMM_SOURCE_URL` | the upstream repository | The "Licence and source" link in the console and portal (AGPL-3.0 §13); point it at your own copy if you change the code. Branding (Settings → Branding) never hides it |
 | `RMM_LOG_FORMAT` | `text` | `json`: one JSON object per log line |
 
 ## Monitoring the server

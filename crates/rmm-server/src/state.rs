@@ -10,6 +10,8 @@ pub struct AppState {
     pub cfg: Settings,
     /// Cached `company_settings` row; written through by the settings API.
     pub company: RwLock<Company>,
+    /// Every `branding` row; read through [`crate::branding::resolve`].
+    pub branding: crate::branding::Cache,
     pub limits: crate::ratelimit::Limits,
     pub releases: crate::updates::Releases,
     /// When this process started (offline alerts allow agents time to reconnect).
@@ -114,6 +116,8 @@ pub struct Settings {
     pub attachment_max_mb: u32,
     /// Bearer token for `GET /metrics` (RMM_METRICS_TOKEN); the route is off without it.
     pub metrics_token: Option<String>,
+    /// The AGPL source offer shown in the console and portal (RMM_SOURCE_URL).
+    pub source_url: String,
 }
 
 impl Settings {

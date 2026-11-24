@@ -35,6 +35,8 @@ sha1 = "0.11"
 data-encoding = "2"
 tar = { version = "0.4", default-features = false }
 flate2 = "1"
+# Branding images: dimension checks and the PDF and .ico forms of uploaded logos.
+png = "0.18"
 rpm = { version = "0.30", default-features = false, features = ["payload", "gzip-compression"] }
 msi = "0.11"
 cab = "0.6"

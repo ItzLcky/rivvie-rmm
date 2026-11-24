@@ -45,6 +45,8 @@
 //! quiet. Without it that section checks everything that doesn't need a device.
 //! `RMM_E2E_ONLY=network` runs only that section (after the enrollment it needs).
 //!
+//! `RMM_E2E_ONLY=branding` runs only the white-labelling section (after the sign-in and tenancy).
+//!
 //! `RMM_E2E_ONLY=desk` runs only the core and service desk sections (faster while working on
 //! tickets, the portal and billing); `RMM_E2E_ONLY=api` only enrollment and the API keys and webhooks.
 //!
@@ -565,6 +567,11 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
     let b_id = client_b["id"].as_str().unwrap();
     let token = admin.post(&format!("/sites/{a_site}/enrollment-tokens"), json!({ "label": "e2e" })).await;
     let token = token["token"].as_str().unwrap().to_string();
+    // RMM_E2E_ONLY=branding: white-labelling needs no agent.
+    if std::env::var("RMM_E2E_ONLY").as_deref() == Ok("branding") {
+        branding(&url, &admin, db, a_id, a_site, b_id).await;
+        return Ok(());
+    }
 
     // --- enrollment: reuse only with the old credential ----------------------------------
     let mut a1 = Agent::new(dir, "a1");
@@ -1203,6 +1210,7 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
     portal_and_sla(&url, &admin, db, a_id, b_id).await;
     billing(&url, &admin, &tech, db, a_id, b_id).await;
     docs_and_vault(&url, &admin, db, a_id, b_id).await;
+    branding(&url, &admin, db, a_id, a_site, b_id).await;
     ticket_docs(&url, &admin, a_id, b_id).await;
     api_keys_and_webhooks(&url, &admin, db, &id1, a_id, b_id).await;
     fields_tags_notes_views(&url, &admin, db, dir, &id1, a_id, b_id).await;
@@ -8287,4 +8295,171 @@ async fn fields_tags_notes_views(url: &str, admin: &Api, db: &sqlx::PgPool, dir:
     let (s, spec, _) = key_call(&key, &v1, Method::GET, "/openapi.json", None).await;
     assert!(s.is_success() && spec["paths"]["/agents/{id}/fields"]["put"]["operationId"] == "setAgentFields", "documented in the OpenAPI document");
     println!("tags, custom fields, notes, saved views: ok");
+}
+
+/// A small RGBA PNG for the branding uploads.
+fn brand_png(w: u32, h: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    {
+        let mut enc = png::Encoder::new(&mut out, w, h);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        let mut wr = enc.write_header().unwrap();
+        let data: Vec<u8> = (0..w * h).flat_map(|i| [29, 78, 216, if i % 3 == 0 { 255 } else { 160 }]).collect();
+        wr.write_image_data(&data).unwrap();
+    }
+    out
+}
+
+async fn brand_upload(admin: &Api, path: &str, name: &str, bytes: Vec<u8>) -> (StatusCode, Value) {
+    let form = reqwest::multipart::Form::new().part("file", reqwest::multipart::Part::bytes(bytes).file_name(name.to_string()));
+    portal_form(admin, path, form).await
+}
+
+/// White-labelling (docs/design/branding.md): the instance's branding and a client's override
+/// reach the public settings, the portal, mail, the MSI and the QBR PDF. `RMM_E2E_ONLY=branding`
+/// runs just this (after the sign-in and the tenancy it needs). It puts everything back.
+async fn branding(url: &str, admin: &Api, db: &sqlx::PgPool, a_id: &str, a_site: &str, b_id: &str) {
+    let http = reqwest::Client::new();
+    let (smtp_port, mail) = smtp_sink().await;
+    admin
+        .call(reqwest::Method::PUT, "/settings/smtp", Some(json!({ "host": "127.0.0.1", "port": smtp_port, "security": "none", "from": "Help <help@msp.example>" })))
+        .await;
+
+    // --- the instance -----------------------------------------------------------------------------
+    let (s, v) = admin.call(reqwest::Method::PUT, "/settings/branding", Some(json!({ "accent": "#808080" }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "a mid-tone neither text colour reads on: {v}");
+    let (s, _) = admin.call(reqwest::Method::PUT, "/settings/branding", Some(json!({ "support_url": "javascript:alert(1)" }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let (s, _) = admin.call(reqwest::Method::PUT, "/settings/branding", Some(json!({ "support_email": "not an address" }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let saved = admin
+        .put(
+            "/settings/branding",
+            json!({ "product_name": "Brand Remote", "accent": "#1D4ED8", "support_email": "help@brand.example", "support_phone": "+1 555 0100",
+                    "email_from_name": "Brand Help Desk", "email_footer": "Brand IT, 1 Harbour Rd" }),
+        )
+        .await;
+    assert_eq!((saved["accent"].as_str(), saved["resolved"]["name"].as_str()), (Some("#1d4ed8"), Some("Brand Remote")), "{saved}");
+    assert_eq!(saved["resolved"]["theme"]["light"]["on_cta"], "#ffffff");
+
+    // Images: PNG or JPEG only (no SVG), the icon square.
+    let (s, _) = brand_upload(admin, "/settings/branding/logo_light", "logo.svg", b"<svg xmlns='http://www.w3.org/2000/svg'/>".to_vec()).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let (s, v) = brand_upload(admin, "/settings/branding/icon", "icon.png", brand_png(64, 32)).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    let logo = brand_png(120, 30);
+    let (s, v) = brand_upload(admin, "/settings/branding/logo_light", "logo.png", logo.clone()).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let (s, v) = brand_upload(admin, "/settings/branding/icon", "icon.png", brand_png(64, 64)).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let (s, _) = Api::new(url).call(reqwest::Method::GET, "/settings/branding", None).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "not public");
+
+    // Public: the sign-in pages get it without a session, and the image with an ETag.
+    let public: Value = http.get(format!("{url}/api/settings/public")).send().await.unwrap().json().await.unwrap();
+    let b = &public["branding"];
+    assert_eq!((b["product_name"].as_str(), b["support"]["email"].as_str()), (Some("Brand Remote"), Some("help@brand.example")), "{public}");
+    assert!(b["source_url"].as_str().is_some_and(|u| u.starts_with("https://")), "the source offer is always there");
+    assert!(b.get("email_footer").is_none(), "mail settings aren't public");
+    let logo_url = b["logo_light"].as_str().unwrap().to_string();
+    assert!(logo_url.starts_with("/api/branding/logo_light?v="));
+    let res = http.get(format!("{url}{logo_url}")).send().await.unwrap();
+    assert_eq!((res.status(), res.headers()["content-type"].to_str().unwrap()), (StatusCode::OK, "image/png"));
+    let etag = res.headers()["etag"].to_str().unwrap().to_string();
+    assert_eq!(res.bytes().await.unwrap().to_vec(), logo);
+    let res = http.get(format!("{url}/api/branding/logo_light")).header("if-none-match", &etag).send().await.unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(http.get(format!("{url}/api/branding/logo_dark")).send().await.unwrap().status(), StatusCode::NOT_FOUND);
+    let info: Value = http.get(format!("{url}/api/portal/info")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(info["branding"]["name"], "Brand Remote");
+
+    // --- a client's override ----------------------------------------------------------------------
+    let (s, _) = admin.call(reqwest::Method::GET, &format!("/clients/{}/branding", uuid::Uuid::new_v4()), None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    let a = admin.put(&format!("/clients/{a_id}/branding"), json!({ "support_email": "a-desk@brand.example", "email_from_name": "Brand for A" })).await;
+    assert_eq!((a["resolved"]["support"]["email"].as_str(), a["resolved"]["support"]["phone"].as_str()), (Some("a-desk@brand.example"), Some("+1 555 0100")), "{a}");
+
+    // Mail: the client's sender name for its contacts, the instance's for others, the footer on both.
+    let ca = admin.post("/contacts", json!({ "client_id": a_id, "name": "Ada Brand", "email": "ada@client-a.example", "portal_enabled": true })).await;
+    let cb = admin.post("/contacts", json!({ "client_id": b_id, "name": "Ben Brand", "email": "ben@client-b.example", "portal_enabled": true })).await;
+    admin.post(&format!("/contacts/{}/portal-invite", ca["id"].as_str().unwrap()), json!({})).await;
+    admin.post(&format!("/contacts/{}/portal-invite", cb["id"].as_str().unwrap()), json!({})).await;
+    let ma = wait_mail(&mail, "A's invitation", |to, _| to.iter().any(|t| t == "ada@client-a.example")).await;
+    let mb = wait_mail(&mail, "B's invitation", |to, _| to.iter().any(|t| t == "ben@client-b.example")).await;
+    let from_a = header(&ma, "From").unwrap();
+    let from_b = header(&mb, "From").unwrap();
+    assert!(from_a.contains("Brand for A") && from_a.contains("help@msp.example"), "{from_a}");
+    assert!(from_b.contains("Brand Help Desk"), "{from_b}");
+    for m in [&ma, &mb] {
+        let text = mail_text(m).replace("\r\n", "\n");
+        assert!(text.trim_end().ends_with("Brand IT, 1 Harbour Rd") && text.contains("\n--"), "the footer goes last: {text}");
+    }
+    let stored: Vec<Option<String>> = sqlx::query_scalar("SELECT from_name FROM email_messages WHERE purpose = 'portal_link' AND $1 = ANY(to_addrs)")
+        .bind("ada@client-a.example")
+        .fetch_all(db)
+        .await
+        .unwrap();
+    assert_eq!(stored, [Some("Brand for A".to_string())]);
+
+    // The portal: each contact sees their own client's branding.
+    let pa = Api::new(url);
+    pa.post("/portal/auth/verify", json!({ "token": token_after(&mail_text(&ma), "/portal/login?token=") })).await;
+    let pb = Api::new(url);
+    pb.post("/portal/auth/verify", json!({ "token": token_after(&mail_text(&mb), "/portal/login?token=") })).await;
+    assert_eq!(pa.get("/portal/me").await["branding"]["support"]["email"], "a-desk@brand.example");
+    assert_eq!(pb.get("/portal/me").await["branding"]["support"]["email"], "help@brand.example", "B has no override");
+    // A's own logo is served to A's contacts only; others get the instance's.
+    let dark = brand_png(100, 20);
+    let (s, v) = brand_upload(admin, &format!("/clients/{a_id}/branding/logo_dark"), "dark.png", dark.clone()).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let me_a = pa.get("/portal/me").await;
+    let own = me_a["branding"]["logo_dark"].as_str().unwrap().to_string();
+    assert!(own.starts_with("/api/portal/branding/logo_dark"), "{me_a}");
+    assert_eq!(pa.http.get(format!("{url}{own}")).send().await.unwrap().bytes().await.unwrap().to_vec(), dark);
+    assert_eq!(pb.http.get(format!("{url}{own}")).send().await.unwrap().status(), StatusCode::NOT_FOUND, "B's contact gets the instance's (none)");
+    assert_eq!(http.get(format!("{url}{own}")).send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    assert!(pb.get("/portal/me").await["branding"]["logo_dark"].is_null());
+
+    // --- packages ------------------------------------------------------------------------------------
+    let pkg = admin.post(&format!("/sites/{a_site}/enrollment-tokens"), json!({ "purpose": "package" })).await;
+    let res = http.get(pkg["windows_packages"]["msi"].as_str().unwrap()).send().await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let disposition = res.headers()["content-disposition"].to_str().unwrap().to_string();
+    assert!(disposition.contains("filename=\"brand-remote-agent-") && disposition.ends_with(".msi\""), "{disposition}");
+    let mut msi = msi::Package::open(std::io::Cursor::new(res.bytes().await.unwrap().to_vec())).unwrap();
+    let props: std::collections::HashMap<String, String> = msi
+        .select_rows(msi::Select::table("Property"))
+        .unwrap()
+        .map(|r| (r[0].as_str().unwrap().to_string(), r[1].as_str().unwrap().to_string()))
+        .collect();
+    assert_eq!(props["ProductName"], "Brand Remote Agent");
+    assert_eq!(props["ARPPRODUCTICON"], "AgentIcon.ico");
+    let ca_row: Vec<_> = msi.select_rows(msi::Select::table("CustomAction")).unwrap().collect();
+    assert!(ca_row[0][3].as_str().unwrap().contains("--product-name \"Brand Remote\""));
+    let res = http.get(pkg["packages"]["deb"].as_str().unwrap()).send().await.unwrap();
+    let disposition = res.headers()["content-disposition"].to_str().unwrap().to_string();
+    assert!(disposition.contains("filename=\"brand-remote-agent_"), "{disposition}");
+
+    // --- the QBR PDF carries the logo -------------------------------------------------------------------
+    let res = admin.http.get(format!("{}/reports/qbr/{a_id}", admin.base)).send().await.unwrap();
+    assert_eq!(res.headers()["content-type"], "application/pdf");
+    let pdf = res.bytes().await.unwrap();
+    let text = String::from_utf8_lossy(&pdf);
+    assert!(text.contains("/XObject << /Im0 ") && text.contains("/Subtype /Image"), "the QBR has the logo");
+
+    assert!(audit_count(db, "branding.update").await >= 5);
+
+    // --- put it back ---------------------------------------------------------------------------------------
+    admin.call(reqwest::Method::DELETE, &format!("/clients/{a_id}/branding"), None).await;
+    assert!(pa.get("/portal/me").await["branding"]["logo_dark"].is_null(), "the override is gone");
+    for v in ["logo_light", "icon"] {
+        admin.call(reqwest::Method::DELETE, &format!("/settings/branding/{v}"), None).await;
+    }
+    let cleared = admin.put("/settings/branding", json!({})).await;
+    assert!(cleared["resolved"]["product_name"].is_null() && cleared["resolved"]["logo_light"].is_null(), "{cleared}");
+    for c in [&ca, &cb] {
+        admin.call(reqwest::Method::DELETE, &format!("/contacts/{}", c["id"].as_str().unwrap()), None).await;
+    }
+    println!("branding: ok");
 }
