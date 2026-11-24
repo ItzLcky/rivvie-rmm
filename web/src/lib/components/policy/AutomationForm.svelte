@@ -2,9 +2,10 @@
 	import { oncePerDevice, type AutomationTrigger } from '#lib/policy/policy.js';
 	import type { Config } from '#lib/policy/types.js';
 	import type { PolicyKind } from '#lib/types.js';
+	import { cleanParams } from './ScheduleForm.svelte';
 
 	type Draft = {
-		trigger: AutomationTrigger; script_id: string; args: string; timeout_secs: string;
+		trigger: AutomationTrigger; script_id: string; args: string; params: Record<string, string>; timeout_secs: string;
 		offline_minutes: number; alert_kind: PolicyKind; tag_id: string; field_id: string; field_value: string;
 		retry_failed: boolean; max_attempts: number; retry_minutes: number;
 		cooldown_minutes: number; max_runs_per_hour: number; respect_window: boolean; retain_days: number;
@@ -12,7 +13,7 @@
 	function fromConfig(c: Config): Draft {
 		return {
 			trigger: (c.trigger as AutomationTrigger) ?? 'enrollment', script_id: (c.script_id as string) ?? '',
-			args: ((c.args as string[]) ?? []).join('\n'), timeout_secs: c.timeout_secs == null ? '' : String(c.timeout_secs),
+			args: ((c.args as string[]) ?? []).join('\n'), params: { ...((c.params as Record<string, string>) ?? {}) }, timeout_secs: c.timeout_secs == null ? '' : String(c.timeout_secs),
 			offline_minutes: Number(c.offline_minutes ?? 30), alert_kind: (c.alert_kind as PolicyKind) ?? 'disk',
 			tag_id: (c.tag_id as string) ?? '', field_id: (c.field_id as string) ?? '', field_value: c.field_value == null ? '' : String(c.field_value),
 			retry_failed: !!c.retry_failed, max_attempts: Number(c.max_attempts ?? 3), retry_minutes: Number(c.retry_minutes ?? 30),
@@ -25,6 +26,7 @@
 		const once = oncePerDevice.includes(d.trigger);
 		return {
 			trigger: d.trigger, script_id: d.script_id || null, args: d.args.split('\n').map((a) => a.trim()).filter(Boolean),
+			...cleanParams(d.params),
 			timeout_secs: d.timeout_secs.trim() ? Number(d.timeout_secs) : null,
 			offline_minutes: d.trigger === 'agent_online' ? Number(d.offline_minutes) : null,
 			alert_kind: d.trigger === 'alert_opened' ? d.alert_kind : null,
@@ -54,6 +56,7 @@
 	import Switch from '#lib/ui/Switch.svelte';
 	import Textarea from '#lib/ui/Textarea.svelte';
 	import PField from './PField.svelte';
+	import ParamInputs, { missing } from '../scripts/ParamInputs.svelte';
 
 	/** An automation: what starts it, which script runs, and the safeguards that keep it from running away. */
 	let {
@@ -88,7 +91,7 @@
 	});
 	$effect(() => {
 		const c = toConfig(draft);
-		const ok = !!c.script_id && (draft.trigger !== 'tag_added' || !!c.tag_id) && (draft.trigger !== 'field_changed' || !!c.field_id) && !Object.values(errors).some(Boolean);
+		const ok = !!c.script_id && (draft.trigger !== 'tag_added' || !!c.tag_id) && (draft.trigger !== 'field_changed' || !!c.field_id) && !Object.values(errors).some(Boolean) && !missing(script?.params ?? [], draft.params).length;
 		untrack(() => onchange(c, ok));
 	});
 
@@ -159,6 +162,12 @@
 		<PField path="script_id" label="Script" id="au-script" class="clear-both" hint={below ? 'The same script in every set.' : 'A saved script, run as a job on the device. Its result is in Jobs and in the device’s automation history.'}>
 			{#if scripts.data}<Combobox id="au-script" bind:value={draft.script_id} items={scriptItems} placeholder="Pick a saved script" label="Script" onchange={pick} disabled={fixed} />{:else}<Skeleton class="h-8 w-full" />{/if}
 		</PField>
+		{#if script?.params?.length}
+			<fieldset class="space-y-2">
+				<legend class="label">Parameters</legend>
+				<ParamInputs specs={script.params} bind:values={draft.params} {clientId} vaultOnly variables idPrefix="au-p" {disabled} />
+			</fieldset>
+		{/if}
 		<PField path="args" label="Arguments" id="au-args" hint="One per line, passed to the script in order.">
 			<Textarea id="au-args" rows={2} class="font-mono text-[13px]" bind:value={draft.args} />
 		</PField>

@@ -414,6 +414,7 @@ fn capabilities() -> Vec<String> {
         rmm_proto::tools::CAPABILITY.to_string(),
         rmm_proto::net::CAPABILITY.to_string(),
         rmm_proto::net::WOL_CAPABILITY.to_string(),
+        rmm_proto::SCRIPT_ENV_CAPABILITY.to_string(),
     ];
     if cfg!(any(target_os = "linux", windows)) || std::env::var_os("RMM_DESKTOP_FAKE").is_some() {
         caps.push(rmm_proto::desktop::CAPABILITY.to_string());

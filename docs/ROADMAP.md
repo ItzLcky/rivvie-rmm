@@ -18,7 +18,7 @@ Follow the [manual plan](design/windows-testing.md) on Windows 10/11 and Server 
 
 - [ ] Install and service on a real host: the `C:\ProgramData\RMM` ACL, the Program Files copy, SCM recovery actions, file logging, reinstall over a running service, MSI upgrade and repair.
 - [ ] Self-update: service stop/start from the detached watchdog, and rollback.
-- [ ] Jobs and shells (ConPTY, Job Objects), service list and control (`Win32_Service`), Event Log watchers (`wevtutil`).
+- [ ] Jobs and shells (ConPTY, Job Objects), script parameters in PowerShell (`$env:RMM_PARAM_X`) and cmd (`%RMM_PARAM_X%`), service list and control (`Win32_Service`), Event Log watchers (`wevtutil`).
 - [ ] Patches: WUA scan and install, the `PSWindowsUpdate` fallback, reboot handling.
 - [ ] Remote desktop: session-0 helper, `Winlogon`/UAC desktop switching, `SendSAS`, multi-monitor DPI, RDP sessions.
 - [ ] Security: Defender (including the EICAR detection the runner skips), Security Center with a third-party product, passive mode; the sensor's process/network polling, quarantine, Windows Firewall isolation.

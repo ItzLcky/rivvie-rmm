@@ -12,7 +12,7 @@
 use std::sync::Arc;
 
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use chrono::{DateTime, Utc};
@@ -26,9 +26,12 @@ use crate::crypto::DataKey;
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 use crate::totp;
+use crate::vault::{HISTORY_KEPT, NEEDS_KEY, clean_name, clean_url, clean_username, open, seal};
 
-/// Earlier passwords kept per item.
-const HISTORY_KEPT: i64 = 10;
+/// The client's vault key (see [`crate::vault::client_key`]).
+async fn client_key(st: &AppState, master: &DataKey, client: Uuid) -> ApiResult<DataKey> {
+    crate::vault::client_key(&st.db, master, client).await
+}
 
 /// Whether `u` may see vault items at all (metadata on documents included).
 pub fn can_read(u: &User) -> bool {
@@ -44,7 +47,7 @@ fn gate<'a>(st: &'a AppState, u: &User, client: Uuid, perm: Perm) -> ApiResult<&
     if !u.second_factor() {
         return Err(ApiError::Denied("turn on two-factor authentication to use the vault".into()));
     }
-    st.cfg.data_key.as_ref().ok_or_else(|| ApiError::Conflict("the vault needs RMM_DATA_KEY to be set on the server".into()))
+    st.cfg.data_key.as_ref().ok_or_else(|| ApiError::Conflict(NEEDS_KEY.into()))
 }
 
 /// [`gate`] for one item: an unknown item and another client's are both 404.
@@ -56,44 +59,6 @@ async fn item_gate<'a>(st: &'a AppState, u: &User, id: Uuid, perm: Perm) -> ApiR
         .filter(|c| u.can_see_client(*c))
         .ok_or(ApiError::NotFound("credential"))?;
     Ok((client, gate(st, u, client, perm)?))
-}
-
-/// The client's vault key, made on first use. Two first uses at once both end up with the
-/// one that was stored.
-async fn client_key(st: &AppState, master: &DataKey, client: Uuid) -> ApiResult<DataKey> {
-    let aad = format!("vault-key:{client}");
-    let load = || sqlx::query_scalar::<_, Vec<u8>>("SELECT wrapped_key FROM vault_keys WHERE client_id = $1").bind(client).fetch_optional(&st.db);
-    let wrapped = match load().await? {
-        Some(w) => w,
-        None => {
-            let mut raw = [0u8; 32];
-            getrandom::fill(&mut raw).expect("OS RNG unavailable");
-            sqlx::query("INSERT INTO vault_keys (client_id, wrapped_key) VALUES ($1, $2) ON CONFLICT (client_id) DO NOTHING")
-                .bind(client)
-                .bind(master.seal_aad(&raw, &aad))
-                .execute(&st.db)
-                .await
-                .map_err(|e| match e {
-                    sqlx::Error::Database(d) if d.is_foreign_key_violation() => ApiError::NotFound("client"),
-                    e => e.into(),
-                })?;
-            load().await?.ok_or(ApiError::NotFound("client"))?
-        }
-    };
-    let raw: [u8; 32] = master
-        .open_aad(&wrapped, &aad)
-        .and_then(|k| k.try_into().ok())
-        .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("can't unwrap the vault key of client {client}: RMM_DATA_KEY has changed")))?;
-    Ok(DataKey::from_bytes(raw))
-}
-
-fn seal(key: &DataKey, item: Uuid, field: &str, plain: &[u8]) -> Vec<u8> {
-    key.seal_aad(plain, &format!("{item}:{field}"))
-}
-
-fn open(key: &DataKey, item: Uuid, field: &str, sealed: &[u8]) -> ApiResult<Vec<u8>> {
-    key.open_aad(sealed, &format!("{item}:{field}"))
-        .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("vault item {item}: {field} doesn't decrypt")))
 }
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -111,22 +76,52 @@ pub struct ItemRow {
     password_changed_at: Option<DateTime<Utc>>,
     updated_at: DateTime<Utc>,
     updated_by_name: Option<String>,
+    /// Set on items the server keeps (`disk_recovery`, `local_admin`, `identity`): their
+    /// password and username are changed only by the feature that owns them.
+    managed_kind: Option<String>,
+    /// The device a managed item belongs to (cleared, not the item, when the device is deleted).
+    agent_id: Option<Uuid>,
+    agent_hostname: Option<String>,
+    managed_state: Option<String>,
 }
 
 /// Metadata only: no sealed column is ever selected into a response.
 pub const ITEM_COLS: &str = "i.id, i.client_id, i.name, i.username, i.url, i.password IS NOT NULL AS has_password,
      i.totp_secret IS NOT NULL AS has_totp, i.notes IS NOT NULL AS has_notes,
      (SELECT count(*) FROM client_doc_vault_links l WHERE l.item_id = i.id) AS docs,
-     i.password_changed_at, i.updated_at, u.name AS updated_by_name
-  FROM vault_items i LEFT JOIN users u ON u.id = i.updated_by";
+     i.password_changed_at, i.updated_at, u.name AS updated_by_name,
+     i.managed_kind, i.agent_id, ag.hostname AS agent_hostname, i.managed_state
+  FROM vault_items i LEFT JOIN users u ON u.id = i.updated_by LEFT JOIN agents ag ON ag.id = i.agent_id";
 
-pub async fn list(State(st): State<Arc<AppState>>, u: User, Path(client): Path<Uuid>) -> ApiResult<Json<Vec<ItemRow>>> {
+#[derive(Deserialize)]
+pub struct ListQuery {
+    /// `managed` (any kind), `manual` (typed in by people), or one managed kind.
+    kind: Option<String>,
+}
+
+pub async fn list(State(st): State<Arc<AppState>>, u: User, Path(client): Path<Uuid>, Query(q): Query<ListQuery>) -> ApiResult<Json<Vec<ItemRow>>> {
     gate(&st, &u, client, Perm::VaultRead)?;
+    // ($2 managed?, $3 kind)
+    let (managed, kind): (Option<bool>, Option<&str>) = match q.kind.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
+        None => (None, None),
+        Some("managed") => (Some(true), None),
+        Some("manual") => (Some(false), None),
+        Some(k) => match crate::vault::ManagedKind::parse(k) {
+            Some(k) => (Some(true), Some(k.as_str())),
+            None => return Err(ApiError::BadRequest(format!("unknown kind {k}: managed, manual, disk_recovery, local_admin or identity"))),
+        },
+    };
     Ok(Json(
-        sqlx::query_as(AssertSqlSafe(format!("SELECT {ITEM_COLS} WHERE i.client_id = $1 ORDER BY lower(i.name), i.id")))
-            .bind(client)
-            .fetch_all(&st.db)
-            .await?,
+        sqlx::query_as(AssertSqlSafe(format!(
+            "SELECT {ITEM_COLS} WHERE i.client_id = $1 AND ($2::boolean IS NULL OR (i.managed_kind IS NOT NULL) = $2)
+                AND ($3::text IS NULL OR i.managed_kind = $3)
+              ORDER BY lower(i.name), i.id"
+        )))
+        .bind(client)
+        .bind(managed)
+        .bind(kind)
+        .fetch_all(&st.db)
+        .await?,
     ))
 }
 
@@ -158,35 +153,6 @@ async fn detail(st: &AppState, id: Uuid) -> ApiResult<Value> {
 pub async fn get(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uuid>) -> ApiResult<Json<Value>> {
     item_gate(&st, &u, id, Perm::VaultRead).await?;
     Ok(Json(detail(&st, id).await?))
-}
-
-fn clean_name(s: &str) -> ApiResult<String> {
-    let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    if s.is_empty() || s.chars().count() > 200 {
-        return Err(ApiError::BadRequest("name must be 1-200 characters".into()));
-    }
-    Ok(s)
-}
-
-fn clean_username(s: &str) -> ApiResult<String> {
-    let s = s.trim().to_string();
-    if s.chars().count() > 200 {
-        return Err(ApiError::BadRequest("the username is limited to 200 characters".into()));
-    }
-    Ok(s)
-}
-
-/// Shown as a link to open, so no script or data URLs.
-fn clean_url(s: &str) -> ApiResult<String> {
-    let s = s.trim().to_string();
-    if s.chars().count() > 2000 {
-        return Err(ApiError::BadRequest("the URL is limited to 2,000 characters".into()));
-    }
-    let lower = s.to_ascii_lowercase().replace(|c: char| c.is_ascii_whitespace() || c.is_ascii_control(), "");
-    if ["javascript:", "data:", "vbscript:", "file:", "blob:"].iter().any(|p| lower.starts_with(p)) {
-        return Err(ApiError::BadRequest("the URL must be a web address or host name".into()));
-    }
-    Ok(s)
 }
 
 /// A secret to store: an empty string is the same as none.
@@ -223,8 +189,8 @@ pub async fn create(State(st): State<Arc<AppState>>, u: User, Path(client): Path
     let name = clean_name(&b.name)?;
     let username = clean_username(&b.username)?;
     let url = clean_url(&b.url)?;
-    let password = secret(b.password.as_deref(), "password", 1000)?;
-    let notes = secret(b.notes.as_deref(), "notes", 20_000)?;
+    let password = secret(b.password.as_deref(), "password", crate::vault::PASSWORD_MAX)?;
+    let notes = secret(b.notes.as_deref(), "notes", crate::vault::NOTES_MAX)?;
     let spec = parse_totp(b.totp.as_deref())?;
     let key = client_key(&st, master, client).await?;
     let id = Uuid::new_v4();
@@ -280,20 +246,24 @@ pub async fn update(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uui
     let name = b.name.as_deref().map(clean_name).transpose()?;
     let username = b.username.as_deref().map(clean_username).transpose()?;
     let url = b.url.as_deref().map(clean_url).transpose()?;
-    let password = b.password.as_ref().map(|p| secret(p.as_deref(), "password", 1000)).transpose()?;
-    let notes = b.notes.as_ref().map(|n| secret(n.as_deref(), "notes", 20_000)).transpose()?;
+    let password = b.password.as_ref().map(|p| secret(p.as_deref(), "password", crate::vault::PASSWORD_MAX)).transpose()?;
+    let notes = b.notes.as_ref().map(|n| secret(n.as_deref(), "notes", crate::vault::NOTES_MAX)).transpose()?;
     let spec = b.totp.as_ref().map(|t| parse_totp(t.as_deref())).transpose()?;
     let key = client_key(&st, master, client).await?;
 
     let mut tx = st.db.begin().await?;
-    type Cur = (String, String, String, Option<Vec<u8>>, bool, bool);
-    let (cur_name, cur_user, cur_url, cur_pw, had_notes, had_totp): Cur = sqlx::query_as(
-        "SELECT name, username, url, password, notes IS NOT NULL, totp_secret IS NOT NULL FROM vault_items WHERE id = $1 FOR UPDATE",
+    type Cur = (String, String, String, Option<Vec<u8>>, bool, bool, Option<String>);
+    let (cur_name, cur_user, cur_url, cur_pw, had_notes, had_totp, managed): Cur = sqlx::query_as(
+        "SELECT name, username, url, password, notes IS NOT NULL, totp_secret IS NOT NULL, managed_kind FROM vault_items WHERE id = $1 FOR UPDATE",
     )
     .bind(id)
     .fetch_optional(&mut *tx)
     .await?
     .ok_or(ApiError::NotFound("credential"))?;
+    // The feature that keeps a managed item owns its password and username (crate::vault).
+    if managed.is_some() && (password.is_some() || username.as_ref().is_some_and(|n| *n != cur_user)) {
+        return Err(ApiError::Conflict("this credential is kept by the server: its password and username can't be edited".into()));
+    }
     let old_pw = if password.is_some() { cur_pw.as_deref().map(|c| open(&key, id, "password", c)).transpose()? } else { None };
     // Saving the form with the same password isn't a change.
     let password = password.filter(|p| p.as_deref().map(str::as_bytes) != old_pw.as_deref());
@@ -447,16 +417,6 @@ pub async fn totp(State(st): State<Arc<AppState>>, u: User, Path(id): Path<Uuid>
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn urls() {
-        for ok in ["", "https://fw.acme.local:4443", "10.0.0.1", "rdp://server01", "ssh://root@host"] {
-            assert!(clean_url(ok).is_ok(), "{ok}");
-        }
-        for bad in ["javascript:alert(1)", " JavaScript:alert(1)", "java\tscript:x", "data:text/html,x", "vbscript:x"] {
-            assert!(clean_url(bad).is_err(), "{bad}");
-        }
-    }
 
     #[test]
     fn update_fields() {

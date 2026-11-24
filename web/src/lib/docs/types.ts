@@ -85,7 +85,15 @@ export interface VaultItem {
 	password_changed_at: string | null;
 	updated_at: string;
 	updated_by_name: string | null;
+	/** Set on items the server keeps (recovery keys, rotated admin passwords): their password and username can't be edited. */
+	managed_kind?: ManagedKind | null;
+	agent_id?: string | null;
+	agent_hostname?: string | null;
+	managed_state?: string | null;
 }
+
+export type ManagedKind = 'disk_recovery' | 'local_admin' | 'identity';
+export const managedKindLabel: Record<ManagedKind, string> = { disk_recovery: 'Disk recovery key', local_admin: 'Local admin', identity: 'Identity reset' };
 
 export interface VaultDetail extends VaultItem {
 	linked_docs: { id: string; title: string }[];

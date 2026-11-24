@@ -134,6 +134,18 @@
 		{#if job.stderr}<p class="text-muted border-border border-t px-3 py-1.5 text-xs">Standard error is shown in red, after standard output.</p>{/if}
 	</section>
 
+	{#if job.params && Object.keys(job.params).length}
+		<section class="card p-4" aria-labelledby="job-params-h">
+			<h2 id="job-params-h" class="mb-2 text-sm font-semibold">Parameters</h2>
+			<dl class="grid gap-x-4 gap-y-1 text-sm sm:grid-cols-[minmax(8rem,auto)_1fr]">
+				{#each Object.entries(job.params) as [k, v] (k)}
+					<dt class="text-muted font-mono text-xs leading-6">RMM_PARAM_{k.toUpperCase()}</dt>
+					<dd class="min-w-0 font-mono text-xs leading-6 break-all">{String(v)}</dd>
+				{/each}
+			</dl>
+		</section>
+	{/if}
+
 	<details class="card group">
 		<summary class="text-muted hover:text-fg cursor-pointer px-4 py-2.5 text-sm select-none">
 			Script · {interpreterLabel(job.interpreter)} · timeout {job.timeout_secs}s{job.args.length ? ` · ${job.args.length} argument${job.args.length === 1 ? '' : 's'}` : ''}

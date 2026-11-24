@@ -12,8 +12,22 @@ back, restore the backup taken before the upgrade (see
 
 ## [Unreleased]
 
+Migrations `0036`, `0037`, `0043`, `0044` and `0045` are new.
+
 ### Added
 
+- **Script parameters.** Saved scripts declare typed parameters (text, number, yes/no, choice,
+  secret) that the run dialog, schedules and automations fill in; each reaches the script as the
+  environment variable `RMM_PARAM_<NAME>` (the script text is never rewritten). Text values may
+  use `{{agent.hostname}}`, `{{client.name}}`, `{{site.name}}`, `{{field.<name>}}` and more,
+  expanded per device; every job also gets `RMM_AGENT_*`, `RMM_CLIENT_*`, `RMM_SITE_*` and
+  `RMM_JOB_ID`. Secrets are never shown or kept after the job runs, and policies take them from
+  the client's vault. Needs agents of this release (older ones end such jobs as `error`). See
+  [docs/design/script-params.md](docs/design/script-params.md).
+- **Managed vault items.** The server can keep credentials of its own in a client's vault
+  (`vault::put_managed`, for the coming disk encryption escrow and local admin rotation),
+  shown with a "Managed" badge and filter; their password and username can't be edited by hand.
+  See [docs/design/vault-managed.md](docs/design/vault-managed.md).
 - **White-labelling** ([design](docs/design/branding.md), migration `0044`): Settings → Branding sets the product name, light and dark logos, a square icon, an accent colour (checked for 4.5:1 contrast in both themes), a support contact card, and the email sender name and footer. A client can override any of it for its own people (portal, mail to its contacts, its PDFs and packages, the consent prompt on its devices). Branded MSI `ProductName` and icon, package file names and descriptions, the Windows service display name, and the QBR and invoice PDF header logo. A "Licence and source" link (`RMM_SOURCE_URL`) is always shown.
 - **Wake-on-LAN.** Wake an offline device from its page, or many from the agents list, through
   another online agent at its site (the site's designated network agent first, else one on the

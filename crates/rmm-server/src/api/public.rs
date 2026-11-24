@@ -565,11 +565,15 @@ fn base_schemas() -> Value {
                 "args": { "type": "array", "items": { "type": "string" } },
                 "timeout_secs": { "type": "integer", "description": "Default: the script's own." },
                 "ticket_id": { "type": "string", "format": "uuid", "description": "Run from this ticket: the result is added to its timeline." },
+                "params": {
+                    "type": "object", "additionalProperties": true,
+                    "description": "Values of the script's parameters, by name (see the script's `params`). Each reaches the script as the environment variable RMM_PARAM_<NAME>, never in its text. Text values may hold placeholders such as {{agent.hostname}} or {{field.<name>}}, expanded per agent. Secret values are never stored or shown; vault items can't be named through the API.",
+                },
             },
         },
         "Script": object("A saved script.", &[
             ("id", "uuid"), ("name", "string"), ("description", "string"), ("interpreter", "string"), ("body", "string"),
-            ("timeout_secs", "integer"), ("client_id", "uuid?"), ("client_name", "string?"), ("created_at", "datetime"), ("updated_at", "datetime"),
+            ("timeout_secs", "integer"), ("client_id", "uuid?"), ("client_name", "string?"), ("params", "array"), ("created_at", "datetime"), ("updated_at", "datetime"),
         ]),
         "Alert": object("An alert: something that needs attention on an agent.", &[
             ("id", "uuid"), ("policy_id", "uuid?"), ("policy_name", "string?"), ("agent_id", "uuid"), ("hostname", "string"),

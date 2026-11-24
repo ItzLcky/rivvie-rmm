@@ -105,6 +105,7 @@ const pages: [string, string][] = [
 	['client-docs-edit', '/clients/c-acme?tab=docs&doc=d-network&edit=1'],
 	['client-passwords', '/clients/c-acme?tab=passwords'],
 	['client-password', '/clients/c-acme?tab=passwords&item=6f1c0c1e-9a51-4c0e-b6c9-0a4de1f3a111'],
+	['client-password-managed', '/clients/c-acme?tab=passwords&item=6f1c0c1e-9a51-4c0e-b6c9-0a4de1f3a1f0'],
 	['settings-documentation', '/settings/documentation'],
 	['agent-tickets', '/agents/a-3?tab=tickets'],
 	['agent-notes', '/agents/a-3?tab=notes'],
@@ -290,6 +291,21 @@ for (const theme of ['light', 'dark'] as const) {
 			await expect(page.getByRole('dialog').getByLabel('Group').first()).toHaveValue('0b8d1f64-2e7a-4a53-9c1b-6f1d3a7e9c02');
 			await expect(page).toHaveScreenshot(`${theme}-sso-mappings.png`);
 			r = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa']).analyze();
+			expect(r.violations.filter((v) => v.impact === 'serious' || v.impact === 'critical').map((v) => v.id)).toEqual([]);
+		});
+
+		test('run a script with parameters', async ({ page }) => {
+			await mockApi(page);
+			await page.goto('/agents/a-1');
+			await settle(page);
+			await page.getByRole('button', { name: 'Run script' }).first().click();
+			const dialog = page.getByRole('dialog');
+			await dialog.getByRole('button', { name: 'Show options' }).click();
+			await page.getByRole('option', { name: /Restart print spooler/ }).click();
+			await dialog.locator('#rs-p-printer').fill('PRN-{{agent.hostname}}');
+			await expect(dialog.getByText('$RMM_PARAM_ADMIN_PASSWORD')).toBeVisible();
+			await expect(page).toHaveScreenshot(`${theme}-run-script-params.png`);
+			const r = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa']).analyze();
 			expect(r.violations.filter((v) => v.impact === 'serious' || v.impact === 'critical').map((v) => v.id)).toEqual([]);
 		});
 

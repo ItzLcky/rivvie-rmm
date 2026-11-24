@@ -100,10 +100,17 @@ export interface Client {
 }
 
 export type Interpreter = 'bash' | 'sh' | 'powershell' | 'cmd' | 'python';
+export type ParamType = 'text' | 'number' | 'bool' | 'select' | 'secret';
+/** A parameter a saved script declares: passed to it as the environment variable RMM_PARAM_<NAME>. */
+export interface ParamSpec {
+	name: string; label: string; type: ParamType; required: boolean;
+	default?: string | number | boolean | null; choices?: string[]; description: string;
+}
 export interface Script {
 	id: string; name: string; description: string; interpreter: Interpreter; body: string; timeout_secs: number;
 	/** null = MSP-wide */
 	client_id: string | null; client_name: string | null;
+	params: ParamSpec[];
 	created_at: string; updated_at: string;
 }
 
@@ -115,6 +122,8 @@ export interface Job {
 }
 export interface JobDetail extends Job {
 	body: string; args: string[]; timeout_secs: number; stdout: string; stderr: string;
+	/** The parameters it was given, after placeholders were expanded; secrets as "•••". */
+	params: Record<string, string | number | boolean>;
 	/** Full output lengths, to pass back as since_stdout/since_stderr for the next chunk. */
 	stdout_len: number; stderr_len: number;
 }

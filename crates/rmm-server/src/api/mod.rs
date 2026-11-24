@@ -59,7 +59,7 @@ mod wake;
 mod webhooks;
 
 pub use agents::refresh_health as refresh_agent_health;
-pub use jobs::{FAILED as JOB_FAILED, deliver as deliver_job};
+pub use jobs::{FAILED as JOB_FAILED, deliver as deliver_job, end_with_error as end_job_with_error};
 pub use portal::PORTAL_LINK_MINUTES;
 pub use sso::seal_existing as seal_sso_secrets;
 pub use totp::{clear as clear_totp, seal_existing as seal_totp_secrets};

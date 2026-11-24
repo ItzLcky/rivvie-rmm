@@ -46,6 +46,7 @@
 //! `RMM_E2E_ONLY=network` runs only that section (after the enrollment it needs).
 //!
 //! `RMM_E2E_ONLY=branding` runs only the white-labelling section (after the sign-in and tenancy).
+//! `RMM_E2E_ONLY=script_params` runs only enrollment and the script parameters section.
 //!
 //! `RMM_E2E_ONLY=desk` runs only the core and service desk sections (faster while working on
 //! tickets, the portal and billing); `RMM_E2E_ONLY=api` only enrollment and the API keys and webhooks.
@@ -594,6 +595,12 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
         api_keys_and_webhooks(&url, &admin, db, &id1, a_id, b_id).await;
         fields_tags_notes_views(&url, &admin, db, dir, &id1, a_id, b_id).await;
     automation_tags_and_fields(&url, &admin, db, &id1, &id3, a_id, b_id).await;
+        a1.kill();
+        return Ok(());
+    }
+
+    if std::env::var("RMM_E2E_ONLY").as_deref() == Ok("script_params") {
+        script_params(&admin, db, dir, &mut a1, &id1, a_id, b_id).await;
         a1.kill();
         return Ok(());
     }
@@ -1212,7 +1219,8 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
     }
     portal_and_sla(&url, &admin, db, a_id, b_id).await;
     billing(&url, &admin, &tech, db, a_id, b_id).await;
-    docs_and_vault(&url, &admin, db, a_id, b_id).await;
+    script_params(&admin, db, dir, &mut a1, &id1, a_id, b_id).await;
+    docs_and_vault(server, &url, &admin, db, dir, a_id, b_id).await;
     branding(&url, &admin, db, a_id, a_site, b_id).await;
     ticket_docs(&url, &admin, a_id, b_id).await;
     api_keys_and_webhooks(&url, &admin, db, &id1, a_id, b_id).await;
@@ -1315,6 +1323,17 @@ fn opens_with(key_hex: &str, bytes: &[u8]) -> bool {
 }
 
 /// A value sealed with this hex key, as `crypto.rs` stores it (nonce || ciphertext).
+/// [`seal_with`] with associated data, as `DataKey::seal_aad` does.
+fn seal_aad_with(key_hex: &str, plain: &[u8], aad: &str) -> Vec<u8> {
+    use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+    use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+    let key: [u8; 32] = hex::decode(key_hex).unwrap().try_into().unwrap();
+    let nonce = [7u8; 12];
+    let mut out = nonce.to_vec();
+    out.extend(ChaCha20Poly1305::new(&Key::from(key)).encrypt(&Nonce::from(nonce), Payload { msg: plain, aad: aad.as_bytes() }).unwrap());
+    out
+}
+
 fn seal_with(key_hex: &str, plain: &[u8]) -> Vec<u8> {
     use chacha20poly1305::aead::{Aead, KeyInit};
     use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
@@ -1736,6 +1755,26 @@ async fn key_rotation(server: &mut Server, admin: &Api, db: &sqlx::PgPool, admin
         .await
         .unwrap();
     let wrapped = || async { sqlx::query_scalar::<_, Vec<u8>>("SELECT wrapped_key FROM vault_keys WHERE client_id = $1::uuid").bind(a_id).fetch_one(db).await.unwrap() };
+    // A managed item (opened through its client key after the rotation, like any item), and a
+    // queued job whose secret parameter is sealed with the data key itself (`jobs.env_sealed`):
+    // the agent gets it once the server is back on the new key.
+    let out = put_managed_cli(server, &["--client", a_id, "--kind", "local_admin", "--reference", "rotation-e2e", "--name", "Rotation admin"], "managed-rot-pw");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let managed_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let env_job = uuid::Uuid::new_v4();
+    let env_agent: Option<uuid::Uuid> = sqlx::query_scalar("SELECT id FROM agents WHERE online AND 'script_env' = ANY(capabilities) LIMIT 1").fetch_optional(db).await.unwrap();
+    if let Some(agent) = env_agent {
+        sqlx::query(
+            "INSERT INTO jobs (id, agent_id, interpreter, body, args, timeout_secs, params, env_sealed)
+             VALUES ($1, $2, 'bash', 'printf %s \"$RMM_PARAM_TOKEN\"', '[]', 30, '{\"token\": \"•••\"}', $3)",
+        )
+        .bind(env_job)
+        .bind(agent)
+        .bind(seal_aad_with(&server.data_key, br#"{"token":"rotated-env-secret"}"#, &format!("job-env:{env_job}")))
+        .execute(db)
+        .await
+        .unwrap();
+    }
 
     let before = sealed_values(db).await;
     let tables_before: std::collections::BTreeSet<_> = before.iter().map(|(t, _)| *t).collect();
@@ -1816,6 +1855,12 @@ async fn key_rotation(server: &mut Server, admin: &Api, db: &sqlx::PgPool, admin
     assert!(code["code"] == c1.as_str() || code["code"] == c2.as_str(), "the vault TOTP still computes: {code}");
     let other = admin.get(&format!("/clients/{a_id}/vault")).await;
     assert!(other.as_array().unwrap().iter().any(|i| i["id"] == item_id.as_str()));
+    assert_eq!(admin.post(&format!("/vault/{managed_id}/reveal"), json!({ "field": "password" })).await["value"], "managed-rot-pw");
+    admin.call(reqwest::Method::DELETE, &format!("/vault/{managed_id}"), None).await;
+    if env_agent.is_some() {
+        let j = admin.wait_job(&env_job.to_string(), 60).await;
+        assert_eq!((j["status"].as_str(), j["stdout"].as_str()), (Some("succeeded"), Some("rotated-env-secret")), "the job's sealed parameters were rewrapped: {j}");
+    }
     // A new item sealed after the rotation, read back through the same client key.
     let fresh = admin.post(&format!("/clients/{a_id}/vault"), json!({ "name": "After rotation", "password": "after-rot" })).await;
     assert_eq!(admin.post(&format!("/vault/{}/reveal", fresh["id"].as_str().unwrap()), json!({ "field": "password" })).await["value"], "after-rot");
@@ -6249,7 +6294,7 @@ async fn signed_in(url: &str, admin: &Api, email: &str, role: &str, client: Opti
 /// Client documentation (categories, templates, pages, links, export) and the password vault
 /// (encryption at rest, reveal, history, TOTP, who is refused, and that no secret ever shows
 /// up outside a reveal).
-async fn docs_and_vault(url: &str, admin: &Api, db: &sqlx::PgPool, a_id: &str, b_id: &str) {
+async fn docs_and_vault(server: &Server, url: &str, admin: &Api, db: &sqlx::PgPool, dir: &Path, a_id: &str, b_id: &str) {
     use reqwest::Method;
     let tech = signed_in(url, admin, "docs-tech@e2e.test", "technician", None, true).await;
 
@@ -6484,7 +6529,71 @@ async fn docs_and_vault(url: &str, admin: &Api, db: &sqlx::PgPool, a_id: &str, b
     assert_eq!(admin.call(Method::GET, &format!("/vault/{item_id}"), None).await.0, StatusCode::NOT_FOUND);
     let d = admin.get(&format!("/docs/{linked_id}")).await;
     assert_eq!((d["credentials"].clone(), d["body"].as_str()), (json!([]), Some(format!("[admin](vault:{item_id})").as_str())));
+
+    // --- managed items: the system write path (vault::put_managed) ------------------------------
+    let site: (uuid::Uuid,) = sqlx::query_as("SELECT id FROM sites WHERE client_id = $1::uuid LIMIT 1").bind(a_id).fetch_one(db).await.unwrap();
+    let token = admin.post(&format!("/sites/{}/enrollment-tokens", site.0), json!({ "label": "vault e2e" })).await["token"].as_str().unwrap().to_string();
+    let dev = Agent::new(dir, "vaultdev").enroll(&server.url(), &token).unwrap();
+    let reference = format!("{dev}:C:");
+    let put = |password: &str| {
+        let out = put_managed_cli(server, &["--client", a_id, "--kind", "disk_recovery", "--reference", &reference, "--name", "BitLocker recovery: VAULTDEV C:",
+            "--username", "{PROTECTOR-1}", "--agent", &dev], password);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let managed = put("111111-222222-333333");
+    assert_eq!(put("444444-555555-666666"), managed, "the same reference updates the same item");
+    assert_eq!(put("444444-555555-666666"), managed, "writing the same key again changes nothing");
+    let (items, history): (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM vault_items WHERE managed_ref = $1), (SELECT count(*) FROM vault_item_history WHERE item_id = $2::uuid)",
+    )
+    .bind(&reference)
+    .bind(&managed)
+    .fetch_one(db)
+    .await
+    .unwrap();
+    assert_eq!((items, history), (1, 1), "one item, one earlier key");
+    let writes: Vec<(Value,)> = sqlx::query_as("SELECT details FROM audit_log WHERE action = 'vault.system_write' AND target_id = $1::uuid ORDER BY id").bind(&managed).fetch_all(db).await.unwrap();
+    assert_eq!(writes.len(), 2, "unchanged writes aren't audited: {writes:?}");
+    assert_eq!((writes[0].0["created"].as_bool(), writes[1].0["fields"].clone()), (Some(true), json!(["password"])), "{writes:?}");
+    assert!(!writes.iter().any(|(w,)| w.to_string().contains("111111") || w.to_string().contains("444444")), "no value in the audit log");
+    let listed = admin.get(&format!("/clients/{a_id}/vault?kind=disk_recovery")).await;
+    let row = listed.as_array().unwrap().iter().find(|r| r["id"] == managed.as_str()).cloned().expect("listed under its kind");
+    assert_eq!((row["managed_kind"].as_str(), row["agent_id"].as_str()), (Some("disk_recovery"), Some(dev.as_str())), "{row}");
+    assert!(admin.get(&format!("/clients/{a_id}/vault?kind=manual")).await.as_array().unwrap().iter().all(|r| r["managed_kind"].is_null()));
+    assert_eq!(admin.call(Method::GET, &format!("/clients/{a_id}/vault?kind=bogus"), None).await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(admin.post(&format!("/vault/{managed}/reveal"), json!({ "field": "password" })).await["value"], "444444-555555-666666");
+    let hist = admin.get(&format!("/vault/{managed}")).await["history"][0]["id"].as_i64().unwrap();
+    assert_eq!(admin.post(&format!("/vault/{managed}/reveal"), json!({ "history": hist })).await["value"], "111111-222222-333333");
+    // People can't change what the server keeps, but may rename it.
+    for body in [json!({ "password": "typed-in" }), json!({ "username": "someone" })] {
+        let (s, v) = admin.call(Method::PUT, &format!("/vault/{managed}"), Some(body)).await;
+        assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    }
+    assert_eq!(admin.put(&format!("/vault/{managed}"), json!({ "name": "VAULTDEV system drive" })).await["name"], "VAULTDEV system drive");
+    // Deleting the device keeps its recovery key.
+    assert!(admin.call(Method::DELETE, &format!("/agents/{dev}"), None).await.0.is_success());
+    let kept = admin.get(&format!("/vault/{managed}")).await;
+    assert!(kept["agent_id"].is_null() && kept["managed_kind"] == "disk_recovery", "{kept}");
+    assert_eq!(admin.post(&format!("/vault/{managed}/reveal"), json!({ "field": "password" })).await["value"], "444444-555555-666666");
+    // An unknown client is refused; the CLI never prints the password.
+    let out = put_managed_cli(server, &["--client", &uuid::Uuid::new_v4().to_string(), "--kind", "local_admin", "--reference", "x", "--name", "x"], "pw-never-echoed");
+    assert!(!out.status.success() && !String::from_utf8_lossy(&out.stderr).contains("pw-never-echoed"));
+    admin.call(Method::DELETE, &format!("/vault/{managed}"), None).await;
     println!("documentation and the vault: ok");
+}
+
+/// `rmm-server vault-put-managed` (the test hook into `vault::put_managed`), the password in
+/// RMM_VAULT_PASSWORD.
+fn put_managed_cli(server: &Server, args: &[&str], password: &str) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_rmm-server"))
+        .arg("vault-put-managed")
+        .args(args)
+        .env("DATABASE_URL", &server.db_url)
+        .env("RMM_DATA_KEY", &server.data_key)
+        .env("RMM_VAULT_PASSWORD", password)
+        .output()
+        .expect("running rmm-server vault-put-managed")
 }
 
 /// Documentation pages linked to tickets: link, duplicate, the client rule, unlink, the timeline,
@@ -8719,4 +8828,174 @@ async fn branding(url: &str, admin: &Api, db: &sqlx::PgPool, a_id: &str, a_site:
         admin.call(reqwest::Method::DELETE, &format!("/contacts/{}", c["id"].as_str().unwrap()), None).await;
     }
     println!("branding: ok");
+}
+
+/// Script parameters (docs/design/script-params.md): typed values reach the script as
+/// RMM_PARAM_<NAME> environment variables, never in its text; secrets stay out of `jobs` and
+/// `audit_log`, wait sealed for an offline agent, and come from the vault for policies.
+async fn script_params(admin: &Api, db: &sqlx::PgPool, dir: &Path, a1: &mut Agent, id1: &str, a_id: &str, b_id: &str) {
+    use reqwest::Method;
+    const SECRET: &str = "s3cret-param-value";
+    let marker = dir.join("params-injected");
+    let _ = std::fs::remove_file(&marker);
+    let hostname = admin.get(&format!("/agents/{id1}")).await["hostname"].as_str().unwrap().to_string();
+    // A custom field to expand, set on the agent.
+    let field = admin.post("/custom-fields", json!({ "entity": "agent", "name": "params_rack", "label": "Rack", "kind": "text" })).await;
+    let field_id = field["id"].as_str().unwrap().to_string();
+    admin.put(&format!("/agents/{id1}/fields"), json!({ "values": { "params_rack": "R7" } })).await;
+
+    // --- declaring them --------------------------------------------------------------------------
+    let body = "printf 'T=%s|C=%s|F=%s|S=%s|M=%s|H=%s|J=%s|A=%s\\n' \"$RMM_PARAM_TARGET\" \"$RMM_PARAM_COUNT\" \"$RMM_PARAM_FORCE\" \"$RMM_PARAM_TOKEN\" \"$RMM_PARAM_MODE\" \"$RMM_AGENT_HOSTNAME\" \"$RMM_JOB_ID\" \"$1\"";
+    let specs = json!([
+        { "name": "target", "label": "Target", "type": "text", "required": true },
+        { "name": "count", "type": "number", "default": 3 },
+        { "name": "force", "type": "bool", "default": false },
+        { "name": "mode", "type": "select", "choices": ["fast", "safe"], "default": "safe" },
+        { "name": "token", "type": "secret" },
+    ]);
+    for bad in [
+        json!([{ "name": "Bad", "type": "text" }]),
+        json!([{ "name": "t", "type": "text", "default": "{{agent.nope}}" }]),
+        json!([{ "name": "t", "type": "text", "default": "{{field.no_such_field}}" }]),
+        json!([{ "name": "p", "type": "secret", "default": "x" }]),
+    ] {
+        let (s, v) = admin.call(Method::POST, "/scripts", Some(json!({ "name": "bad params", "interpreter": "bash", "body": "true", "params": bad }))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    }
+    let script = admin.post("/scripts", json!({ "name": "params e2e", "interpreter": "bash", "body": body, "params": specs })).await;
+    let sid = script["id"].as_str().unwrap().to_string();
+    assert_eq!(script["params"].as_array().unwrap().len(), 5, "{script}");
+    assert_eq!(script["params"][0]["label"], "Target");
+    let listed = admin.get("/scripts").await;
+    assert!(listed.as_array().unwrap().iter().any(|s| s["id"] == sid.as_str() && s["params"][1]["default"] == 3), "listScripts has params");
+
+    let run = |params: Value| {
+        let sid = sid.clone();
+        let id1 = id1.to_string();
+        async move { admin.call(Method::POST, "/jobs", Some(json!({ "agent_ids": [id1], "script_id": sid, "args": ["arg1"], "params": params }))).await }
+    };
+    let started = |v: &Value| v["jobs"][0]["job_id"].as_str().unwrap().to_string();
+
+    // --- values arrive verbatim, as environment only -----------------------------------------------
+    let evil = format!("$(touch {}); \"`'", marker.display());
+    let (s, v) = run(json!({ "target": evil, "force": "yes", "token": SECRET })).await;
+    assert!(s.is_success(), "{v}");
+    let job = started(&v);
+    let j = admin.wait_job(&job, 30).await;
+    assert_eq!(j["status"], "succeeded", "{j}");
+    assert_eq!(j["stdout"], format!("T={evil}|C=3|F=true|S={SECRET}|M=safe|H={hostname}|J={job}|A=arg1\n"), "{j}");
+    assert!(!marker.exists(), "the value was never run as code");
+    assert_eq!(j["body"], body, "the body is never rewritten");
+    assert_eq!(j["params"]["token"], "•••", "{j}");
+    assert_eq!(j["params"]["target"], evil.as_str());
+    // The secret is in no table but its output, and in no audit entry.
+    let (stored, sealed): (String, Option<Vec<u8>>) = sqlx::query_as("SELECT (to_jsonb(j) - 'stdout')::text, env_sealed FROM jobs j WHERE id = $1::uuid").bind(&job).fetch_one(db).await.unwrap();
+    assert!(!stored.contains(SECRET) && sealed.is_none(), "secrets leave the job once it ran: {stored}");
+    let (in_audit,): (i64,) = sqlx::query_as("SELECT count(*) FROM audit_log WHERE details::text LIKE '%' || $1 || '%'").bind(SECRET).fetch_one(db).await.unwrap();
+    assert_eq!(in_audit, 0);
+    let (audited,): (Value,) = sqlx::query_as("SELECT details FROM audit_log WHERE action = 'job.create' AND target_id = $1::uuid ORDER BY id DESC LIMIT 1").bind(&sid).fetch_one(db).await.unwrap();
+    assert_eq!((audited["params"]["token"].as_str(), audited["params"]["force"].as_bool()), (Some("•••"), Some(true)), "names and non-secret values: {audited}");
+
+    // --- refused values -----------------------------------------------------------------------------
+    for (bad, why) in [
+        (json!({}), "is required"),
+        (json!({ "target": "x", "nope": 1 }), "no parameter nope"),
+        (json!({ "target": "x", "count": "many" }), "number"),
+        (json!({ "target": "x", "mode": "reckless" }), "not one of"),
+        (json!({ "target": "{{agent.bogus}}" }), "unknown placeholder"),
+        (json!({ "target": "{{field.no_such_field}}" }), "no custom field"),
+    ] {
+        let (s, v) = run(bad).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+        assert!(v["error"].as_str().unwrap().contains(why), "{why}: {v}");
+    }
+    let (s, v) = admin.call(Method::POST, "/jobs", Some(json!({ "agent_ids": [id1], "interpreter": "bash", "body": "true", "params": { "x": "1" } }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "ad-hoc scripts take no parameters: {v}");
+
+    // --- placeholders expand per device --------------------------------------------------------------
+    let (_, v) = run(json!({ "target": "rack-{{field.params_rack}}-{{ agent.hostname }}", "count": 7, "mode": "fast" })).await;
+    let j = admin.wait_job(&started(&v), 30).await;
+    assert!(j["stdout"].as_str().unwrap().starts_with(&format!("T=rack-R7-{hostname}|C=7|F=false|S=|M=fast|")), "{j}");
+
+    // --- from the vault ---------------------------------------------------------------------------------
+    let item = admin.post(&format!("/clients/{a_id}/vault"), json!({ "name": "Param secret", "password": "from-the-vault" })).await;
+    let item_id = item["id"].as_str().unwrap().to_string();
+    let (_, v) = run(json!({ "target": "v", "token": format!("vault:{item_id}") })).await;
+    let j = admin.wait_job(&started(&v), 30).await;
+    assert!(j["stdout"].as_str().unwrap().contains("|S=from-the-vault|"), "{j}");
+    let (used,): (i64,) = sqlx::query_as("SELECT count(*) FROM audit_log WHERE action = 'vault.use' AND target_id = $1::uuid").bind(&item_id).fetch_one(db).await.unwrap();
+    assert_eq!(used, 1, "using a vault item is audited");
+    // Another client's vault item can't reach this agent.
+    let other = admin.post(&format!("/clients/{b_id}/vault"), json!({ "name": "B secret", "password": "b-only" })).await;
+    let (s, v) = run(json!({ "target": "v", "token": format!("vault:{}", other["id"].as_str().unwrap()) })).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+
+    // --- a queued job keeps its secret sealed until the agent is back ----------------------------------------
+    a1.kill();
+    admin.wait_online(id1, false).await;
+    let (_, v) = run(json!({ "target": "later", "token": SECRET })).await;
+    assert_eq!(v["jobs"][0]["status"], "queued", "{v}");
+    let queued = started(&v);
+    let (sealed, params): (Option<Vec<u8>>, Value) = sqlx::query_as("SELECT env_sealed, params FROM jobs WHERE id = $1::uuid").bind(&queued).fetch_one(db).await.unwrap();
+    let sealed = sealed.expect("the secret waits sealed");
+    assert!(!sealed.windows(SECRET.len()).any(|w| w == SECRET.as_bytes()) && params["token"] == "•••");
+    a1.run(dir);
+    admin.wait_online(id1, true).await;
+    let j = admin.wait_job(&queued, 60).await;
+    assert!(j["stdout"].as_str().unwrap().contains(&format!("T=later|C=3|F=false|S={SECRET}|")), "{j}");
+    let (sealed,): (Option<Vec<u8>>,) = sqlx::query_as("SELECT env_sealed FROM jobs WHERE id = $1::uuid").bind(&queued).fetch_one(db).await.unwrap();
+    assert!(sealed.is_none(), "dropped once delivered and finished");
+
+    // --- an agent without the capability gets an error, not a run without its values ---------------------------
+    sqlx::query("UPDATE agents SET capabilities = array_remove(capabilities, 'script_env') WHERE id = $1::uuid").bind(id1).execute(db).await.unwrap();
+    let (_, v) = run(json!({ "target": "old" })).await;
+    assert_eq!(v["jobs"][0]["status"], "error", "{v}");
+    let j = admin.job(&started(&v)).await;
+    assert!(j["stderr"].as_str().unwrap().contains("agent too old for script parameters") && j["stdout"] == "", "{j}");
+    sqlx::query("UPDATE agents SET capabilities = array_append(capabilities, 'script_env') WHERE id = $1::uuid").bind(id1).execute(db).await.unwrap();
+
+    // --- schedules: values in the item, one overridden in a set below ------------------------------------------
+    let item_body = |params: Value| json!({ "module": "schedule", "name": "Params nightly", "client_id": a_id,
+        "config": { "script_id": sid, "cron": "0 3 * * *", "params": params } });
+    let (s, v) = admin.call(Method::POST, &format!("/policy-sets/{ROOT_SET}/items"), Some(item_body(json!({ "target": "x", "token": "literal" })))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "a policy never stores a secret: {v}");
+    let (s, v) = admin.call(Method::POST, &format!("/policy-sets/{ROOT_SET}/items"), Some(item_body(json!({ "count": "2" })))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "the required one is missing: {v}");
+    let (s, v) = admin.call(Method::POST, &format!("/policy-sets/{ROOT_SET}/items"), Some(json!({ "module": "schedule", "name": "Params everywhere",
+        "config": { "script_id": sid, "cron": "0 3 * * *", "params": { "target": "x", "token": format!("vault:{item_id}") } } }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "a vault item needs the policy limited to its client: {v}");
+    let sched = admin.post(&format!("/policy-sets/{ROOT_SET}/items"), item_body(json!({ "target": "{{agent.hostname}}", "count": "2", "token": format!("vault:{item_id}") }))).await;
+    let sched_id = sched["id"].as_str().unwrap().to_string();
+    // a1 in a set of its own below its current one, overriding one value.
+    let current = admin.get(&format!("/agents/{id1}/policy")).await["set"]["id"].as_str().unwrap().to_string();
+    admin.put(&format!("/agents/{id1}/policy-pin"), json!({ "policy_set_id": current })).await;
+    let custom = admin.post(&format!("/agents/{id1}/policy-pin/customize"), json!({})).await;
+    let custom_set = custom["set"]["id"].as_str().unwrap().to_string();
+    admin.put(&format!("/policy-items/{sched_id}/overrides/{custom_set}"), json!({ "config": { "params": { "count": "9" } } })).await;
+    let (s, v) = admin.call(Method::PUT, &format!("/policy-items/{sched_id}/overrides/{custom_set}"), Some(json!({ "config": { "params": { "count": "nine" } } }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "overrides are checked against the script: {v}");
+    let r = admin.post(&format!("/schedules/{sched_id}/run"), json!({})).await;
+    assert_eq!(r["sent"].as_i64(), Some(1), "{r}");
+    let runs = admin.get(&format!("/jobs?schedule_id={sched_id}")).await;
+    let run_id = runs["items"].as_array().unwrap().iter().find(|j| j["agent_id"] == id1).unwrap()["id"].as_str().unwrap().to_string();
+    let j = admin.wait_job(&run_id, 30).await;
+    assert!(j["stdout"].as_str().unwrap().starts_with(&format!("T={hostname}|C=9|F=false|S=from-the-vault|")), "the override changed one value: {j}");
+
+    // --- changing the script's parameters re-checks the policies that use it -----------------------------------
+    let mut stricter = specs.clone();
+    stricter.as_array_mut().unwrap().push(json!({ "name": "extra", "type": "text", "required": true }));
+    let (s, v) = admin.call(Method::PUT, &format!("/scripts/{sid}"), Some(json!({ "name": "params e2e", "interpreter": "bash", "body": body, "params": stricter }))).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("Params nightly"), "names the policy: {v}");
+    assert_eq!(admin.get(&format!("/scripts/{sid}")).await["params"].as_array().unwrap().len(), 5, "nothing changed");
+
+    // Clean up.
+    admin.put(&format!("/agents/{id1}/policy-pin"), json!({ "policy_set_id": null })).await;
+    admin.call(Method::DELETE, &format!("/policy-sets/{custom_set}"), None).await;
+    assert_eq!(admin.delete_policy(&sched_id).await, StatusCode::OK);
+    admin.call(Method::DELETE, &format!("/scripts/{sid}"), None).await;
+    admin.call(Method::DELETE, &format!("/vault/{item_id}"), None).await;
+    admin.call(Method::DELETE, &format!("/vault/{}", other["id"].as_str().unwrap()), None).await;
+    admin.call(Method::DELETE, &format!("/custom-fields/{field_id}"), None).await;
+    println!("script parameters: ok");
 }

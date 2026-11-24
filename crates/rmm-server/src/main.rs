@@ -39,6 +39,8 @@ mod shell_ws;
 mod state;
 mod storage;
 mod tickets;
+mod vault;
+mod params;
 mod totp;
 mod updates;
 mod webauthn;
@@ -99,6 +101,29 @@ enum Cmd {
         /// Count what would change and check that the old key opens everything; write nothing.
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Store a managed vault item through the system write path (vault::put_managed), as disk
+    /// encryption escrow and LAPS do. For tests and break-glass imports; needs RMM_DATA_KEY. The
+    /// password comes from RMM_VAULT_PASSWORD (never the command line).
+    #[command(hide = true)]
+    VaultPutManaged {
+        #[arg(long)]
+        client: uuid::Uuid,
+        /// disk_recovery, local_admin or identity.
+        #[arg(long)]
+        kind: String,
+        #[arg(long)]
+        reference: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long, default_value = "")]
+        username: String,
+        #[arg(long)]
+        agent: Option<uuid::Uuid>,
+        #[arg(long)]
+        state: Option<String>,
+        #[arg(long, env = "RMM_VAULT_PASSWORD", hide_env_values = true)]
+        password: String,
     },
 }
 
@@ -262,6 +287,15 @@ async fn main() -> Result<()> {
                 auth::audit(&db, None, "system.data_key_rotated", None, rotate::audit_details(&report)).await;
                 println!("RMM_DATA_KEY rotated:\n{report}\nSet RMM_DATA_KEY to the new key and start the server.");
             }
+            Ok(())
+        }
+        Cmd::VaultPutManaged { client, kind, reference, name, username, agent, state, password } => {
+            let key = std::env::var("RMM_DATA_KEY").ok().filter(|k| !k.trim().is_empty()).context(vault::NEEDS_KEY)?;
+            let key = crypto::DataKey::parse(key.trim()).context("RMM_DATA_KEY")?;
+            let kind = vault::ManagedKind::parse(&kind).context("kind must be disk_recovery, local_admin or identity")?;
+            let m = vault::Managed { kind, agent_id: agent, reference, name, username, state, ..Default::default() };
+            let id = vault::put_managed_with(&db, &key, client, m, &password, vault::Source::system("cli")).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!("{id}");
             Ok(())
         }
         Cmd::Serve(args) => serve(db, args).await,

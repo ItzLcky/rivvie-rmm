@@ -495,9 +495,16 @@ async fn run_alert_script(st: &AppState, alert_id: Uuid) -> anyhow::Result<()> {
     }
     let interpreter = crate::agent_ws::parse_interpreter(&interp).ok_or_else(|| anyhow::anyhow!("script has unknown interpreter {interp}"))?;
     let job_id = Uuid::new_v4();
+    // An alert passes no values: only the script's defaults (a script with required parameters
+    // can't be chosen, see params::check_policy).
+    let (params, sealed, why) = match crate::params::env_for(st, script_id, &Default::default(), agent_id, client_id, job_id, "alert").await? {
+        Ok((p, s)) => (p, s, None),
+        Err(why) => (Value::Object(Default::default()), None, Some(why)),
+    };
     let mut tx = st.db.begin().await?;
     sqlx::query(
-        "INSERT INTO jobs (id, agent_id, script_id, interpreter, body, args, timeout_secs) VALUES ($1, $2, $3, $4, $5, '[]', $6)",
+        "INSERT INTO jobs (id, agent_id, script_id, interpreter, body, args, timeout_secs, params, env_sealed)
+         VALUES ($1, $2, $3, $4, $5, '[]', $6, $7, $8)",
     )
     .bind(job_id)
     .bind(agent_id)
@@ -505,6 +512,8 @@ async fn run_alert_script(st: &AppState, alert_id: Uuid) -> anyhow::Result<()> {
     .bind(&interp)
     .bind(&body)
     .bind(timeout.clamp(1, 86400))
+    .bind(params)
+    .bind(sealed)
     .execute(&mut *tx)
     .await?;
     let claimed = sqlx::query("UPDATE alerts SET script_job_id = $2 WHERE id = $1 AND script_job_id IS NULL")
@@ -517,7 +526,11 @@ async fn run_alert_script(st: &AppState, alert_id: Uuid) -> anyhow::Result<()> {
         return Ok(());
     }
     tx.commit().await?;
-    let job = rmm_proto::ScriptJob { job_id, interpreter, script: body, args: vec![], timeout_secs: timeout.clamp(1, 86400) as u32 };
+    if let Some(why) = why {
+        crate::api::end_job_with_error(st, job_id, agent_id, client_id, &why).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+        return Ok(());
+    }
+    let job = rmm_proto::ScriptJob { job_id, interpreter, script: body, args: vec![], timeout_secs: timeout.clamp(1, 86400) as u32, env: vec![] };
     let status = crate::api::deliver_job(st, agent_id, client_id, job).await.map_err(|e| anyhow::anyhow!("{e}"))?;
     info!(alert = %alert_id, %job_id, status, "alert script started");
     Ok(())
