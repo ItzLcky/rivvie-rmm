@@ -135,7 +135,6 @@ const pages: [string, string][] = [
 	['backups', '/backups'],
 	['agent-backups', '/agents/a-2'],
 	['client-users', '/clients/c-acme?tab=users'],
-	['client-user', '/clients/c-acme?tab=users&iu=iu-03'],
 	['client-mobile', '/clients/c-acme?tab=mobile']
 ];
 const phone: [string, string][] = [
@@ -234,6 +233,16 @@ for (const theme of ['light', 'dark'] as const) {
 			await expect(drawer.getByLabel('URL')).toHaveValue('https://www.acme.example/');
 			await settle(page);
 			await expect(page).toHaveScreenshot(`${theme}-uptime-form.png`);
+		});
+
+		test('identity user drawer', async ({ page }) => {
+			await mockApi(page);
+			await page.goto('/clients/c-acme?tab=users&iu=iu-03');
+			await settle(page);
+			await expect(page.getByRole('dialog', { name: 'Directory account' }).getByRole('heading', { name: 'IT Admin', exact: true })).toBeVisible();
+			await expect(page).toHaveScreenshot(`${theme}-client-user.png`);
+			const r = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa']).analyze();
+			expect(r.violations.filter((v) => v.impact === 'serious' || v.impact === 'critical').map((v) => v.id)).toEqual([]);
 		});
 
 		test('identity reset dialog', async ({ page }) => {
