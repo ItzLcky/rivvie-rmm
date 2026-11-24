@@ -12,10 +12,23 @@ back, restore the backup taken before the upgrade (see
 
 ## [Unreleased]
 
-Migrations `0036`, `0037`, `0040` and `0042` to `0047` are new.
+Migrations `0036`, `0037`, `0040`, `0042` to `0047` and `0052` are new.
 
 ### Added
 
+- **End-user tray app.** `rmm-agent tray` runs as the signed-in user: a notification-area icon
+  on Windows (started by an `HKLM\…\Run` value the MSI and `rmm-agent install` write) with
+  "Request help", the branded contact card and configurable links; on Linux a "Request help"
+  launcher (zenity or kdialog) and an autostart entry for prompts, both in the deb and rpm. A
+  request (subject, description, optional screenshot taken before the form opens) becomes a
+  ticket for the device's client with source `agent` ("From device"), the device linked, the
+  screenshot attached and a context note (OS, uptime, user, addresses, open alerts); requests
+  made offline are kept (up to three) and sent once on reconnect. Five an hour per user, twenty
+  a day per device. Consent prompts and a "technician connected" notice go through the tray when
+  one is connected for the session. New policy module `tray`; Settings → Service desk chooses
+  the board (`tray_board_id`). The service's socket (`/run/rmm-agent/tray.sock`, or the named
+  pipe `\\.\pipe\rmm-agent-tray`) accepts nothing privileged. Agent capability `tray`; older
+  agents are unaffected. Migration `0052`. See [docs/design/tray.md](docs/design/tray.md).
 - **Script parameters.** Saved scripts declare typed parameters (text, number, yes/no, choice,
   secret) that the run dialog, schedules and automations fill in; each reaches the script as the
   environment variable `RMM_PARAM_<NAME>` (the script text is never rewritten). Text values may

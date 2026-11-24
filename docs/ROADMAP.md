@@ -26,11 +26,12 @@ Follow the [manual plan](design/windows-testing.md) on Windows 10/11 and Server 
 - [ ] Branding on Windows: the branded MSI's name and icon in *Apps and features*, the service display name, the consent prompt title ([plan](design/windows-testing.md) §2.6).
 - [ ] Wake-on-LAN on a real LAN: a machine actually waking (S3/S4/S5, Fast startup), senders on each OS, and how switches treat directed broadcasts across VLANs ([plan](design/windows-testing.md#wake-on-lan-any-os-real-network)).
 - [ ] Uptime and backups on real hosts: ICMP through `IcmpSendEcho`, Windows Server Backup and Veeam event logs from real installs, Time Machine on a Mac (section 7a of the plan).
+- [ ] The tray app on Windows: the icon, menu, request form and screenshot, consent prompts and the "technician connected" balloon through the tray, several sessions on a terminal server, UAC and the secure desktop, the Run value after MSI install and uninstall on a real host ([plan](design/windows-testing.md) §6a).
 - [ ] Fix what breaks, and record the tested versions in the README.
 
 ### 2. Before the first real customer
 
-- [ ] **Security review** by someone outside the project: agent/server protocol, enrollment, the update and content signing chain, session handling, per-client scoping, the shell and desktop relays, the client portal, the password vault (envelope encryption, reveal auditing, rate limits), API keys and SSO.
+- [ ] **Security review** by someone outside the project: the tray app's local socket and named pipe (open to every local user of a SYSTEM/root service; `tray/ipc.rs`, `tray/server.rs`, the pipe DACL in `tray/win.rs`), agent/server protocol, enrollment, the update and content signing chain, session handling, per-client scoping, the shell and desktop relays, the client portal, the password vault (envelope encryption, reveal auditing, rate limits), API keys and SSO.
 - [ ] **Try the integrations against the real services**, not stand-ins: AWS S3 (MinIO is done and in CI), Microsoft 365 over Graph, QuickBooks Online (sandbox company), Xero (demo organisation), OIDC with real Entra ID and Google tenants, and how real mail clients render our emails (including the branded sender name and footer, and scheduled report emails with their PDF attachments).
 - [ ] **Paging and push on real services** ([oncall](design/oncall.md), [pwa](design/pwa.md)): texts through a real Twilio number (and A2P 10DLC registration), PagerDuty and Opsgenie incidents opened and closed, Web Push delivered by Chrome, Firefox, Edge and Safari, the Acknowledge action from a lock screen, and the installed app on iOS 16.4+ and Android.
 

@@ -62,6 +62,7 @@ Known gaps: no Windows run of any of it; SSO untested against real IdPs; no aler
 
 ## Parity features (unreleased)
 
+- **End-user tray app** (`0052`, [design](design/tray.md)): `rmm-agent tray` as the signed-in user; request help (subject, description, screenshot) as a ticket linked to the device with a context note, the branded contact card and links, consent prompts and a "technician connected" notice; Windows icon, Linux launcher, headless `--request` for scripts; offline requests kept and sent once.
 - **Wake-on-LAN** (`0043`, [design](design/wake-on-lan.md)): wake one device or many through an online agent at the site; optional wake before a patch window.
 - **Scheduled reports** (`0045`, [design](design/scheduled-reports.md)): the four reports as PDFs on a timetable, emailed to users and contacts with the owner's access checked at run time; history and send now.
 - **White-labelling** (`0044`, [design](design/branding.md)): instance branding with per-client overrides; product name, logos, icon, contrast-checked accent, support card, email sender and footer; branded MSI, packages, service name, consent prompt and PDF headers; an always-present AGPL source link.

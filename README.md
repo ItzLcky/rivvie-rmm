@@ -843,6 +843,20 @@ sign-in screen), there's no clipboard sync or session recording, and the Windows
 compile-checked only, like the rest of the Windows agent. `RMM_DESKTOP_FAKE=<file>` makes the
 agent serve a synthetic screen and log input to `<file>`, for testing without a display.
 
+## Tray app
+
+`rmm-agent tray` is the help desk app for the person at the machine, running as them and
+talking to the agent service over a local socket (`/run/rmm-agent/tray.sock`, or the named pipe
+`\\.\pipe\rmm-agent-tray` on Windows). On Windows it's an icon in the notification area,
+started at sign-in by the MSI's `Run` value: Request help (subject, description, an optional
+screenshot), the branded contact card and the links from the device's **Tray app** policy. On
+Linux the deb and rpm add a "Request help" launcher (zenity or kdialog) and an autostart entry
+that shows consent prompts and the "technician connected" notice. A request becomes a ticket for
+the device's client ("From device") on the board chosen in Settings → Service desk, with the
+device linked, the screenshot and a context note; made offline, it's sent when the agent is back.
+For scripts and tests: `rmm-agent tray --request --subject "…" [--body "…"] [--screenshot
+file.png]` and `rmm-agent tray --show-config`. See [docs/design/tray.md](docs/design/tray.md).
+
 ## Endpoint protection
 
 Agents report the protection the operating system already has. Nothing replaces it: the agent

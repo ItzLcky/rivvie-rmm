@@ -53,6 +53,9 @@
 //! against local HTTP, TCP, TLS and DNS listeners; backup alerts through the agent's fake
 //! provider, and a real restic repository when `restic` is on PATH).
 //!
+//! `RMM_E2E_ONLY=tray` runs only the tray app section (the headless `rmm-agent tray` over a1's
+//! real Unix socket).
+//!
 //! `RMM_E2E_ONLY=desk` runs only the core and service desk sections (faster while working on
 //! tickets, the portal and billing); `RMM_E2E_ONLY=api` only enrollment and the API keys and webhooks.
 //!
@@ -632,6 +635,11 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
     }
     if std::env::var("RMM_E2E_ONLY").as_deref() == Ok("uptime") {
         uptime(&url, &admin, db, dir, &id1, a_id, a_site, b_id).await;
+        a1.kill();
+        return Ok(());
+    }
+    if std::env::var("RMM_E2E_ONLY").as_deref() == Ok("tray") {
+        tray(server, &admin, db, dir, &id1, a_id).await;
         a1.kill();
         return Ok(());
     }
@@ -1268,6 +1276,7 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
     if all {
         uptime(&url, &admin, db, dir, &id1, a_id, a_site, b_id).await;
         backups(&url, &admin, db, dir, &id1, b_id).await;
+        tray(server, &admin, db, dir, &id1, a_id).await;
     }
     sso_and_passkeys(server, db, dir, &secret).await;
 
@@ -9392,3 +9401,4 @@ async fn push(url: &str, admin: &Api, db: &sqlx::PgPool, id1: &str, a_id: &str, 
 }
 
 include!("e2e_parts/monitoring.rs");
+include!("e2e_parts/tray.rs");

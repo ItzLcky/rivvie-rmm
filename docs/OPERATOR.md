@@ -261,7 +261,8 @@ port, 8080).
 |---|---|
 | `RMM_AGENT_CONFIG` | Path to `agent.toml` (default `/etc/rmm-agent/agent.toml`, or `C:\ProgramData\RMM\agent.toml`) |
 | `RMM_ENROLL_TOKEN` | Enrollment token for `rmm-agent enroll`, as an alternative to `--token` |
-| `RMM_STATE_DIR` | Where the agent keeps content, quarantine, telemetry and unsent results (tests run it unprivileged) |
+| `RMM_STATE_DIR` | Where the agent keeps content, quarantine, telemetry and unsent results (tests run it unprivileged); when set, the tray socket is `tray.sock` inside it |
+| `RMM_TRAY_SOCKET` | Unix only: the tray app's socket, for the service and `rmm-agent tray` alike (default `/run/rmm-agent/tray.sock`) |
 | `RMM_SENSOR_SCAN_ROOTS`, `RMM_SENSOR_WATCH`, `RMM_SENSOR_CANARY_DIRS` | Sensor scan roots, watched directories and canary directories |
 | `RMM_UPDATE_PUBKEY` (build time) | The release public key compiled into the agent |
 | `RMM_AGENT_VERSION` (build time) | Version the agent reports, instead of the crate's |
