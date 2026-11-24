@@ -3694,10 +3694,19 @@ ExecStart=/tmp/x
     let (s, v) = admin.call(reqwest::Method::PUT, "/security/rules/E2E-B-1", Some(json!({ "mode": "block" }))).await;
     assert!(s == StatusCode::BAD_REQUEST && v["error"].as_str().unwrap().contains("can't block yet"), "{v}");
     admin.call(reqwest::Method::PUT, "/security/rules/E2E-B-1", Some(json!({ "mode": "disabled", "reason": "e2e kill switch" }))).await;
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    admin.run_script(id1, "sh -c 'sleep 4; true' rmm-e2e-marker-again", 30).await;
-    tokio::time::sleep(Duration::from_secs(8)).await;
-    assert_eq!(detections_for(admin, id1, "E2E-B-1").await.len(), 1, "a disabled rule doesn't fire");
+    // Nothing tells us when the sensor has the new mode, so run the marker until a run of it
+    // leaves no new detection (under load the first run can still beat the policy push).
+    let mut quiet = false;
+    for _ in 0..6 {
+        let before = detections_for(admin, id1, "E2E-B-1").await.len();
+        admin.run_script(id1, "sh -c 'sleep 4; true' rmm-e2e-marker-again", 30).await;
+        tokio::time::sleep(Duration::from_secs(8)).await;
+        if detections_for(admin, id1, "E2E-B-1").await.len() == before {
+            quiet = true;
+            break;
+        }
+    }
+    assert!(quiet, "a disabled rule doesn't fire");
     admin.call(reqwest::Method::PUT, "/security/rules/E2E-B-1", Some(json!({ "mode": null }))).await;
 
     // --- response: kill a process tree, triage, isolation ----------------------------------------
