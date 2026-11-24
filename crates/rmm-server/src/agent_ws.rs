@@ -751,5 +751,6 @@ async fn store_inventory(state: &Arc<AppState>, agent_id: Uuid, inv: &Inventory)
         info!(%agent_id, from = %before, to = %after, "agent moved to another policy set");
         crate::policy::changed(state, crate::policy::Change::agents(vec![agent_id])).await;
     }
+    crate::vuln::inventory_stored(state, agent_id, inv).await;
     Ok(())
 }

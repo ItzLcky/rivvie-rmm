@@ -667,6 +667,11 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
         a1.kill();
         return Ok(());
     }
+    if std::env::var("RMM_E2E_ONLY").as_deref() == Ok("vulnerabilities") {
+        vulnerabilities(server, &url, &admin, db, &id1, &id3, a_id, b_id).await;
+        a1.kill();
+        return Ok(());
+    }
 
     if std::env::var("RMM_E2E_ONLY").as_deref() == Ok("network") {
         network(&url, &admin, db, &id1, a_id, a_site, b_id).await;
@@ -1349,6 +1354,10 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
     assert_eq!(limited, Some(20));
 
     observability(&url, dir).await;
+    // After the counters are checked: it restarts the server (with the mock feeds' URLs).
+    if all {
+        vulnerabilities(server, &url, &admin, db, &id1, &id3, a_id, b_id).await;
+    }
     // After the counters are checked: it restarts the server.
     audit_export_siem_sealing(server, &admin, &tech, db).await;
     // Last but the drill: it restarts the server, which would reset the counters checked above.
@@ -9427,3 +9436,4 @@ async fn push(url: &str, admin: &Api, db: &sqlx::PgPool, id1: &str, a_id: &str, 
 include!("e2e_parts/monitoring.rs");
 include!("e2e_parts/identity.rs");
 include!("e2e_parts/device_security.rs");
+include!("e2e_parts/vulnerabilities.rs");

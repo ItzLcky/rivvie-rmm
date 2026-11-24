@@ -445,6 +445,34 @@ pub static OPS: &[Op] = &[
         ],
         paged: true, body: None, response: Resp::Paged("Detection"),
     },
+    // ---- vulnerabilities (read) ---------------------------------------------------------
+    Op {
+        id: "listVulnerabilities", method: "GET", path: "/vulnerabilities", group: "security", summary: "Vulnerabilities in the fleet, one row per CVE",
+        note: "Needs the `security.read` permission on the key. Counts devices with the CVE open and not accepted.", query: &[
+            CLIENT_Q,
+            ("severity", "string", "Comma-separated: critical, high, medium, low, unknown."),
+            ("kev", "boolean", "Only (or never) CVEs in CISA's known-exploited catalog."),
+            ("fix", "boolean", "Only with (or without) a fixed version."),
+            ("accepted", "boolean", "Also CVEs every affected device has accepted."),
+            ("q", "string", "CVE, advisory, summary or package."),
+        ],
+        paged: true, body: None, response: Resp::Paged("VulnerabilityRow"),
+    },
+    Op {
+        id: "listVulnerabilityDevices", method: "GET", path: "/vulnerabilities/{id}/devices", group: "security",
+        summary: "The devices with a CVE (or advisory) open", note: "Needs the `security.read` permission on the key. At most 2000.",
+        query: &[CLIENT_Q], paged: false, body: None, response: Resp::List("VulnerabilityDevice"),
+    },
+    Op {
+        id: "listAgentVulnerabilities", method: "GET", path: "/agents/{id}/vulnerabilities", group: "security",
+        summary: "An agent's open vulnerability findings and whether it is assessed",
+        note: "Needs the `security.read` permission on the key.", query: NONE, paged: false, body: None, response: Resp::Object,
+    },
+    Op {
+        id: "listVulnerableSoftware", method: "GET", path: "/vulnerabilities/software", group: "security",
+        summary: "Vulnerable packages and Windows products, worst first", note: "Needs the `security.read` permission on the key. At most 500.",
+        query: &[CLIENT_Q, ("q", "string", "Package or installed title.")], paged: false, body: None, response: Resp::List("VulnerableSoftware"),
+    },
     // ---- audit log (admins, or whoever holds audit.read) ----------------------------------
     Op {
         id: "listAudit", method: "GET", path: "/audit", group: "audit", summary: "List audit log events, newest first",
@@ -569,6 +597,21 @@ fn field_schemas() -> Value {
                 },
             },
         },
+        "VulnerabilityRow": object("A CVE (or an advisory without one) open on devices.", &[
+            ("key", "string"), ("cve", "string?"), ("advisories", "array"), ("summary", "string"), ("severity", "string"), ("cvss", "number?"),
+            ("epss", "number?"), ("kev", "boolean"), ("published", "datetime?"), ("devices", "integer"), ("accepted_devices", "integer"),
+            ("fix_available", "boolean"), ("packages", "array"), ("first_seen", "datetime"),
+        ]),
+        "VulnerabilityDevice": object("A device with a CVE open.", &[
+            ("agent_id", "uuid"), ("hostname", "string"), ("online", "boolean"), ("os_family", "string"), ("os_name", "string"), ("client_id", "uuid"),
+            ("client_name", "string"), ("site_name", "string"), ("vuln_id", "string"), ("package", "string"), ("software_name", "string"),
+            ("installed_version", "string"), ("fixed_version", "string?"), ("fix_available", "boolean"), ("first_seen", "datetime"),
+            ("accepted", "boolean"), ("product_id", "uuid?"), ("remediation", "object?"),
+        ]),
+        "VulnerableSoftware": object("A vulnerable package or Windows product.", &[
+            ("package", "string"), ("ecosystems", "array"), ("product_id", "uuid?"), ("product_name", "string?"), ("package_id", "uuid?"),
+            ("devices", "integer"), ("cves", "integer"), ("severity", "string"), ("kev", "boolean"), ("fix_available", "boolean"), ("fixed_versions", "array"),
+        ]),
         "Note": object("A note on an agent.", &[
             ("id", "uuid"), ("agent_id", "uuid"), ("body", "string"), ("author_id", "uuid?"), ("author_name", "string"), ("pinned", "boolean"),
             ("created_at", "datetime"), ("updated_at", "datetime"), ("can_edit", "boolean"),

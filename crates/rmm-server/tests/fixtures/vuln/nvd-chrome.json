@@ -1,0 +1,53 @@
+{
+  "resultsPerPage": 2,
+  "startIndex": 0,
+  "totalResults": 2,
+  "format": "NVD_CVE",
+  "version": "2.0",
+  "timestamp": "2024-11-20T10:00:00.000",
+  "vulnerabilities": [
+    {
+      "cve": {
+        "id": "CVE-2024-7971",
+        "published": "2024-08-21T21:15:09.000",
+        "lastModified": "2024-08-27T13:42:14.000",
+        "vulnStatus": "Analyzed",
+        "descriptions": [
+          { "lang": "en", "value": "Type confusion in V8 in Google Chrome prior to 128.0.6613.84 allowed a remote attacker to exploit heap corruption via a crafted HTML page." },
+          { "lang": "es", "value": "Confusión de tipos en V8" }
+        ],
+        "metrics": {
+          "cvssMetricV31": [
+            { "source": "nvd@nist.gov", "type": "Primary", "cvssData": { "version": "3.1", "vectorString": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:H/I:H/A:H", "baseScore": 8.8, "baseSeverity": "HIGH" } }
+          ]
+        },
+        "configurations": [
+          { "nodes": [ { "operator": "OR", "negate": false, "cpeMatch": [
+            { "vulnerable": true, "criteria": "cpe:2.3:a:google:chrome:*:*:*:*:*:*:*:*", "versionEndExcluding": "128.0.6613.84", "matchCriteriaId": "A" }
+          ] } ] }
+        ],
+        "references": [ { "url": "https://chromereleases.googleblog.com/", "source": "chrome-cve-admin@google.com" } ]
+      }
+    },
+    {
+      "cve": {
+        "id": "CVE-2024-0001",
+        "published": "2024-01-01T00:00:00.000",
+        "lastModified": "2024-01-02T00:00:00.000",
+        "descriptions": [ { "lang": "en", "value": "Something in Chrome on Android only." } ],
+        "metrics": { "cvssMetricV2": [ { "cvssData": { "version": "2.0", "baseScore": 4.3 }, "baseSeverity": "MEDIUM" } ] },
+        "configurations": [
+          { "operator": "AND", "nodes": [
+            { "operator": "OR", "negate": false, "cpeMatch": [ { "vulnerable": true, "criteria": "cpe:2.3:a:google:chrome:*:*:*:*:*:*:*:*", "versionEndExcluding": "121.0" } ] },
+            { "operator": "OR", "negate": false, "cpeMatch": [ { "vulnerable": false, "criteria": "cpe:2.3:o:google:android:-:*:*:*:*:*:*:*" } ] }
+          ] },
+          { "nodes": [ { "operator": "OR", "negate": false, "cpeMatch": [
+            { "vulnerable": true, "criteria": "cpe:2.3:a:google:chrome:120.0.1:*:*:*:*:*:*:*" },
+            { "vulnerable": true, "criteria": "cpe:2.3:a:google:chrome:*:*:*:*:*:iphone_os:*:*", "versionEndExcluding": "122.0" },
+            { "vulnerable": true, "criteria": "cpe:2.3:a:mozilla:firefox:*:*:*:*:*:*:*:*", "versionEndExcluding": "100.0" }
+          ] } ] }
+        ]
+      }
+    }
+  ]
+}

@@ -11,7 +11,7 @@
 	import { liveReload, onLive } from '#lib/live.svelte.js';
 	import { forgetAgent, rememberAgent } from '#lib/recent.js';
 	import { resource } from '#lib/resource.svelte.js';
-	import { can } from '#lib/session.svelte.js';
+	import { allowed, can } from '#lib/session.svelte.js';
 	import { attempt, toast } from '#lib/toast.svelte.js';
 	import type { AgentDetail, AuditRow, Job, MetricPoint, Page, Release, Software } from '#lib/types.js';
 	import { param, setParams } from '#lib/url.svelte.js';
@@ -46,6 +46,7 @@
 	import TagChip from '#lib/components/tags/TagChip.svelte';
 	import TagPicker from '#lib/components/tags/TagPicker.svelte';
 	import AgentSecurity from '#lib/components/agent/AgentSecurity.svelte';
+	import AgentVulnerabilities from '#lib/components/agent/AgentVulnerabilities.svelte';
 	import AgentServices from '#lib/components/agent/AgentServices.svelte';
 	import NewTicket from '#lib/components/ticket/NewTicket.svelte';
 	import TicketTable from '#lib/components/ticket/TicketTable.svelte';
@@ -308,6 +309,7 @@
 					{ value: 'patches', label: 'Patches', count: a.patches_overdue || a.patches_failed ? num(a.patches_overdue + a.patches_failed) : undefined, title: a.patches_overdue || a.patches_failed ? 'Overdue security updates and failed installs' : undefined },
 					{ value: 'deployments', label: 'Deployments' },
 					{ value: 'security', label: 'Security' },
+					{ value: 'vulnerabilities', label: 'Vulnerabilities', hidden: !allowed('security.read') },
 					{ value: 'jobs', label: 'Jobs' },
 					{ value: 'files', label: 'Files', hidden: !can('technician') }
 				] },
@@ -546,6 +548,8 @@
 			</TicketTable>
 		{:else if tab === 'security'}
 			<AgentSecurity agentId={a.id} hostname={a.hostname} os={a.os_family} />
+		{:else if tab === 'vulnerabilities'}
+			<AgentVulnerabilities agentId={a.id} hostname={a.hostname} clientId={a.client_id} clientName={a.client_name} />
 		{:else if tab === 'services'}
 			<AgentServices agentId={a.id} online={a.online} hostname={a.hostname} />
 		{:else if tab === 'logs'}

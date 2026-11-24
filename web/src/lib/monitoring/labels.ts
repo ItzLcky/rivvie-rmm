@@ -17,7 +17,8 @@ export const kindLabels: Record<PolicyKind, string> = {
 	uptime: 'Uptime monitor',
 	backup: 'Backups',
 	disk_encryption: 'Disk encryption',
-	local_admin: 'Local admin password'
+	local_admin: 'Local admin password',
+	vulnerability: 'Vulnerabilities'
 };
 
 export const kindHelp: Record<PolicyKind, string> = {
@@ -36,7 +37,8 @@ export const kindHelp: Record<PolicyKind, string> = {
 	uptime: 'A website, port, host or DNS name stops answering, answers slowly, or its certificate nears expiry.',
 	backup: 'A backup job fails, or hasn’t succeeded for too long.',
 	disk_encryption: 'A volume isn’t encrypted, protection stays suspended, or a BitLocker recovery key isn’t escrowed.',
-	local_admin: 'Rotating the managed local admin password fails, conflicts with Windows LAPS, or is overdue.'
+	local_admin: 'Rotating the managed local admin password fails, conflicts with Windows LAPS, or is overdue.',
+	vulnerability: 'Installed software has known vulnerabilities: one alert per device, worst CVEs first.'
 };
 
 export const severityTone: Record<Severity, Tone> = { critical: 'danger', warning: 'warning', info: 'info' };
@@ -122,6 +124,14 @@ export function describePolicy(p: { kind: PolicyKind; params: Record<string, unk
 			const s = Array.isArray(q.sources) ? q.sources.length : 0;
 			const what = [...p, s ? `${s} source${s === 1 ? '' : 's'}` : ''].filter(Boolean).join(', ');
 			return `Failed, or no success for ${q.max_age_hours ?? 26} h${what ? ` (${what})` : ''}${q.require ? '; one must exist' : ''}`;
+		}
+		case 'vulnerability': {
+			const bits = [`${String(q.min_severity ?? 'critical')} or worse`];
+			if (q.kev_only) bits.push('known exploited');
+			if (q.fix_available_only !== false) bits.push('with a fix');
+			if (Number(q.older_than_days ?? 14) > 0) bits.push(`open over ${q.older_than_days ?? 14} days`);
+			if (q.min_epss != null) bits.push(`EPSS ≥ ${Math.round(Number(q.min_epss) * 100)}%`);
+			return bits.join(', ');
 		}
 		case 'log': {
 			const bits = [`${String(q.min_level ?? 'error')} or worse`];

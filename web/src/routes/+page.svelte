@@ -17,6 +17,7 @@
 	import Stat from '#lib/ui/Stat.svelte';
 	import Badge from '#lib/ui/Badge.svelte';
 	import OsIcon from '#lib/components/OsIcon.svelte';
+	import VulnStrip from '#lib/components/vulns/VulnStrip.svelte';
 
 	const res = resource(() => api.get<Dashboard>(`/dashboard${qs({ client_id: clientId() })}`));
 	liveReload(() => res.reload(), (e) => e.type === 'jobs' || e.type === 'alert' || (e.type === 'job' && !e.output) || (e.type === 'agent' && !e.last_metrics), {
@@ -79,6 +80,7 @@
 				<Stat label="Failed jobs (24 h)" icon={CircleSlash} value={failedCount(d)} tone="danger" href={link('/jobs?status=failed')} />
 				<Stat label="Disks over 90%" icon={HardDrive} value={d.high_disk.length} capped={d.high_disk.length >= 10} tone="danger" href={link('/agents?sort=disk&dir=desc')} />
 			</section>
+			<VulnStrip clientId={clientId()} class="mt-4" />
 
 			{@const items = feed(d)}
 			<div class="mt-6 grid items-start gap-6 xl:grid-cols-[minmax(0,7fr)_minmax(0,5fr)]">

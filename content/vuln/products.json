@@ -1,0 +1,1329 @@
+[
+ {
+  "vendor": "google",
+  "product": "chrome",
+  "name": "Google Chrome",
+  "patterns": [
+   "Google Chrome"
+  ],
+  "publisher": "Google*"
+ },
+ {
+  "vendor": "mozilla",
+  "product": "firefox",
+  "name": "Mozilla Firefox",
+  "patterns": [
+   "Mozilla Firefox*"
+  ],
+  "publisher": "Mozilla*"
+ },
+ {
+  "vendor": "mozilla",
+  "product": "firefox_esr",
+  "name": "Mozilla Firefox ESR",
+  "patterns": [
+   "Mozilla Firefox ESR*",
+   "Mozilla Firefox * ESR*"
+  ],
+  "publisher": "Mozilla*"
+ },
+ {
+  "vendor": "mozilla",
+  "product": "thunderbird",
+  "name": "Mozilla Thunderbird",
+  "patterns": [
+   "Mozilla Thunderbird*"
+  ],
+  "publisher": "Mozilla*"
+ },
+ {
+  "vendor": "microsoft",
+  "product": "edge_chromium",
+  "name": "Microsoft Edge",
+  "patterns": [
+   "Microsoft Edge"
+  ],
+  "publisher": "Microsoft*"
+ },
+ {
+  "vendor": "opera",
+  "product": "opera_browser",
+  "name": "Opera",
+  "patterns": [
+   "Opera Stable*",
+   "Opera *"
+  ],
+  "publisher": "Opera*"
+ },
+ {
+  "vendor": "vivaldi",
+  "product": "vivaldi",
+  "name": "Vivaldi",
+  "patterns": [
+   "Vivaldi"
+  ],
+  "publisher": "Vivaldi*"
+ },
+ {
+  "vendor": "brave",
+  "product": "brave",
+  "name": "Brave",
+  "patterns": [
+   "Brave"
+  ],
+  "publisher": "Brave*"
+ },
+ {
+  "vendor": "adobe",
+  "product": "acrobat_reader_dc",
+  "name": "Adobe Acrobat Reader",
+  "patterns": [
+   "Adobe Acrobat Reader*"
+  ],
+  "publisher": "Adobe*"
+ },
+ {
+  "vendor": "adobe",
+  "product": "acrobat_dc",
+  "name": "Adobe Acrobat",
+  "patterns": [
+   "Adobe Acrobat DC*",
+   "Adobe Acrobat (64-bit)",
+   "Adobe Acrobat Pro*"
+  ],
+  "publisher": "Adobe*"
+ },
+ {
+  "vendor": "adobe",
+  "product": "acrobat_reader",
+  "name": "Adobe Reader (legacy)",
+  "patterns": [
+   "Adobe Reader*"
+  ],
+  "publisher": "Adobe*"
+ },
+ {
+  "vendor": "adobe",
+  "product": "creative_cloud",
+  "name": "Adobe Creative Cloud",
+  "patterns": [
+   "Adobe Creative Cloud"
+  ],
+  "publisher": "Adobe*"
+ },
+ {
+  "vendor": "adobe",
+  "product": "photoshop",
+  "name": "Adobe Photoshop",
+  "patterns": [
+   "Adobe Photoshop*"
+  ],
+  "publisher": "Adobe*"
+ },
+ {
+  "vendor": "adobe",
+  "product": "illustrator",
+  "name": "Adobe Illustrator",
+  "patterns": [
+   "Adobe Illustrator*"
+  ],
+  "publisher": "Adobe*"
+ },
+ {
+  "vendor": "adobe",
+  "product": "indesign",
+  "name": "Adobe InDesign",
+  "patterns": [
+   "Adobe InDesign*"
+  ],
+  "publisher": "Adobe*"
+ },
+ {
+  "vendor": "adobe",
+  "product": "premiere_pro",
+  "name": "Adobe Premiere Pro",
+  "patterns": [
+   "Adobe Premiere Pro*"
+  ],
+  "publisher": "Adobe*"
+ },
+ {
+  "vendor": "adobe",
+  "product": "after_effects",
+  "name": "Adobe After Effects",
+  "patterns": [
+   "Adobe After Effects*"
+  ],
+  "publisher": "Adobe*"
+ },
+ {
+  "vendor": "adobe",
+  "product": "dreamweaver",
+  "name": "Adobe Dreamweaver",
+  "patterns": [
+   "Adobe Dreamweaver*"
+  ],
+  "publisher": "Adobe*"
+ },
+ {
+  "vendor": "adobe",
+  "product": "animate",
+  "name": "Adobe Animate",
+  "patterns": [
+   "Adobe Animate*"
+  ],
+  "publisher": "Adobe*"
+ },
+ {
+  "vendor": "adobe",
+  "product": "bridge",
+  "name": "Adobe Bridge",
+  "patterns": [
+   "Adobe Bridge*"
+  ],
+  "publisher": "Adobe*"
+ },
+ {
+  "vendor": "adobe",
+  "product": "flash_player",
+  "name": "Adobe Flash Player",
+  "patterns": [
+   "Adobe Flash Player*"
+  ],
+  "publisher": "Adobe*"
+ },
+ {
+  "vendor": "adobe",
+  "product": "shockwave_player",
+  "name": "Adobe Shockwave Player",
+  "patterns": [
+   "Adobe Shockwave Player*"
+  ],
+  "publisher": "Adobe*"
+ },
+ {
+  "vendor": "adobe",
+  "product": "air",
+  "name": "Adobe AIR",
+  "patterns": [
+   "Adobe AIR"
+  ]
+ },
+ {
+  "vendor": "oracle",
+  "product": "vm_virtualbox",
+  "name": "Oracle VirtualBox",
+  "patterns": [
+   "Oracle VM VirtualBox*",
+   "Oracle VirtualBox*"
+  ],
+  "publisher": "Oracle*"
+ },
+ {
+  "vendor": "oracle",
+  "product": "mysql",
+  "name": "MySQL Server",
+  "patterns": [
+   "MySQL Server*"
+  ],
+  "publisher": "Oracle*"
+ },
+ {
+  "vendor": "oracle",
+  "product": "mysql_workbench",
+  "name": "MySQL Workbench",
+  "patterns": [
+   "MySQL Workbench*"
+  ],
+  "publisher": "Oracle*"
+ },
+ {
+  "vendor": "libreoffice",
+  "product": "libreoffice",
+  "name": "LibreOffice",
+  "patterns": [
+   "LibreOffice*"
+  ],
+  "publisher": "The Document Foundation*"
+ },
+ {
+  "vendor": "apache",
+  "product": "openoffice",
+  "name": "Apache OpenOffice",
+  "patterns": [
+   "OpenOffice*",
+   "Apache OpenOffice*"
+  ],
+  "publisher": "Apache*"
+ },
+ {
+  "vendor": "apache",
+  "product": "tomcat",
+  "name": "Apache Tomcat",
+  "patterns": [
+   "Apache Tomcat*"
+  ]
+ },
+ {
+  "vendor": "apache",
+  "product": "netbeans",
+  "name": "Apache NetBeans",
+  "patterns": [
+   "Apache NetBeans*"
+  ]
+ },
+ {
+  "vendor": "nodejs",
+  "product": "node.js",
+  "name": "Node.js",
+  "patterns": [
+   "Node.js"
+  ],
+  "publisher": "Node.js*"
+ },
+ {
+  "vendor": "golang",
+  "product": "go",
+  "name": "Go",
+  "patterns": [
+   "Go Programming Language*"
+  ]
+ },
+ {
+  "vendor": "git-scm",
+  "product": "git",
+  "name": "Git",
+  "patterns": [
+   "Git",
+   "Git version *"
+  ],
+  "publisher": "The Git Development Community*"
+ },
+ {
+  "vendor": "tortoisegit",
+  "product": "tortoisegit",
+  "name": "TortoiseGit",
+  "patterns": [
+   "TortoiseGit*"
+  ]
+ },
+ {
+  "vendor": "tortoisesvn",
+  "product": "tortoisesvn",
+  "name": "TortoiseSVN",
+  "patterns": [
+   "TortoiseSVN*"
+  ]
+ },
+ {
+  "vendor": "microsoft",
+  "product": "visual_studio_code",
+  "name": "Visual Studio Code",
+  "patterns": [
+   "Microsoft Visual Studio Code*"
+  ],
+  "publisher": "Microsoft*"
+ },
+ {
+  "vendor": "microsoft",
+  "product": "visual_studio_2022",
+  "name": "Visual Studio 2022",
+  "patterns": [
+   "Visual Studio * 2022"
+  ],
+  "publisher": "Microsoft*"
+ },
+ {
+  "vendor": "microsoft",
+  "product": "teams",
+  "name": "Microsoft Teams",
+  "patterns": [
+   "Microsoft Teams*"
+  ],
+  "publisher": "Microsoft*"
+ },
+ {
+  "vendor": "microsoft",
+  "product": "onedrive",
+  "name": "Microsoft OneDrive",
+  "patterns": [
+   "Microsoft OneDrive"
+  ],
+  "publisher": "Microsoft*"
+ },
+ {
+  "vendor": "microsoft",
+  "product": "powershell",
+  "name": "PowerShell 7",
+  "patterns": [
+   "PowerShell 7*"
+  ],
+  "publisher": "Microsoft*"
+ },
+ {
+  "vendor": "microsoft",
+  "product": "skype",
+  "name": "Skype",
+  "patterns": [
+   "Skype*"
+  ],
+  "publisher": "Skype*"
+ },
+ {
+  "vendor": "microsoft",
+  "product": "azure_cli",
+  "name": "Microsoft Azure CLI",
+  "patterns": [
+   "Microsoft Azure CLI*"
+  ],
+  "publisher": "Microsoft*"
+ },
+ {
+  "vendor": "7-zip",
+  "product": "7-zip",
+  "name": "7-Zip",
+  "patterns": [
+   "7-Zip*"
+  ],
+  "publisher": "Igor Pavlov*"
+ },
+ {
+  "vendor": "rarlab",
+  "product": "winrar",
+  "name": "WinRAR",
+  "patterns": [
+   "WinRAR*"
+  ],
+  "publisher": "win.rar*"
+ },
+ {
+  "vendor": "winzip",
+  "product": "winzip",
+  "name": "WinZip",
+  "patterns": [
+   "WinZip*"
+  ]
+ },
+ {
+  "vendor": "giorgiotani",
+  "product": "peazip",
+  "name": "PeaZip",
+  "patterns": [
+   "PeaZip*"
+  ]
+ },
+ {
+  "vendor": "notepad-plus-plus",
+  "product": "notepad\\+\\+",
+  "name": "Notepad++",
+  "patterns": [
+   "Notepad++*"
+  ]
+ },
+ {
+  "vendor": "jetbrains",
+  "product": "intellij_idea",
+  "name": "IntelliJ IDEA",
+  "patterns": [
+   "IntelliJ IDEA*"
+  ],
+  "publisher": "JetBrains*"
+ },
+ {
+  "vendor": "jetbrains",
+  "product": "pycharm",
+  "name": "PyCharm",
+  "patterns": [
+   "PyCharm*"
+  ],
+  "publisher": "JetBrains*"
+ },
+ {
+  "vendor": "jetbrains",
+  "product": "webstorm",
+  "name": "WebStorm",
+  "patterns": [
+   "WebStorm*"
+  ],
+  "publisher": "JetBrains*"
+ },
+ {
+  "vendor": "jetbrains",
+  "product": "phpstorm",
+  "name": "PhpStorm",
+  "patterns": [
+   "PhpStorm*"
+  ],
+  "publisher": "JetBrains*"
+ },
+ {
+  "vendor": "jetbrains",
+  "product": "rider",
+  "name": "Rider",
+  "patterns": [
+   "JetBrains Rider*"
+  ],
+  "publisher": "JetBrains*"
+ },
+ {
+  "vendor": "jetbrains",
+  "product": "goland",
+  "name": "GoLand",
+  "patterns": [
+   "GoLand*"
+  ],
+  "publisher": "JetBrains*"
+ },
+ {
+  "vendor": "jetbrains",
+  "product": "clion",
+  "name": "CLion",
+  "patterns": [
+   "CLion*"
+  ],
+  "publisher": "JetBrains*"
+ },
+ {
+  "vendor": "jetbrains",
+  "product": "datagrip",
+  "name": "DataGrip",
+  "patterns": [
+   "DataGrip*"
+  ],
+  "publisher": "JetBrains*"
+ },
+ {
+  "vendor": "jetbrains",
+  "product": "toolbox_app",
+  "name": "JetBrains Toolbox",
+  "patterns": [
+   "JetBrains Toolbox*"
+  ],
+  "publisher": "JetBrains*"
+ },
+ {
+  "vendor": "putty",
+  "product": "putty",
+  "name": "PuTTY",
+  "patterns": [
+   "PuTTY*"
+  ]
+ },
+ {
+  "vendor": "winscp",
+  "product": "winscp",
+  "name": "WinSCP",
+  "patterns": [
+   "WinSCP*"
+  ]
+ },
+ {
+  "vendor": "filezilla-project",
+  "product": "filezilla_client",
+  "name": "FileZilla",
+  "patterns": [
+   "FileZilla*"
+  ]
+ },
+ {
+  "vendor": "filezilla-project",
+  "product": "filezilla_server",
+  "name": "FileZilla Server",
+  "patterns": [
+   "FileZilla Server*"
+  ]
+ },
+ {
+  "vendor": "mobatek",
+  "product": "mobaxterm",
+  "name": "MobaXterm",
+  "patterns": [
+   "MobaXterm*"
+  ]
+ },
+ {
+  "vendor": "mremoteng",
+  "product": "mremoteng",
+  "name": "mRemoteNG",
+  "patterns": [
+   "mRemoteNG*"
+  ]
+ },
+ {
+  "vendor": "openvpn",
+  "product": "openvpn",
+  "name": "OpenVPN",
+  "patterns": [
+   "OpenVPN *",
+   "OpenVPN"
+  ],
+  "publisher": "OpenVPN*"
+ },
+ {
+  "vendor": "openvpn",
+  "product": "openvpn_connect",
+  "name": "OpenVPN Connect",
+  "patterns": [
+   "OpenVPN Connect*"
+  ],
+  "publisher": "OpenVPN*"
+ },
+ {
+  "vendor": "fortinet",
+  "product": "forticlient",
+  "name": "FortiClient",
+  "patterns": [
+   "FortiClient*"
+  ],
+  "publisher": "Fortinet*"
+ },
+ {
+  "vendor": "cisco",
+  "product": "anyconnect_secure_mobility_client",
+  "name": "Cisco AnyConnect",
+  "patterns": [
+   "Cisco AnyConnect Secure Mobility Client*"
+  ],
+  "publisher": "Cisco*"
+ },
+ {
+  "vendor": "cisco",
+  "product": "secure_client",
+  "name": "Cisco Secure Client",
+  "patterns": [
+   "Cisco Secure Client*"
+  ],
+  "publisher": "Cisco*"
+ },
+ {
+  "vendor": "cisco",
+  "product": "webex_meetings",
+  "name": "Cisco Webex Meetings",
+  "patterns": [
+   "Cisco Webex Meetings*"
+  ],
+  "publisher": "Cisco*"
+ },
+ {
+  "vendor": "cisco",
+  "product": "jabber",
+  "name": "Cisco Jabber",
+  "patterns": [
+   "Cisco Jabber*"
+  ],
+  "publisher": "Cisco*"
+ },
+ {
+  "vendor": "paloaltonetworks",
+  "product": "globalprotect",
+  "name": "GlobalProtect",
+  "patterns": [
+   "GlobalProtect*"
+  ],
+  "publisher": "Palo Alto*"
+ },
+ {
+  "vendor": "teamviewer",
+  "product": "teamviewer",
+  "name": "TeamViewer",
+  "patterns": [
+   "TeamViewer*"
+  ],
+  "publisher": "TeamViewer*"
+ },
+ {
+  "vendor": "anydesk",
+  "product": "anydesk",
+  "name": "AnyDesk",
+  "patterns": [
+   "AnyDesk*"
+  ],
+  "publisher": "AnyDesk*"
+ },
+ {
+  "vendor": "realvnc",
+  "product": "vnc_server",
+  "name": "RealVNC Server",
+  "patterns": [
+   "VNC Server*",
+   "RealVNC Server*"
+  ],
+  "publisher": "RealVNC*"
+ },
+ {
+  "vendor": "realvnc",
+  "product": "vnc_viewer",
+  "name": "RealVNC Viewer",
+  "patterns": [
+   "VNC Viewer*",
+   "RealVNC Viewer*"
+  ],
+  "publisher": "RealVNC*"
+ },
+ {
+  "vendor": "tightvnc",
+  "product": "tightvnc",
+  "name": "TightVNC",
+  "patterns": [
+   "TightVNC*"
+  ]
+ },
+ {
+  "vendor": "uvnc",
+  "product": "ultravnc",
+  "name": "UltraVNC",
+  "patterns": [
+   "UltraVNC*"
+  ]
+ },
+ {
+  "vendor": "connectwise",
+  "product": "screenconnect",
+  "name": "ScreenConnect client",
+  "patterns": [
+   "ScreenConnect Client*",
+   "ConnectWise Control Client*"
+  ]
+ },
+ {
+  "vendor": "zoom",
+  "product": "meetings",
+  "name": "Zoom Workplace",
+  "patterns": [
+   "Zoom*",
+   "Zoom Workplace*"
+  ],
+  "publisher": "Zoom Video Communications*"
+ },
+ {
+  "vendor": "slack",
+  "product": "slack",
+  "name": "Slack",
+  "patterns": [
+   "Slack*"
+  ],
+  "publisher": "Slack Technologies*"
+ },
+ {
+  "vendor": "discord",
+  "product": "discord",
+  "name": "Discord",
+  "patterns": [
+   "Discord"
+  ],
+  "publisher": "Discord*"
+ },
+ {
+  "vendor": "telegram",
+  "product": "telegram_desktop",
+  "name": "Telegram Desktop",
+  "patterns": [
+   "Telegram Desktop*"
+  ]
+ },
+ {
+  "vendor": "signal",
+  "product": "signal-desktop",
+  "name": "Signal",
+  "patterns": [
+   "Signal*"
+  ],
+  "publisher": "Signal Messenger*"
+ },
+ {
+  "vendor": "videolan",
+  "product": "vlc_media_player",
+  "name": "VLC media player",
+  "patterns": [
+   "VLC media player*"
+  ],
+  "publisher": "VideoLAN*"
+ },
+ {
+  "vendor": "audacityteam",
+  "product": "audacity",
+  "name": "Audacity",
+  "patterns": [
+   "Audacity*"
+  ]
+ },
+ {
+  "vendor": "gimp",
+  "product": "gimp",
+  "name": "GIMP",
+  "patterns": [
+   "GIMP*"
+  ]
+ },
+ {
+  "vendor": "inkscape",
+  "product": "inkscape",
+  "name": "Inkscape",
+  "patterns": [
+   "Inkscape*"
+  ]
+ },
+ {
+  "vendor": "blender",
+  "product": "blender",
+  "name": "Blender",
+  "patterns": [
+   "Blender*"
+  ],
+  "publisher": "Blender Foundation*"
+ },
+ {
+  "vendor": "irfanview",
+  "product": "irfanview",
+  "name": "IrfanView",
+  "patterns": [
+   "IrfanView*"
+  ]
+ },
+ {
+  "vendor": "greenshot",
+  "product": "greenshot",
+  "name": "Greenshot",
+  "patterns": [
+   "Greenshot*"
+  ]
+ },
+ {
+  "vendor": "obsproject",
+  "product": "obs_studio",
+  "name": "OBS Studio",
+  "patterns": [
+   "OBS Studio*"
+  ]
+ },
+ {
+  "vendor": "handbrake",
+  "product": "handbrake",
+  "name": "HandBrake",
+  "patterns": [
+   "HandBrake*"
+  ]
+ },
+ {
+  "vendor": "foobar2000",
+  "product": "foobar2000",
+  "name": "foobar2000",
+  "patterns": [
+   "foobar2000*"
+  ]
+ },
+ {
+  "vendor": "kodi",
+  "product": "kodi",
+  "name": "Kodi",
+  "patterns": [
+   "Kodi"
+  ]
+ },
+ {
+  "vendor": "plex",
+  "product": "media_server",
+  "name": "Plex Media Server",
+  "patterns": [
+   "Plex Media Server*"
+  ],
+  "publisher": "Plex*"
+ },
+ {
+  "vendor": "apple",
+  "product": "itunes",
+  "name": "iTunes",
+  "patterns": [
+   "iTunes"
+  ],
+  "publisher": "Apple*"
+ },
+ {
+  "vendor": "apple",
+  "product": "icloud",
+  "name": "iCloud",
+  "patterns": [
+   "iCloud*"
+  ],
+  "publisher": "Apple*"
+ },
+ {
+  "vendor": "apple",
+  "product": "quicktime",
+  "name": "QuickTime",
+  "patterns": [
+   "QuickTime*"
+  ],
+  "publisher": "Apple*"
+ },
+ {
+  "vendor": "citrix",
+  "product": "workspace",
+  "name": "Citrix Workspace",
+  "patterns": [
+   "Citrix Workspace*"
+  ],
+  "publisher": "Citrix*"
+ },
+ {
+  "vendor": "citrix",
+  "product": "receiver",
+  "name": "Citrix Receiver",
+  "patterns": [
+   "Citrix Receiver*"
+  ],
+  "publisher": "Citrix*"
+ },
+ {
+  "vendor": "vmware",
+  "product": "workstation",
+  "name": "VMware Workstation",
+  "patterns": [
+   "VMware Workstation*"
+  ],
+  "publisher": "VMware*"
+ },
+ {
+  "vendor": "vmware",
+  "product": "workstation_player",
+  "name": "VMware Workstation Player",
+  "patterns": [
+   "VMware Player*",
+   "VMware Workstation Player*"
+  ],
+  "publisher": "VMware*"
+ },
+ {
+  "vendor": "vmware",
+  "product": "tools",
+  "name": "VMware Tools",
+  "patterns": [
+   "VMware Tools"
+  ],
+  "publisher": "VMware*"
+ },
+ {
+  "vendor": "vmware",
+  "product": "horizon_client",
+  "name": "VMware Horizon Client",
+  "patterns": [
+   "VMware Horizon Client*",
+   "Omnissa Horizon Client*"
+  ]
+ },
+ {
+  "vendor": "postgresql",
+  "product": "postgresql",
+  "name": "PostgreSQL",
+  "patterns": [
+   "PostgreSQL *"
+  ],
+  "publisher": "PostgreSQL Global Development Group*"
+ },
+ {
+  "vendor": "mariadb",
+  "product": "mariadb",
+  "name": "MariaDB",
+  "patterns": [
+   "MariaDB *"
+  ]
+ },
+ {
+  "vendor": "mongodb",
+  "product": "mongodb",
+  "name": "MongoDB",
+  "patterns": [
+   "MongoDB *"
+  ],
+  "publisher": "MongoDB*"
+ },
+ {
+  "vendor": "wireshark",
+  "product": "wireshark",
+  "name": "Wireshark",
+  "patterns": [
+   "Wireshark*"
+  ]
+ },
+ {
+  "vendor": "nmap",
+  "product": "nmap",
+  "name": "Nmap",
+  "patterns": [
+   "Nmap*"
+  ]
+ },
+ {
+  "vendor": "keepass",
+  "product": "keepass",
+  "name": "KeePass",
+  "patterns": [
+   "KeePass Password Safe*"
+  ]
+ },
+ {
+  "vendor": "keepassxc",
+  "product": "keepassxc",
+  "name": "KeePassXC",
+  "patterns": [
+   "KeePassXC*"
+  ]
+ },
+ {
+  "vendor": "idrix",
+  "product": "veracrypt",
+  "name": "VeraCrypt",
+  "patterns": [
+   "VeraCrypt*"
+  ]
+ },
+ {
+  "vendor": "cpuid",
+  "product": "cpu-z",
+  "name": "CPU-Z",
+  "patterns": [
+   "CPUID CPU-Z*"
+  ],
+  "publisher": "CPUID*"
+ },
+ {
+  "vendor": "piriform",
+  "product": "ccleaner",
+  "name": "CCleaner",
+  "patterns": [
+   "CCleaner*"
+  ]
+ },
+ {
+  "vendor": "docker",
+  "product": "desktop",
+  "name": "Docker Desktop",
+  "patterns": [
+   "Docker Desktop"
+  ],
+  "publisher": "Docker*"
+ },
+ {
+  "vendor": "hashicorp",
+  "product": "vagrant",
+  "name": "Vagrant",
+  "patterns": [
+   "Vagrant"
+  ],
+  "publisher": "HashiCorp*"
+ },
+ {
+  "vendor": "nextcloud",
+  "product": "desktop",
+  "name": "Nextcloud desktop client",
+  "patterns": [
+   "Nextcloud*"
+  ],
+  "publisher": "Nextcloud*"
+ },
+ {
+  "vendor": "calibre-ebook",
+  "product": "calibre",
+  "name": "calibre",
+  "patterns": [
+   "calibre*"
+  ]
+ },
+ {
+  "vendor": "pidgin",
+  "product": "pidgin",
+  "name": "Pidgin",
+  "patterns": [
+   "Pidgin*"
+  ]
+ },
+ {
+  "vendor": "sumatrapdfreader",
+  "product": "sumatrapdf",
+  "name": "SumatraPDF",
+  "patterns": [
+   "SumatraPDF*"
+  ]
+ },
+ {
+  "vendor": "geek_software",
+  "product": "pdf24_creator",
+  "name": "PDF24 Creator",
+  "patterns": [
+   "PDF24 Creator*"
+  ]
+ },
+ {
+  "vendor": "pdfforge",
+  "product": "pdfcreator",
+  "name": "PDFCreator",
+  "patterns": [
+   "PDFCreator*"
+  ]
+ },
+ {
+  "vendor": "gonitro",
+  "product": "nitro_pro",
+  "name": "Nitro PDF Pro",
+  "patterns": [
+   "Nitro Pro*",
+   "Nitro PDF Pro*"
+  ]
+ },
+ {
+  "vendor": "tracker-software",
+  "product": "pdf-xchange_editor",
+  "name": "PDF-XChange Editor",
+  "patterns": [
+   "PDF-XChange Editor*"
+  ]
+ },
+ {
+  "vendor": "foxit",
+  "product": "pdf_reader",
+  "name": "Foxit PDF Reader",
+  "patterns": [
+   "Foxit PDF Reader*",
+   "Foxit Reader*"
+  ],
+  "publisher": "Foxit*"
+ },
+ {
+  "vendor": "foxit",
+  "product": "pdf_editor",
+  "name": "Foxit PDF Editor",
+  "patterns": [
+   "Foxit PDF Editor*",
+   "Foxit PhantomPDF*"
+  ],
+  "publisher": "Foxit*"
+ },
+ {
+  "vendor": "artifex",
+  "product": "ghostscript",
+  "name": "Ghostscript",
+  "patterns": [
+   "GPL Ghostscript*"
+  ]
+ },
+ {
+  "vendor": "imagemagick",
+  "product": "imagemagick",
+  "name": "ImageMagick",
+  "patterns": [
+   "ImageMagick*"
+  ]
+ },
+ {
+  "vendor": "nvidia",
+  "product": "geforce_experience",
+  "name": "NVIDIA GeForce Experience",
+  "patterns": [
+   "NVIDIA GeForce Experience*"
+  ],
+  "publisher": "NVIDIA*"
+ },
+ {
+  "vendor": "hp",
+  "product": "support_assistant",
+  "name": "HP Support Assistant",
+  "patterns": [
+   "HP Support Assistant"
+  ],
+  "publisher": "HP*"
+ },
+ {
+  "vendor": "openssl",
+  "product": "openssl",
+  "name": "OpenSSL (Win64/Win32)",
+  "patterns": [
+   "OpenSSL *"
+  ]
+ },
+ {
+  "vendor": "vim",
+  "product": "vim",
+  "name": "Vim",
+  "patterns": [
+   "Vim *"
+  ]
+ },
+ {
+  "vendor": "gnu",
+  "product": "emacs",
+  "name": "GNU Emacs",
+  "patterns": [
+   "GNU Emacs*",
+   "Emacs*"
+  ]
+ },
+ {
+  "vendor": "r-project",
+  "product": "r",
+  "name": "R for Windows",
+  "patterns": [
+   "R for Windows*"
+  ]
+ },
+ {
+  "vendor": "rstudio",
+  "product": "rstudio",
+  "name": "RStudio",
+  "patterns": [
+   "RStudio"
+  ]
+ },
+ {
+  "vendor": "zabbix",
+  "product": "zabbix",
+  "name": "Zabbix Agent",
+  "patterns": [
+   "Zabbix Agent*"
+  ],
+  "publisher": "Zabbix*"
+ },
+ {
+  "vendor": "splunk",
+  "product": "universal_forwarder",
+  "name": "Splunk Universal Forwarder",
+  "patterns": [
+   "UniversalForwarder"
+  ],
+  "publisher": "Splunk*"
+ },
+ {
+  "vendor": "veeam",
+  "product": "backup_and_replication",
+  "name": "Veeam Backup & Replication",
+  "patterns": [
+   "Veeam Backup & Replication*"
+  ],
+  "publisher": "Veeam*"
+ },
+ {
+  "vendor": "lenovo",
+  "product": "system_update",
+  "name": "Lenovo System Update",
+  "patterns": [
+   "Lenovo System Update"
+  ],
+  "publisher": "Lenovo*"
+ },
+ {
+  "vendor": "dell",
+  "product": "command_update",
+  "name": "Dell Command | Update",
+  "patterns": [
+   "Dell Command | Update*"
+  ],
+  "publisher": "Dell*"
+ },
+ {
+  "vendor": "logitech",
+  "product": "options",
+  "name": "Logitech Options",
+  "patterns": [
+   "Logitech Options"
+  ],
+  "publisher": "Logitech*"
+ },
+ {
+  "vendor": "tableau",
+  "product": "tableau_desktop",
+  "name": "Tableau Desktop",
+  "patterns": [
+   "Tableau *"
+  ],
+  "publisher": "Tableau*"
+ },
+ {
+  "vendor": "autodesk",
+  "product": "desktop_app",
+  "name": "Autodesk Desktop App",
+  "patterns": [
+   "Autodesk Desktop App"
+  ],
+  "publisher": "Autodesk*"
+ },
+ {
+  "vendor": "sonicwall",
+  "product": "netextender",
+  "name": "SonicWall NetExtender",
+  "patterns": [
+   "SonicWall NetExtender*",
+   "NetExtender*"
+  ],
+  "publisher": "SonicWall*"
+ },
+ {
+  "vendor": "ivanti",
+  "product": "connect_secure",
+  "name": "Ivanti Secure Access Client",
+  "patterns": [
+   "Ivanti Secure Access Client*",
+   "Pulse Secure*"
+  ]
+ },
+ {
+  "vendor": "wireguard",
+  "product": "wireguard",
+  "name": "WireGuard",
+  "patterns": [
+   "WireGuard"
+  ],
+  "publisher": "WireGuard*"
+ },
+ {
+  "vendor": "dropbox",
+  "product": "dropbox",
+  "name": "Dropbox",
+  "patterns": [
+   "Dropbox"
+  ],
+  "publisher": "Dropbox*"
+ },
+ {
+  "vendor": "box",
+  "product": "box_drive",
+  "name": "Box Drive",
+  "patterns": [
+   "Box"
+  ],
+  "publisher": "Box*"
+ },
+ {
+  "vendor": "google",
+  "product": "drive",
+  "name": "Google Drive",
+  "patterns": [
+   "Google Drive"
+  ],
+  "publisher": "Google*"
+ },
+ {
+  "vendor": "evernote",
+  "product": "evernote",
+  "name": "Evernote",
+  "patterns": [
+   "Evernote*"
+  ]
+ },
+ {
+  "vendor": "notion",
+  "product": "notion",
+  "name": "Notion",
+  "patterns": [
+   "Notion*"
+  ],
+  "publisher": "Notion*"
+ },
+ {
+  "vendor": "postman",
+  "product": "postman",
+  "name": "Postman",
+  "patterns": [
+   "Postman*"
+  ],
+  "publisher": "Postman*"
+ }
+]

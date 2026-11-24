@@ -130,18 +130,6 @@ The e2e test only proves the packet bytes reach a socket on loopback. On a real 
 4. A `file_age` source on a UNC path (`\\nas\backups`) as SYSTEM: what the service account can and can't read.
 5. macOS (not Windows, but nowhere else to note it): Time Machine to a local disk and to a network destination, `tmutil latestbackup` and `tmutil status` while a backup runs.
 
-## 7c. Identity: Active Directory on a domain controller
-
-The e2e drives a fake directory; none of the PowerShell has run against a real DC. On a lab domain (one DC is enough; two to see replication), with the agent installed on a DC:
-
-1. The agent lists `identity_ad` in its capabilities (`ProductType` `LanmanNT`); a member server and a workstation don't.
-2. Add the client's AD directory and sync: every user and group appear, with last logon, password set and expiry (a "never expires" account shows none), locked accounts, `adminCount` users and Domain Admins members as privileged, and membership. Change a user in ADUC and sync again: a delta picks it up. Delete a user: it's marked gone after the next full sync (edit and save the directory to force one).
-3. Lock an account (bad passwords), unlock it from the console; with two DCs, note how long until the other DC sees it.
-4. Reset to the vault and shown once; sign in with it and get asked to change it. A fine-grained password policy (or the domain policy's length) refusing a short typed password gives the directory's message. Check the ActiveDirectory module's event logs and PowerShell script block logging (event 4104) for whether the password appears anywhere: it is in the stdin JSON, not the script, but logging policies vary.
-5. Disable, enable, remove from groups (including a group in another domain of the forest, expected to fail with a message).
-6. The built-in Administrator and krbtgt are refused even when the server is made to ask (send the op from a debug build).
-7. Windows PowerShell 5.1 on Server 2016, 2019, 2022 and 2025.
-
 ## 7b. Disk encryption and local admin rotation
 
 The CI runner has no BitLocker and isn't domain-joined; these need real hosts ([disk-encryption](disk-encryption.md), [local-admin](local-admin.md)).
@@ -154,6 +142,27 @@ The CI runner has no BitLocker and isn't domain-joined; these need real hosts ([
 6. Windows LAPS on the same machine managing `rmmadmin` (`AdministratorAccountName`): `conflict` and the alert; managing only the built-in Administrator: no conflict.
 7. A localised Windows (German, French): the account joins *Administratoren*/*Administrateurs* (looked up by SID). A local password policy stricter than the default (length 24): the failure message names the policy, the device keeps its previous password.
 8. Linux as root (Ubuntu with `sudo`, Rocky with `wheel`): the account is created, can `sudo`, and `chpasswd` sets the vault's password; on a host without `chpasswd`: `unsupported`.
+
+## 7c. Identity: Active Directory on a domain controller
+
+The e2e drives a fake directory; none of the PowerShell has run against a real DC. On a lab domain (one DC is enough; two to see replication), with the agent installed on a DC:
+
+1. The agent lists `identity_ad` in its capabilities (`ProductType` `LanmanNT`); a member server and a workstation don't.
+2. Add the client's AD directory and sync: every user and group appear, with last logon, password set and expiry (a "never expires" account shows none), locked accounts, `adminCount` users and Domain Admins members as privileged, and membership. Change a user in ADUC and sync again: a delta picks it up. Delete a user: it's marked gone after the next full sync (edit and save the directory to force one).
+3. Lock an account (bad passwords), unlock it from the console; with two DCs, note how long until the other DC sees it.
+4. Reset to the vault and shown once; sign in with it and get asked to change it. A fine-grained password policy (or the domain policy's length) refusing a short typed password gives the directory's message. Check the ActiveDirectory module's event logs and PowerShell script block logging (event 4104) for whether the password appears anywhere: it is in the stdin JSON, not the script, but logging policies vary.
+5. Disable, enable, remove from groups (including a group in another domain of the forest, expected to fail with a message).
+6. The built-in Administrator and krbtgt are refused even when the server is made to ask (send the op from a debug build).
+7. Windows PowerShell 5.1 on Server 2016, 2019, 2022 and 2025.
+
+## 7d. Vulnerabilities
+
+The e2e test proves the Windows path with a seeded inventory and a mock NVD. On a real Windows 10/11 host with a few mapped applications installed (Chrome, Firefox and Firefox ESR, 7-Zip, Notepad++, VLC, Adobe Acrobat Reader, Zoom):
+
+1. The device's Vulnerabilities tab says it is assessed as Windows applications, and each mapped application's installed title and `DisplayVersion` (Software tab) match its mapping (Firefox ESR goes to `firefox_esr`, not `firefox`).
+2. With an old version of one installed (an old 7-Zip or VLC), its known CVEs appear with the fixed version; after upgrading through the catalog's "Upgrade with" and a fresh inventory, they resolve.
+3. Applications not in the map show under Not assessed; mapping one (with its real CPE) brings in its NVD data on the next sync.
+4. Check the version formats: Zoom's, Adobe's and Office's `DisplayVersion`s against the NVD ranges for them, and note any product whose versions don't compare (as Python's and Java's don't, which is why they aren't mapped).
 
 ## 8. Fix what breaks, record versions
 

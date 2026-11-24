@@ -141,7 +141,18 @@ const pages: [string, string][] = [
 	['security-disk-encryption', '/security?tab=encryption'],
 	['policy-set-disk-encryption', '/policies/sets/00000000-0000-4000-8001-000000000000?section=encryption'],
 	['policy-set-local-admin', '/policies/sets/00000000-0000-4000-8001-000000000001?section=localadmin'],
-	['policy-new-disk-encryption', '/policies/sets/00000000-0000-4000-8001-000000000000?section=alerts&item=new&kind=disk_encryption']
+	['policy-new-disk-encryption', '/policies/sets/00000000-0000-4000-8001-000000000000?section=alerts&item=new&kind=disk_encryption'],
+	['vulnerabilities', '/vulnerabilities'],
+	['vulnerabilities-devices', '/vulnerabilities?tab=devices'],
+	['vulnerabilities-software', '/vulnerabilities?tab=software'],
+	['vulnerabilities-unassessed', '/vulnerabilities?tab=unassessed'],
+	['vulnerabilities-feeds', '/vulnerabilities?tab=feeds'],
+	['vulnerability', '/vulnerabilities/CVE-2024-6387'],
+	['vulnerability-windows', '/vulnerabilities/CVE-2024-7971'],
+	['agent-vulnerabilities', '/agents/a-3?tab=vulnerabilities'],
+	['agent-vulnerabilities-windows', '/agents/a-1?tab=vulnerabilities'],
+	['agent-vulnerabilities-unassessed', '/agents/a-7?tab=vulnerabilities'],
+	['policy-new-vulnerability', '/policies/sets/00000000-0000-4000-8001-000000000000?section=alerts&item=new&kind=vulnerability']
 ];
 const phone: [string, string][] = [
 	['dashboard', '/'],
@@ -184,7 +195,10 @@ const phone: [string, string][] = [
 	['backups', '/backups'],
 	['client-users', '/clients/c-acme?tab=users'],
 	['security-disk-encryption', '/security?tab=encryption'],
-	['agent-disk-encryption', '/agents/a-2?tab=inventory']
+	['agent-disk-encryption', '/agents/a-2?tab=inventory'],
+	['vulnerabilities', '/vulnerabilities'],
+	['vulnerability', '/vulnerabilities/CVE-2024-6387'],
+	['agent-vulnerabilities', '/agents/a-3?tab=vulnerabilities']
 ];
 
 const jpeg = readFileSync(new URL('./fixtures/desktop.jpg', import.meta.url));
