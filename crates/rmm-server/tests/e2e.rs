@@ -215,6 +215,8 @@ impl Agent {
                 .env("RMM_SENSOR_WATCH", sensor_dir(log_dir, &name, "watch"))
                 .env("RMM_SENSOR_CANARY_DIRS", sensor_dir(log_dir, &name, "home"))
                 .env("RMM_SENSOR_SCAN_ROOTS", sensor_dir(log_dir, &name, "scan"))
+                // Wake-on-LAN packets go to the test's socket, not the LAN.
+                .env("RMM_WOL_FAKE", wol_sink().local_addr().unwrap().to_string())
                 .stdout(log.try_clone().unwrap())
                 .stderr(log)
                 .spawn()
@@ -591,6 +593,7 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
 
     if std::env::var("RMM_E2E_ONLY").as_deref() == Ok("network") {
         network(&url, &admin, db, &id1, a_id, a_site, b_id).await;
+        wake_on_lan(&url, &admin, db, dir, &id1, a_id, a_site).await;
         a1.kill();
         return Ok(());
     }
@@ -1207,6 +1210,7 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
     api_keys_and_webhooks(&url, &admin, db, &id1, a_id, b_id).await;
     fields_tags_notes_views(&url, &admin, db, dir, &id1, a_id, b_id).await;
     network(&url, &admin, db, &id1, a_id, a_site, b_id).await;
+    wake_on_lan(&url, &admin, db, dir, &id1, a_id, a_site).await;
     sso_and_passkeys(server, db, dir, &secret).await;
 
     // --- rate limits ------------------------------------------------------------------------------
@@ -1349,6 +1353,129 @@ async fn sealed_values(db: &sqlx::PgPool) -> Vec<(&'static str, Vec<u8>)> {
 /// Network discovery and SNMP monitoring: the designated agent, credentials sealed at rest, what
 /// a site may be told to scan, and, with `RMM_E2E_SNMP`, a real scan and reading of a net-snmp
 /// device, its counters and alerts, and the public API.
+/// Where every test agent sends its Wake-on-LAN packets (`RMM_WOL_FAKE`).
+fn wol_sink() -> &'static std::net::UdpSocket {
+    static SINK: std::sync::OnceLock<std::net::UdpSocket> = std::sync::OnceLock::new();
+    SINK.get_or_init(|| std::net::UdpSocket::bind("127.0.0.1:0").unwrap())
+}
+
+/// The packets that reach [`wol_sink`] within `secs`: after the first, until half a second passes without one.
+async fn wol_packets(secs: u64) -> Vec<Vec<u8>> {
+    tokio::task::spawn_blocking(move || {
+        let sock = wol_sink();
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        let mut out = Vec::new();
+        let mut buf = [0u8; 512];
+        loop {
+            // Zero seconds drains what is queued already.
+            let left = if out.is_empty() { deadline.saturating_duration_since(Instant::now()) } else { Duration::from_millis(500) };
+            sock.set_read_timeout(Some(left.max(Duration::from_millis(5)))).unwrap();
+            match sock.recv(&mut buf) {
+                Ok(n) => out.push(buf[..n].to_vec()),
+                Err(_) => break,
+            }
+        }
+        out
+    })
+    .await
+    .unwrap()
+}
+
+fn magic_packet(mac: [u8; 6]) -> Vec<u8> {
+    let mut p = vec![0xff; 6];
+    for _ in 0..16 {
+        p.extend_from_slice(&mac);
+    }
+    p
+}
+
+/// Wake-on-LAN (docs/design/wake-on-lan.md): an offline device is woken through the online
+/// agent of its site, a site with nobody online can't be, and a patch window wakes once.
+async fn wake_on_lan(url: &str, admin: &Api, db: &sqlx::PgPool, dir: &Path, id1: &str, a_id: &str, a_site: &str) {
+    use reqwest::Method;
+    eventually(30, "the agent lists the wol capability", || async {
+        let caps: Vec<String> = sqlx::query_scalar("SELECT capabilities FROM agents WHERE id = $1::uuid").bind(id1).fetch_one(db).await.unwrap();
+        caps.iter().any(|c| c == "wol").then_some(())
+    })
+    .await;
+    // B: a device of the same site that is switched off. Its inventory is written here, so its
+    // MAC is known whatever machine runs the test.
+    let token = admin.post(&format!("/sites/{a_site}/enrollment-tokens"), json!({ "label": "wol" })).await["token"].as_str().unwrap().to_string();
+    let b = Agent::new(dir, "wol-b").enroll(url, &token).unwrap();
+    let b_mac = [0x5c, 0x26, 0x0a, 0xe2, 0xe0, 0x01];
+    let inventory = |mac: &str| {
+        json!({ "network": [
+            { "name": "lo", "mac": "00:00:00:00:00:00", "addrs": ["127.0.0.1/8"] },
+            { "name": "docker0", "mac": "02:42:ac:11:00:01", "addrs": ["172.17.0.1/16"] },
+            { "name": "eth0", "mac": mac, "addrs": ["10.99.0.5/24"] },
+        ]})
+    };
+    sqlx::query("UPDATE agents SET inventory = $2 WHERE id = $1::uuid").bind(&b).bind(inventory("5C-26-0A-E2-E0-01")).execute(db).await.unwrap();
+    wol_packets(0).await;
+
+    let r = admin.post(&format!("/agents/{b}/wake"), json!({})).await;
+    assert_eq!((r["outcome"].as_str(), r["results"][0]["sender_id"].as_str()), (Some("sent"), Some(id1)), "{r}");
+    let packets = wol_packets(10).await;
+    assert!(!packets.is_empty() && packets.iter().all(|p| *p == magic_packet(b_mac)), "B's magic packet only: {packets:?}");
+    assert!(packets.len() >= 3, "sent three times: {}", packets.len());
+    let sent_at: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar("SELECT wol_sent_at FROM agents WHERE id = $1::uuid").bind(&b).fetch_one(db).await.unwrap();
+    assert!(sent_at.is_some());
+    let audit = admin.get(&format!("/agents/{b}/activity")).await;
+    assert!(audit.as_array().unwrap().iter().any(|r| r["action"] == "agent.wake"), "{audit}");
+    // An online device has nothing to wake.
+    assert_eq!(admin.post(&format!("/agents/{id1}/wake"), json!({})).await["outcome"], "online");
+
+    // Bulk: B again, and C at a site where nobody is online; one invisible id spoils it all.
+    let site_c = admin.post(&format!("/clients/{a_id}/sites"), json!({ "name": "Branch (nobody on)" })).await["id"].as_str().unwrap().to_string();
+    let token_c = admin.post(&format!("/sites/{site_c}/enrollment-tokens"), json!({ "label": "wol" })).await["token"].as_str().unwrap().to_string();
+    let c = Agent::new(dir, "wol-c").enroll(url, &token_c).unwrap();
+    sqlx::query("UPDATE agents SET inventory = $2 WHERE id = $1::uuid").bind(&c).bind(inventory("5c:26:0a:e2:e0:02")).execute(db).await.unwrap();
+    let d = Agent::new(dir, "wol-d").enroll(url, &token).unwrap(); // no inventory: no MAC
+    let (s, _) = admin.call(Method::POST, "/agents/wake", Some(json!({ "agent_ids": [b, uuid::Uuid::new_v4()] }))).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    let (s, _) = admin.call(Method::POST, "/agents/wake", Some(json!({ "agent_ids": [] }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let r = admin.post("/agents/wake", json!({ "agent_ids": [b, c, d, id1] })).await;
+    assert_eq!((r["sent"].as_i64(), r["no_sender"].as_i64(), r["no_mac"].as_i64(), r["online"].as_i64()), (Some(1), Some(1), Some(1), Some(1)), "{r}");
+    let outcome = |id: &str| r["results"].as_array().unwrap().iter().find(|x| x["agent_id"] == id).unwrap()["outcome"].clone();
+    assert_eq!((outcome(&b), outcome(&c), outcome(&d)), (json!("sent"), json!("no_sender"), json!("no_mac")));
+    assert!(wol_packets(10).await.iter().all(|p| *p == magic_packet(b_mac)), "nothing for C");
+
+    // Before a patch window: B has an approved update, its policy installs automatically in a
+    // window that opens in ten minutes, and wakes 30 minutes before.
+    let before = admin.item_in(ROOT_SET, PATCH_ITEM).await["item_config"].clone();
+    let (s, v) = admin.set_root_item(PATCH_ITEM, json!({ "wake_before_minutes": 61 })).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    sqlx::query("UPDATE agents SET wol_sent_at = NULL WHERE id = $1::uuid").bind(&b).execute(db).await.unwrap();
+    sqlx::query(
+        "INSERT INTO patches (agent_id, update_id, title, category, approval, approval_manual) VALUES ($1::uuid, 'wol-upd', 'Update for WoL', 'security', 'approved', true)",
+    )
+    .bind(&b)
+    .execute(db)
+    .await
+    .unwrap();
+    let start = (chrono::Utc::now() + chrono::Duration::minutes(10)).format("%H:%M").to_string();
+    let (s, v) = admin
+        .set_root_item(
+            PATCH_ITEM,
+            json!({ "auto_install": true, "wake_before_minutes": 30, "window": { "days": [0, 1, 2, 3, 4, 5, 6], "start": start, "minutes": 60, "tz": "UTC" } }),
+        )
+        .await;
+    assert!(s.is_success(), "{v}");
+    wol_packets(0).await;
+    let packets = wol_packets(75).await;
+    assert!(!packets.is_empty() && packets.iter().all(|p| *p == magic_packet(b_mac)), "the patch scheduler woke B: {packets:?}");
+    let sent_at: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar("SELECT wol_sent_at FROM agents WHERE id = $1::uuid").bind(&b).fetch_one(db).await.unwrap();
+    assert!(sent_at.is_some());
+    assert!(wol_packets(70).await.is_empty(), "once: not again on the next tick");
+    let (s, v) = admin.call(Method::PUT, &format!("/policy-items/{PATCH_ITEM}"), Some(json!({ "config": before }))).await;
+    assert!(s.is_success(), "{v}");
+    for id in [&b, &c, &d] {
+        let (s, _) = admin.call(Method::DELETE, &format!("/agents/{id}"), None).await;
+        assert!(s.is_success());
+    }
+}
+
 async fn network(url: &str, admin: &Api, db: &sqlx::PgPool, id1: &str, a_id: &str, a_site: &str, b_id: &str) {
     use reqwest::Method;
     let snmp = std::env::var("RMM_E2E_SNMP").ok().filter(|s| !s.is_empty());
@@ -5959,7 +6086,137 @@ async fn billing(url: &str, admin: &Api, tech: &Api, db: &sqlx::PgPool, a_id: &s
     assert!(String::from_utf8_lossy(&qbr).contains("(Quarterly business review)"));
     let ov = admin.get("/billing/overview").await;
     assert!(ov["currencies"].as_array().unwrap().iter().any(|c| c["currency"] == "USD"), "{ov}");
+    scheduled_reports(url, admin, db, a_id, b_id, &mail, payer["id"].as_str().unwrap()).await;
     println!("time, contracts, invoices, accounting, projects, schedule, reports: ok");
+}
+
+/// Scheduled reports (docs/design/scheduled-reports.md): send now, the PDF reaches a user and a
+/// contact, who may receive what, the owner's access at run time, and the timetable.
+async fn scheduled_reports(url: &str, admin: &Api, db: &sqlx::PgPool, a_id: &str, b_id: &str, mail: &Mail, payer_id: &str) {
+    use reqwest::Method;
+    let pdf_to = |raw: &str| {
+        let m = mail_parser::MessageParser::default().parse(raw.as_bytes()).unwrap();
+        let att = m.attachments().next().expect("a PDF attached");
+        (att.attachment_name().unwrap_or_default().to_string(), att.decoded().starts_with(b"%PDF"))
+    };
+    // A QBR for client A, monthly, to the admin and client A's billing contact.
+    let admin_id = admin.get("/auth/me").await["id"].as_str().unwrap().to_string();
+    let qbr = admin
+        .post(
+            "/report-schedules",
+            json!({ "name": "Client A monthly review", "report": "qbr", "client_id": a_id, "params": { "range": "last_month" },
+                    "cron": "0 7 1 * *", "timezone": "Europe/London", "user_ids": [admin_id], "contact_ids": [payer_id],
+                    "message": "Here is last month's review." }),
+        )
+        .await;
+    let qbr_id = qbr["id"].as_str().unwrap().to_string();
+    let next = chrono::DateTime::parse_from_rfc3339(qbr["next_run_at"].as_str().expect("a next run")).unwrap();
+    let local = next.with_timezone(&chrono_tz::Europe::London);
+    assert_eq!(local.format("%d %H:%M").to_string(), "01 07:00", "the 1st at 07:00 in London: {next}");
+    assert!(next > chrono::Utc::now());
+    let before = mail.lock().unwrap().len();
+    let run = admin.post(&format!("/report-schedules/{qbr_id}/run"), json!({})).await;
+    assert_eq!(run["status"], "sent", "{run}");
+    assert_eq!(run["trigger"], "manual");
+    let queued: Vec<&str> = run["recipients"].as_array().unwrap().iter().filter(|r| r["status"] == "queued").map(|r| r["email"].as_str().unwrap()).collect();
+    assert_eq!(queued, [ADMIN_EMAIL, "paula@client-a.example"], "{run}");
+    for to in [ADMIN_EMAIL, "paula@client-a.example"] {
+        let raw = eventually(30, "the report email", || async {
+            mail.lock().unwrap()[before..].iter().find(|(r, d)| r.iter().any(|x| x == to) && d.contains("monthly review")).map(|(_, d)| d.clone())
+        })
+        .await;
+        let (name, pdf) = pdf_to(&raw);
+        assert!(pdf && name.starts_with("QBR-ClientA-") && name.ends_with(".pdf"), "{name}");
+        assert!(mail_text(&raw).contains("Here is last month's review."));
+        let to_header = header(&raw, "To").unwrap_or_default().to_string();
+        assert!(!to_header.contains(if to == ADMIN_EMAIL { "paula" } else { "admin" }), "one message per recipient: {to_header}");
+    }
+    let runs = admin.get(&format!("/report-schedules/{qbr_id}/runs")).await;
+    assert_eq!(runs.as_array().unwrap().len(), 1);
+    let res = admin.http.get(format!("{}/report-runs/{}/download", admin.base, run["id"].as_str().unwrap())).send().await.unwrap();
+    assert!(res.status().is_success() && res.bytes().await.unwrap().starts_with(b"%PDF"));
+    let audit: i64 = sqlx::query_scalar("SELECT count(*) FROM audit_log WHERE action = 'report.sent' AND target_id = $1::uuid").bind(&qbr_id).fetch_one(db).await.unwrap();
+    assert_eq!(audit, 1);
+
+    // Who may receive what.
+    let body = |report: &str, client: Option<&str>, contacts: Vec<&str>| {
+        json!({ "name": "x", "report": report, "client_id": client, "cron": "0 7 * * 1", "user_ids": [admin_id], "contact_ids": contacts })
+    };
+    for (what, b) in [
+        ("a contact on a profitability report", body("profitability", None, vec![payer_id])),
+        ("a contact on utilisation", body("utilisation", None, vec![payer_id])),
+        ("a contact on another client's QBR", body("qbr", Some(b_id), vec![payer_id])),
+        ("a contact on an all-clients service desk report", body("service_desk", None, vec![payer_id])),
+        ("a QBR without a client", body("qbr", None, vec![])),
+        ("a bad cron", json!({ "name": "x", "report": "service_desk", "cron": "every day", "user_ids": [admin_id] })),
+        ("nobody to send to", json!({ "name": "x", "report": "service_desk", "cron": "0 7 * * 1" })),
+        ("an unknown range", json!({ "name": "x", "report": "service_desk", "cron": "0 7 * * 1", "user_ids": [admin_id], "params": { "range": "forever" } })),
+    ] {
+        let (s, v) = admin.call(Method::POST, "/report-schedules", Some(b)).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{what}: {v}");
+    }
+    let desk = admin.post("/report-schedules", body("service_desk", Some(a_id), vec![payer_id])).await;
+    assert_eq!(desk["report"], "service_desk", "a client's service desk report may go to its contact");
+
+    // A technician: their own schedules only, money only with billing.read, no other addresses.
+    let tech = signed_in(url, admin, "reports-tech@e2e.test", "technician", None, false).await;
+    let tech_id = tech.get("/auth/me").await["id"].as_str().unwrap().to_string();
+    let mine = json!({ "name": "Margins", "report": "profitability", "cron": "0 8 * * 1", "user_ids": [tech_id] });
+    let (s, _) = tech.call(Method::POST, "/report-schedules", Some(mine.clone())).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "no billing.read");
+    let (s, _) = tech
+        .call(Method::POST, "/report-schedules", Some(json!({ "name": "x", "report": "service_desk", "cron": "0 8 * * 1", "extra_emails": ["boss@elsewhere.example"] })))
+        .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "other addresses are an admin's call");
+    admin.put(&format!("/users/{tech_id}/permissions"), json!({ "permissions": ["security.read", "billing.read"] })).await;
+    let margins = tech.post("/report-schedules", mine).await;
+    let margins_id = margins["id"].as_str().unwrap().to_string();
+    assert!(tech.get("/report-schedules").await.as_array().unwrap().iter().all(|r| r["owner_id"] == tech_id.as_str()), "only their own");
+    let (s, _) = tech.call(Method::GET, &format!("/report-schedules/{qbr_id}"), None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    assert!(admin.get("/report-schedules").await.as_array().unwrap().len() >= 3, "admins see all");
+    let ok = tech.post(&format!("/report-schedules/{margins_id}/run"), json!({})).await;
+    assert_eq!(ok["status"], "sent", "{ok}");
+    // The owner loses billing.read: the next run fails, saying why, and mails nothing.
+    admin.put(&format!("/users/{tech_id}/permissions"), json!({ "permissions": ["security.read"] })).await;
+    let sent_before = mail.lock().unwrap().len();
+    let failed = admin.post(&format!("/report-schedules/{margins_id}/run"), json!({})).await;
+    assert_eq!(failed["status"], "failed", "{failed}");
+    assert!(failed["error"].as_str().unwrap().contains("billing.read"), "{failed}");
+    let s = admin.get(&format!("/report-schedules/{margins_id}")).await;
+    assert_eq!((s["last_status"].as_str(), s["last_error"].is_string()), (Some("failed"), true));
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(
+        !mail.lock().unwrap()[sent_before..].iter().any(|(to, _)| to.iter().any(|t| t == "reports-tech@e2e.test")),
+        "nothing was mailed"
+    );
+
+    // The timetable: a due schedule runs on its own and moves to its next time.
+    sqlx::query("UPDATE report_schedules SET next_run_at = now() - interval '1 minute' WHERE id = $1::uuid").bind(&qbr_id).execute(db).await.unwrap();
+    let r = eventually(60, "the scheduled run", || async {
+        let runs = admin.get(&format!("/report-schedules/{qbr_id}/runs")).await;
+        runs.as_array().unwrap().iter().find(|r| r["trigger"] == "schedule" && r["status"] != "running").cloned()
+    })
+    .await;
+    assert_eq!(r["status"], "sent", "{r}");
+    let s = admin.get(&format!("/report-schedules/{qbr_id}")).await;
+    let next = chrono::DateTime::parse_from_rfc3339(s["next_run_at"].as_str().unwrap()).unwrap();
+    assert!(next > chrono::Utc::now(), "moved on: {next}");
+    // Off: no next run. Deleting takes the runs and their PDFs with it.
+    let mut off = s.clone();
+    off["enabled"] = json!(false);
+    let off = admin.put(&format!("/report-schedules/{qbr_id}"), off).await;
+    assert!(off["next_run_at"].is_null(), "{off}");
+    let keys: Vec<String> = sqlx::query_scalar("SELECT storage_key FROM report_runs WHERE schedule_id = $1::uuid AND storage_key IS NOT NULL").bind(&qbr_id).fetch_all(db).await.unwrap();
+    assert_eq!(keys.len(), 2);
+    let (s, _) = admin.call(Method::DELETE, &format!("/report-schedules/{qbr_id}"), None).await;
+    assert!(s.is_success());
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM report_runs WHERE schedule_id = $1::uuid").bind(&qbr_id).fetch_one(db).await.unwrap();
+    assert_eq!(left, 0);
+    for id in [desk["id"].as_str().unwrap(), &margins_id] {
+        admin.call(Method::DELETE, &format!("/report-schedules/{id}"), None).await;
+    }
+    println!("scheduled reports: ok");
 }
 
 /// A user signed in through their own session, with two-factor authentication turned on when

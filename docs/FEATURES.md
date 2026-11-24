@@ -59,3 +59,8 @@ Built in parallel tracks and merged with full local checks (clippy incl. Windows
 - **Reach:** software deployment (`0032`, [design](design/software.md)); network discovery and SNMP (`0033`, [design](design/network.md)); Windows e2e sections and a [real-host test plan](design/windows-testing.md).
 
 Known gaps: no Windows run of any of it; SSO untested against real IdPs; no alerts for failed deployments; SNMP traps, LLDP and IPv6 scans not built; automations whose `field_value` no longer matches a select field's choices never fire.
+
+## Parity features (unreleased)
+
+- **Wake-on-LAN** (`0043`, [design](design/wake-on-lan.md)): wake one device or many through an online agent at the site; optional wake before a patch window.
+- **Scheduled reports** (`0045`, [design](design/scheduled-reports.md)): the four reports as PDFs on a timetable, emailed to users and contacts with the owner's access checked at run time; history and send now.

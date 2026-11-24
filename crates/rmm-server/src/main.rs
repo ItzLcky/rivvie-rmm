@@ -25,6 +25,7 @@ mod paging;
 mod patches;
 mod software;
 mod ratelimit;
+mod reports;
 mod rotate;
 mod siem;
 mod scheduler;
@@ -40,6 +41,7 @@ mod tickets;
 mod totp;
 mod updates;
 mod webauthn;
+mod wol;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -350,6 +352,7 @@ async fn serve(db: sqlx::PgPool, args: ServeArgs) -> Result<()> {
     tokio::spawn(updates::run(state.clone()));
     tokio::spawn(siem::run(state.clone()));
     tokio::spawn(netmon::run(state.clone()));
+    tokio::spawn(reports::run(state.clone()));
     if state.cfg.metrics_token.is_some() {
         info!("metrics: GET /metrics (bearer token required)");
     }

@@ -12,6 +12,22 @@ back, restore the backup taken before the upgrade (see
 
 ## [Unreleased]
 
+### Added
+
+- **Wake-on-LAN.** Wake an offline device from its page, or many from the agents list, through
+  another online agent at its site (the site's designated network agent first, else one on the
+  same subnet). A patch policy can wake devices up to an hour before their install window
+  (`wake_before_minutes`), at most once in 12 hours. `POST /agents/{id}/wake`, `POST /agents/wake`
+  (public API `wakeAgent`, `wakeAgents`), audited as `agent.wake`; agent capability `wol`.
+  Migration `0043`. See [docs/design/wake-on-lan.md](docs/design/wake-on-lan.md).
+- **Scheduled and emailed reports.** The service desk, utilisation, profitability and QBR reports
+  as PDFs on a cron timetable (weekly, monthly, quarterly presets; last week, month, quarter or 30
+  days), mailed one message per recipient to users, client contacts (QBR and their own client's
+  service desk report only) and, for admins, other addresses. Each run uses its owner's access at
+  the time it's sent, and fails with the reason if that's gone. History with the PDFs (kept 400
+  days) and "send now" under Reports → Scheduled. Migration `0045`. See
+  [docs/design/scheduled-reports.md](docs/design/scheduled-reports.md).
+
 ## [0.2.0] - 2026-11-23
 
 The first release since agent self-update shipped. Everything below is new since `v0.1.1`.
