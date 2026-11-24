@@ -176,7 +176,7 @@
 						{@const url = view[img.v]}
 						<div class="flex flex-wrap items-center gap-4">
 							<div class={['flex h-14 w-32 shrink-0 items-center justify-center rounded-md border p-2', img.dark ? 'bg-nav border-nav-border' : 'bg-raised border-border']}>
-								{#if url}<img src={url} alt="" class="max-h-full max-w-full object-contain" />{:else}<span class={['text-xs', img.dark ? 'text-nav-muted' : 'text-subtle']}>None</span>{/if}
+								{#if url}<img src={url} alt="" class="max-h-full max-w-full object-contain" />{:else}<span class={['text-xs', img.dark ? 'text-nav-muted' : 'text-muted']}>None</span>{/if}
 							</div>
 							<div class="min-w-0 flex-1">
 								<div class="text-sm font-medium">{img.label}</div>

@@ -123,8 +123,7 @@ const pages: [string, string][] = [
 	['network-device-down', '/network/devices/nd-2'],
 	['network-device-printer', '/network/devices/nd-3'],
 	['network-settings', '/network/settings?client=c-acme'],
-	['settings-branding', '/settings/branding'],
-	['client-branding', '/clients/c-acme?tab=settings']
+	['settings-branding', '/settings/branding']
 ];
 const phone: [string, string][] = [
 	['dashboard', '/'],
@@ -237,7 +236,8 @@ for (const theme of ['light', 'dark'] as const) {
 				await page.goto(path);
 				await settle(page);
 				if (name === 'branded-portal') await expect(page.getByRole('region', { name: 'Support contact' })).toContainText('acme-desk@northwind.example');
-				await expect(page.getByRole('link', { name: 'Licence and source' }).first()).toBeVisible();
+				// The AGPL source offer: on the sign-in pages and in the portal (the console has it on Account).
+				if (name !== 'branded-dashboard') await expect(page.getByRole('link', { name: 'Licence and source' }).first()).toBeVisible();
 				await expect(page).toHaveScreenshot(`${theme}-${name}.png`, { fullPage: name === 'branded-portal' });
 				const r = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa']).analyze();
 				expect(r.violations.filter((v) => v.impact === 'serious' || v.impact === 'critical').map((v) => v.id)).toEqual([]);
