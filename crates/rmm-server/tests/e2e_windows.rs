@@ -25,6 +25,10 @@
 //!   Defender would scan).
 //! - `sensor`: the sensor starts, reports process telemetry and a behaviour detection, and
 //!   quarantines (and restores) a test file that signed content flags.
+//! - `diskenc`: disk encryption through BitLocker's CIM classes: a report arrives and lists
+//!   `C:` (the runner has no BitLocker, so escrow there is unproven).
+//! - `laps`: local admin rotation, the real path: `rmm-e2e-admin` is created and its password
+//!   set with the NetUser APIs, checked with `LogonUserW`, rotated again, then deleted.
 //! - `update`: self-update with a signed build: the detached watchdog stops and starts the
 //!   service; a build that never confirms is rolled back; then the update that does confirm.
 //!   Needs two agent builds, see below.
@@ -453,7 +457,7 @@ struct Sections {
 }
 
 impl Sections {
-    const ALL: [&str; 7] = ["base", "shell", "eventlog", "patches", "defender", "sensor", "update"];
+    const ALL: [&str; 9] = ["base", "shell", "eventlog", "patches", "defender", "sensor", "diskenc", "laps", "update"];
 
     fn from_env() -> Self {
         let list = |k: &str| {
@@ -486,6 +490,8 @@ impl Sections {
                 "patches" => patches(admin, id).await,
                 "defender" => defender(admin, dir, id).await,
                 "sensor" => sensor(admin, dir, id).await,
+                "diskenc" => diskenc(admin, id).await,
+                "laps" => laps(admin, id).await,
                 "update" => update(admin, dir, id).await,
                 _ => unreachable!(),
             }
@@ -926,6 +932,73 @@ async fn sensor(admin: &Api, dir: &Path, id: &str) {
     let (st, v) = admin.set_root_item(SECURITY_ITEM, policy(false)).await;
     assert!(st.is_success(), "{v}");
     eventually(60, "the sensor to stop", || async { (security_state(admin, id).await["sensor"]["running"] != true).then_some(()) }).await;
+}
+
+// --- disk encryption -------------------------------------------------------------------------------------
+
+async fn diskenc(admin: &Api, id: &str) {
+    admin.post(&format!("/agents/{id}/disk-encryption/refresh"), json!({})).await;
+    let d = eventually(120, "a disk encryption report", || async {
+        let d = admin.get(&format!("/agents/{id}/disk-encryption")).await;
+        (!d["reported_at"].is_null()).then_some(d)
+    })
+    .await;
+    println!("disk encryption: {d}");
+    let c = d["volumes"].as_array().unwrap().iter().find(|v| v["volume_id"] == "C:").unwrap_or_else(|| panic!("C: listed: {d}"));
+    assert_eq!(c["role"], "os", "{d}");
+    assert!(c["status"].is_string() && c["kind"].is_string(), "{d}");
+    assert!(d["error"].is_null(), "read without an error: {d}");
+}
+
+// --- local admin rotation (Windows LAPS-style) --------------------------------------------------------------
+
+const LAPS_ITEM: &str = "00000000-0000-4000-8000-000000000006";
+const LAPS_ACCOUNT: &str = "rmm-e2e-admin";
+
+/// Signs in as the local account with `LogonUserW` (network logon); the password reaches
+/// PowerShell through the environment, never its command line.
+fn logon_works(password: &str) -> bool {
+    let script = r#"
+Add-Type -Namespace E2E -Name Logon -MemberDefinition '[DllImport("advapi32.dll", SetLastError=true, CharSet=CharSet.Unicode)] public static extern bool LogonUserW(string u, string d, string p, int t, int pr, out IntPtr h);'
+$h = [IntPtr]::Zero
+if ([E2E.Logon]::LogonUserW('rmm-e2e-admin', '.', $env:RMM_E2E_PW, 3, 0, [ref]$h)) { 'ok' } else { 'failed ' + [Runtime.InteropServices.Marshal]::GetLastWin32Error() }
+"#;
+    let out = Command::new("powershell.exe").args(["-NoProfile", "-NonInteractive", "-Command", script]).env("RMM_E2E_PW", password).output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    println!("LogonUserW: {text}");
+    text == "ok"
+}
+
+async fn laps_state(admin: &Api, id: &str, status: &str, after: Option<&str>) -> Value {
+    eventually(120, &format!("local admin state {status}"), || async {
+        let v = admin.get(&format!("/agents/{id}/local-admin")).await;
+        let s = &v["state"];
+        (s["status"] == status && after.is_none_or(|t| s["rotated_at"].as_str().is_some_and(|r| r > t))).then(|| s.clone())
+    })
+    .await
+}
+
+async fn laps(admin: &Api, id: &str) {
+    let _ = sh("net.exe", &["user", LAPS_ACCOUNT, "/delete"]);
+    let (s, v) = admin.set_root_item(LAPS_ITEM, json!({ "enabled": true, "account": LAPS_ACCOUNT, "create": true })).await;
+    assert!(s.is_success(), "{v}");
+    let first = laps_state(admin, id, "ok", None).await;
+    let item = first["vault_item_id"].as_str().expect("the vault item").to_string();
+    let pw1 = admin.post(&format!("/vault/{item}/reveal"), json!({ "field": "password" })).await["value"].as_str().unwrap().to_string();
+    let (_, groups) = powershell("(Get-LocalGroupMember -SID S-1-5-32-544 | Select-Object -ExpandProperty Name) -join ';'");
+    assert!(groups.to_ascii_lowercase().contains(LAPS_ACCOUNT), "an administrator: {groups}");
+    assert!(logon_works(&pw1), "the stored password signs in");
+    // Rotate again: the old password stops working, the new one works.
+    admin.post(&format!("/agents/{id}/local-admin/rotate"), json!({})).await;
+    let second = laps_state(admin, id, "ok", first["rotated_at"].as_str()).await;
+    assert_eq!(second["vault_item_id"], first["vault_item_id"]);
+    let pw2 = admin.post(&format!("/vault/{item}/reveal"), json!({ "field": "password" })).await["value"].as_str().unwrap().to_string();
+    assert_ne!(pw1, pw2);
+    assert!(logon_works(&pw2), "the rotated password signs in");
+    assert!(!logon_works(&pw1), "the old one doesn't");
+    admin.set_root_item(LAPS_ITEM, json!({ "enabled": false, "account": "rmmadmin" })).await;
+    let (ok, out) = sh("net.exe", &["user", LAPS_ACCOUNT, "/delete"]);
+    assert!(ok, "{out}");
 }
 
 // --- self-update ----------------------------------------------------------------------------------------------
