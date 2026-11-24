@@ -26,12 +26,14 @@ Follow the [manual plan](design/windows-testing.md) on Windows 10/11 and Server 
 - [ ] Branding on Windows: the branded MSI's name and icon in *Apps and features*, the service display name, the consent prompt title ([plan](design/windows-testing.md) §2.6).
 - [ ] Wake-on-LAN on a real LAN: a machine actually waking (S3/S4/S5, Fast startup), senders on each OS, and how switches treat directed broadcasts across VLANs ([plan](design/windows-testing.md#wake-on-lan-any-os-real-network)).
 - [ ] Uptime and backups on real hosts: ICMP through `IcmpSendEcho`, Windows Server Backup and Veeam event logs from real installs, Time Machine on a Mac (section 7a of the plan).
+- [ ] Identity on a real domain controller (Server 2016-2025): the `LanmanNT` detection, the sync script (`uSNChanged` deltas, `LockedOut`, FILETIMEs, `MemberOf` mapping) and each action script, a fine-grained password policy refusing a reset, RID 500/502 refused, and replication delay after an unlock ([plan](design/windows-testing.md) §7b).
 - [ ] Fix what breaks, and record the tested versions in the README.
 
 ### 2. Before the first real customer
 
 - [ ] **Security review** by someone outside the project: agent/server protocol, enrollment, the update and content signing chain, session handling, per-client scoping, the shell and desktop relays, the client portal, the password vault (envelope encryption, reveal auditing, rate limits), API keys and SSO.
 - [ ] **Try the integrations against the real services**, not stand-ins: AWS S3 (MinIO is done and in CI), Microsoft 365 over Graph, QuickBooks Online (sandbox company), Xero (demo organisation), OIDC with real Entra ID and Google tenants, and how real mail clients render our emails (including the branded sender name and footer, and scheduled report emails with their PDF attachments).
+- [ ] **Entra ID and Intune on a real tenant** ([identity](design/identity.md), [mdm](design/mdm.md)): the application permissions and the User Administrator role a password reset needs, `revokeSignInSessions`, removing from mail-enabled and dynamic groups (refused by Graph), directory roles and MFA registration with and without premium licences, paging and throttling on a large tenant, `managedDevices` compliance and encryption per platform, and how Intune device names match agent host names.
 - [ ] **Paging and push on real services** ([oncall](design/oncall.md), [pwa](design/pwa.md)): texts through a real Twilio number (and A2P 10DLC registration), PagerDuty and Opsgenie incidents opened and closed, Web Push delivered by Chrome, Firefox, Edge and Safari, the Acknowledge action from a lock screen, and the installed app on iOS 16.4+ and Android.
 
 ### 3. Gaps left by `v0.2.0`

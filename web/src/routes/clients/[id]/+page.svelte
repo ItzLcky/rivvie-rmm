@@ -12,6 +12,8 @@
 	import { allowed, can } from '#lib/session.svelte.js';
 	import ClientDocs from '#lib/components/docs/ClientDocs.svelte';
 	import ClientVault from '#lib/components/vault/ClientVault.svelte';
+	import UserList from '#lib/components/identity/UserList.svelte';
+	import MdmDevices from '#lib/components/identity/MdmDevices.svelte';
 	import ClientBilling from '#lib/components/billing/ClientBilling.svelte';
 	import BrandingEditor from '#lib/components/branding/BrandingEditor.svelte';
 	import { attempt, toast } from '#lib/toast.svelte.js';
@@ -223,6 +225,8 @@
 				{ value: 'fields', label: 'Fields' },
 				{ value: 'docs', label: 'Docs' },
 				{ value: 'passwords', label: 'Passwords', hidden: !allowed('vault.read') },
+				{ value: 'users', label: 'Users', hidden: !allowed('identity.read') },
+				{ value: 'mobile', label: 'Mobile and Intune', hidden: !allowed('identity.read') },
 				{ value: 'policies', label: 'Policies' },
 				{ value: 'billing', label: 'Billing', hidden: !allowed('billing.read') },
 				{ value: 'settings', label: 'Settings', hidden: !can('admin') }
@@ -383,6 +387,10 @@
 			<ClientDocs clientId={c.id} clientName={c.name} />
 		{:else if tab === 'passwords' && allowed('vault.read')}
 			<ClientVault clientId={c.id} clientName={c.name} />
+		{:else if tab === 'users' && allowed('identity.read')}
+			<UserList clientId={c.id} clientName={c.name} />
+		{:else if tab === 'mobile' && allowed('identity.read')}
+			<MdmDevices clientId={c.id} clientName={c.name} />
 		{:else if tab === 'policies'}
 			<div class="space-y-5">
 				<section class="card" aria-labelledby="assign-heading">

@@ -6,6 +6,7 @@ mod deploy;
 mod desktop;
 mod fetch;
 mod fsutil;
+mod identity;
 mod jobs;
 mod logwatch;
 mod net;

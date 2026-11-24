@@ -373,6 +373,13 @@ async fn handle(msg: ServerMsg, ctx: &Ctx, shells: &mut HashMap<Uuid, ShellSessi
         ServerMsg::WakeOnLan { request_id, targets } => {
             tokio::spawn(crate::net::wake(request_id, targets, tx.clone()));
         }
+        ServerMsg::Identity { request_id, op } => {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let reply = crate::identity::handle(op).await;
+                let _ = tx.send(AgentMsg::IdentityReply { request_id, reply }).await;
+            });
+        }
         ServerMsg::DesktopOpen { session_id, settings, consent } => {
             if desktops.len() >= MAX_DESKTOPS {
                 let reason = Some(format!("this machine already has {MAX_DESKTOPS} remote desktop sessions open"));
@@ -425,6 +432,9 @@ fn capabilities() -> Vec<String> {
     ];
     if cfg!(any(target_os = "linux", windows)) || std::env::var_os("RMM_DESKTOP_FAKE").is_some() {
         caps.push(rmm_proto::desktop::CAPABILITY.to_string());
+    }
+    if crate::identity::available() {
+        caps.push(rmm_proto::identity::CAPABILITY.to_string());
     }
     caps
 }

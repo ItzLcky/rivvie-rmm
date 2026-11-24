@@ -71,7 +71,7 @@ impl Histogram {
 
 /// Agent message types, in the order of [`Metrics::agent_messages`]. Must match
 /// `agent_ws::message_type`.
-pub const AGENT_MESSAGE_TYPES: [&str; 38] = [
+pub const AGENT_MESSAGE_TYPES: [&str; 43] = [
     "enroll",
     "auth",
     "heartbeat",
@@ -110,6 +110,12 @@ pub const AGENT_MESSAGE_TYPES: [&str; 38] = [
     "snmp_poll_result",
     "wake_on_lan_result",
     "check_results",
+    // 38-41 belong to other parity tracks; the coordinator puts their names here at merge.
+    "reserved_38",
+    "reserved_39",
+    "reserved_40",
+    "reserved_41",
+    "identity_reply",
 ];
 
 /// Why a message for an agent or a browser session was thrown away.

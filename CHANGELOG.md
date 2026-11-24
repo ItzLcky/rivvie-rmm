@@ -12,10 +12,28 @@ back, restore the backup taken before the upgrade (see
 
 ## [Unreleased]
 
-Migrations `0036`, `0037`, `0040` and `0042` to `0047` are new.
+Migrations `0036`, `0037`, `0040`, `0042` to `0047` and `0049` to `0051` are new.
 
 ### Added
 
+- **Identity management.** A client's Active Directory (through our agent on one of its domain
+  controllers, capability `identity_ad`) and Entra ID tenant (through Graph, with an app
+  registration in the customer's tenant whose secret is sealed) on a new Users tab: users and
+  groups synced on a schedule (AD deltas by `uSNChanged`, a full sync daily), matched to contacts
+  by email, with filters for locked, disabled, stale, no-MFA and privileged accounts. Unlock,
+  reset the password (generated or typed; shown once and stored nowhere, or saved in the vault as
+  a managed item), disable and enable, remove from groups and revoke sessions, audited as
+  `identity.*`. New permissions `identity.read` and `identity.manage` (technicians by default);
+  actions need two-factor authentication, privileged accounts an admin; RID 500 and 502 are never
+  touched; accounts synced from AD are changed in AD. AD operations use dedicated agent messages,
+  never script jobs. Ticket templates with checklists (seeded "New starter" and "Leaver") whose
+  items can run those actions on the ticket's directory user, each noted on the timeline.
+  Migrations `0049`, `0050`. See [docs/design/identity.md](docs/design/identity.md).
+- **Intune devices, read-only.** With the extra Graph permission, a client's Entra connection
+  also reads its Intune managed devices: a Mobile and Intune tab with compliance, encryption,
+  last check-in, user, the matched agent (by host name) and the gaps both ways; public API
+  `listMdmDevices`. Nothing is sent to Intune. Migration `0051`. See
+  [docs/design/mdm.md](docs/design/mdm.md).
 - **Script parameters.** Saved scripts declare typed parameters (text, number, yes/no, choice,
   secret) that the run dialog, schedules and automations fill in; each reaches the script as the
   environment variable `RMM_PARAM_<NAME>` (the script text is never rewritten). Text values may

@@ -38,6 +38,9 @@ mod scheduler;
 mod crypto;
 mod csat;
 mod graph;
+mod entra;
+mod identity;
+mod mdm;
 mod security;
 mod sla;
 mod shell_ws;
@@ -406,6 +409,7 @@ async fn serve(db: sqlx::PgPool, args: ServeArgs) -> Result<()> {
     tokio::spawn(oncall::run(state.clone()));
     tokio::spawn(push::run(state.clone()));
     tokio::spawn(uptime::run(state.clone()));
+    tokio::spawn(identity::run(state.clone()));
     if state.cfg.metrics_token.is_some() {
         info!("metrics: GET /metrics (bearer token required)");
     }

@@ -113,11 +113,13 @@
 		{ value: 'time.approve', label: 'Approve time', hint: 'Approve and reject timesheets' },
 		{ value: 'vault.read', label: 'See passwords', hint: 'Reveal vault passwords and notes, show TOTP codes. Needs two-factor authentication.' },
 		{ value: 'vault.manage', label: 'Manage passwords', hint: 'Add, change and delete vault credentials. Needs two-factor authentication.' },
-		{ value: 'audit.read', label: 'Audit log', hint: 'Read and export the audit log, in the dashboard and through API keys' }
+		{ value: 'audit.read', label: 'Audit log', hint: 'Read and export the audit log, in the dashboard and through API keys' },
+		{ value: 'identity.read', label: 'See directory users', hint: 'A client’s Active Directory and Entra ID users and groups, and its Intune devices' },
+		{ value: 'identity.manage', label: 'Manage directory users', hint: 'Unlock, reset passwords, disable, remove from groups, revoke sessions. Needs two-factor authentication; privileged accounts need an admin.' }
 	];
 	const roleDefaults: Record<string, string[]> = {
-		admin: ['security.read', 'security.respond', 'security.manage', 'billing.read', 'billing.manage', 'time.approve', 'vault.read', 'vault.manage', 'audit.read'],
-		technician: ['security.read', 'security.respond', 'vault.read', 'vault.manage'],
+		admin: ['security.read', 'security.respond', 'security.manage', 'billing.read', 'billing.manage', 'time.approve', 'vault.read', 'vault.manage', 'audit.read', 'identity.read', 'identity.manage'],
+		technician: ['security.read', 'security.respond', 'vault.read', 'vault.manage', 'identity.read', 'identity.manage'],
 		readonly: ['security.read']
 	};
 	const permLabel = (list: string[]) => (list.length ? perms.filter((p) => list.includes(p.value)).map((p) => p.label).join(', ') : 'No access');

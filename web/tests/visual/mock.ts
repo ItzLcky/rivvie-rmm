@@ -1309,7 +1309,7 @@ const docTemplates = [
 }));
 const categoryOut = (c: (typeof docCategories)[number]) => ({ ...c, docs: clientDocs.filter((d) => d.category_id === c.id).length, templates: docTemplates.filter((t) => t.category_id === c.id).length });
 
-const admin = { id: 'u-1', email: 'dana@northwind.example', name: 'Dana Admin', role: 'admin', totp_enabled: true, mfa_setup_required: false, client_ids: null, preferences: {}, permissions: ['security.read', 'security.respond', 'security.manage', 'vault.read', 'vault.manage'] };
+const admin = { id: 'u-1', email: 'dana@northwind.example', name: 'Dana Admin', role: 'admin', totp_enabled: true, mfa_setup_required: false, client_ids: null, preferences: {}, permissions: ['security.read', 'security.respond', 'security.manage', 'vault.read', 'vault.manage', 'identity.read', 'identity.manage'] };
 
 // --- Network discovery and SNMP devices ------------------------------------------------------------
 const netDev = (n: number, name: string, kind: string, host: string, state: 'up' | 'down', extra: Record<string, unknown> = {}) => ({
@@ -1522,6 +1522,59 @@ const portalTickets = [
 	{ id: 'pt-2', number: 1031, subject: 'New starter laptop for Raj', status_name: 'Resolved', status_category: 'resolved', priority: 3, contact_name: 'Ann Lopez', created_at: ago(60 * 24 * 6), last_activity_at: ago(60 * 24 * 2), merged_into: null }
 ];
 
+
+// --- identity: directories, users, Intune devices, ticket templates ------------------------------
+const identitySources = [
+	{ id: 'is-ad', client_id: 'c-acme', kind: 'ad', name: 'acme.local', agent_id: 'a-1', agent_hostname: 'acme-dc01', agent_online: true, tenant_id: '', app_client_id: '', has_secret: false, sync_devices: false, sync_minutes: 60, enabled: true, last_sync_at: ago(12), last_error: null, users: 5, groups: 4, devices: 0 },
+	{ id: 'is-entra', client_id: 'c-acme', kind: 'entra', name: 'Acme Microsoft 365', agent_id: null, agent_hostname: null, agent_online: null, tenant_id: 'acmecorp.onmicrosoft.com', app_client_id: '3c1d2e4f-5a6b-4c7d-8e9f-0a1b2c3d4e5f', has_secret: true, sync_devices: true, sync_minutes: 60, enabled: true, last_sync_at: ago(34), last_error: null, users: 2, groups: 1, devices: 4 }
+];
+const dirUser = (id: string, src: 'is-ad' | 'is-entra', username: string, display: string, extra: Record<string, unknown> = {}) => ({
+	id, source_id: src, source_name: src === 'is-ad' ? 'acme.local' : 'Acme Microsoft 365', kind: src === 'is-ad' ? 'ad' : 'entra', external_id: src === 'is-ad' ? `S-1-5-21-1004336348-1177238915-682003330-${1100 + id.length}` : `8d4c1f1e-0000-4000-8000-0000000000${id.slice(-2)}`,
+	username, upn: `${username}@acme.example`, display_name: display, email: `${username}@acme.example`, enabled: true, locked: false, privileged: false, synced_from_ad: false,
+	last_logon_at: ago(60 * 3), password_last_set: ago(60 * 24 * 40), password_expires_at: src === 'is-ad' ? ago(-60 * 24 * 50) : null, mfa_registered: src === 'is-ad' ? null : true,
+	department: '', title: '', contact_id: null as string | null, contact_name: null as string | null, deleted_at: null, synced_at: ago(12), ...extra
+});
+const dirUsers = [
+	dirUser('iu-01', 'is-ad', 'ann.lopez', 'Ann Lopez', { department: 'Office', title: 'Office manager', contact_id: 'ct-ann', contact_name: 'Ann Lopez', locked: true }),
+	dirUser('iu-02', 'is-ad', 'raj.patel', 'Raj Patel', { department: 'Warehouse', title: 'Warehouse lead', contact_id: 'ct-raj', contact_name: 'Raj Patel' }),
+	dirUser('iu-03', 'is-ad', 'it.admin', 'IT Admin', { privileged: true, last_logon_at: ago(60 * 24 * 2) }),
+	dirUser('iu-04', 'is-ad', 'temp.sales', 'Temp Sales', { enabled: false, last_logon_at: ago(60 * 24 * 130) }),
+	dirUser('iu-05', 'is-ad', 'svc.backup', 'Backup service', { last_logon_at: null, password_last_set: ago(60 * 24 * 700), password_expires_at: null }),
+	dirUser('iu-06', 'is-entra', 'ann', 'Ann Lopez', { contact_id: 'ct-ann', contact_name: 'Ann Lopez', synced_from_ad: true, last_logon_at: null }),
+	dirUser('iu-07', 'is-entra', 'kim.ng', 'Kim Ng', { mfa_registered: false, last_logon_at: null, department: 'Sales', title: 'Account manager' })
+];
+const dirUserDetail = (u: (typeof dirUsers)[number]) => ({
+	...u, client_id: 'c-acme', can_manage: true, vault_item_id: u.id === 'iu-02' ? 'v-1' : null,
+	groups: u.kind === 'ad' ? [{ id: 'ig-1', name: 'Warehouse', privileged: false }, { id: 'ig-2', name: 'VPN Users', privileged: false }, ...(u.privileged ? [{ id: 'ig-3', name: 'Domain Admins', privileged: true }] : [])] : [{ id: 'ig-9', name: 'Sales', privileged: false }]
+});
+const mdmDevice = (n: number, name: string, os: string, compliance: string, extra: Record<string, unknown> = {}) => ({
+	id: `md-${n}`, source_id: 'is-entra', source_name: 'Acme Microsoft 365', external_id: `0f5e0000-0000-4000-8000-00000000000${n}`, name, user_upn: 'ann@acme.example', os, os_version: os === 'Windows' ? '10.0.22631.4460' : '18.1',
+	compliance, encrypted: true, ownership: 'company', serial: `5CD12${n}4XYZ`, model: 'EliteBook 840 G9', manufacturer: 'HP', enrolled_at: ago(60 * 24 * 300), last_sync_at: ago(60 * n + 7),
+	agent_id: null as string | null, agent_hostname: null as string | null, agent_online: null as boolean | null, synced_at: ago(34), ...extra
+});
+const mdmDevices = [
+	mdmDevice(1, 'ACME-DC01', 'Windows', 'compliant', { agent_id: 'a-1', agent_hostname: 'acme-dc01', agent_online: true, user_upn: 'it.admin@acme.example' }),
+	mdmDevice(2, 'ACME-FS01', 'Windows', 'noncompliant', { agent_id: 'a-2', agent_hostname: 'acme-fs01', agent_online: true, encrypted: false, user_upn: 'raj.patel@acme.example' }),
+	mdmDevice(3, 'Ann’s iPhone', 'iOS', 'compliant', { ownership: 'personal', model: 'iPhone 15', manufacturer: 'Apple', serial: 'F2LXK0000000' }),
+	mdmDevice(4, 'ACME-LT07', 'Windows', 'inGracePeriod', { user_upn: 'kim.ng@acme.example' })
+];
+const ticketTemplates = [
+	{ id: 'tt-starter', name: 'New starter', client_id: null, client_name: null, board_id: null, type_id: null, priority: 3, subject: 'New starter: {name}', body: 'Set up a new member of staff.', updated_at: ago(60 * 24 * 10),
+	  checklist: [{ text: 'Confirm start date, role and manager' }, { text: 'Set an initial password and send it to the manager', action: 'identity.reset_password' }, { text: 'Add to the right groups' }, { text: 'Prepare and enroll a device' }] },
+	{ id: 'tt-leaver', name: 'Leaver', client_id: null, client_name: null, board_id: null, type_id: null, priority: 2, subject: 'Leaver: {name}', body: 'Offboard a member of staff who is leaving.', updated_at: ago(60 * 24 * 10),
+	  checklist: [{ text: 'Confirm the leaving date with the client' }, { text: 'Disable the account', action: 'identity.disable' }, { text: 'Sign out of every session', action: 'identity.revoke_sessions' }, { text: 'Remove from groups', action: 'identity.remove_groups' }, { text: 'Reset the password', action: 'identity.reset_password' }, { text: 'Collect equipment and convert or forward the mailbox' }] },
+	{ id: 'tt-laptop', name: 'Laptop swap', client_id: 'c-acme', client_name: 'Acme Corp', board_id: null, type_id: null, priority: 3, subject: 'Laptop swap: {name}', body: '', updated_at: ago(60 * 24 * 2), checklist: [{ text: 'Wipe the old laptop' }, { text: 'Sign out of every session', action: 'identity.revoke_sessions' }] }
+];
+const ticketChecklist = {
+	identity_user: { id: 'iu-02', display_name: 'Raj Patel', username: 'raj.patel', upn: 'raj.patel@acme.example', kind: 'ad', enabled: true, privileged: false, deleted: false },
+	items: [
+		{ id: 'ci-1', position: 0, text: 'Confirm the leaving date with the client', action: null, action_state: null, done_by: 'u-1', done_by_name: 'Dana Admin', done_at: ago(50) },
+		{ id: 'ci-2', position: 1, text: 'Disable the account', action: 'identity.disable', action_state: 'done', done_by: 'u-1', done_by_name: 'Dana Admin', done_at: ago(40) },
+		{ id: 'ci-3', position: 2, text: 'Remove from groups', action: 'identity.remove_groups', action_state: 'failed: the domain controller’s agent is offline', done_by: null, done_by_name: null, done_at: null },
+		{ id: 'ci-4', position: 3, text: 'Collect equipment and convert or forward the mailbox', action: null, action_state: null, done_by: null, done_by_name: null, done_at: null }
+	]
+};
+
 export async function mockApi(p: Page, opts: { signedIn?: boolean; ssoRequired?: boolean; branded?: boolean } = {}) {
 	const signedIn = opts.signedIn ?? true;
 	await p.clock.setFixedTime(NOW);
@@ -1542,6 +1595,8 @@ export async function mockApi(p: Page, opts: { signedIn?: boolean; ssoRequired?:
 			return json({ results: [{ agent_id: 'a-5', outcome: 'sent', sender_id: 'a-3' }], sent: 1, no_mac: 0, no_sender: 0, online: 0 });
 		if (route.request().method() === 'POST' && /^\/agents\/[^/]+\/wake$/.test(path))
 			return json({ results: [{ agent_id: path.split('/')[2], outcome: 'sent', sender_id: 'a-3' }], sent: 1, no_mac: 0, no_sender: 0, online: 0, outcome: 'sent' });
+		if (route.request().method() === 'POST' && /^\/identity\/users\/[^/]+\/reset-password$/.test(path))
+			return json(route.request().postDataJSON()?.delivery === 'show' ? { ok: true, delivered: 'shown', password: 'Kq7#vRm2xP9-tLw4' } : { ok: true, delivered: 'vault', item_id: 'v-1' });
 		if (route.request().method() !== 'GET') return json({ ok: true });
 		let m: RegExpMatchArray | null;
 		if (path === '/settings/public') return json({ company_name: 'Northwind IT', ...(opts.branded ? { branding } : {}) });
@@ -1770,6 +1825,26 @@ export async function mockApi(p: Page, opts: { signedIn?: boolean; ssoRequired?:
 		if (path === '/settings/smtp') return json({ host: 'smtp.office365.com', port: 587, security: 'starttls', username: 'rmm@northwind.example', password_set: true, from: 'Northwind RMM <rmm@northwind.example>' });
 		if (path === '/api-keys') return json(q.get('all') ? allApiKeys : apiKeys);
 		if (path === '/api-keys/options') return json({ groups: [{ id: 'clients', label: 'Clients and sites' }, { id: 'agents', label: 'Agents, inventory and metrics' }, { id: 'jobs', label: 'Jobs and results' }, { id: 'scripts', label: 'Script library' }, { id: 'alerts', label: 'Alerts' }, { id: 'tickets', label: 'Tickets' }, { id: 'security', label: 'Endpoint protection (needs the security.read permission)' }], permissions: admin.permissions, can_write: true, default_rate_limit: 600 });
+		if ((m = path.match(/^\/clients\/([^/]+)\/identity-sources$/))) return json(identitySources.filter((x) => x.client_id === m![1]));
+		if ((m = path.match(/^\/clients\/([^/]+)\/identity\/users$/))) {
+			const f = q.get('filter');
+			const rows = m[1] !== 'c-acme' ? [] : dirUsers.filter((u) => (!q.get('contact_id') || u.contact_id === q.get('contact_id')) && (!q.get('source_id') || u.source_id === q.get('source_id')) && (!f || (f === 'locked' ? u.locked : f === 'disabled' ? !u.enabled : f === 'privileged' ? u.privileged : f === 'no_mfa' ? u.mfa_registered === false : true)));
+			return json(page(rows, Number(q.get('limit') ?? 50)));
+		}
+		if ((m = path.match(/^\/clients\/([^/]+)\/identity\/groups$/))) return json([]);
+		if ((m = path.match(/^\/identity\/users\/([^/]+)$/))) {
+			const u = dirUsers.find((x) => x.id === m![1]);
+			return u ? json(dirUserDetail(u)) : json({ error: 'directory user not found' }, 404);
+		}
+		if ((m = path.match(/^\/clients\/([^/]+)\/mdm\/summary$/)))
+			return json(m[1] === 'c-acme' ? { sources: 1, total: 4, by_compliance: { compliant: 2, inGracePeriod: 1, noncompliant: 1 }, unmatched: 2, agents_not_in_intune: [{ id: 'a-3', hostname: 'acme-web01', os_family: 'windows', online: true, last_seen_at: ago(0) }] } : { sources: 0, total: 0, by_compliance: {}, unmatched: 0, agents_not_in_intune: [] });
+		if ((m = path.match(/^\/clients\/([^/]+)\/mdm\/devices$/))) {
+			const rank: Record<string, number> = { noncompliant: 0, error: 1, conflict: 2, inGracePeriod: 3, unknown: 4, compliant: 5 };
+			const rows = (m[1] === 'c-acme' ? mdmDevices : []).filter((d) => (!q.get('unmatched') || !d.agent_id) && (!q.get('compliance') || q.get('compliance')!.split(',').includes(d.compliance)));
+			return json(page([...rows].sort((a, b) => rank[a.compliance] - rank[b.compliance] || a.name.localeCompare(b.name)), Number(q.get('limit') ?? 50)));
+		}
+		if (path === '/ticket-templates') return json(ticketTemplates.filter((t) => !q.get('client_id') || !t.client_id || t.client_id === q.get('client_id')));
+		if ((m = path.match(/^\/tickets\/([^/]+)\/checklist$/))) return json(m[1] === 't-1' ? ticketChecklist : { identity_user: null, items: [] });
 		if (path === '/uptime/summary') {
 			const ms = uptimeMonitors.filter((m) => !q.get('client_id') || m.client_id === q.get('client_id'));
 			return json({ monitors: ms.length, up: ms.filter((m) => m.state === 'up').length, down: ms.filter((m) => m.state === 'down').length, unknown: ms.filter((m) => m.state === 'unknown').length, disabled: 0, uptime_30d: 99.71 });

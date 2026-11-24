@@ -39,6 +39,7 @@
 	import { targetLabels, until } from '#lib/servicedesk/sla.js';
 	import SlaBadge from '#lib/components/ticket/SlaBadge.svelte';
 	import TicketTime from '#lib/components/work/TicketTime.svelte';
+	import TicketChecklist from '#lib/components/ticket/TicketChecklist.svelte';
 	import Async from '#lib/ui/Async.svelte';
 	import Badge from '#lib/ui/Badge.svelte';
 	import Button from '#lib/ui/Button.svelte';
@@ -585,6 +586,10 @@
 						{/if}
 					</dl>
 				</section>
+
+				{#if tech && t.client_id}
+					<TicketChecklist ticketId={t.id} clientId={t.client_id} contactId={t.contact_id} locked={!!t.merged_into || t.status_category === 'closed'} />
+				{/if}
 
 				{#if tech}
 					<TicketTime ticketId={t.id} clientId={t.client_id} locked={!!t.merged_into || t.status_category === 'closed'} number={t.number} subject={t.subject} />

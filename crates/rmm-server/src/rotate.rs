@@ -22,6 +22,7 @@
 //! | `jobs`                  | `env_sealed` (AAD `job-env:<job id>`; secret script parameters of a job not yet delivered) | always sealed |
 //! | `company_settings` (SMS)| `sms_token_enc`                                | `sms_token_sealed`  |
 //! | `push_keys`             | `private` (the VAPID signing key)              | `private_sealed`    |
+//! | `identity_sources`      | `secret` (an Entra app's client secret)        | `secret_sealed`     |
 //!
 //! The vault's items are sealed with the per-client keys, not with `RMM_DATA_KEY`, so
 //! rewrapping `vault_keys` is all the vault needs: no item is touched.
@@ -109,6 +110,7 @@ pub const TABLES: &[Table] = &[
         aad_prefix: None,
     },
     Table { name: "push_keys", pk: "id", pk_type: "boolean", columns: &["private"], flag: Some("private_sealed"), aad_prefix: None },
+    Table { name: "identity_sources", pk: "id", pk_type: "uuid", columns: &["secret"], flag: Some("secret_sealed"), aad_prefix: None },
 ];
 
 #[derive(Debug, PartialEq, Eq)]

@@ -171,6 +171,8 @@ pub struct Hub {
     queries: std::sync::Mutex<HashMap<Uuid, (Uuid, oneshot::Sender<QueryResult>)>>,
     /// Tool requests (processes, files) waiting for the agent's answer.
     tools: std::sync::Mutex<HashMap<Uuid, (Uuid, oneshot::Sender<rmm_proto::tools::Reply>)>>,
+    /// Directory operations waiting for the domain controller's answer.
+    identity: std::sync::Mutex<HashMap<Uuid, (Uuid, oneshot::Sender<rmm_proto::identity::Reply>)>>,
     events: broadcast::Sender<Event>,
 }
 
@@ -188,6 +190,7 @@ impl Default for Hub {
             controls: Default::default(),
             queries: Default::default(),
             tools: Default::default(),
+            identity: Default::default(),
             events,
         }
     }
@@ -393,6 +396,34 @@ impl Hub {
 
     pub fn complete_tool(&self, from_agent: Uuid, request_id: Uuid, reply: rmm_proto::tools::Reply) {
         let mut t = self.tools.lock().unwrap();
+        if t.get(&request_id).is_some_and(|(a, _)| *a == from_agent)
+            && let Some((_, tx)) = t.remove(&request_id)
+        {
+            let _ = tx.send(reply);
+        }
+    }
+
+    /// Sends a directory operation to a domain controller's agent and waits up to `timeout`
+    /// for the answer, like [`Hub::tool`].
+    pub async fn identity(&self, agent_id: Uuid, op: rmm_proto::identity::Op, timeout: std::time::Duration) -> Result<rmm_proto::identity::Reply, String> {
+        let request_id = Uuid::new_v4();
+        let (tx, rx) = oneshot::channel();
+        self.identity.lock().unwrap().insert(request_id, (agent_id, tx));
+        if !self.send(agent_id, ServerMsg::Identity { request_id, op }).await {
+            self.identity.lock().unwrap().remove(&request_id);
+            return Err("the domain controller's agent is offline".into());
+        }
+        let res = tokio::time::timeout(timeout, rx).await;
+        self.identity.lock().unwrap().remove(&request_id);
+        match res {
+            Ok(Ok(reply)) => Ok(reply),
+            Ok(Err(_)) => Err("the domain controller's agent disconnected".into()),
+            Err(_) => Err(format!("the domain controller's agent didn't answer within {} seconds", timeout.as_secs())),
+        }
+    }
+
+    pub fn complete_identity(&self, from_agent: Uuid, request_id: Uuid, reply: rmm_proto::identity::Reply) {
+        let mut t = self.identity.lock().unwrap();
         if t.get(&request_id).is_some_and(|(a, _)| *a == from_agent)
             && let Some((_, tx)) = t.remove(&request_id)
         {

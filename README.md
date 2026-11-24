@@ -814,6 +814,10 @@ A site's designated agent scans its network (ICMP where it may, TCP, the ARP tab
 
 **Wake-on-LAN:** an offline device can be woken from its page (or many from the agents list) through another online agent at its site, which sends the magic packets to the subnet's broadcast address. A patch policy can wake devices before their install window (`wake_before_minutes`). The device's network adapter and BIOS must allow it, and most networks don't pass the broadcast between VLANs. `RMM_WOL_FAKE=<addr:port>` makes a debug agent send the packets there instead. Design: [docs/design/wake-on-lan.md](docs/design/wake-on-lan.md).
 
+## Identity and Intune
+
+A client's **Users** tab manages its directories: Active Directory through our agent on one of its domain controllers (directory operations travel as dedicated agent messages, never as scripts, and the built-in Administrator and krbtgt are never touched), and Entra ID through Microsoft Graph with an app registration in the customer's tenant. Unlock, reset a password (shown once and stored nowhere, or saved in the client's vault), disable and enable, remove from groups and revoke sessions; `identity.read` and `identity.manage`, two-factor authentication for actions and an admin for privileged accounts. Ticket templates ("New starter", "Leaver") carry checklists whose items run those actions. With `DeviceManagementManagedDevices.Read.All` the same Entra connection reads the tenant's Intune devices (read-only) for the **Mobile and Intune** tab. Graph endpoints follow `RMM_GRAPH_URL` and `RMM_GRAPH_LOGIN_URL` (national clouds, tests). `RMM_IDENTITY_FAKE=<file>` makes a debug agent act as a domain controller backed by that JSON file. Design: [docs/design/identity.md](docs/design/identity.md), [docs/design/mdm.md](docs/design/mdm.md).
+
 ## Remote desktop
 
 Open an agent and choose **Remote desktop** (technicians and admins). The agent starts a helper
