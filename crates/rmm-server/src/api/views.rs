@@ -23,7 +23,7 @@ use crate::state::AppState;
 /// The query keys each page's views may carry.
 fn allowed_keys(page: &str) -> &'static [&'static str] {
     match page {
-        "agents" => &["client", "site", "view", "q", "os", "health", "category", "set", "tag", "cf", "cfv", "sort", "dir"],
+        "agents" => &["client", "site", "view", "q", "os", "health", "category", "set", "tag", "cf", "cfv", "encryption", "sort", "dir"],
         _ => &[],
     }
 }

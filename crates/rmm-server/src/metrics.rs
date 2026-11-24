@@ -110,11 +110,10 @@ pub const AGENT_MESSAGE_TYPES: [&str; 43] = [
     "snmp_poll_result",
     "wake_on_lan_result",
     "check_results",
-    // 38-41 belong to other parity tracks; the coordinator puts their names here at merge.
-    "reserved_38",
-    "reserved_39",
-    "reserved_40",
-    "reserved_41",
+    "disk_encryption",
+    "disk_recovery_key",
+    "disk_protector_result",
+    "local_admin_result",
     "identity_reply",
 ];
 

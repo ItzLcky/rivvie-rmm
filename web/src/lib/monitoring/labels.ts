@@ -15,7 +15,9 @@ export const kindLabels: Record<PolicyKind, string> = {
 	net_interface: 'Network interface down',
 	net_threshold: 'Network device threshold',
 	uptime: 'Uptime monitor',
-	backup: 'Backups'
+	backup: 'Backups',
+	disk_encryption: 'Disk encryption',
+	local_admin: 'Local admin password'
 };
 
 export const kindHelp: Record<PolicyKind, string> = {
@@ -32,7 +34,9 @@ export const kindHelp: Record<PolicyKind, string> = {
 	net_interface: 'A monitored port that is switched on has no link.',
 	net_threshold: 'A device’s CPU, memory, port traffic or toner level crosses a limit.',
 	uptime: 'A website, port, host or DNS name stops answering, answers slowly, or its certificate nears expiry.',
-	backup: 'A backup job fails, or hasn’t succeeded for too long.'
+	backup: 'A backup job fails, or hasn’t succeeded for too long.',
+	disk_encryption: 'A volume isn’t encrypted, protection stays suspended, or a BitLocker recovery key isn’t escrowed.',
+	local_admin: 'Rotating the managed local admin password fails, conflicts with Windows LAPS, or is overdue.'
 };
 
 export const severityTone: Record<Severity, Tone> = { critical: 'danger', warning: 'warning', info: 'info' };
@@ -106,6 +110,13 @@ export function describePolicy(p: { kind: PolicyKind; params: Record<string, unk
 			const k = list(q.kinds);
 			return bits.join(', ') + (k.length ? ` (${k.join(', ')})` : '');
 		}
+		case 'disk_encryption': {
+			const bits = [q.volumes === 'all_fixed' ? 'Every fixed volume' : 'The system volume', 'encrypted'];
+			if (q.require_escrow !== false) bits.push('recovery key escrowed');
+			return `${bits.join(', ')}; suspended over ${q.grace_hours ?? 24} h`;
+		}
+		case 'local_admin':
+			return `Rotation failed or over ${q.overdue_days ?? 7} days overdue`;
 		case 'backup': {
 			const p = list(q.providers).map((x) => (x === 'auto' ? 'detected products' : x));
 			const s = Array.isArray(q.sources) ? q.sources.length : 0;

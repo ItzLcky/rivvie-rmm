@@ -27,6 +27,8 @@
 	import Select from '#lib/ui/Select.svelte';
 	import Tabs from '#lib/ui/Tabs.svelte';
 	import HealthBadge from '#lib/components/HealthBadge.svelte';
+	import { summaryLabel, summaryTone } from '#lib/devicesec.js';
+	import Badge from '#lib/ui/Badge.svelte';
 	import OsBadge from '#lib/components/OsBadge.svelte';
 	import RunScript from '#lib/components/RunScript.svelte';
 	import Status from '#lib/components/Status.svelte';
@@ -64,6 +66,7 @@
 			cf: param('cf'),
 			cfv: param('cf') ? param('cfv') : '',
 			health: param('health') || (views[view] as { health?: string }).health,
+			encryption: param('encryption'),
 			q: param('q'),
 			sort: sort.key,
 			dir: sort.dir
@@ -132,7 +135,7 @@
 		return Object.fromEntries(keys.map((k, i) => [k, `${num(pages[i].total)}${pages[i].total_exact ? '' : '+'}`])) as Record<View, string>;
 	});
 	liveReload(() => viewCounts.reload(), (e) => e.type === 'agent' && !e.last_metrics, { debounceMs: 1500 });
-	const filtered = $derived(!!(param('q') || param('os') || param('site') || param('health') || param('category') || param('set') || param('tag') || param('cf') || view !== 'all'));
+	const filtered = $derived(!!(param('q') || param('os') || param('site') || param('health') || param('category') || param('set') || param('tag') || param('cf') || param('encryption') || view !== 'all'));
 
 	const categories = resource(() => api.get<Category[]>('/device-categories'));
 	let categorizing = $state(false);
@@ -193,6 +196,7 @@
 	{#snippet osCell(a: AgentSummary)}<OsBadge os={a.os_family} name={a.os_name} muted />{/snippet}
 	{#snippet statusCell(a: AgentSummary)}<Status online={a.online} />{/snippet}
 	{#snippet healthCell(a: AgentSummary)}<HealthBadge health={a.health} agent={a} />{/snippet}
+	{#snippet encryptionCell(a: AgentSummary)}<Badge tone={summaryTone[a.encryption ?? 'unknown']}>{summaryLabel[a.encryption ?? 'unknown']}</Badge>{/snippet}
 	{#snippet cpuCell(a: AgentSummary)}{#if a.last_metrics && a.online}<UsageBar bar={false} value={a.last_metrics.cpu_percent} />{:else}<span class="text-muted" aria-label="no data">–</span>{/if}{/snippet}
 	{#snippet memCell(a: AgentSummary)}{#if a.last_metrics}<UsageBar bar={false} value={a.last_metrics.mem_total ? (100 * a.last_metrics.mem_used) / a.last_metrics.mem_total : 0} />{:else}<span class="text-muted" aria-label="no data">–</span>{/if}{/snippet}
 	{#snippet diskCell(a: AgentSummary)}{#if a.last_metrics}<UsageBar bar={false} value={a.disk_max_pct} />{:else}<span class="text-muted" aria-label="no data">–</span>{/if}{/snippet}
@@ -208,7 +212,7 @@
 	<DataTable
 		id="agents"
 		caption="Agents"
-		activeFilters={[param('site'), param('os'), param('health'), param('category'), param('set'), param('tag'), param('cf')].filter(Boolean).length}
+		activeFilters={[param('site'), param('os'), param('health'), param('category'), param('set'), param('tag'), param('cf'), param('encryption')].filter(Boolean).length}
 		rows={list.rows}
 		key={(a) => a.id}
 		loading={list.loading}
@@ -224,6 +228,7 @@
 			{ id: 'category', label: 'Category', sort: 'category', cell: categoryCell, from: 'lg' },
 			{ id: 'tags', label: 'Tags', cell: tagsCell, defaultHidden: true },
 			{ id: 'set', label: 'Policy set', cell: setCell, defaultHidden: true },
+			{ id: 'encryption', label: 'Encryption', cell: encryptionCell, defaultHidden: true },
 			{ id: 'status', label: 'Status', sort: 'status', cell: statusCell, from: 'md' },
 			{ id: 'health', label: 'Health', sort: 'health', cell: healthCell, from: 'sm' },
 			{ id: 'cpu', label: 'CPU', sort: 'cpu', cell: cpuCell, align: 'right', from: 'xl' },
@@ -239,7 +244,7 @@
 			<SavedViews
 				pageId="agents"
 				path="/agents"
-				keys={['client', 'site', 'view', 'q', 'os', 'health', 'category', 'set', 'tag', 'cf', 'cfv', 'sort', 'dir']}
+				keys={['client', 'site', 'view', 'q', 'os', 'health', 'category', 'set', 'tag', 'cf', 'cfv', 'encryption', 'sort', 'dir']}
 				columnTable="agents"
 				{defaultHidden}
 			/>
@@ -264,6 +269,19 @@
 					{ value: 'windows', label: 'Windows' },
 					{ value: 'linux', label: 'Linux' },
 					{ value: 'macos', label: 'macOS' }
+				]}
+			/>
+			<Select
+				aria-label="Disk encryption"
+				class="w-full sm:w-auto"
+				value={param('encryption')}
+				onchange={(e) => setParams({ encryption: e.currentTarget.value })}
+				options={[
+					{ value: '', label: 'Any encryption' },
+					{ value: 'encrypted', label: 'Encrypted' },
+					{ value: 'partial', label: 'Partly encrypted' },
+					{ value: 'none', label: 'Not encrypted' },
+					{ value: 'unknown', label: 'Not reported' }
 				]}
 			/>
 			<Select
@@ -324,7 +342,7 @@
 		{#snippet empty()}
 			{#if filtered}
 				<EmptyState title="No agents match" description="Try another view or clear the filters.">
-					{#snippet action()}<Button size="sm" onclick={() => { q = ''; setParams({ q: null, os: null, site: null, health: null, category: null, set: null, tag: null, cf: null, cfv: null, view: null }); }}>Clear filters</Button>{/snippet}
+					{#snippet action()}<Button size="sm" onclick={() => { q = ''; setParams({ q: null, os: null, site: null, health: null, category: null, set: null, tag: null, cf: null, cfv: null, encryption: null, view: null }); }}>Clear filters</Button>{/snippet}
 				</EmptyState>
 			{:else}
 				<EmptyState title={scoped ? `No agents for ${scoped.name} yet` : 'No agents yet'} description="Create an enrollment token for a site and run the install command on each machine.">

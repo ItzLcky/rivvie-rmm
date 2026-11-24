@@ -398,6 +398,25 @@ pub static OPS: &[Op] = &[
         ],
         paged: true, body: None, response: Resp::Paged("MdmDevice"),
     },
+    // ---- disk encryption (read) ----------------------------------------------------------------
+    Op {
+        id: "listDiskEncryption", method: "GET", path: "/disk-encryption", group: "security", summary: "List the encryption state of volumes across devices",
+        note: "BitLocker, FileVault and LUKS state of each fixed volume as the agents last reported it. Recovery passwords are kept in the vault, which isn't in this API.",
+        query: &[
+            CLIENT_Q,
+            ("status", "string", "Comma-separated: `encrypted`, `encrypting`, `decrypting`, `unencrypted`, `suspended`, `unknown`."),
+            ("escrowed", "boolean", "Only BitLocker volumes whose recovery password is (or isn't) escrowed."),
+            ("os_only", "boolean", "Only system volumes."),
+            ("alerting", "boolean", "Only volumes with (or without) an open disk encryption alert."),
+            ("q", "string", "Hostname."),
+        ],
+        paged: true, body: None, response: Resp::Paged("DiskVolume"),
+    },
+    Op {
+        id: "getAgentDiskEncryption", method: "GET", path: "/agents/{id}/disk-encryption", group: "security", summary: "An agent's disk encryption",
+        note: "Its volumes, TPM, the time of its last report and whether its policy escrows recovery passwords.",
+        query: NONE, paged: false, body: None, response: Resp::One("AgentDiskEncryption"),
+    },
     Op {
         id: "listDiscoveredDevices", method: "GET", path: "/network/discovered", group: "network", summary: "List the hosts that network scans found",
         note: "`state` says whether a host is managed (an agent runs on it), monitored (read over SNMP), ignored, known or still unmanaged.",
@@ -767,6 +786,17 @@ fn base_schemas() -> Value {
             ("os", "string"), ("os_version", "string"), ("compliance", "string"), ("encrypted", "boolean?"), ("ownership", "string"), ("serial", "string"),
             ("model", "string"), ("manufacturer", "string"), ("enrolled_at", "datetime?"), ("last_sync_at", "datetime?"), ("agent_id", "uuid?"),
             ("agent_hostname", "string?"), ("agent_online", "boolean?"), ("synced_at", "datetime"),
+        ]),
+        "DiskVolume": object("A fixed volume's encryption state.", &[
+            ("agent_id", "uuid"), ("hostname", "string"), ("online", "boolean"), ("client_id", "uuid"), ("client_name", "string"), ("site_name", "string"),
+            ("volume_id", "string"), ("mount", "string"), ("device", "string"), ("kind", "string"), ("role", "string"), ("status", "string"),
+            ("percent", "number?"), ("method", "string?"), ("protectors", "array"), ("protection_on", "boolean"), ("locked", "boolean"),
+            ("recovery_protector_id", "string?"), ("escrowed", "boolean"), ("escrowed_at", "datetime?"), ("escrow_error", "string?"),
+            ("vault_item_id", "uuid?"), ("suspended_since", "datetime?"), ("updated_at", "datetime"), ("alerting", "boolean"),
+        ]),
+        "AgentDiskEncryption": object("A device's disk encryption.", &[
+            ("reported_at", "datetime?"), ("error", "string?"), ("tpm", "object?"), ("summary", "string?"), ("escrow_recovery_keys", "boolean"),
+            ("add_recovery_protector", "boolean"), ("volumes", "array"),
         ]),
         "DiscoveredDevice": object("A host a network scan found.", &[
             ("id", "uuid"), ("site_id", "uuid"), ("site_name", "string"), ("client_id", "uuid"), ("client_name", "string"), ("ip", "string"),

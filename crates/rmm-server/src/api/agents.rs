@@ -81,6 +81,8 @@ pub struct AgentSummary {
     policy_set_name: String,
     /// `[{id, name, color}]`, by name.
     tags: serde_json::Value,
+    /// Disk encryption of its fixed volumes: `encrypted` (all), `partial`, `none`; None until it reports.
+    encryption: Option<String>,
     #[sqlx(default)]
     #[serde(skip)]
     sort_key: String,
@@ -96,7 +98,8 @@ pub(crate) const SUMMARY_COLS: &str = concat!(
        (SELECT dc.name FROM device_categories dc WHERE dc.id = a.category_id) AS category_name, a.policy_set_id,
        (SELECT ps.name FROM policy_sets ps WHERE ps.id = a.policy_set_id) AS policy_set_name,
        coalesce((SELECT jsonb_agg(jsonb_build_object('id', t.id, 'name', t.name, 'color', t.color) ORDER BY lower(t.name))
-                   FROM agent_tags atg JOIN tags t ON t.id = atg.tag_id WHERE atg.agent_id = a.id), '[]'::jsonb) AS tags"
+                   FROM agent_tags atg JOIN tags t ON t.id = atg.tag_id WHERE atg.agent_id = a.id), '[]'::jsonb) AS tags,
+       a.diskenc_status AS encryption"
 );
 const AGENT_FROM: &str = "FROM agents a JOIN sites s ON s.id = a.site_id JOIN clients c ON c.id = s.client_id";
 
@@ -139,6 +142,8 @@ pub struct ListQuery {
     cf: Option<Uuid>,
     /// ...and, with `cf`, that value: matched exactly, or as a case-insensitive substring for text fields.
     cfv: Option<String>,
+    /// Comma-separated disk encryption summaries: `encrypted`, `partial`, `none`, `unknown` (never reported).
+    encryption: Option<String>,
 }
 
 /// Matches hostname, OS name, an IP address prefix or a logged-in user. `$n` is the search text.
@@ -160,11 +165,15 @@ pub async fn list(
     Query(q): Query<ListQuery>,
     Query(page): Query<PageQuery>,
 ) -> ApiResult<Json<Page<AgentSummary>>> {
-    let plan = Plan::new(SORT_KEYS, ("hostname", false), &page, "a.id", "uuid", 15)?;
+    let plan = Plan::new(SORT_KEYS, ("hostname", false), &page, "a.id", "uuid", 16)?;
     let tags = super::tags::parse_filter(q.tag.as_deref())?;
     let cf = super::fields::filter(&st, &u, q.cf, q.cfv.as_deref()).await?;
     let health: Option<Vec<String>> =
         q.health.as_deref().filter(|h| !h.is_empty()).map(|h| h.split(',').map(str::to_string).collect());
+    let encryption: Option<Vec<String>> = q.encryption.as_deref().filter(|h| !h.is_empty()).map(|h| h.split(',').map(|s| s.trim().to_string()).collect());
+    if let Some(bad) = encryption.iter().flatten().find(|e| !["encrypted", "partial", "none", "unknown"].contains(&e.as_str())) {
+        return Err(ApiError::BadRequest(format!("unknown encryption state {bad}: encrypted, partial, none or unknown")));
+    }
     let filters = format!(
         "{AGENT_FROM}
           WHERE ($1::uuid IS NULL OR c.id = $1)
@@ -180,7 +189,8 @@ pub async fn list(
             AND ($11::uuid[] IS NULL OR (SELECT count(*) FROM agent_tags x WHERE x.agent_id = a.id AND x.tag_id = ANY($11)) = cardinality($11))
             AND ($12::uuid IS NULL OR EXISTS (SELECT 1 FROM custom_field_values v WHERE v.field_id = $12 AND v.agent_id = a.id
                    AND ($13::jsonb IS NULL OR v.value = $13)
-                   AND ($14::text IS NULL OR strpos(lower(v.value #>> '{{}}'), lower($14)) > 0)))",
+                   AND ($14::text IS NULL OR strpos(lower(v.value #>> '{{}}'), lower($14)) > 0)))
+            AND ($15::text[] IS NULL OR coalesce(a.diskenc_status, 'unknown') = ANY($15))",
         search = agent_search(3),
         health = health_name!(),
     );
@@ -189,7 +199,7 @@ pub async fn list(
     let os = q.os.as_deref().filter(|s| !s.is_empty());
     macro_rules! bind_filters {
         ($query:expr) => {
-            $query.bind(q.client_id).bind(q.site_id).bind(search).bind(q.online).bind(os).bind(u.scope()).bind(&health).bind(q.new_days).bind(q.category_id).bind(q.policy_set_id).bind(&tags).bind(cf.field).bind(&cf.exact).bind(&cf.contains)
+            $query.bind(q.client_id).bind(q.site_id).bind(search).bind(q.online).bind(os).bind(u.scope()).bind(&health).bind(q.new_days).bind(q.category_id).bind(q.policy_set_id).bind(&tags).bind(cf.field).bind(&cf.exact).bind(&cf.contains).bind(&encryption)
         };
     }
     let mut rows = bind_filters!(sqlx::query_as::<_, AgentSummary>(AssertSqlSafe(sql)));

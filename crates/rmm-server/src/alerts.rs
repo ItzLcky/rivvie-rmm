@@ -272,6 +272,8 @@ pub enum Rule {
     NetThreshold(NetThresholdRule),
     Uptime(UptimeRule),
     Backup(BackupRule),
+    DiskEncryption(crate::diskenc::DiskEncryptionRule),
+    LocalAdmin(crate::localadmin::LocalAdminRule),
 }
 
 impl Rule {
@@ -377,6 +379,8 @@ impl Rule {
                 Ok(())
             }
             Rule::Backup(r) => crate::backups::validate(r),
+            Rule::DiskEncryption(r) => crate::diskenc::validate(r),
+            Rule::LocalAdmin(r) => crate::localadmin::validate(r),
             Rule::Patch(r) => {
                 if r.reboot_hours.is_some_and(|h| !(1..=8760).contains(&h)) {
                     return Err("restart pending must be 1-8760 hours".into());
@@ -773,6 +777,8 @@ pub async fn recheck_item(st: &AppState, item_id: Uuid) {
     crate::netalerts::recheck_item(st, item_id).await;
     crate::uptime::recheck_item(st, item_id).await;
     crate::backups::recheck_item(st, item_id).await;
+    crate::diskenc::recheck_item(st, item_id).await;
+    crate::localadmin::recheck_item(st, item_id).await;
     let rows: sqlx::Result<Vec<(Uuid, Uuid)>> = sqlx::query_as(
         "SELECT ap.agent_id, a.policy_set_id FROM agent_policy ap JOIN agents a ON a.id = ap.agent_id
           WHERE ap.item_id = $1 AND ap.module = 'alert' AND ap.enabled
@@ -797,6 +803,8 @@ pub async fn recheck_agent(st: &AppState, agent_id: Uuid) {
     crate::netalerts::recheck_agent(st, agent_id).await;
     crate::uptime::recheck_agent(st, agent_id).await;
     crate::backups::recheck_agent(st, agent_id).await;
+    crate::diskenc::recheck_agent(st, agent_id).await;
+    crate::localadmin::recheck_agent(st, agent_id).await;
     for kind in ["service", "security", "patch"] {
         match policies_for(st, agent_id, kind).await {
             Ok(ps) => {

@@ -68,6 +68,9 @@ agents[6].enrolled_at = ago(60 * 24 * 2);
 // Patch state that counts against health, and a snoozed machine.
 Object.assign(agents[2], { patches_overdue: 2, patches_failed: 1, reboot_pending: true, reboot_pending_since: ago(60 * 30) });
 agents[3].alerts_muted = true;
+// Disk encryption summaries (docs/design/disk-encryption.md).
+const encryptionOf: Record<string, 'encrypted' | 'partial' | 'none' | null> = { 'a-1': 'encrypted', 'a-2': 'partial', 'a-3': 'none', 'a-4': 'encrypted', 'a-5': 'encrypted', 'a-6': 'none', 'a-7': null };
+for (const a of agents) Object.assign(a, { encryption: encryptionOf[a.id] ?? null });
 
 // --- tags, custom fields, notes, saved views -----------------------------------------------------
 const tagList = [
@@ -954,6 +957,8 @@ const PATCH_ITEM = '00000000-0000-4000-8000-000000000001';
 const SECURITY_ITEM = '00000000-0000-4000-8000-000000000002';
 const REMOTE_ITEM = '00000000-0000-4000-8000-000000000003';
 const AGENT_ITEM = '00000000-0000-4000-8000-000000000004';
+const DISKENC_ITEM = '00000000-0000-4000-8000-000000000005';
+const LOCAL_ADMIN_ITEM = '00000000-0000-4000-8000-000000000006';
 interface PItem { id: string; set: string; module: string; name: string; enabled: boolean; config: Cfg; client_id: string | null; site_id: string | null; excluded: { id: string; hostname: string }[] }
 const alertSet: Record<string, string> = { 'p-off': SET.root, 'p-disk': SET.root, 'p-cpu': SET.root, 'p-svc': SET.root, 'p-job': SET.linux, 'p-log': SET.linux };
 const alertConfig = (p: (typeof policies)[number]): Cfg => ({
@@ -983,7 +988,10 @@ const items: PItem[] = [
 	{ id: SECURITY_ITEM, set: SET.root, module: 'security', name: 'Security', enabled: true, client_id: null, site_id: null, excluded: [],
 		config: { sensor_enabled: true, quick_scan_hours: 24, full_scan_days: 7, auto_quarantine: true, prevention: true, canaries: true, telemetry_mb: 256, realtime: 'block', scan_on_write: true, archive_depth: 5, database_max_age_hours: 72 } },
 	{ id: REMOTE_ITEM, set: SET.root, module: 'remote_access', name: 'Remote access', enabled: true, client_id: null, site_id: null, excluded: [], config: { desktop_enabled: true, desktop_consent: false, shell_enabled: true, files_enabled: true } },
-	{ id: AGENT_ITEM, set: SET.root, module: 'agent', name: 'Agent', enabled: true, client_id: null, site_id: null, excluded: [], config: { auto_update: true } }
+	{ id: AGENT_ITEM, set: SET.root, module: 'agent', name: 'Agent', enabled: true, client_id: null, site_id: null, excluded: [], config: { auto_update: true } },
+	{ id: DISKENC_ITEM, set: SET.root, module: 'disk_encryption', name: 'Disk encryption', enabled: true, client_id: null, site_id: null, excluded: [], config: { escrow_recovery_keys: true, add_recovery_protector: false } },
+	{ id: LOCAL_ADMIN_ITEM, set: SET.root, module: 'local_admin', name: 'Local admin password', enabled: true, client_id: null, site_id: null, excluded: [],
+		config: { enabled: false, account: 'rmmadmin', create: true, rotate_days: 30, length: 20, rotate_after_reveal_hours: 24 } }
 ];
 const overrides: { item: string; set: string; enabled: boolean | null; config: Cfg }[] = [
 	{ item: PATCH_ITEM, set: SET.acmeWin, enabled: null, config: { auto_approve_severities: ['critical'], deferral_days: 2, auto_install: true, reboot_policy: 'if_required' } },
@@ -996,7 +1004,8 @@ const overrides: { item: string; set: string; enabled: boolean | null; config: C
 	{ item: 'au-addon', set: SET.winSrv, enabled: null, config: { max_runs_per_hour: 10, respect_window: false } },
 	{ item: 'p-svc', set: SET.web01, enabled: false, config: {} },
 	{ item: AGENT_ITEM, set: SET.winSrv, enabled: null, config: { auto_update: false } },
-	{ item: PATCH_ITEM, set: SET.dc, enabled: null, config: { auto_install: false, reboot_policy: 'never' } }
+	{ item: PATCH_ITEM, set: SET.dc, enabled: null, config: { auto_install: false, reboot_policy: 'never' } },
+	{ item: LOCAL_ADMIN_ITEM, set: SET.win, enabled: null, config: { enabled: true, rotate_days: 14 } }
 ];
 
 const isObj = (v: unknown): v is Cfg => typeof v === 'object' && v !== null && !Array.isArray(v);
@@ -1183,7 +1192,9 @@ const vaultItems = [
 	{ id: V.sw, name: 'Core switch', username: 'manager', url: '10.0.0.2', has_password: true, has_totp: false, has_notes: false, docs: 0, password_changed_at: ago(60 * 24 * 300) },
 	{ id: V.veeam, name: 'Veeam console', username: 'ACME\\svc-backup', url: 'rdp://acme-backup01', has_password: true, has_totp: false, has_notes: true, docs: 1, password_changed_at: null },
 	{ id: '6f1c0c1e-9a51-4c0e-b6c9-0a4de1f3a1f0', name: 'BitLocker recovery: acme-dc01 C:', username: '{3F2A6C1D-4B8E-4F0A-9C21-7D5E8B1A0C33}', url: '', has_password: true, has_totp: false, has_notes: false, docs: 0, password_changed_at: ago(60 * 24 * 3),
-		managed_kind: 'disk_recovery', agent_id: 'a-1', agent_hostname: 'acme-dc01', managed_state: null }
+		managed_kind: 'disk_recovery', agent_id: 'a-1', agent_hostname: 'acme-dc01', managed_state: null },
+	{ id: '7a2d1c3e-6b5f-4c8d-9e0a-1b2c3d4e5f60', name: 'Local admin: acme-fs01', username: 'rmmadmin', url: '', has_password: true, has_totp: false, has_notes: false, docs: 0, password_changed_at: ago(60 * 24 * 6),
+		managed_kind: 'local_admin', agent_id: 'a-2', agent_hostname: 'acme-fs01', managed_state: 'current' }
 ].map((v, i) => ({ managed_kind: null, agent_id: null, agent_hostname: null, managed_state: null, ...v, client_id: 'c-acme', updated_at: ago(60 * (30 + i * 200)), updated_by_name: i % 2 ? 'Terry Tech' : 'Dana Admin' }));
 const vaultDetail = (id: string) => {
 	const v = vaultItems.find((x) => x.id === id)!;
@@ -1362,6 +1373,47 @@ const backupJobsMock = [
 	{ agent_id: 'a-6', hostname: 'globex-db01', online: true, client_id: 'c-globex', client_name: 'Globex', site_name: 'Main', provider: 'restic', job: 'sftp:backup@nas.globex.example:/srv/restic/db01', last_run_at: ago(60 * 3), last_success_at: ago(60 * 3), last_result: 'success', message: 'snapshot 5e4f3a2b of /var/lib/postgresql', size_bytes: 52_428_800_000, updated_at: ago(40), alerting: false },
 	{ agent_id: 'a-5', hostname: 'globex-app01', online: true, client_id: 'c-globex', client_name: 'Globex', site_name: 'Main', provider: 'file_age', job: '/srv/dumps/*.sql.gz', last_run_at: ago(60 * 50), last_success_at: ago(60 * 50), last_result: 'success', message: 'newest file app-2026-06-13.sql.gz', size_bytes: 734_003_200, updated_at: ago(33), alerting: true }
 ];
+
+// Disk encryption and local admin rotation (docs/design/disk-encryption.md, docs/design/local-admin.md).
+const diskVol = (agentId: string, volume: string, role: 'os' | 'data', kind: string, status: string, o: Record<string, unknown> = {}) => {
+	const a = agents.find((x) => x.id === agentId)!;
+	return {
+		agent_id: agentId, hostname: a.hostname, online: a.online, client_id: a.client_id, client_name: a.client_name, site_name: a.site_name, volume_id: volume,
+		mount: kind === 'bitlocker' || volume.endsWith(':') ? `${volume}\\` : volume, device: '', kind, role, status, percent: status === 'unencrypted' ? 0 : 100,
+		method: kind === 'bitlocker' ? 'XTS-AES-128' : kind === 'luks' ? 'aes-xts-plain64' : null, protectors: kind === 'bitlocker' ? ['tpm', 'recovery_password'] : kind === 'luks' ? ['passphrase'] : [],
+		protection_on: status === 'encrypted', locked: false, recovery_protector_id: kind === 'bitlocker' ? '{3F2A6C1D-4B8E-4F0A-9C21-7D5E8B1A0C33}' : null,
+		escrowed: kind === 'bitlocker', escrowed_at: kind === 'bitlocker' ? ago(60 * 24 * 3) : null, escrow_error: null, vault_item_id: null as string | null,
+		suspended_since: null as string | null, updated_at: ago(40), alerting: false, ...o
+	};
+};
+const diskVolumes = [
+	diskVol('a-1', 'C:', 'os', 'bitlocker', 'encrypted', { vault_item_id: '6f1c0c1e-9a51-4c0e-b6c9-0a4de1f3a1f0' }),
+	diskVol('a-2', 'C:', 'os', 'bitlocker', 'suspended', { protection_on: false, suspended_since: ago(60 * 30), escrowed: false, recovery_protector_id: '{9A1B2C3D-0000-4000-8000-00000000A2C0}', alerting: true }),
+	diskVol('a-2', 'D:', 'data', 'none', 'unencrypted'),
+	diskVol('a-2', 'E:', 'data', 'bitlocker', 'encrypting', { percent: 62, protectors: ['external_key'], recovery_protector_id: null, escrowed: false, escrow_error: 'adding a recovery password failed: ProtectKeyWithNumericalPassword (Group Policy may forbid recovery passwords) failed: 0x8031005A' }),
+	diskVol('a-3', '/', 'os', 'none', 'unencrypted', { alerting: true }),
+	diskVol('a-4', 'C:', 'os', 'bitlocker', 'encrypted'),
+	diskVol('a-5', '/', 'os', 'luks', 'encrypted'),
+	diskVol('a-5', '/srv', 'data', 'luks', 'encrypted'),
+	diskVol('a-6', '/', 'os', 'none', 'unencrypted')
+];
+const diskencFor = (id: string) => {
+	const v = diskVolumes.filter((x) => x.agent_id === id);
+	const win = agents.find((a) => a.id === id)?.os_family === 'windows';
+	return {
+		reported_at: v.length ? ago(40) : null, error: null, tpm: v.length ? (win ? { present: true, ready: true, enabled: true, activated: true, version: '2.0', manufacturer: 'INTC' } : { present: false }) : null,
+		summary: encryptionOf[id] ?? null, escrow_recovery_keys: true, add_recovery_protector: id === 'a-2', volumes: v
+	};
+};
+const localAdminFor = (id: string) => {
+	const win = agents.find((a) => a.id === id)?.os_family === 'windows';
+	const policy = { enabled: win, account: 'rmmadmin', create: true, rotate_days: 14, length: 20, rotate_after_reveal_hours: 24 };
+	if (id === 'a-2')
+		return { policy, managed_state: 'current', needs_data_key: false, state: { agent_id: id, account: 'rmmadmin', vault_item_id: '7a2d1c3e-6b5f-4c8d-9e0a-1b2c3d4e5f60', status: 'ok', rotated_at: ago(60 * 24 * 6), next_rotate_at: ago(-60 * 24 * 8), rotate_reason: 'schedule', attempts: 0, sent_at: ago(60 * 24 * 6), last_error: null, updated_at: ago(60 * 24 * 6) } };
+	if (id === 'a-1')
+		return { policy, managed_state: 'pending', needs_data_key: false, state: { agent_id: id, account: 'rmmadmin', vault_item_id: null, status: 'failed', rotated_at: ago(60 * 24 * 20), next_rotate_at: ago(-25), rotate_reason: 'schedule', attempts: 3, sent_at: ago(35), last_error: 'NetUserSetInfo: the password doesn\'t meet the local password policy (length, complexity or history)', updated_at: ago(35) } };
+	return { policy, managed_state: null, needs_data_key: false, state: null };
+};
 
 const netDevices = [
 	netDev(1, 'Core switch', 'switch', '192.168.10.2', 'up', { sys_descr: 'Cisco IOS Software, Catalyst L3 Switch Software (CAT9K_IOSXE), Version 17.9.4', vendor: 'Cisco Systems', mac: '00:1b:54:aa:10:02', cpu_percent: 17, mem_used: 612_000_000, mem_total: 2_000_000_000, interfaces: 8, interfaces_up: 5, storage: [{ descr: 'flash:', kind: 'disk', used: 410_000_000, total: 1_600_000_000 }] }),
@@ -1861,6 +1913,13 @@ export async function mockApi(p: Page, opts: { signedIn?: boolean; ssoRequired?:
 			return json(page([...rows].sort((a, b) => rank[a.last_result] - rank[b.last_result]), Number(q.get('limit') ?? 50)));
 		}
 		if ((m = path.match(/^\/agents\/([^/]+)\/backups$/))) return json(backupJobsMock.filter((j) => j.agent_id === m![1]));
+		if (path === '/disk-encryption') {
+			const rank: Record<string, number> = { unencrypted: 0, suspended: 1, decrypting: 2, unknown: 3, encrypting: 4, encrypted: 5 };
+			const rows = diskVolumes.filter((v) => (!q.get('client_id') || v.client_id === q.get('client_id')) && (!q.get('status') || q.get('status')!.split(',').includes(v.status)) && (!q.get('os_only') || v.role === 'os') && (q.get('escrowed') == null || (v.kind === 'bitlocker' && String(v.escrowed) === q.get('escrowed'))));
+			return json(page([...rows].sort((a, b) => rank[a.status] - rank[b.status]), Number(q.get('limit') ?? 50)));
+		}
+		if ((m = path.match(/^\/agents\/([^/]+)\/disk-encryption$/))) return json(diskencFor(m[1]));
+		if ((m = path.match(/^\/agents\/([^/]+)\/local-admin$/))) return json(localAdminFor(m[1]));
 		if (path === '/network/summary') return json({ unmanaged: discoveredHosts.filter((d) => d.state === 'unmanaged' && d.online).length, devices: netDevices.length, down: netDevices.filter((d) => d.state === 'down').length });
 		if (path === '/network/devices')
 			return json(netDevices.filter((d) => (!q.get('state') || d.state === q.get('state')) && (!q.get('kind') || d.kind === q.get('kind')) && (!q.get('client_id') || d.client_id === q.get('client_id'))));

@@ -11,6 +11,7 @@ mod attachments;
 mod alerts;
 mod apikeys;
 mod backups;
+mod diskenc;
 mod billing;
 mod branding;
 mod channels;
@@ -22,6 +23,7 @@ mod downloads;
 mod fields;
 mod identity;
 mod kb;
+mod localadmin;
 mod jobs;
 mod msi;
 mod notes;
@@ -477,6 +479,12 @@ pub fn router(attachment_max: u64) -> Router<Arc<AppState>> {
         .route("/tickets/{id}/checklist/{item}/run", post(ticket_templates::run))
         .route("/agents/{id}/backups", get(backups::for_agent))
         .route("/agents/{id}/backups/check", post(backups::check_now))
+        .route("/disk-encryption", get(diskenc::list))
+        .route("/agents/{id}/disk-encryption", get(diskenc::for_agent))
+        .route("/agents/{id}/disk-encryption/refresh", post(diskenc::refresh))
+        .route("/agents/{id}/disk-encryption/{volume}/rotate-key", post(diskenc::rotate))
+        .route("/agents/{id}/local-admin", get(localadmin::for_agent))
+        .route("/agents/{id}/local-admin/rotate", post(localadmin::rotate))
         .route("/network/summary", get(network::summary))
         .route("/network/discovered", get(network::list_discovered))
         .route("/network/discovered/bulk", post(network::bulk_discovered))

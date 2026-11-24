@@ -1,0 +1,34 @@
+BitLocker Drive Encryption: Configuration Tool version 10.0.22621
+Copyright (C) 2013 Microsoft Corporation. All rights reserved.
+
+Disk volumes that can be protected with
+BitLocker Drive Encryption:
+Volume D: [Data]
+[Data Volume]
+
+    Size:                 931.51 GB
+    BitLocker Version:    None
+    Conversion Status:    Fully Decrypted
+    Percentage Encrypted: 0.0%
+    Encryption Method:    None
+    Protection Status:    Protection Off
+    Lock Status:          Unlocked
+    Identification Field: None
+    Automatic Unlock:     Disabled
+    Key Protectors:       None Found
+
+Volume C: [OS]
+[OS Volume]
+
+    Size:                 237.86 GB
+    BitLocker Version:    2.0
+    Conversion Status:    Fully Encrypted
+    Percentage Encrypted: 100.0%
+    Encryption Method:    XTS-AES 128
+    Protection Status:    Protection On
+    Lock Status:          Unlocked
+    Identification Field: Unknown
+    Key Protectors:
+        TPM
+        Numerical Password
+

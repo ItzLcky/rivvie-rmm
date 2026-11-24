@@ -135,7 +135,13 @@ const pages: [string, string][] = [
 	['backups', '/backups'],
 	['agent-backups', '/agents/a-2'],
 	['client-users', '/clients/c-acme?tab=users'],
-	['client-mobile', '/clients/c-acme?tab=mobile']
+	['client-mobile', '/clients/c-acme?tab=mobile'],
+	['agent-disk-encryption', '/agents/a-2?tab=inventory'],
+	['agent-local-admin-failed', '/agents/a-1'],
+	['security-disk-encryption', '/security?tab=encryption'],
+	['policy-set-disk-encryption', '/policies/sets/00000000-0000-4000-8001-000000000000?section=encryption'],
+	['policy-set-local-admin', '/policies/sets/00000000-0000-4000-8001-000000000001?section=localadmin'],
+	['policy-new-disk-encryption', '/policies/sets/00000000-0000-4000-8001-000000000000?section=alerts&item=new&kind=disk_encryption']
 ];
 const phone: [string, string][] = [
 	['dashboard', '/'],
@@ -176,7 +182,9 @@ const phone: [string, string][] = [
 	['uptime', '/uptime'],
 	['uptime-monitor', '/uptime/um-web'],
 	['backups', '/backups'],
-	['client-users', '/clients/c-acme?tab=users']
+	['client-users', '/clients/c-acme?tab=users'],
+	['security-disk-encryption', '/security?tab=encryption'],
+	['agent-disk-encryption', '/agents/a-2?tab=inventory']
 ];
 
 const jpeg = readFileSync(new URL('./fixtures/desktop.jpg', import.meta.url));

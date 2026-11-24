@@ -36,6 +36,8 @@ export interface AgentSummary {
 	patches_overdue: number; patches_failed: number; reboot_pending: boolean; reboot_pending_since: string | null;
 	/** A maintenance window or snooze is holding its alerts back right now. */
 	alerts_muted: boolean;
+	/** Disk encryption of its fixed volumes; null until it reports. */
+	encryption?: 'encrypted' | 'partial' | 'none' | null;
 	/** Policy management: its device category and the policy set it uses. */
 	platform?: 'workstation' | 'server'; category_id?: string; category_name?: string; policy_set_id?: string; policy_set_name?: string;
 	/** Labels on it, by name. */
@@ -150,7 +152,7 @@ export interface Session { id: string; created_at: string; last_seen_at: string;
 
 export type Severity = 'critical' | 'warning' | 'info';
 export type AlertState = 'open' | 'acknowledged' | 'resolved';
-export type PolicyKind = 'offline' | 'cpu' | 'memory' | 'disk' | 'service' | 'job_failed' | 'log' | 'security' | 'patch' | 'net_down' | 'net_interface' | 'net_threshold' | 'uptime' | 'backup';
+export type PolicyKind = 'offline' | 'cpu' | 'memory' | 'disk' | 'service' | 'job_failed' | 'log' | 'security' | 'patch' | 'net_down' | 'net_interface' | 'net_threshold' | 'uptime' | 'backup' | 'disk_encryption' | 'local_admin';
 export type LogLevel = 'critical' | 'error' | 'warning' | 'info';
 
 export interface Alert {
