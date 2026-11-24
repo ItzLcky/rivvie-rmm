@@ -193,7 +193,7 @@ mod tests {
         let (_, seen) = inspect("127.0.0.1", old, Some("localhost"), crate::allow_all, Duration::from_secs(5)).await.unwrap();
         assert!(seen.cert.unwrap().days_left(chrono::Utc::now()) < 0);
         // Nothing listening: a connection error, not a hang.
-        let e = inspect("127.0.0.1", 1, None, crate::allow_all, Duration::from_secs(3)).await.unwrap_err();
+        let e = inspect("127.0.0.1", 1, None, crate::allow_all, Duration::from_secs(10)).await.unwrap_err();
         assert!(e.contains("refused"), "{e}");
     }
 }

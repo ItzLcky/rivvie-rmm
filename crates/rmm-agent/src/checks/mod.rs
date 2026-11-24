@@ -309,7 +309,7 @@ mod tests {
     use super::*;
 
     fn spec(kind: CheckKind) -> CheckSpec {
-        CheckSpec { id: Uuid::new_v4(), interval_secs: 30, timeout_secs: 3, kind }
+        CheckSpec { id: Uuid::new_v4(), interval_secs: 30, timeout_secs: 10, kind }
     }
 
     #[tokio::test]

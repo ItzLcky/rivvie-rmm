@@ -7,6 +7,8 @@
 //! (the first that isn't an id or a number is the name; `Success`/`Warning`/`Failed` or 0/1/2 is
 //! the result), else from the message (`Backup job 'X' finished with Y`).
 
+#![cfg_attr(not(windows), allow(dead_code))]
+
 use std::collections::BTreeMap;
 
 use rmm_proto::checks::{BackupJob, BackupResult};

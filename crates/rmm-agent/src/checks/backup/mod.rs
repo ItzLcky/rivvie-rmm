@@ -11,7 +11,7 @@
 //! (`{"jobs": [BackupJob...], "errors": [["provider", "why"]...]}`), read on every check, while
 //! the file exists (without it the real providers are read).
 
-#![cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+#![cfg_attr(not(windows), allow(dead_code))]
 
 mod borg;
 mod file_age;
@@ -28,8 +28,6 @@ use rmm_proto::checks::{BackupJob, BackupResult, BackupSource};
 
 /// One tool run.
 const TOOL_TIMEOUT: Duration = Duration::from_secs(120);
-
-pub const PROVIDERS: &[&str] = &["auto", "wsb", "veeam", "restic", "borg", "timemachine", "file_age"];
 
 /// What a check found: the jobs, and per provider that couldn't be read, why.
 #[derive(Debug, Default)]

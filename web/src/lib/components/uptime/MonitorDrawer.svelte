@@ -45,6 +45,9 @@
 	let enabled = $state(m?.enabled ?? true);
 	let saving = $state(false);
 
+	$effect(() => {
+		if (!site && sites.length) site = sites[0].value;
+	});
 	const clientOf = $derived(m?.client_id ?? sites.find((s) => s.value === site)?.client ?? '');
 	const agents = resource(() => (clientOf ? api.get<Page<AgentSummary>>(`/agents?client_id=${clientOf}&limit=500&sort=hostname`) : Promise.resolve(null)));
 	const designated = resource(() => (site ? api.get<{ agent_id: string | null; agent_hostname: string | null }>(`/sites/${site}/network`) : Promise.resolve(null)));

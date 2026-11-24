@@ -3,6 +3,8 @@
 //! one is running; `AutoBackup` in `com.apple.TimeMachine`'s preferences whether backups
 //! happen on their own.
 
+#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
+
 use chrono::{DateTime, Local, NaiveDateTime, TimeZone, Utc};
 use rmm_proto::checks::{BackupJob, BackupResult};
 

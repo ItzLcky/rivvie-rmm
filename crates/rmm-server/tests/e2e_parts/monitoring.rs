@@ -449,6 +449,7 @@ async fn backups(url: &str, admin: &Api, db: &sqlx::PgPool, dir: &Path, id1: &st
         run(&["backup", data.to_str().unwrap()]);
         let env = dir.join("restic.env");
         std::fs::write(&env, format!("RESTIC_REPOSITORY={}\nRESTIC_PASSWORD_FILE={}\n", repo.display(), pw.display())).unwrap();
+        #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&env, std::fs::Permissions::from_mode(0o600)).unwrap();

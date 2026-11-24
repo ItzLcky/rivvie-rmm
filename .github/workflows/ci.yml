@@ -17,12 +17,12 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Clippy (agent + proto + sign + scan engine + content)
-        run: cargo clippy -p rmm-agent -p rmm-proto -p rmm-sign -p rmm-scan -p rmm-content --all-targets -- -D warnings
+      - name: Clippy (agent + checks + proto + sign + scan engine + content)
+        run: cargo clippy -p rmm-agent -p rmm-checks -p rmm-proto -p rmm-sign -p rmm-scan -p rmm-content --all-targets -- -D warnings
       - name: Clippy (scan engine and agent without YARA)
         run: cargo clippy -p rmm-scan -p rmm-agent --no-default-features --all-targets -- -D warnings
-      - name: Test (agent + proto + sign + scan engine + content)
-        run: cargo test -p rmm-agent -p rmm-proto -p rmm-sign -p rmm-scan -p rmm-content
+      - name: Test (agent + checks + proto + sign + scan engine + content)
+        run: cargo test -p rmm-agent -p rmm-checks -p rmm-proto -p rmm-sign -p rmm-scan -p rmm-content
       - name: Server and load generator (Linux only)
         if: runner.os == 'Linux'
         run: cargo clippy -p rmm-server -p rmm-loadgen --all-targets -- -D warnings && cargo test -p rmm-server -p rmm-loadgen

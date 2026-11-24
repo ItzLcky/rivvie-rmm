@@ -2,6 +2,8 @@
 //! when the cmdlets aren't there (event 4 is a finished backup; an error-level event is a
 //! failure; event 1, started, is a backup running).
 
+#![cfg_attr(not(windows), allow(dead_code))]
+
 use chrono::{DateTime, Utc};
 use rmm_proto::checks::{BackupJob, BackupResult};
 

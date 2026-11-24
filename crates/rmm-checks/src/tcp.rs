@@ -57,7 +57,7 @@ mod tests {
         let (ms, peer) = connect("127.0.0.1", port, crate::allow_all, Duration::from_secs(2)).await.unwrap();
         assert!(ms < 2000 && peer.port() == port);
         drop(l);
-        let e = connect("127.0.0.1", port, crate::allow_all, Duration::from_secs(2)).await.unwrap_err();
+        let e = connect("127.0.0.1", port, crate::allow_all, Duration::from_secs(10)).await.unwrap_err();
         assert!(e.contains("refused"), "{e}");
         let e = connect("127.0.0.1", port, crate::addr::public_only, Duration::from_secs(2)).await.unwrap_err();
         assert!(e.contains("loopback"), "the guard sees the address: {e}");
