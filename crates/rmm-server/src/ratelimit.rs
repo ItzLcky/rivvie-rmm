@@ -120,6 +120,8 @@ pub struct Limits {
     pub sso_start: Limiter,
     /// Failed single sign-on callbacks (a valid state, then something wrong) per client IP.
     pub sso_callback: Limiter,
+    /// Directory actions (unlock, reset, disable...) per user; every request takes a token.
+    pub identity_action: Limiter,
     /// Requests per API key.
     pub api_keys: KeyLimiter,
 }
@@ -134,6 +136,8 @@ impl Default for Limits {
             vault_reveal: Limiter::new(60, Duration::from_secs(5)),
             sso_start: Limiter::new(30, Duration::from_secs(10)),
             sso_callback: Limiter::new(30, Duration::from_secs(20)),
+            // 30 per 5 minutes.
+            identity_action: Limiter::new(30, Duration::from_secs(10)),
             api_keys: KeyLimiter::default(),
         }
     }
@@ -147,6 +151,7 @@ impl Limits {
         self.vault_reveal.prune();
         self.sso_start.prune();
         self.sso_callback.prune();
+        self.identity_action.prune();
         self.api_keys.prune();
     }
 }

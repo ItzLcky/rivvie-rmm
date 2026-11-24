@@ -191,10 +191,15 @@ pub enum Perm {
     AuditRead,
     /// On-call schedules and escalation policies (anyone may put themselves on call).
     OncallManage,
+    /// See a client's directory users and groups, and its Intune devices.
+    IdentityRead,
+    /// Unlock, reset passwords, disable and enable, remove from groups, revoke sessions.
+    /// Needs two-factor authentication; privileged accounts need an admin as well.
+    IdentityManage,
 }
 
 impl Perm {
-    pub const ALL: [Perm; 10] = [
+    pub const ALL: [Perm; 12] = [
         Perm::SecurityRead,
         Perm::SecurityRespond,
         Perm::SecurityManage,
@@ -205,6 +210,8 @@ impl Perm {
         Perm::VaultManage,
         Perm::AuditRead,
         Perm::OncallManage,
+        Perm::IdentityRead,
+        Perm::IdentityManage,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -219,6 +226,8 @@ impl Perm {
             Perm::VaultManage => "vault.manage",
             Perm::AuditRead => "audit.read",
             Perm::OncallManage => "oncall.manage",
+            Perm::IdentityRead => "identity.read",
+            Perm::IdentityManage => "identity.manage",
         }
     }
 
@@ -234,7 +243,7 @@ impl Perm {
     fn default_for(self, role: Role) -> bool {
         match self {
             Perm::SecurityRead => true,
-            Perm::SecurityRespond | Perm::VaultRead | Perm::VaultManage => role >= Role::Technician,
+            Perm::SecurityRespond | Perm::VaultRead | Perm::VaultManage | Perm::IdentityRead | Perm::IdentityManage => role >= Role::Technician,
             // Money stays with admins unless someone is given it explicitly.
             Perm::SecurityManage | Perm::BillingRead | Perm::BillingManage | Perm::TimeApprove | Perm::AuditRead | Perm::OncallManage => {
                 role >= Role::Admin

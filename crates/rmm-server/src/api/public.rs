@@ -386,6 +386,18 @@ pub static OPS: &[Op] = &[
         id: "listAgentBackups", method: "GET", path: "/agents/{id}/backups", group: "agents", summary: "An agent's backup jobs",
         note: "", query: NONE, paged: false, body: None, response: Resp::List("BackupJob"),
     },
+    // ---- Intune devices (read) -------------------------------------------------------------
+    Op {
+        id: "listMdmDevices", method: "GET", path: "/clients/{id}/mdm/devices", group: "agents", summary: "List a client's Intune managed devices",
+        note: "Read through the client's Entra ID connection, with the agent each is matched to. Needs the `identity.read` permission on the key.",
+        query: &[
+            ("compliance", "string", "Comma-separated Intune compliance states: `compliant`, `noncompliant`, `inGracePeriod`, `conflict`, `error`, `unknown`."),
+            ("os", "string", "Operating system as Intune names it (`Windows`, `iOS`, `Android`, `macOS`)."),
+            ("unmatched", "boolean", "Only devices with (or without) no matching agent."),
+            ("q", "string", "Device name, user or serial number."),
+        ],
+        paged: true, body: None, response: Resp::Paged("MdmDevice"),
+    },
     Op {
         id: "listDiscoveredDevices", method: "GET", path: "/network/discovered", group: "network", summary: "List the hosts that network scans found",
         note: "`state` says whether a host is managed (an agent runs on it), monitored (read over SNMP), ignored, known or still unmanaged.",
@@ -749,6 +761,12 @@ fn base_schemas() -> Value {
             ("agent_id", "uuid"), ("hostname", "string"), ("online", "boolean"), ("client_id", "uuid"), ("client_name", "string"), ("site_name", "string"),
             ("provider", "string"), ("job", "string"), ("last_run_at", "datetime?"), ("last_success_at", "datetime?"), ("last_result", "string"),
             ("message", "string"), ("size_bytes", "integer?"), ("updated_at", "datetime"), ("alerting", "boolean"),
+        ]),
+        "MdmDevice": object("A device Intune manages, as last read from the client's tenant.", &[
+            ("id", "uuid"), ("source_id", "uuid"), ("source_name", "string"), ("external_id", "string"), ("name", "string"), ("user_upn", "string"),
+            ("os", "string"), ("os_version", "string"), ("compliance", "string"), ("encrypted", "boolean?"), ("ownership", "string"), ("serial", "string"),
+            ("model", "string"), ("manufacturer", "string"), ("enrolled_at", "datetime?"), ("last_sync_at", "datetime?"), ("agent_id", "uuid?"),
+            ("agent_hostname", "string?"), ("agent_online", "boolean?"), ("synced_at", "datetime"),
         ]),
         "DiscoveredDevice": object("A host a network scan found.", &[
             ("id", "uuid"), ("site_id", "uuid"), ("site_name", "string"), ("client_id", "uuid"), ("client_name", "string"), ("ip", "string"),

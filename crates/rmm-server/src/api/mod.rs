@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use axum::Router;
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 
 use crate::state::AppState;
 
@@ -20,6 +20,7 @@ mod desk;
 mod docs;
 mod downloads;
 mod fields;
+mod identity;
 mod kb;
 mod jobs;
 mod msi;
@@ -49,6 +50,7 @@ mod sso;
 pub(crate) mod sla;
 pub(crate) mod tickets;
 mod tags;
+mod ticket_templates;
 mod uptime;
 mod time;
 mod tools;
@@ -456,6 +458,23 @@ pub fn router(attachment_max: u64) -> Router<Arc<AppState>> {
         .route("/uptime/monitors/{id}/results", get(uptime::results))
         .route("/uptime/summary", get(uptime::summary))
         .route("/backups", get(backups::list))
+        .route("/clients/{id}/identity-sources", get(identity::list_sources).post(identity::create_source))
+        .route("/identity-sources/{id}", put(identity::update_source).delete(identity::delete_source))
+        .route("/identity-sources/{id}/test", post(identity::test_source))
+        .route("/identity-sources/{id}/sync", post(identity::sync_source))
+        .route("/clients/{id}/identity/users", get(identity::list_users))
+        .route("/clients/{id}/identity/groups", get(identity::list_groups))
+        .route("/identity/users/{id}", get(identity::get_user))
+        .route("/identity/users/{id}/{action}", post(identity::act))
+        .route("/clients/{id}/mdm/devices", get(identity::list_devices))
+        .route("/clients/{id}/mdm/summary", get(identity::devices_summary))
+        .route("/mdm/devices/{id}", get(identity::get_device))
+        .route("/ticket-templates", get(ticket_templates::list).post(ticket_templates::create))
+        .route("/ticket-templates/{id}", put(ticket_templates::update).delete(ticket_templates::remove))
+        .route("/tickets/from-template", post(ticket_templates::from_template))
+        .route("/tickets/{id}/checklist", get(ticket_templates::get_checklist).put(ticket_templates::put_checklist))
+        .route("/tickets/{id}/checklist/{item}", post(ticket_templates::tick))
+        .route("/tickets/{id}/checklist/{item}/run", post(ticket_templates::run))
         .route("/agents/{id}/backups", get(backups::for_agent))
         .route("/agents/{id}/backups/check", post(backups::check_now))
         .route("/network/summary", get(network::summary))

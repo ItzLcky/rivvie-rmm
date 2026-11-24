@@ -617,6 +617,7 @@ async fn on_message(
         AgentMsg::SnmpPollResult { poll_id, results } => crate::netmon::ingest_poll(state, agent_id, poll_id, results).await,
         AgentMsg::WakeOnLanResult { request_id, sent, error } => crate::wol::complete(agent_id, request_id, sent, error),
         AgentMsg::CheckResults { results } => crate::checks::ingest(state, agent_id, results).await?,
+        AgentMsg::IdentityReply { request_id, reply } => state.hub.complete_identity(agent_id, request_id, reply),
         AgentMsg::Pong { .. } => {}
         AgentMsg::Enroll { .. } | AgentMsg::Auth { .. } => {}
     }
@@ -664,6 +665,7 @@ fn message_type(m: &AgentMsg) -> usize {
         AgentMsg::SnmpPollResult { .. } => 35,
         AgentMsg::WakeOnLanResult { .. } => 36,
         AgentMsg::CheckResults { .. } => 37,
+        AgentMsg::IdentityReply { .. } => 42,
     }
 }
 
