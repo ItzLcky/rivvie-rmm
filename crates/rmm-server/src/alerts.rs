@@ -164,6 +164,93 @@ pub struct NetThresholdRule {
     pub kinds: Vec<String>,
 }
 
+fn two() -> i32 {
+    2
+}
+
+fn fourteen() -> i32 {
+    14
+}
+
+/// An uptime monitor that fails, whose certificate nears expiry, or that answers slowly.
+/// Evaluated per monitor as its runner agent reports ([`crate::uptime`]); the item is the
+/// runner agent's, like the network kinds.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UptimeRule {
+    /// Consecutive failed checks before the monitor counts as down.
+    #[serde(default = "two")]
+    pub failures: i32,
+    /// Only these kinds of monitor (`ping`, `tcp`, `http`, `tls`, `dns`). Empty: all.
+    #[serde(default)]
+    pub kinds: Vec<String>,
+    /// A certificate that expires within this many days (0: don't check).
+    #[serde(default = "fourteen")]
+    pub cert_days: i32,
+    /// Slower than this for `failures` checks in a row. None: don't check.
+    #[serde(default)]
+    pub latency_ms: Option<i32>,
+}
+
+impl Default for UptimeRule {
+    fn default() -> Self {
+        UptimeRule { failures: 2, kinds: vec![], cert_days: 14, latency_ms: None }
+    }
+}
+
+/// Where a `backup` item tells the agent to look (secrets stay on the machine: restic and borg
+/// read an env file that is already there).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct BackupSourceRule {
+    pub provider: String,
+    #[serde(default)]
+    pub env_file: Option<String>,
+    #[serde(default)]
+    pub repo: Option<String>,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub glob: Option<String>,
+}
+
+fn auto() -> Vec<String> {
+    vec!["auto".into()]
+}
+
+fn every_job() -> Vec<String> {
+    vec!["*".into()]
+}
+
+fn twenty_six() -> i32 {
+    26
+}
+
+/// Backup jobs on the device that failed, or haven't succeeded for `max_age_hours`
+/// ([`crate::backups`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BackupRule {
+    /// `auto`, `wsb`, `veeam`, `restic`, `borg`, `timemachine`, `file_age`.
+    #[serde(default = "auto")]
+    pub providers: Vec<String>,
+    #[serde(default)]
+    pub sources: Vec<BackupSourceRule>,
+    /// Job names (`*` globs).
+    #[serde(default = "every_job")]
+    pub jobs: Vec<String>,
+    #[serde(default = "twenty_six")]
+    pub max_age_hours: i32,
+    #[serde(default)]
+    pub warning_is_failure: bool,
+    /// Alert when no job is found at all (for server sets, where a backup must exist).
+    #[serde(default)]
+    pub require: bool,
+}
+
+impl Default for BackupRule {
+    fn default() -> Self {
+        BackupRule { providers: auto(), sources: vec![], jobs: every_job(), max_age_hours: 26, warning_is_failure: false, require: false }
+    }
+}
+
 /// What a policy checks: `kind` and `params` columns together.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "params", rename_all = "snake_case")]
@@ -183,6 +270,8 @@ pub enum Rule {
     NetDown(NetDownRule),
     NetInterface(NetInterfaceRule),
     NetThreshold(NetThresholdRule),
+    Uptime(UptimeRule),
+    Backup(BackupRule),
 }
 
 impl Rule {
@@ -272,6 +361,22 @@ impl Rule {
                 list(&r.names, "interfaces")?;
                 list(&r.kinds, "device kinds")
             }
+            Rule::Uptime(r) => {
+                if !(1..=20).contains(&r.failures) {
+                    return Err("failures must be 1-20 checks in a row".into());
+                }
+                if !(0..=365).contains(&r.cert_days) {
+                    return Err("certificate days must be 0-365 (0: don't check)".into());
+                }
+                if r.latency_ms.is_some_and(|l| !(1..=120_000).contains(&l)) {
+                    return Err("latency must be 1-120000 ms".into());
+                }
+                if let Some(k) = r.kinds.iter().find(|k| !crate::uptime::KINDS.contains(&k.as_str())) {
+                    return Err(format!("unknown monitor kind {k:?}: {}", crate::uptime::KINDS.join(", ")));
+                }
+                Ok(())
+            }
+            Rule::Backup(r) => crate::backups::validate(r),
             Rule::Patch(r) => {
                 if r.reboot_hours.is_some_and(|h| !(1..=8760).contains(&h)) {
                     return Err("restart pending must be 1-8760 hours".into());
@@ -483,7 +588,7 @@ async fn run_alert_script(st: &AppState, alert_id: Uuid) -> anyhow::Result<()> {
         "SELECT al.agent_id, s.client_id, sc.id, sc.interpreter, sc.body, sc.timeout_secs, sc.client_id, al.details
            FROM alerts al JOIN agents a ON a.id = al.agent_id JOIN sites s ON s.id = a.site_id
            JOIN scripts sc ON sc.id = (policy_config(al.policy_id, al.agent_id) ->> 'run_script_id')::uuid
-          WHERE al.id = $1 AND al.policy_id IS NOT NULL AND al.script_job_id IS NULL AND al.device_id IS NULL",
+          WHERE al.id = $1 AND al.policy_id IS NOT NULL AND al.script_job_id IS NULL AND al.device_id IS NULL AND al.monitor_id IS NULL",
     )
     .bind(alert_id)
     .fetch_optional(&st.db)
@@ -525,8 +630,8 @@ async fn run_alert_script(st: &AppState, alert_id: Uuid) -> anyhow::Result<()> {
 
 /// Opens (or refreshes) the alert for (policy, agent, key). `bump` adds to its occurrence
 /// count when it was already open.
-async fn fire(st: &AppState, p: &Policy, agent_id: Uuid, key: &str, title: &str, details: Value, bump: i32) -> sqlx::Result<()> {
-    fire_for(st, p, agent_id, None, key, title, details, bump).await
+pub(crate) async fn fire(st: &AppState, p: &Policy, agent_id: Uuid, key: &str, title: &str, details: Value, bump: i32) -> sqlx::Result<()> {
+    fire_on(st, p, agent_id, None, None, key, title, details, bump).await
 }
 
 /// [`fire`], for an alert about a network device (read through `agent_id`).
@@ -541,9 +646,25 @@ pub(crate) async fn fire_for(
     details: Value,
     bump: i32,
 ) -> sqlx::Result<()> {
+    fire_on(st, p, agent_id, device_id, None, key, title, details, bump).await
+}
+
+/// [`fire`], for an alert about a network device or an uptime monitor (checked through `agent_id`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn fire_on(
+    st: &AppState,
+    p: &Policy,
+    agent_id: Uuid,
+    device_id: Option<Uuid>,
+    monitor_id: Option<Uuid>,
+    key: &str,
+    title: &str,
+    details: Value,
+    bump: i32,
+) -> sqlx::Result<()> {
     let (id, inserted): (Uuid, bool) = sqlx::query_as(
-        "INSERT INTO alerts (id, policy_id, agent_id, key, kind, severity, title, details, occurrences, device_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, greatest($9, 1), $10)
+        "INSERT INTO alerts (id, policy_id, agent_id, key, kind, severity, title, details, occurrences, device_id, monitor_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, greatest($9, 1), $10, $11)
          ON CONFLICT (policy_id, agent_id, key) WHERE resolved_at IS NULL
          DO UPDATE SET last_seen_at = now(), title = EXCLUDED.title, details = EXCLUDED.details,
                        occurrences = alerts.occurrences + $9
@@ -559,6 +680,7 @@ pub(crate) async fn fire_for(
     .bind(details)
     .bind(bump)
     .bind(device_id)
+    .bind(monitor_id)
     .fetch_one(&st.db)
     .await?;
     if inserted {
@@ -582,7 +704,7 @@ async fn client_of(st: &AppState, agent_id: Uuid) -> sqlx::Result<Uuid> {
 
 /// Resolves the policy's open alerts on this agent whose key is in `keys` (all keys if None),
 /// except those in `keep`.
-async fn clear(st: &AppState, p: &Policy, agent_id: Uuid, keys: Option<&[String]>, keep: &[String]) -> sqlx::Result<()> {
+pub(crate) async fn clear(st: &AppState, p: &Policy, agent_id: Uuid, keys: Option<&[String]>, keep: &[String]) -> sqlx::Result<()> {
     let ids: Vec<Uuid> = sqlx::query_scalar(
         "UPDATE alerts SET resolved_at = now(), resolution = 'cleared'
           WHERE policy_id = $1 AND agent_id = $2 AND resolved_at IS NULL
@@ -633,6 +755,8 @@ pub async fn close_for_item(st: &AppState, item_id: Uuid) {
 /// An alert item changed: re-check event-driven kinds against every agent it covers now.
 pub async fn recheck_item(st: &AppState, item_id: Uuid) {
     crate::netalerts::recheck_item(st, item_id).await;
+    crate::uptime::recheck_item(st, item_id).await;
+    crate::backups::recheck_item(st, item_id).await;
     let rows: sqlx::Result<Vec<(Uuid, Uuid)>> = sqlx::query_as(
         "SELECT ap.agent_id, a.policy_set_id FROM agent_policy ap JOIN agents a ON a.id = ap.agent_id
           WHERE ap.item_id = $1 AND ap.module = 'alert' AND ap.enabled
@@ -655,6 +779,8 @@ pub async fn recheck_item(st: &AppState, item_id: Uuid) {
 /// event-driven alerts from its last reports.
 pub async fn recheck_agent(st: &AppState, agent_id: Uuid) {
     crate::netalerts::recheck_agent(st, agent_id).await;
+    crate::uptime::recheck_agent(st, agent_id).await;
+    crate::backups::recheck_agent(st, agent_id).await;
     for kind in ["service", "security", "patch"] {
         match policies_for(st, agent_id, kind).await {
             Ok(ps) => {
@@ -1673,6 +1799,28 @@ mod tests {
         assert!(Rule::Security(SecurityRule { stale_hours: Some(1), ..rule.clone() }).validate().is_err());
         let f = security_findings(&rule, &[], &[], &[], None, &r(true, h(30), h(40)), now);
         assert_eq!(f.iter().map(|f| f.0.as_str()).collect::<Vec<_>>(), ["stale"]);
+    }
+
+    #[test]
+    fn uptime_and_backup_rules() {
+        assert_eq!(Rule::parse("uptime", &json!({})).unwrap(), Rule::Uptime(UptimeRule::default()));
+        assert!(Rule::parse("uptime", &json!({ "failures": 0 })).unwrap().validate().is_err());
+        assert!(Rule::parse("uptime", &json!({ "kinds": ["smtp"] })).unwrap().validate().is_err());
+        assert!(Rule::parse("uptime", &json!({ "kinds": ["http", "tls"], "latency_ms": 800, "cert_days": 0 })).unwrap().validate().is_ok());
+        let b = Rule::parse("backup", &json!({})).unwrap();
+        assert_eq!(b, Rule::Backup(BackupRule::default()));
+        assert_eq!(b.params()["max_age_hours"], 26);
+        assert!(b.validate().is_ok());
+        assert!(Rule::parse("backup", &json!({ "providers": ["tape"] })).unwrap().validate().is_err());
+        assert!(Rule::parse("backup", &json!({ "max_age_hours": 0 })).unwrap().validate().is_err());
+        let src = |s: Value| Rule::parse("backup", &json!({ "providers": [], "sources": [s] })).unwrap().validate();
+        assert!(src(json!({ "provider": "restic", "env_file": "/etc/restic/env" })).is_ok());
+        assert!(src(json!({ "provider": "restic", "env_file": "relative/env" })).is_err());
+        assert!(src(json!({ "provider": "restic", "env_file": "/etc/../root/env" })).is_err());
+        assert!(src(json!({ "provider": "restic" })).is_err(), "restic needs an env file or a repository");
+        assert!(src(json!({ "provider": "file_age", "path": "C:\\Backups", "glob": "*.bak" })).is_ok());
+        assert!(src(json!({ "provider": "file_age" })).is_err());
+        assert!(src(json!({ "provider": "wsb" })).is_err(), "Windows Server Backup takes no source");
     }
 
     #[test]

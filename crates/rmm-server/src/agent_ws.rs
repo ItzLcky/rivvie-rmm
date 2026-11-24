@@ -294,6 +294,7 @@ async fn run_session(
     if let Err(e) = crate::security::on_connect(&state, agent_id, client_id, &capabilities, &held.security_actions).await {
         warn!(%agent_id, "security state on connect: {e:#}");
     }
+    crate::checks::on_connect(&state, agent_id, &capabilities, &tx).await;
     // Replies to this connection only (job acks). Weak, so the writer still ends when the
     // hub drops the agent (kick) and every other sender is gone.
     let reply = tx.downgrade();
@@ -597,6 +598,7 @@ async fn on_message(
             crate::netmon::ingest_scan(state, agent_id, scan_id, subnets, scanned, hosts, error).await?
         }
         AgentMsg::SnmpPollResult { poll_id, results } => crate::netmon::ingest_poll(state, agent_id, poll_id, results).await,
+        AgentMsg::CheckResults { results } => crate::checks::ingest(state, agent_id, results).await?,
         AgentMsg::Pong { .. } => {}
         AgentMsg::Enroll { .. } | AgentMsg::Auth { .. } => {}
     }
@@ -642,6 +644,7 @@ fn message_type(m: &AgentMsg) -> usize {
         AgentMsg::SoftwareResult(_) => 33,
         AgentMsg::NetScanResult { .. } => 34,
         AgentMsg::SnmpPollResult { .. } => 35,
+        AgentMsg::CheckResults { .. } => 36,
     }
 }
 

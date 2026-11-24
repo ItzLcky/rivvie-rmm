@@ -10,6 +10,7 @@ mod agents;
 mod attachments;
 mod alerts;
 mod apikeys;
+mod backups;
 mod billing;
 mod channels;
 mod auth;
@@ -45,6 +46,7 @@ mod sso;
 pub(crate) mod sla;
 pub(crate) mod tickets;
 mod tags;
+mod uptime;
 mod time;
 mod tools;
 mod totp;
@@ -402,6 +404,14 @@ pub fn router(attachment_max: u64) -> Router<Arc<AppState>> {
         .route("/sites/{id}/network", get(network::site_settings).put(network::update_settings))
         .route("/sites/{id}/network/scan", post(network::scan))
         .route("/sites/{id}/network/scans", get(network::scans))
+        .route("/uptime/monitors", get(uptime::list).post(uptime::create))
+        .route("/uptime/monitors/{id}", get(uptime::get).put(uptime::update).delete(uptime::remove))
+        .route("/uptime/monitors/{id}/check", post(uptime::check_now))
+        .route("/uptime/monitors/{id}/results", get(uptime::results))
+        .route("/uptime/summary", get(uptime::summary))
+        .route("/backups", get(backups::list))
+        .route("/agents/{id}/backups", get(backups::for_agent))
+        .route("/agents/{id}/backups/check", post(backups::check_now))
         .route("/network/summary", get(network::summary))
         .route("/network/discovered", get(network::list_discovered))
         .route("/network/discovered/bulk", post(network::bulk_discovered))

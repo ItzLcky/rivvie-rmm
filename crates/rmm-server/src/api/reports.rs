@@ -231,6 +231,84 @@ fn mins(m: Option<f64>) -> String {
 }
 
 /// The quarterly business review for one client, as a PDF (default: last quarter).
+/// QBR "Availability": each uptime monitor's share of passed checks in the period (from the
+/// hourly rollups).
+async fn availability_blocks(st: &AppState, client: Uuid, from: NaiveDate, to: NaiveDate, blocks: &mut Vec<Block>) -> ApiResult<()> {
+    let rows: Vec<(String, String, i64, i64)> = sqlx::query_as(
+        "SELECT m.name, m.kind, coalesce(sum(h.checks), 0)::bigint, coalesce(sum(h.failures), 0)::bigint
+           FROM uptime_monitors m LEFT JOIN uptime_hourly h ON h.monitor_id = m.id AND h.hour >= $2::date AND h.hour < $3::date + 1
+          WHERE m.client_id = $1 GROUP BY m.id, m.name, m.kind ORDER BY lower(m.name) LIMIT 50",
+    )
+    .bind(client)
+    .bind(from)
+    .bind(to)
+    .fetch_all(&st.db)
+    .await?;
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let (checks, failures) = rows.iter().fold((0, 0), |(c, f), r| (c + r.2, f + r.3));
+    blocks.push(Block::Heading("Availability".into()));
+    blocks.push(Block::Paragraph(format!(
+        "{} monitored services; {} of checks passed overall.",
+        rows.len(),
+        crate::uptime::percent(checks, failures).map_or("none".into(), |p| format!("{p}%"))
+    )));
+    blocks.push(Block::Table(
+        vec!["Monitor".into(), "Checks".into(), "Failed".into(), "Availability".into()],
+        rows.iter()
+            .map(|(n, k, c, f)| vec![format!("{n} ({})", k.to_uppercase()), c.to_string(), f.to_string(), crate::uptime::percent(*c, *f).map_or("–".into(), |p| format!("{p}%"))])
+            .collect(),
+    ));
+    Ok(())
+}
+
+/// QBR "Backup success": the client's backup jobs as last reported, and the backup alerts of
+/// the period.
+async fn backup_blocks(st: &AppState, client: Uuid, from: NaiveDate, to: NaiveDate, blocks: &mut Vec<Block>) -> ApiResult<()> {
+    let (devices, jobs, ok, failed): (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT count(DISTINCT b.agent_id), count(*), count(*) FILTER (WHERE b.last_result = 'success'), count(*) FILTER (WHERE b.last_result = 'failed')
+           FROM backup_jobs b JOIN agents a ON a.id = b.agent_id JOIN sites s ON s.id = a.site_id WHERE s.client_id = $1",
+    )
+    .bind(client)
+    .fetch_one(&st.db)
+    .await?;
+    let alerts: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM alerts al JOIN agents a ON a.id = al.agent_id JOIN sites s ON s.id = a.site_id
+          WHERE s.client_id = $1 AND al.kind = 'backup' AND al.opened_at >= $2 AND al.opened_at < $3::date + 1",
+    )
+    .bind(client)
+    .bind(from)
+    .bind(to)
+    .fetch_one(&st.db)
+    .await?;
+    if jobs == 0 && alerts == 0 {
+        return Ok(());
+    }
+    blocks.push(Block::Heading("Backup success".into()));
+    blocks.push(Block::Figures(vec![
+        ("Devices with backups".into(), devices.to_string()),
+        ("Backup jobs".into(), jobs.to_string()),
+        ("Last run succeeded".into(), pct(ok, jobs).map_or("–".into(), |p| format!("{p}%"))),
+        ("Last run failed".into(), failed.to_string()),
+        ("Backup alerts in the period".into(), alerts.to_string()),
+    ]));
+    let failing: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT a.hostname, b.job, b.provider FROM backup_jobs b JOIN agents a ON a.id = b.agent_id JOIN sites s ON s.id = a.site_id
+          WHERE s.client_id = $1 AND b.last_result = 'failed' ORDER BY lower(a.hostname), lower(b.job) LIMIT 10",
+    )
+    .bind(client)
+    .fetch_all(&st.db)
+    .await?;
+    if !failing.is_empty() {
+        blocks.push(Block::Table(
+            vec!["Device".into(), "Failing job".into()],
+            failing.into_iter().map(|(h, j, p)| vec![h, format!("{j} ({})", crate::backups::label(&p))]).collect(),
+        ));
+    }
+    Ok(())
+}
+
 pub async fn qbr(State(st): State<Arc<AppState>>, u: User, Path(client): Path<Uuid>, Query(q): Query<Range>) -> ApiResult<Response> {
     super::access::client(&u, client)?;
     let (from, to) = match (q.from, q.to) {
@@ -344,6 +422,8 @@ pub async fn qbr(State(st): State<Arc<AppState>>, u: User, Path(client): Path<Uu
         offline.0,
         offline.1.unwrap_or(0.0)
     )));
+    availability_blocks(&st, client, from, to, &mut blocks).await?;
+    backup_blocks(&st, client, from, to, &mut blocks).await?;
     let subtitle = format!("{name} · {} – {}", from.format("%-d %B %Y"), to.format("%-d %B %Y"));
     let pdf = crate::pdf::report("Quarterly business review", &subtitle, &crate::email::brand(&st), &blocks);
     let file = format!("QBR-{}-{}", name.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>(), from.format("%Y-%m"));

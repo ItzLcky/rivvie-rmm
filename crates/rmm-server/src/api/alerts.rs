@@ -51,6 +51,9 @@ pub struct AlertRow {
     /// A monitored network device it is about (`hostname` is the agent that reads it).
     device_id: Option<Uuid>,
     device_name: Option<String>,
+    /// An uptime monitor it is about (`hostname` is the agent that runs it).
+    monitor_id: Option<Uuid>,
+    monitor_name: Option<String>,
     #[sqlx(default)]
     #[serde(skip)]
     sort_key: String,
@@ -64,13 +67,13 @@ fn alert_cols() -> String {
         "al.id, al.policy_id, p.name AS policy_name, al.agent_id, a.hostname, s.client_id, c.name AS client_name, s.name AS site_name,
          al.kind, al.severity, al.title, al.details, al.occurrences, {STATE} AS state, al.opened_at, al.last_seen_at,
          al.acknowledged_at, ua.name AS acknowledged_by_name, al.resolved_at, ur.name AS resolved_by_name, al.resolution, al.suppressed,
-         al.script_job_id, al.device_id, nd.name AS device_name"
+         al.script_job_id, al.device_id, nd.name AS device_name, al.monitor_id, um.name AS monitor_name"
     )
 }
 const ALERT_FROM: &str = "FROM alerts al JOIN agents a ON a.id = al.agent_id JOIN sites s ON s.id = a.site_id
        JOIN clients c ON c.id = s.client_id LEFT JOIN policy_items p ON p.id = al.policy_id
        LEFT JOIN users ua ON ua.id = al.acknowledged_by LEFT JOIN users ur ON ur.id = al.resolved_by
-       LEFT JOIN net_devices nd ON nd.id = al.device_id";
+       LEFT JOIN net_devices nd ON nd.id = al.device_id LEFT JOIN uptime_monitors um ON um.id = al.monitor_id";
 
 const SORT_KEYS: &[SortKey] = &[
     SortKey { name: "opened", expr: "al.opened_at", ty: "timestamptz" },

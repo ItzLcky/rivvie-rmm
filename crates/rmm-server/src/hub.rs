@@ -77,6 +77,18 @@ pub enum Event {
         #[serde(skip)]
         client_id: Uuid,
     },
+    /// An agent reported its backup jobs.
+    Backups {
+        agent_id: Uuid,
+        #[serde(skip)]
+        client_id: Uuid,
+    },
+    /// An uptime monitor was checked or changed state.
+    Monitor {
+        id: Uuid,
+        #[serde(skip)]
+        client_id: Uuid,
+    },
     /// A ticket was created or changed (fields, timeline).
     Ticket {
         id: Uuid,
@@ -96,7 +108,9 @@ impl Event {
             | Event::Patches { client_id, .. }
             | Event::Software { client_id, .. }
             | Event::Security { client_id, .. }
-            | Event::Network { client_id, .. } => Some(*client_id),
+            | Event::Network { client_id, .. }
+            | Event::Monitor { client_id, .. }
+            | Event::Backups { client_id, .. } => Some(*client_id),
             Event::Ticket { client_id, .. } => *client_id,
             Event::Jobs => None,
         }

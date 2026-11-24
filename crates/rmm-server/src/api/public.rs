@@ -330,6 +330,46 @@ pub static OPS: &[Op] = &[
         note: "About 500 points whatever the range; beyond 48 hours from hourly rollups.",
         query: &[("hours", "integer", "How far back, 1-8784. Default 24.")], paged: false, body: None, response: Resp::List("NetworkDevicePoint"),
     },
+    // ---- uptime monitors (read) --------------------------------------------------------------
+    Op {
+        id: "listUptimeMonitors", method: "GET", path: "/uptime/monitors", group: "network", summary: "List uptime monitors",
+        note: "Ping, TCP, HTTP(S), TLS certificate and DNS checks run by an agent. `uptime_24h` and `uptime_30d` are the percent of checks that passed.",
+        query: &[
+            CLIENT_Q,
+            ("site_id", "uuid", "Only this site."),
+            ("state", "string", "`up`, `down` or `unknown`."),
+            ("kind", "string", "`ping`, `tcp`, `http`, `tls` or `dns`."),
+            ("q", "string", "Name, target or client."),
+        ],
+        paged: false, body: None, response: Resp::List("UptimeMonitor"),
+    },
+    Op {
+        id: "getUptimeMonitor", method: "GET", path: "/uptime/monitors/{id}", group: "network", summary: "Get a monitor with 90 days of availability, its open alerts and latest results",
+        note: "", query: NONE, paged: false, body: None, response: Resp::One("UptimeMonitorDetail"),
+    },
+    Op {
+        id: "getUptimeResults", method: "GET", path: "/uptime/monitors/{id}/results", group: "network", summary: "Checks, failures and latency of a monitor over time",
+        note: "About 500 points whatever the range; raw results for ranges within the last 48 hours, hourly rollups beyond.",
+        query: &[("from", "datetime", "Start (default: 24 hours before `to`)."), ("to", "datetime", "End (default: now).")],
+        paged: false, body: None, response: Resp::List("UptimePoint"),
+    },
+    // ---- backups (read) -------------------------------------------------------------------------
+    Op {
+        id: "listBackups", method: "GET", path: "/backups", group: "agents", summary: "List backup jobs across devices",
+        note: "The last result of each backup job the agents report (Windows Server Backup, Veeam, restic, borg, Time Machine, backup files).",
+        query: &[
+            CLIENT_Q,
+            ("result", "string", "Comma-separated: `success`, `warning`, `failed`, `running`, `unknown`."),
+            ("provider", "string", "`wsb`, `veeam`, `restic`, `borg`, `timemachine` or `file_age`."),
+            ("alerting", "boolean", "Only jobs with (or without) an open backup alert."),
+            ("q", "string", "Hostname or job."),
+        ],
+        paged: true, body: None, response: Resp::Paged("BackupJob"),
+    },
+    Op {
+        id: "listAgentBackups", method: "GET", path: "/agents/{id}/backups", group: "agents", summary: "An agent's backup jobs",
+        note: "", query: NONE, paged: false, body: None, response: Resp::List("BackupJob"),
+    },
     Op {
         id: "listDiscoveredDevices", method: "GET", path: "/network/discovered", group: "network", summary: "List the hosts that network scans found",
         note: "`state` says whether a host is managed (an agent runs on it), monitored (read over SNMP), ignored, known or still unmanaged.",
@@ -663,6 +703,25 @@ fn base_schemas() -> Value {
         },
         "NetworkDevicePoint": object("One point of a device's history.", &[
             ("ts", "datetime"), ("reachable_pct", "number"), ("rtt_ms", "number?"), ("cpu_percent", "number?"), ("mem_used", "integer?"), ("mem_total", "integer?"),
+        ]),
+        "UptimeMonitor": object("A check run on a schedule by an agent.", &[
+            ("id", "uuid"), ("client_id", "uuid"), ("client_name", "string"), ("site_id", "uuid"), ("site_name", "string"), ("name", "string"),
+            ("kind", "string"), ("config", "object"), ("target", "string"), ("runner", "string"), ("agent_id", "uuid?"), ("runner_agent_id", "uuid?"),
+            ("runner_hostname", "string?"), ("runner_online", "boolean"), ("interval_secs", "integer"), ("timeout_secs", "integer"), ("enabled", "boolean"),
+            ("state", "string"), ("state_since", "datetime"), ("fail_count", "integer"), ("last_at", "datetime?"), ("last_ms", "integer?"),
+            ("last_message", "string?"), ("last_value", "number?"), ("cert_not_after", "datetime?"), ("cert", "object?"), ("open_alerts", "integer"),
+            ("uptime_24h", "number?"), ("uptime_30d", "number?"),
+        ]),
+        "UptimeMonitorDetail": {
+            "allOf": [reference("UptimeMonitor"), object("Daily availability, open alerts and the latest results.", &[("days", "array"), ("alerts", "array"), ("recent", "array")])],
+        },
+        "UptimePoint": object("One point of a monitor's history.", &[
+            ("ts", "datetime"), ("checks", "integer"), ("failures", "integer"), ("avg_ms", "number?"), ("max_ms", "integer?"),
+        ]),
+        "BackupJob": object("A backup job's last result on a device.", &[
+            ("agent_id", "uuid"), ("hostname", "string"), ("online", "boolean"), ("client_id", "uuid"), ("client_name", "string"), ("site_name", "string"),
+            ("provider", "string"), ("job", "string"), ("last_run_at", "datetime?"), ("last_success_at", "datetime?"), ("last_result", "string"),
+            ("message", "string"), ("size_bytes", "integer?"), ("updated_at", "datetime"), ("alerting", "boolean"),
         ]),
         "DiscoveredDevice": object("A host a network scan found.", &[
             ("id", "uuid"), ("site_id", "uuid"), ("site_name", "string"), ("client_id", "uuid"), ("client_name", "string"), ("ip", "string"),
