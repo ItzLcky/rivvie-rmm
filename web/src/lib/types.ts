@@ -282,7 +282,7 @@ export interface Compliance {
 
 export type Priority = 1 | 2 | 3 | 4;
 export type StatusCategory = 'new' | 'open' | 'waiting_client' | 'waiting_vendor' | 'resolved' | 'closed';
-export type TicketSource = 'dashboard' | 'email' | 'alert' | 'portal' | 'api';
+export type TicketSource = 'dashboard' | 'email' | 'alert' | 'portal' | 'api' | 'agent';
 export interface BoardStatus { id: string; name: string; category: StatusCategory; position: number }
 export interface Board {
 	id: string; name: string; description: string; position: number; statuses: BoardStatus[]; open_tickets: number;
@@ -349,7 +349,7 @@ export interface KbArticle {
 	id: string; title: string; category: string; public: boolean; client_id: string | null; client_name: string | null; body?: string | null;
 	excerpt: string; updated_by_name: string | null; created_at: string; updated_at: string;
 }
-export interface DeskSettings { portal_board_id: string | null; portal_welcome: string; csat_enabled: boolean }
+export interface DeskSettings { portal_board_id: string | null; portal_welcome: string; csat_enabled: boolean; tray_board_id?: string | null }
 
 export interface Contact {
 	id: string; client_id: string; client_name: string; site_id: string | null; site_name: string | null; name: string; email: string;

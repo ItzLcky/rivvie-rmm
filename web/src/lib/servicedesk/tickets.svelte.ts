@@ -35,7 +35,7 @@ export const categories: { value: StatusCategory; label: string; tone: Tone; hin
 ];
 export const categoryOf = (c: StatusCategory) => categories.find((x) => x.value === c) ?? categories[1];
 
-export const sourceLabels: Record<string, string> = { dashboard: 'Dashboard', email: 'Email', alert: 'Alert', portal: 'Portal', api: 'API' };
+export const sourceLabels: Record<string, string> = { dashboard: 'Dashboard', email: 'Email', alert: 'Alert', portal: 'Portal', api: 'API', agent: 'From device' };
 
 export const ticketNumber = (n: number) => `T-${n}`;
 

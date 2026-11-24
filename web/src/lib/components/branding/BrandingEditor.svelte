@@ -261,6 +261,7 @@
 						hours: form.support_hours.trim() || r.support.hours
 					}}
 				/>
+				<p class="text-muted text-xs">The contact card is shown in the portal and in the tray app on devices, with {name} as its title.</p>
 			</aside>
 		</div>
 	{/snippet}

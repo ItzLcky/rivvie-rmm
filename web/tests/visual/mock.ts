@@ -954,6 +954,7 @@ const PATCH_ITEM = '00000000-0000-4000-8000-000000000001';
 const SECURITY_ITEM = '00000000-0000-4000-8000-000000000002';
 const REMOTE_ITEM = '00000000-0000-4000-8000-000000000003';
 const AGENT_ITEM = '00000000-0000-4000-8000-000000000004';
+const TRAY_ITEM = '00000000-0000-4000-8000-000000000007';
 interface PItem { id: string; set: string; module: string; name: string; enabled: boolean; config: Cfg; client_id: string | null; site_id: string | null; excluded: { id: string; hostname: string }[] }
 const alertSet: Record<string, string> = { 'p-off': SET.root, 'p-disk': SET.root, 'p-cpu': SET.root, 'p-svc': SET.root, 'p-job': SET.linux, 'p-log': SET.linux };
 const alertConfig = (p: (typeof policies)[number]): Cfg => ({
@@ -983,7 +984,9 @@ const items: PItem[] = [
 	{ id: SECURITY_ITEM, set: SET.root, module: 'security', name: 'Security', enabled: true, client_id: null, site_id: null, excluded: [],
 		config: { sensor_enabled: true, quick_scan_hours: 24, full_scan_days: 7, auto_quarantine: true, prevention: true, canaries: true, telemetry_mb: 256, realtime: 'block', scan_on_write: true, archive_depth: 5, database_max_age_hours: 72 } },
 	{ id: REMOTE_ITEM, set: SET.root, module: 'remote_access', name: 'Remote access', enabled: true, client_id: null, site_id: null, excluded: [], config: { desktop_enabled: true, desktop_consent: false, shell_enabled: true, files_enabled: true } },
-	{ id: AGENT_ITEM, set: SET.root, module: 'agent', name: 'Agent', enabled: true, client_id: null, site_id: null, excluded: [], config: { auto_update: true } }
+	{ id: AGENT_ITEM, set: SET.root, module: 'agent', name: 'Agent', enabled: true, client_id: null, site_id: null, excluded: [], config: { auto_update: true } },
+	{ id: TRAY_ITEM, set: SET.root, module: 'tray', name: 'Tray app', enabled: true, client_id: null, site_id: null, excluded: [],
+		config: { enabled: true, request_help: true, contact_card: true, screenshot_default: true, links: [{ label: 'Service status', url: 'https://status.example.com' }] } }
 ];
 const overrides: { item: string; set: string; enabled: boolean | null; config: Cfg }[] = [
 	{ item: PATCH_ITEM, set: SET.acmeWin, enabled: null, config: { auto_approve_severities: ['critical'], deferral_days: 2, auto_install: true, reboot_policy: 'if_required' } },
@@ -1035,7 +1038,7 @@ function chainOf(id: string): PSet[] {
 	for (let s: PSet | undefined = setOf(id); s; s = s.parent_id ? setOf(s.parent_id) : undefined) out.unshift(s);
 	return out;
 }
-const moduleOrder = ['alert', 'schedule', 'software', 'automation', 'patch', 'security', 'remote_access', 'agent'];
+const moduleOrder = ['alert', 'schedule', 'software', 'automation', 'patch', 'security', 'remote_access', 'agent', 'tray'];
 function itemView(it: PItem, chain: PSet[], agent?: Agent) {
 	const ids = chain.map((c) => c.id);
 	const at = ids.indexOf(it.set);

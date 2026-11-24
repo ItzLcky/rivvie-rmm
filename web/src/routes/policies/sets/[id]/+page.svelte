@@ -129,7 +129,8 @@
 						{ value: 'patching', label: 'Patching', count: singleOverride('patch') ? 'edited' : undefined, title: singleOverride('patch') ? 'Overridden in this set' : undefined },
 						{ value: 'security', label: 'Security', count: singleOverride('security') ? 'edited' : undefined, title: singleOverride('security') ? 'Overridden in this set' : undefined },
 						{ value: 'remote', label: 'Remote access', count: singleOverride('remote_access') ? 'edited' : undefined, title: singleOverride('remote_access') ? 'Overridden in this set' : undefined },
-						{ value: 'agent', label: 'Agent', count: singleOverride('agent') ? 'edited' : undefined, title: singleOverride('agent') ? 'Overridden in this set' : undefined }
+						{ value: 'agent', label: 'Agent', count: singleOverride('agent') ? 'edited' : undefined, title: singleOverride('agent') ? 'Overridden in this set' : undefined },
+						{ value: 'tray', label: 'Tray app', count: singleOverride('tray') ? 'edited' : undefined, title: singleOverride('tray') ? 'Overridden in this set' : undefined }
 					] },
 					{ label: 'Set', items: [
 						{ value: 'devices', label: 'Devices', count: num(s.devices) },
