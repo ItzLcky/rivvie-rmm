@@ -38,6 +38,9 @@
 					<Field label="Requests from the portal go to" id="ps-board">
 						<Select id="ps-board" class="w-full" bind:value={() => s.portal_board_id ?? '', (v) => (s.portal_board_id = v || null)} options={[{ value: '', label: 'The first board' }, ...boards.map((b) => ({ value: b.id, label: b.name }))]} />
 					</Field>
+					<Field label="Requests from the tray app go to" id="ps-tray-board" hint="Help requests people send from a device.">
+						<Select id="ps-tray-board" class="w-full" bind:value={() => s.tray_board_id ?? '', (v) => (s.tray_board_id = v || null)} options={[{ value: '', label: 'The portal\'s board' }, ...boards.map((b) => ({ value: b.id, label: b.name }))]} />
+					</Field>
 				</div>
 				<Field label="Welcome text" id="ps-welcome" hint="Shown on the portal's sign-in page and home page.">
 					<Textarea id="ps-welcome" rows={3} maxlength={2000} bind:value={s.portal_welcome} />

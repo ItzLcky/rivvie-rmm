@@ -185,6 +185,13 @@ fn now() -> u64 {
 // .deb: an ar archive of debian-binary, control.tar.gz and data.tar.gz
 // ---------------------------------------------------------------------------
 
+/// The tray app on Linux desktops (docs/design/tray.md): a launcher that opens the request
+/// form, and an autostart entry that stays connected for consent prompts and notices.
+const TRAY_LAUNCHER: &str = "[Desktop Entry]\nType=Application\nName=Request help\nComment=Ask the help desk for help with this computer\n\
+Exec=/usr/bin/rmm-agent tray\nIcon=help-browser\nTerminal=false\nCategories=Utility;\n";
+const TRAY_AUTOSTART: &str = "[Desktop Entry]\nType=Application\nName=Help desk link\nComment=Shows the help desk's prompts and notices\n\
+Exec=/usr/bin/rmm-agent tray --background\nTerminal=false\nNoDisplay=true\nX-GNOME-Autostart-enabled=true\n";
+
 fn deb(binary: &[u8], enroll: &[u8], version: &str, arch: &str, summary: &str) -> anyhow::Result<Vec<u8>> {
     // One line: a newline would start another control field.
     let summary = summary.replace(['\n', '\r'], " ");
@@ -210,6 +217,12 @@ fn deb(binary: &[u8], enroll: &[u8], version: &str, arch: &str, summary: &str) -
         Entry::dir("./etc/", 0o755),
         Entry::dir("./etc/rmm-agent/", 0o700),
         Entry::file("./etc/rmm-agent/enroll.toml", 0o600, enroll),
+        Entry::dir("./etc/xdg/", 0o755),
+        Entry::dir("./etc/xdg/autostart/", 0o755),
+        Entry::file("./etc/xdg/autostart/rmm-tray.desktop", 0o644, TRAY_AUTOSTART.as_bytes()),
+        Entry::dir("./usr/share/", 0o755),
+        Entry::dir("./usr/share/applications/", 0o755),
+        Entry::file("./usr/share/applications/rmm-tray.desktop", 0o644, TRAY_LAUNCHER.as_bytes()),
     ])?;
     let mut out = b"!<arch>\n".to_vec();
     for (name, data) in [("debian-binary", &b"2.0\n"[..]), ("control.tar.gz", &control_tar), ("data.tar.gz", &data_tar)] {
@@ -289,6 +302,8 @@ fn rpm(binary: &[u8], enroll: &[u8], version: &str, arch: &str, summary: &str) -
         .with_file_contents(binary.to_vec(), rpm::FileOptions::new("/usr/bin/rmm-agent").permissions(0o755))?
         .with_dir_entry(rpm::FileOptions::dir("/etc/rmm-agent").permissions(0o700))?
         .with_file_contents(enroll.to_vec(), rpm::FileOptions::new("/etc/rmm-agent/enroll.toml").permissions(0o600).missingok())?
+        .with_file_contents(TRAY_AUTOSTART.as_bytes().to_vec(), rpm::FileOptions::new("/etc/xdg/autostart/rmm-tray.desktop").permissions(0o644))?
+        .with_file_contents(TRAY_LAUNCHER.as_bytes().to_vec(), rpm::FileOptions::new("/usr/share/applications/rmm-tray.desktop").permissions(0o644))?
         .post_install_script(format!("set -e\n{POSTINST}"))
         .pre_uninstall_script(preun)
         .build()?;
@@ -336,6 +351,26 @@ mod tests {
         assert!(pkg.starts_with(b"!<arch>\ndebian-binary   "));
         let names: Vec<String> = ar_names(&pkg);
         assert_eq!(names, ["debian-binary", "control.tar.gz", "data.tar.gz"]);
+        // The data archive carries the tray's launcher and autostart entry.
+        let data = ar_member_data(&pkg, "data.tar.gz");
+        let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(&data[..]));
+        let paths: Vec<String> = tar.entries().unwrap().map(|e| e.unwrap().path().unwrap().to_string_lossy().into_owned()).collect();
+        assert!(paths.iter().any(|p| p.trim_start_matches("./") == "usr/share/applications/rmm-tray.desktop"), "{paths:?}");
+        assert!(paths.iter().any(|p| p.trim_start_matches("./") == "etc/xdg/autostart/rmm-tray.desktop"), "{paths:?}");
+        assert!(TRAY_AUTOSTART.contains("Exec=/usr/bin/rmm-agent tray --background\n"));
+    }
+
+    fn ar_member_data(pkg: &[u8], want: &str) -> Vec<u8> {
+        let mut i = 8;
+        while i + 60 <= pkg.len() {
+            let h = &pkg[i..i + 60];
+            let size: usize = String::from_utf8_lossy(&h[48..58]).trim().parse().unwrap();
+            if String::from_utf8_lossy(&h[..16]).trim() == want {
+                return pkg[i + 60..i + 60 + size].to_vec();
+            }
+            i += 60 + size + size % 2;
+        }
+        panic!("no {want}");
     }
 
     fn ar_names(pkg: &[u8]) -> Vec<String> {

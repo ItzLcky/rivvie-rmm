@@ -43,6 +43,7 @@ mod graph;
 mod entra;
 mod identity;
 mod mdm;
+mod helpdesk_agent;
 mod security;
 mod sla;
 mod shell_ws;

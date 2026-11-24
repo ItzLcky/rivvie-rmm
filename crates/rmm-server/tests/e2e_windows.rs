@@ -201,6 +201,15 @@ fn sh(program: &str, args: &[&str]) -> (bool, String) {
     (out.status.success(), format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)))
 }
 
+/// `HKLM\…\Run\RmmAgentTray`, if it's there.
+fn tray_run_value() -> Option<String> {
+    let (ok, out) = sh("reg.exe", &["query", r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run", "/v", "RmmAgentTray", "/reg:64"]);
+    if !ok {
+        return None;
+    }
+    out.lines().find_map(|l| l.trim().strip_prefix("RmmAgentTray")).map(|r| r.trim().trim_start_matches("REG_SZ").trim().to_string())
+}
+
 fn powershell(script: &str) -> (bool, String) {
     sh("powershell.exe", &["-NoProfile", "-NonInteractive", "-Command", script])
 }
@@ -347,6 +356,8 @@ async fn run(url: String, dir: PathBuf) {
     let (_, acl) = sh("icacls.exe", &[data.to_str().unwrap()]);
     assert!(!acl.contains("BUILTIN\\Users") && !acl.contains("Everyone") && !acl.contains("Authenticated Users"), "{acl}");
     assert!(data.join("logs").join("agent.log").exists(), "the service logs to a file");
+    // The tray app starts at sign-in for everyone: the MSI's Registry row.
+    assert_eq!(tray_run_value().as_deref(), Some(format!("\"{}\" tray", program_files.display()).as_str()), "the tray's Run value after install");
     let install_log = std::fs::read_to_string(data.join("logs").join("install.log")).unwrap_or_default();
     assert!(install_log.contains("ok: enrolled as"), "{install_log}");
 
@@ -362,6 +373,7 @@ async fn run(url: String, dir: PathBuf) {
         ["rmm-agent.old.exe", "rmm-agent.new.exe"].iter().map(|n| program_files.with_file_name(n)).filter(|p| p.exists()).collect();
     msiexec(&dir, &["/x", msi.to_str().unwrap()], "uninstall.log");
     assert_eq!(service_state(), None, "the service is removed");
+    assert_eq!(tray_run_value(), None, "the tray's Run value goes with the package");
     assert!(!program_files.exists(), "the binary is removed");
     for p in &leftovers {
         assert!(!p.exists(), "uninstall removes {} too", p.display());
@@ -457,7 +469,7 @@ struct Sections {
 }
 
 impl Sections {
-    const ALL: [&str; 9] = ["base", "shell", "eventlog", "patches", "defender", "sensor", "diskenc", "laps", "update"];
+    const ALL: [&str; 10] = ["base", "shell", "eventlog", "patches", "defender", "sensor", "diskenc", "laps", "tray", "update"];
 
     fn from_env() -> Self {
         let list = |k: &str| {
@@ -492,6 +504,7 @@ impl Sections {
                 "sensor" => sensor(admin, dir, id).await,
                 "diskenc" => diskenc(admin, id).await,
                 "laps" => laps(admin, id).await,
+                "tray" => tray(admin, id).await,
                 "update" => update(admin, dir, id).await,
                 _ => unreachable!(),
             }
@@ -1033,6 +1046,35 @@ async fn wait_update(admin: &Api, id: &str, secs: u64, finished: &[&str]) -> Val
         }
     })
     .await
+}
+
+// --- the tray app over the named pipe -----------------------------------------------------------------
+
+/// The headless `rmm-agent tray` as the runner's (elevated) user, against the service's pipe.
+async fn tray(admin: &Api, id: &str) {
+    let exe = PathBuf::from(std::env::var("ProgramFiles").unwrap()).join("RMM").join("rmm-agent.exe");
+    let run = |args: &[&str]| {
+        let out = Command::new(&exe).arg("tray").args(args).output().unwrap();
+        (out.status.success(), String::from_utf8_lossy(&out.stdout).into_owned(), String::from_utf8_lossy(&out.stderr).into_owned())
+    };
+    let config = eventually(60, "the tray config over the pipe", || async {
+        let (ok, out, _) = run(&["--show-config"]);
+        let v: Value = serde_json::from_str(out.trim()).ok()?;
+        (ok && !v.is_null()).then_some(v)
+    })
+    .await;
+    assert_eq!(config["enabled"], true, "{config}");
+    let (ok, out, err) = run(&["--request", "--subject", "Windows tray e2e", "--body", "From the named pipe."]);
+    assert!(ok, "{out} {err}");
+    let number: i64 = out.trim().strip_prefix("ticket #").and_then(|s| s.strip_suffix(" created")).and_then(|n| n.parse().ok()).unwrap_or_else(|| panic!("{out}"));
+    let list = admin.get("/tickets?q=Windows%20tray%20e2e").await;
+    let t = list["items"].as_array().unwrap().iter().find(|t| t["number"] == number).cloned().unwrap_or_else(|| panic!("ticket {number}: {list}"));
+    let t = admin.get(&format!("/tickets/{}", t["id"].as_str().unwrap())).await;
+    assert_eq!(t["source"], "agent", "{t}");
+    assert!(t["agents"].as_array().unwrap().iter().any(|a| a["id"] == id), "{t}");
+    // DOMAIN\user from the pipe client's token.
+    let note = t["events"].as_array().unwrap().iter().find(|e| e["kind"] == "note").cloned().unwrap();
+    assert!(note["body"].as_str().unwrap().contains("Signed-in user: ") && note["body"].as_str().unwrap().contains('\\'), "{note}");
 }
 
 async fn update(admin: &Api, dir: &Path, id: &str) {

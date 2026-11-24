@@ -102,6 +102,19 @@ Needs a signed-in console user (a VM console session), not just the agent.
 8. Frame rate and CPU: a video playing full screen at 1080p stays above ~10 fps over a LAN and the agent's CPU stays reasonable (note the number). Closing the session ends the helper process (`Get-Process rmm-agent` shows only the service).
 9. The relay's other half: file browser and transfer to a path with spaces and non-ASCII characters; a 1 GB upload; browsing `C:\Users` as SYSTEM.
 
+## 6a. Tray app
+
+CI (`e2e_windows`, section `tray`) checks the Run value after MSI install and its removal on uninstall, and drives `rmm-agent tray --request` over the named pipe as the runner's elevated user. Everything with a window is manual:
+
+1. Sign in as a standard user after installing the MSI: the icon appears (the branding icon if one is set, else the stock application icon), with the product name as its tooltip. Explorer restarted (`taskkill /f /im explorer.exe`, then start it): the icon comes back.
+2. Menu → Request help: the form opens on top; the screenshot was taken before it opened (the form isn't in the picture). Tab moves between fields, Enter sends, Esc cancels. The ticket has the screenshot, the device, "From device", and `DOMAIN\user` (or `AzureAD\user@…`) in the context note; for an Entra user whose UPN matches a contact's email, the ticket is that contact's.
+3. Unplug the network, send a request: "saved and will be sent"; plug it back in: one ticket. Six requests in an hour: the sixth is refused with the reason.
+4. Contact the help desk…: the card from Settings → Branding (the client's override if it has one). Links open in the default browser; an `http(s)` link only.
+5. Consent on: start a remote desktop session; the Allow/Deny box comes from the tray (title "<product>: remote support request") and closes itself after the timeout as a deny. Quit the tray ("Hide until next sign-in") and try again: the `WTSSendMessage` prompt is used instead. During the session a balloon says a technician is connected, and another when they leave.
+6. A terminal server with two users signed in: each has an icon; a consent prompt for the console session goes to the console user only.
+7. Policy `tray.enabled` off: the icon disappears within a minute; on again: it comes back. Self-update the agent: the tray restarts itself from the new binary (check its version in Task Manager → Details → command line, or `Get-Process rmm-agent | fl Path,StartTime`).
+8. As a standard user, try to create a second server instance of `\\.\pipe\rmm-agent-tray` (PowerShell `New-Object System.IO.Pipes.NamedPipeServerStream('rmm-agent-tray')`): access denied.
+
 ## 7. Security
 
 1. Defender, normal mode: the Security tab shows enabled, real-time, tamper protection, the signature version and age, and the last quick and full scan. Run a quick scan, a full scan and a signature update from the console; each ends with the real result. Drop the EICAR file in `C:\Users\Public`: the detection appears with the right name, severity and resource, an alert opens by policy, and clearing the threat (`Remove-MpThreat`) resolves it.

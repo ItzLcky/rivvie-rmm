@@ -109,6 +109,26 @@ fn open_screen() -> Result<Box<dyn Screen>> {
     }
 }
 
+/// The primary monitor as one JPEG, for a tray help request (taken in the user's own session).
+/// Large screens are halved until the picture fits [`rmm_proto::tray::MAX_SCREENSHOT`].
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
+pub(crate) fn screenshot_jpeg() -> Result<Vec<u8>> {
+    let mut screen = open_screen()?;
+    let monitors = screen.monitors()?;
+    let m = monitors.iter().find(|m| m.primary).or(monitors.first()).context("no monitor")?.clone();
+    let mut buf = Vec::new();
+    screen.capture(&m, &mut buf)?;
+    let (w, h) = (m.width as usize, m.height as usize);
+    anyhow::ensure!(buf.len() >= w * h * 4 && w > 0 && h > 0, "short capture");
+    for scale in [1, 2, 4] {
+        let out = encode::jpeg(&encode::Image { data: &buf, width: w, height: h }, scale, 70)?;
+        if out.len() <= rmm_proto::tray::MAX_SCREENSHOT {
+            return Ok(out);
+        }
+    }
+    bail!("the screenshot is too large")
+}
+
 /// `rmm-agent desktop-helper`: runs until stdin closes. Logs go to stderr, which the agent
 /// forwards to its own log; stdout carries [`FromHelper`] messages only.
 pub fn helper_main() -> Result<()> {

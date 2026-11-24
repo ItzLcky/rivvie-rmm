@@ -93,6 +93,17 @@ impl Target {
         }
     }
 
+    /// The session a tray connection for this target reports (`tray::Peer::session`).
+    fn tray_session(&self) -> Option<u32> {
+        match self {
+            Target::Fake => None,
+            #[cfg(target_os = "linux")]
+            Target::Linux(d) => (d.uid >= 1000).then_some(d.uid),
+            #[cfg(windows)]
+            Target::Windows(s) => Some(s.id()),
+        }
+    }
+
     fn spawn(&self) -> Result<Helper> {
         let exe = std::env::current_exe().context("locating the agent binary")?;
         match self {
@@ -190,10 +201,22 @@ async fn serve(
 
     if let Some(c) = consent {
         let t = target.clone();
-        let mut ask = tokio::task::spawn_blocking(move || t.ask(&c));
-        let answer = loop {
+        // The tray connected for that session asks first, in the user's own session; without
+        // one, the platform's prompt.
+        let mut ask = std::pin::pin!(async move {
+            if let (Some(tray), Some(session)) = (crate::tray::global(), t.tray_session()) {
+                let host = crate::collect::system_info().hostname;
+                let (title, text) = consent_text(&c, &host);
+                if let Some(a) = tray.ask_consent(session, &title, &text, c.timeout_secs).await {
+                    info!("asked through the tray");
+                    return Ok(Some(a));
+                }
+            }
+            tokio::task::spawn_blocking(move || t.ask(&c)).await?
+        });
+        let answer: Option<bool> = loop {
             tokio::select! {
-                a = &mut ask => break a??,
+                a = &mut ask => break a?,
                 // Input and acks can't arrive before the first frame; only a close matters.
                 m = rx.recv() => if m.is_none() { return Ok(None) },
             }
@@ -208,6 +231,18 @@ async fn serve(
     let t = target.clone();
     let helper = tokio::task::spawn_blocking(move || t.spawn()).await??;
     info!("desktop helper started");
+    if let Some(tray) = crate::tray::global() {
+        tray.notice(true);
+    }
+    struct NoticeOff;
+    impl Drop for NoticeOff {
+        fn drop(&mut self) {
+            if let Some(tray) = crate::tray::global() {
+                tray.notice(false);
+            }
+        }
+    }
+    let _notice = NoticeOff;
 
     // Writer: messages for the helper's stdin.
     let (wtx, wrx) = std::sync::mpsc::channel::<ToHelper>();

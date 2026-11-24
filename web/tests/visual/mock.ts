@@ -959,6 +959,7 @@ const REMOTE_ITEM = '00000000-0000-4000-8000-000000000003';
 const AGENT_ITEM = '00000000-0000-4000-8000-000000000004';
 const DISKENC_ITEM = '00000000-0000-4000-8000-000000000005';
 const LOCAL_ADMIN_ITEM = '00000000-0000-4000-8000-000000000006';
+const TRAY_ITEM = '00000000-0000-4000-8000-000000000007';
 interface PItem { id: string; set: string; module: string; name: string; enabled: boolean; config: Cfg; client_id: string | null; site_id: string | null; excluded: { id: string; hostname: string }[] }
 const alertSet: Record<string, string> = { 'p-off': SET.root, 'p-disk': SET.root, 'p-cpu': SET.root, 'p-svc': SET.root, 'p-job': SET.linux, 'p-log': SET.linux };
 const alertConfig = (p: (typeof policies)[number]): Cfg => ({
@@ -991,7 +992,9 @@ const items: PItem[] = [
 	{ id: AGENT_ITEM, set: SET.root, module: 'agent', name: 'Agent', enabled: true, client_id: null, site_id: null, excluded: [], config: { auto_update: true } },
 	{ id: DISKENC_ITEM, set: SET.root, module: 'disk_encryption', name: 'Disk encryption', enabled: true, client_id: null, site_id: null, excluded: [], config: { escrow_recovery_keys: true, add_recovery_protector: false } },
 	{ id: LOCAL_ADMIN_ITEM, set: SET.root, module: 'local_admin', name: 'Local admin password', enabled: true, client_id: null, site_id: null, excluded: [],
-		config: { enabled: false, account: 'rmmadmin', create: true, rotate_days: 30, length: 20, rotate_after_reveal_hours: 24 } }
+		config: { enabled: false, account: 'rmmadmin', create: true, rotate_days: 30, length: 20, rotate_after_reveal_hours: 24 } },
+	{ id: TRAY_ITEM, set: SET.root, module: 'tray', name: 'Tray app', enabled: true, client_id: null, site_id: null, excluded: [],
+		config: { enabled: true, request_help: true, contact_card: true, screenshot_default: true, links: [{ label: 'Service status', url: 'https://status.example.com' }] } }
 ];
 const overrides: { item: string; set: string; enabled: boolean | null; config: Cfg }[] = [
 	{ item: PATCH_ITEM, set: SET.acmeWin, enabled: null, config: { auto_approve_severities: ['critical'], deferral_days: 2, auto_install: true, reboot_policy: 'if_required' } },
@@ -1044,7 +1047,7 @@ function chainOf(id: string): PSet[] {
 	for (let s: PSet | undefined = setOf(id); s; s = s.parent_id ? setOf(s.parent_id) : undefined) out.unshift(s);
 	return out;
 }
-const moduleOrder = ['alert', 'schedule', 'software', 'automation', 'patch', 'security', 'remote_access', 'agent'];
+const moduleOrder = ['alert', 'schedule', 'software', 'automation', 'patch', 'security', 'remote_access', 'agent', 'tray'];
 function itemView(it: PItem, chain: PSet[], agent?: Agent) {
 	const ids = chain.map((c) => c.id);
 	const at = ids.indexOf(it.set);

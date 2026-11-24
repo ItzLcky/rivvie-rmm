@@ -301,6 +301,7 @@ async fn run_session(
     }
     crate::checks::on_connect(&state, agent_id, &capabilities, &tx).await;
     crate::localadmin::on_connect(&state, agent_id, &capabilities).await;
+    crate::helpdesk_agent::on_connect(&state, agent_id, client_id, &capabilities, &tx).await;
     // Replies to this connection only (job acks). Weak, so the writer still ends when the
     // hub drops the agent (kick) and every other sender is gone.
     let reply = tx.downgrade();
@@ -627,6 +628,14 @@ async fn on_message(
         AgentMsg::LocalAdminResult { request_id, ok, created, status, message } => {
             crate::localadmin::ingest_result(state, agent_id, request_id, ok, created, status, message).await?
         }
+        AgentMsg::HelpRequest { request_id, user, session, subject, body, context, screenshot_len } => {
+            let req = crate::helpdesk_agent::Request { request_id, user, session, subject, body, context, screenshot_len };
+            crate::helpdesk_agent::on_request(state, agent_id, client_id, reply, req).await
+        }
+        AgentMsg::HelpAttachment { request_id, offset, data, done } => {
+            let piece = crate::helpdesk_agent::Piece { request_id, offset, data, done };
+            crate::helpdesk_agent::on_attachment(state, agent_id, client_id, reply, piece).await
+        }
         AgentMsg::Pong { .. } => {}
         AgentMsg::Enroll { .. } | AgentMsg::Auth { .. } => {}
     }
@@ -679,6 +688,8 @@ fn message_type(m: &AgentMsg) -> usize {
         AgentMsg::DiskRecoveryKey { .. } => 39,
         AgentMsg::DiskProtectorResult { .. } => 40,
         AgentMsg::LocalAdminResult { .. } => 41,
+        AgentMsg::HelpRequest { .. } => 43,
+        AgentMsg::HelpAttachment { .. } => 44,
     }
 }
 

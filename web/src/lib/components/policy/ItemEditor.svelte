@@ -31,6 +31,7 @@
 	import ScheduleForm, { blankSchedule, normalize as scheduleNorm } from './ScheduleForm.svelte';
 	import SecurityForm, { normalize as securityNorm } from './SecurityForm.svelte';
 	import SoftwareForm, { blankSoftware, normalize as softwareNorm } from './SoftwareForm.svelte';
+	import TrayForm, { normalize as trayNorm } from './TrayForm.svelte';
 
 	/**
 	 * One policy as it applies in one set. Where it's defined, edits change the policy itself;
@@ -68,9 +69,10 @@
 		agent: agentNorm,
 		software: softwareNorm,
 		disk_encryption: diskencNorm,
-		local_admin: localAdminNorm
+		local_admin: localAdminNorm,
+		tray: trayNorm
 	};
-	const singleForms: Partial<Record<Module, Component<FormProps>>> = { patch: PatchForm, security: SecurityForm, remote_access: RemoteAccessForm, agent: AgentForm, disk_encryption: DiskEncryptionForm, local_admin: LocalAdminForm };
+	const singleForms: Partial<Record<Module, Component<FormProps>>> = { patch: PatchForm, security: SecurityForm, remote_access: RemoteAccessForm, agent: AgentForm, disk_encryption: DiskEncryptionForm, local_admin: LocalAdminForm, tray: TrayForm };
 	// svelte-ignore state_referenced_locally
 	const norm = norms[module];
 	// svelte-ignore state_referenced_locally

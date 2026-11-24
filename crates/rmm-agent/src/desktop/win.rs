@@ -75,6 +75,10 @@ impl ConsoleSession {
         Ok(ConsoleSession { id })
     }
 
+    pub fn id(&self) -> u32 {
+        self.id
+    }
+
     /// The signed-in user's name, if anyone is signed in to the console.
     fn user(&self) -> Option<String> {
         let mut buf = PWSTR::null();

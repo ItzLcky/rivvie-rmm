@@ -338,11 +338,14 @@ pub struct DeskSettings {
     portal_board_id: Option<Uuid>,
     portal_welcome: String,
     csat_enabled: bool,
+    /// Where requests from the devices' tray app go; none: the portal's board.
+    #[serde(default)]
+    tray_board_id: Option<Uuid>,
 }
 
 pub async fn get_settings(State(st): State<Arc<AppState>>, u: User) -> ApiResult<Json<DeskSettings>> {
     u.require(Role::Admin)?;
-    Ok(Json(sqlx::query_as("SELECT portal_board_id, portal_welcome, csat_enabled FROM company_settings").fetch_one(&st.db).await?))
+    Ok(Json(sqlx::query_as("SELECT portal_board_id, portal_welcome, csat_enabled, tray_board_id FROM company_settings").fetch_one(&st.db).await?))
 }
 
 pub async fn update_settings(State(st): State<Arc<AppState>>, u: User, Json(b): Json<DeskSettings>) -> ApiResult<Json<DeskSettings>> {
@@ -350,26 +353,27 @@ pub async fn update_settings(State(st): State<Arc<AppState>>, u: User, Json(b): 
     if b.portal_welcome.chars().count() > 2000 {
         return Err(ApiError::BadRequest("the welcome text is limited to 2,000 characters".into()));
     }
-    if let Some(bid) = b.portal_board_id {
+    for bid in [b.portal_board_id, b.tray_board_id].into_iter().flatten() {
         let ok: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM boards WHERE id = $1)").bind(bid).fetch_one(&st.db).await?;
         if !ok {
             return Err(ApiError::NotFound("board"));
         }
     }
     let out: DeskSettings = sqlx::query_as(
-        "UPDATE company_settings SET portal_board_id = $1, portal_welcome = $2, csat_enabled = $3, updated_at = now(), updated_by = $4
-         RETURNING portal_board_id, portal_welcome, csat_enabled",
+        "UPDATE company_settings SET portal_board_id = $1, portal_welcome = $2, csat_enabled = $3, tray_board_id = $5, updated_at = now(), updated_by = $4
+         RETURNING portal_board_id, portal_welcome, csat_enabled, tray_board_id",
     )
     .bind(b.portal_board_id)
     .bind(b.portal_welcome.trim())
     .bind(b.csat_enabled)
     .bind(u.id)
+    .bind(b.tray_board_id)
     .fetch_one(&st.db)
     .await?;
     // The survey switch is read from the cached settings.
     let fresh = crate::state::Company::load(&st.db).await?;
     *st.company.write().unwrap_or_else(|e| e.into_inner()) = fresh;
-    auth::audit(&st.db, Some(u.id), "settings.service_desk", None, json!({ "csat_enabled": out.csat_enabled })).await;
+    auth::audit(&st.db, Some(u.id), "settings.service_desk", None, json!({ "csat_enabled": out.csat_enabled, "tray_board_id": out.tray_board_id })).await;
     Ok(Json(out))
 }
 

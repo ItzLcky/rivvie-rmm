@@ -31,6 +31,8 @@ pub const AGENT_ITEM: Uuid = Uuid::from_u128(0x00000000_0000_4000_8000_000000000
 /// Disk encryption (escrow), and the managed local admin account (0038, 0039).
 pub const DISKENC_ITEM: Uuid = Uuid::from_u128(0x00000000_0000_4000_8000_000000000005);
 pub const LOCAL_ADMIN_ITEM: Uuid = Uuid::from_u128(0x00000000_0000_4000_8000_000000000006);
+/// The end-user tray app (0052_tray.sql).
+pub const TRAY_ITEM: Uuid = Uuid::from_u128(0x00000000_0000_4000_8000_000000000007);
 /// Levels below All devices a set may sit at (the built-in OS and platform levels count).
 pub const MAX_DEPTH: i32 = 8;
 
@@ -47,6 +49,7 @@ pub enum Module {
     Automation,
     DiskEncryption,
     LocalAdmin,
+    Tray,
 }
 
 impl Module {
@@ -62,6 +65,7 @@ impl Module {
             "automation" => Module::Automation,
             "disk_encryption" => Module::DiskEncryption,
             "local_admin" => Module::LocalAdmin,
+            "tray" => Module::Tray,
             _ => return None,
         })
     }
@@ -78,6 +82,7 @@ impl Module {
             Module::Automation => "automation",
             Module::DiskEncryption => "disk_encryption",
             Module::LocalAdmin => "local_admin",
+            Module::Tray => "tray",
         }
     }
 
@@ -106,6 +111,7 @@ impl Module {
             Module::Automation => AUTOMATION_OVERRIDABLE.contains(&field),
             Module::DiskEncryption => DISKENC_FIELDS.contains(&field),
             Module::LocalAdmin => LOCAL_ADMIN_FIELDS.contains(&field),
+            Module::Tray => TRAY_FIELDS.contains(&field),
         }
     }
 }
@@ -143,6 +149,7 @@ const SOFTWARE_FIELDS: &[&str] = &["state", "bootstrap_choco", "window"];
 const REMOTE_FIELDS: &[&str] = &["desktop_enabled", "desktop_consent", "shell_enabled", "files_enabled"];
 const DISKENC_FIELDS: &[&str] = &["escrow_recovery_keys", "add_recovery_protector"];
 const LOCAL_ADMIN_FIELDS: &[&str] = &["enabled", "account", "create", "rotate_days", "length", "rotate_after_reveal_hours"];
+const TRAY_FIELDS: &[&str] = &["enabled", "request_help", "contact_card", "screenshot_default", "links"];
 
 // ---------------------------------------------------------------------------
 // Module configs
@@ -551,6 +558,52 @@ pub struct AgentConfig {
     pub auto_update: bool,
 }
 
+/// What the tray app on the device offers (docs/design/tray.md).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrayConfig {
+    /// Show the tray at all.
+    pub enabled: bool,
+    /// The "Request help" entry.
+    pub request_help: bool,
+    /// The branded contact card (support phone, email, web, hours).
+    pub contact_card: bool,
+    /// "Attach a screenshot" starts ticked.
+    pub screenshot_default: bool,
+    /// Extra menu entries, opened in the browser.
+    #[serde(default)]
+    pub links: Vec<TrayLink>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrayLink {
+    pub label: String,
+    pub url: String,
+}
+
+impl TrayConfig {
+    pub const DEFAULT: TrayConfig = TrayConfig { enabled: true, request_help: true, contact_card: true, screenshot_default: true, links: vec![] };
+
+    fn validate(&mut self) -> Result<(), String> {
+        if self.links.len() > rmm_proto::tray::MAX_LINKS {
+            return Err(format!("at most {} links", rmm_proto::tray::MAX_LINKS));
+        }
+        for l in &mut self.links {
+            l.label = l.label.split_whitespace().collect::<Vec<_>>().join(" ");
+            l.url = l.url.trim().to_string();
+            if l.label.is_empty() || l.label.chars().count() > 60 {
+                return Err("each link needs a label of up to 60 characters".into());
+            }
+            let ok_scheme = l.url.starts_with("https://") || l.url.starts_with("http://");
+            if !ok_scheme || l.url.len() > 500 || l.url.chars().any(|c| c.is_whitespace() || c.is_control() || c == '"') || reqwest::Url::parse(&l.url).is_err() {
+                return Err(format!("{}: links must be http:// or https:// addresses", l.label));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// One package requirement: the package, and whether it must be there, kept current, or gone.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -659,6 +712,11 @@ pub fn validate(module: Module, config: &Value) -> Result<Value, String> {
         }
         Module::RemoteAccess => serde_json::to_value(parse::<RemoteAccessConfig>(config)?),
         Module::Agent => serde_json::to_value(parse::<AgentConfig>(config)?),
+        Module::Tray => {
+            let mut c: TrayConfig = parse(config)?;
+            c.validate()?;
+            serde_json::to_value(c)
+        }
         Module::Software => {
             let c: SoftwareConfig = parse(config)?;
             c.validate()?;
@@ -854,6 +912,18 @@ pub async fn local_admin(st: &AppState, agent_id: Uuid) -> sqlx::Result<LocalAdm
     })
 }
 
+/// The effective tray policy for an agent.
+pub async fn tray(st: &AppState, agent_id: Uuid) -> sqlx::Result<TrayConfig> {
+    let v: Option<Value> = sqlx::query_scalar(
+        "SELECT e.config FROM agents a JOIN policy_effective e ON e.set_id = a.policy_set_id AND e.item_id = $2 WHERE a.id = $1",
+    )
+    .bind(agent_id)
+    .bind(TRAY_ITEM)
+    .fetch_optional(&st.db)
+    .await?;
+    Ok(v.and_then(|v| serde_json::from_value(v).ok()).unwrap_or(TrayConfig::DEFAULT))
+}
+
 // ---------------------------------------------------------------------------
 // Writes
 // ---------------------------------------------------------------------------
@@ -997,6 +1067,7 @@ pub async fn changed(st: &Arc<AppState>, ch: Change) {
     }
     crate::alerts::push_watchers(st, agents).await;
     crate::checks::push(st, agents, &[]).await;
+    crate::helpdesk_agent::push_config(st, agents).await;
     crate::security::push_policies_to(st, agents).await;
     crate::diskenc::policy_changed(st, agents).await;
     crate::localadmin::policy_changed(st, agents).await;
@@ -1072,6 +1143,15 @@ mod tests {
         assert!(validate(Module::Patch, &merge(&patch, &json!({ "window": { "tz": "Mars/Olympus" } }))).is_err());
         assert!(validate(Module::Patch, &merge(&patch, &json!({ "reboot_policy": "sometimes" }))).is_err());
         assert!(validate(Module::RemoteAccess, &json!({ "desktop_enabled": true, "desktop_consent": false, "shell_enabled": true })).is_err(), "missing field");
+        let tray = json!({ "enabled": true, "request_help": true, "contact_card": true, "screenshot_default": false, "links": [{ "label": " Status  page ", "url": "https://status.example.com" }] });
+        assert_eq!(validate(Module::Tray, &tray).unwrap()["links"][0]["label"], "Status page");
+        for bad in ["javascript:alert(1)", "file:///c:/x", "https://a b", "https://"] {
+            assert!(validate(Module::Tray, &merge(&tray, &json!({ "links": [{ "label": "x", "url": bad }] }))).is_err(), "{bad}");
+        }
+        assert!(validate(Module::Tray, &merge(&tray, &json!({ "links": [{ "label": "", "url": "https://a.example" }] }))).is_err());
+        assert!(validate(Module::Tray, &merge(&tray, &json!({ "links": vec![json!({ "label": "x", "url": "https://a.example" }); 11] }))).is_err());
+        assert!(Module::Tray.single() && clean_override(Module::Tray, &json!({ "links": [] })).is_ok());
+        assert!(clean_override(Module::Tray, &json!({ "color": "red" })).is_err());
     }
 
     #[test]

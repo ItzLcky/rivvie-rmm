@@ -5,6 +5,7 @@
 		ArrowRightLeft,
 		BellRing,
 		Copy,
+		MonitorSmartphone,
 		ExternalLink,
 		FileText,
 		GitMerge,
@@ -307,6 +308,7 @@
 				<TicketStatus name={t.status_name} category={t.status_category} />
 				<PriorityBadge priority={t.priority} long />
 				{#if t.client_name}<span>{t.client_name}{#if t.contact_name}{' · '}{t.contact_name}{/if}</span>{:else}<Badge tone="warning">Triage</Badge>{/if}
+				{#if t.source === 'agent'}<Badge icon={MonitorSmartphone} title="Asked for through the tray app on the linked device">From device</Badge>{/if}
 			{/snippet}
 			{#snippet actions()}
 				{#if tech && !t.merged_into}

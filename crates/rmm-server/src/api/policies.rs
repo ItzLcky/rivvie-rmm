@@ -637,7 +637,7 @@ async fn item_views(st: &AppState, u: &User, chain: &[ChainEntry], agent: Option
            LEFT JOIN clients c ON c.id = i.client_id LEFT JOIN sites si ON si.id = i.site_id
            LEFT JOIN policy_schedule_state ss ON ss.item_id = i.id
           WHERE e.set_id = $1 AND ($2::uuid[] IS NULL OR i.client_id IS NULL OR i.client_id = ANY($2))
-          ORDER BY array_position(ARRAY['alert', 'schedule', 'patch', 'security', 'remote_access', 'agent', 'automation'], i.module), lower(i.name)",
+          ORDER BY array_position(ARRAY['alert', 'schedule', 'patch', 'security', 'remote_access', 'agent', 'tray', 'automation'], i.module), lower(i.name)",
     )
     .bind(here.id)
     .bind(u.scope())

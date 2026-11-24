@@ -57,6 +57,8 @@
 //!
 //! `RMM_E2E_ONLY=disk_encryption` and `RMM_E2E_ONLY=local_admin` run only those sections
 //! (BitLocker escrow and local admin rotation, through the agent's fakes).
+//! `RMM_E2E_ONLY=tray` runs only the tray app section (the headless `rmm-agent tray` over a1's
+//! real Unix socket).
 //!
 //! `RMM_E2E_ONLY=desk` runs only the core and service desk sections (faster while working on
 //! tickets, the portal and billing); `RMM_E2E_ONLY=api` only enrollment and the API keys and webhooks.
@@ -643,6 +645,11 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
     }
     if std::env::var("RMM_E2E_ONLY").as_deref() == Ok("uptime") {
         uptime(&url, &admin, db, dir, &id1, a_id, a_site, b_id).await;
+        a1.kill();
+        return Ok(());
+    }
+    if std::env::var("RMM_E2E_ONLY").as_deref() == Ok("tray") {
+        tray(server, &admin, db, dir, &id1, a_id).await;
         a1.kill();
         return Ok(());
     }
@@ -1357,6 +1364,10 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
     // After the counters are checked: it restarts the server (with the mock feeds' URLs).
     if all {
         vulnerabilities(server, &url, &admin, db, &id1, &id3, a_id, b_id).await;
+    }
+    // After the counters are checked: it stops the server to queue a request offline.
+    if all {
+        tray(server, &admin, db, dir, &id1, a_id).await;
     }
     // After the counters are checked: it restarts the server.
     audit_export_siem_sealing(server, &admin, &tech, db).await;
@@ -9437,3 +9448,4 @@ include!("e2e_parts/monitoring.rs");
 include!("e2e_parts/identity.rs");
 include!("e2e_parts/device_security.rs");
 include!("e2e_parts/vulnerabilities.rs");
+include!("e2e_parts/tray.rs");

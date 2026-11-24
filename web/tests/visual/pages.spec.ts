@@ -31,6 +31,7 @@ const pages: [string, string][] = [
 	['policy-set-patching', '/policies/sets/ps-acme-tills?section=patching'],
 	['policy-set-security', '/policies/sets/00000000-0000-4000-8001-000000000000?section=security'],
 	['policy-set-remote', '/policies/sets/ps-acme-tills?section=remote'],
+	['policy-set-tray', '/policies/sets/00000000-0000-4000-8001-000000000000?section=tray'],
 	['policy-set-schedule', '/policies/sets/00000000-0000-4000-8001-000000000002?section=schedules&item=sc-1'],
 	['policy-set-schedules-empty', '/policies/sets/ps-dc?section=schedules'],
 	['policy-set-automations', '/policies/sets/00000000-0000-4000-8001-000000000000?section=automations'],

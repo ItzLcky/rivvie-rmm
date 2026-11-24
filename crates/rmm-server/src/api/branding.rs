@@ -141,6 +141,7 @@ async fn save(st: &AppState, u: &User, scope: Option<Uuid>, b: Update) -> ApiRes
     .execute(&st.db)
     .await?;
     st.branding.reload(&st.db).await?;
+    crate::helpdesk_agent::branding_changed(st, scope).await;
     let changed: Vec<&str> = [
         ("product_name", before.product_name == b.product_name),
         ("accent", before.accent == b.accent),
@@ -226,6 +227,7 @@ async fn set_image(st: &AppState, u: &User, scope: Option<Uuid>, v: Variant, key
     .await?;
     tx.commit().await?;
     st.branding.reload(&st.db).await?;
+    crate::helpdesk_agent::branding_changed(st, scope).await;
     Ok(old)
 }
 
@@ -318,6 +320,7 @@ pub async fn delete_client(State(st): State<Arc<AppState>>, u: User, Path(id): P
         .fetch_optional(&st.db)
         .await?;
     st.branding.reload(&st.db).await?;
+    crate::helpdesk_agent::branding_changed(&st, Some(id)).await;
     if let Some(r) = gone {
         for k in [r.logo_light, r.logo_dark, r.icon].into_iter().flatten() {
             let _ = st.storage.delete(&k).await;

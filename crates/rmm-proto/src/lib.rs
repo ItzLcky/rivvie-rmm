@@ -19,6 +19,7 @@ pub mod security;
 pub mod software;
 pub mod telemetry;
 pub mod tools;
+pub mod tray;
 pub mod update;
 
 use chrono::{DateTime, Utc};
@@ -342,6 +343,32 @@ pub enum AgentMsg {
         #[serde(default)]
         message: String,
     },
+    /// Someone at the machine asked for help through the tray (only from agents listing
+    /// [`tray::CAPABILITY`]). `screenshot_len` bytes follow in [`AgentMsg::HelpAttachment`]s;
+    /// answered with [`ServerMsg::HelpRequestResult`]. Resent with the same `request_id` until
+    /// answered, so the server makes one ticket per id.
+    HelpRequest {
+        request_id: Uuid,
+        /// The account name of whoever asked, as the operating system reports it.
+        user: String,
+        /// The local session id (Windows) or user id (Unix) it came from.
+        #[serde(default)]
+        session: u32,
+        subject: String,
+        body: String,
+        #[serde(default)]
+        context: tray::Context,
+        #[serde(default)]
+        screenshot_len: u32,
+    },
+    /// A piece of a help request's screenshot (the [`AgentMsg::TriageChunk`] pattern).
+    HelpAttachment {
+        request_id: Uuid,
+        offset: u32,
+        #[serde(with = "serde_bytes")]
+        data: Vec<u8>,
+        done: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -610,6 +637,18 @@ pub enum ServerMsg {
         account: String,
         password: localadmin::Secret,
         create: bool,
+    },
+    /// What the tray shows (only to agents listing [`tray::CAPABILITY`]). Sent after connecting
+    /// and whenever the device's tray policy or branding changes.
+    TrayConfig(tray::Config),
+    /// Answer to [`AgentMsg::HelpRequest`]: the ticket's number, or why there is none. An
+    /// error is final; the agent drops the request.
+    HelpRequestResult {
+        request_id: Uuid,
+        #[serde(default)]
+        ticket_number: Option<i64>,
+        #[serde(default)]
+        error: Option<String>,
     },
 }
 

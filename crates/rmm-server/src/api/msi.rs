@@ -12,6 +12,8 @@
 //! - a `ServiceControl` row stops the service before files are replaced and stops and deletes
 //!   it on uninstall. `C:\ProgramData\RMM` (config, state, logs) is left behind, so a reinstall
 //!   keeps the same agent record;
+//! - a `Registry` row writes the tray app's `HKLM\…\Run` value (`"…\rmm-agent.exe" tray`),
+//!   which goes with the component on uninstall;
 //! - every package has a new ProductCode under a fixed UpgradeCode, and the Upgrade table
 //!   removes any other installed version first (a major upgrade).
 //!
@@ -31,6 +33,11 @@ const COMPONENT_ID: &str = "{037A78A8-13FF-4752-B2EB-8B761DE76E4F}";
 const FILE_KEY: &str = "rmm_agent.exe";
 const CABINET: &str = "agent.cab";
 const SERVICE_NAME: &str = "RmmAgent";
+/// The tray app's `Run` value (the agent's `rmm-agent install` writes the same one).
+const RUN_KEY: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run";
+const RUN_VALUE: &str = "RmmAgentTray";
+/// Registry.Root: HKEY_LOCAL_MACHINE.
+const HKLM: i32 = 2;
 
 // CustomAction types: 18 = run an EXE installed by this package (Source = File key,
 // Target = arguments), plus deferred (in the install script), no impersonation (as SYSTEM)
@@ -293,6 +300,26 @@ pub fn build(input: &MsiInput) -> anyhow::Result<Vec<u8>> {
     ]))?;
 
     pkg.create_table(
+        "Registry",
+        vec![
+            Column::build("Registry").primary_key().id_string(72),
+            Column::build("Root").int16(),
+            Column::build("Key").localizable().text_string(255),
+            Column::build("Name").nullable().localizable().formatted_string(255),
+            Column::build("Value").nullable().localizable().formatted_string(0),
+            id("Component_", 72),
+        ],
+    )?;
+    pkg.insert_rows(Insert::into("Registry").row(vec![
+        s("TrayRun"),
+        i(HKLM),
+        s(RUN_KEY),
+        s(RUN_VALUE),
+        s(&format!("\"[#{FILE_KEY}]\" tray")),
+        s("AgentExe"),
+    ]))?;
+
+    pkg.create_table(
         "CustomAction",
         vec![
             Column::build("Action").primary_key().id_string(72),
@@ -357,8 +384,10 @@ pub fn build(input: &MsiInput) -> anyhow::Result<Vec<u8>> {
         ("UnpublishFeatures", None, 1800),
         ("StopServices", Some("VersionNT"), 1900),
         ("DeleteServices", Some("VersionNT"), 2000),
+        ("RemoveRegistryValues", None, 2600),
         ("RemoveFiles", None, 3500),
         ("InstallFiles", None, 4000),
+        ("WriteRegistryValues", None, 5000),
         ("RegisterUser", None, 6000),
         ("RegisterProduct", None, 6100),
         ("PublishFeatures", None, 6300),
@@ -513,6 +542,16 @@ mod tests {
         let at = |a: &str| seq.iter().find(|(n, _)| n == a).unwrap().1;
         assert!(at("InstallFiles") < at("EnrollAgent") && at("EnrollAgent") < at("InstallFinalize"));
         assert!(at("StopServices") < at("RemoveFiles"));
+
+        assert!(at("InstallFiles") < at("WriteRegistryValues") && at("RemoveRegistryValues") < at("RemoveFiles"));
+        // The tray starts at sign-in for everyone, from the installed binary.
+        let reg: Vec<_> = pkg.select_rows(msi::Select::table("Registry")).unwrap().collect();
+        assert_eq!(reg.len(), 1);
+        assert_eq!(reg[0][1].as_int(), Some(2), "HKLM");
+        assert_eq!(reg[0][2].as_str(), Some(r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run"));
+        assert_eq!(reg[0][3].as_str(), Some("RmmAgentTray"));
+        assert_eq!(reg[0][4].as_str(), Some("\"[#rmm_agent.exe]\" tray"));
+        assert_eq!(reg[0][5].as_str(), Some("AgentExe"));
 
         // Uninstall also removes what the self-update leaves beside the binary.
         let removed: Vec<String> = pkg.select_rows(msi::Select::table("RemoveFile")).unwrap().map(|r| r[2].as_str().unwrap().to_string()).collect();
