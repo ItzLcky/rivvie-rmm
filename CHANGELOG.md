@@ -12,7 +12,7 @@ back, restore the backup taken before the upgrade (see
 
 ## [Unreleased]
 
-Migrations `0036` to `0040` and `0042` to `0051` are new.
+Migrations `0036` to `0051` are new.
 
 ### Added
 
@@ -94,6 +94,11 @@ Migrations `0036` to `0040` and `0042` to `0051` are new.
   `uptime` alert kind on the runner's policy set opens alerts after a number of failed checks in a
   row, for certificates near expiry and for slow answers; they don't count against the runner's
   health. New crate `rmm-checks` holds the checks. See [docs/design/uptime.md](docs/design/uptime.md).
+- **Uptime monitors run by the server.** A monitor's runner can be the server instead of an agent,
+  for public websites and endpoints. It refuses loopback, private, link-local and cloud metadata
+  addresses (after resolving the name, and on every redirect) unless `RMM_UPTIME_ALLOW_PRIVATE=1`;
+  URLs with credentials are refused as before. Its alerts come from `uptime` items in All devices
+  whose limit covers the monitor's client and site, and have no agent. Migration `0041`.
 - **Backup monitoring.** Agents read the last result of Windows Server Backup, Veeam, restic, Borg
   and Time Machine jobs, or the newest file in a backup folder, every hour; `/backups` lists every
   job, devices show a Backups card, and the `backup` alert kind (also an automation trigger) opens
@@ -112,6 +117,16 @@ Migrations `0036` to `0040` and `0042` to `0051` are new.
   removed dpkg packages; older agents read as "not assessed". New environment variables
   `RMM_VULN_*_URL`, `RMM_NVD_API_KEY`, `RMM_VULN_SYNC_HOURS`. Migration `0048`. See
   [docs/design/vulnerabilities.md](docs/design/vulnerabilities.md).
+
+### Changed
+
+- **Alerts can be without an agent** (migration `0041`): every alert carries its client
+  (`alerts.client_id`, filled in for existing rows from the agent's site), and `agent_id` is null
+  for alerts of monitors the server runs. In the API, `agent_id`, `hostname` and `site_name` of an
+  alert may be null (`site_name` is the monitor's site for monitor alerts). Webhook payloads of
+  such alerts have `"agent": null` and a `monitor` object, and their `url` is the alert's page;
+  notification payloads add `client` and `monitor`, and leave `agent.id` and `agent.hostname` null.
+  The alerts list shows a monitor alert by its monitor ("checked by" the agent or the server).
 
 ## [0.2.0] - 2026-11-23
 
