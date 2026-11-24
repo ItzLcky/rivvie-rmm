@@ -100,9 +100,10 @@ async fn vulnerabilities(server: &mut Server, url: &str, admin: &Api, db: &sqlx:
     admin.wait_online(id1, true).await;
 
     // --- this host's ecosystem and a real package of it ------------------------------------------
+    // Evaluated once its inventory is in (before that it reads "no inventory").
     let status = eventually(60, "the agent to be assessed", || async {
         let v = vuln_findings(admin, id1).await;
-        v["evaluated_at"].is_string().then_some(v)
+        (v["evaluated_at"].is_string() && v["unassessed"] != "no_inventory").then_some(v)
     })
     .await;
     let agent = admin.get(&format!("/agents/{id1}")).await;
