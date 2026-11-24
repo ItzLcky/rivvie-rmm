@@ -143,7 +143,14 @@ const alerts = [
 	alert(5, 'p-job', 2, 'Job failed: Disk usage report', 160, { occurrences: 3, details: { job_id: 'j-1', status: 'failed', exit_code: 2, script: 'Disk usage report' } }),
 	alert(6, 'p-cpu', 0, 'CPU at or above 85% for 15 minutes', 60 * 26, { state: 'resolved', resolved_at: ago(60 * 25), resolution: 'cleared', details: { value: 92.4, threshold: 85, minutes: 15 } })
 ];
-for (const a of alerts) if (a.state !== 'resolved') agents.find((x) => x.id === a.agent_id)!.open_alerts++;
+// A monitor the server runs: an alert without an agent, of the client, at the monitor's site.
+alerts.push({
+	...alerts[0], id: 'al-7', policy_id: 'p-uptime', policy_name: 'Client websites', agent_id: null as unknown as string, hostname: null as unknown as string, client_id: 'c-acme', client_name: 'Acme Corp',
+	site_name: 'Head office', kind: 'uptime', severity: 'critical', title: 'Monitor down: Acme web shop', opened_at: ago(14), last_seen_at: ago(1),
+	details: { monitor: 'Acme web shop', kind: 'http', target: 'https://shop.acme.example/', failures: 3, message: 'HTTP 502' },
+	...({ monitor_id: 'um-shop', monitor_name: 'Acme web shop' } as Record<string, unknown>)
+});
+for (const a of alerts) if (a.state !== 'resolved' && a.agent_id) agents.find((x) => x.id === a.agent_id)!.open_alerts++;
 const channels = [
 	{ id: 'ch-mail', name: 'NOC mailbox', kind: 'email', enabled: true, policies: 2, has_secret: false, config: { to: ['noc@northwind.example', 'oncall@northwind.example'] } },
 	{ id: 'ch-teams', name: 'Teams: Escalations', kind: 'teams', enabled: true, policies: 1, has_secret: false, config: { url: 'https://northwind.webhook.office.com/webhookb2/abc' } },
@@ -1347,6 +1354,7 @@ const uptimeMonitors = [
 	{ ...monitorBase, id: 'um-vpn', client_id: 'c-acme', client_name: 'Acme Corp', site_id: 's-acme-hq', site_name: 'Head office', name: 'VPN gateway', kind: 'tls', config: { host: 'vpn.acme.example', port: 443, server_name: null }, target: 'vpn.acme.example:443', agent_id: null, runner_agent_id: 'a-1', runner_hostname: 'acme-dc01', runner_online: true, state: 'up', state_since: ago(60 * 24 * 20), last_at: ago(2), last_ms: 41, last_message: 'certificate valid for 9 more days (TLSv1.3)', last_value: 9, cert_not_after: ago(-60 * 24 * 9 - 60), cert: { subject: 'CN=vpn.acme.example, O=Acme Corp', issuer: 'C=US, O=DigiCert Inc, CN=DigiCert TLS RSA SHA256 2020 CA1', sans: ['vpn.acme.example'], not_before: ago(60 * 24 * 356), not_after: ago(-60 * 24 * 9 - 60), untrusted: null }, open_alerts: 1, uptime_24h: 100, uptime_30d: 100 },
 	{ ...monitorBase, id: 'um-erp', client_id: 'c-acme', client_name: 'Acme Corp', site_id: 's-acme-wh', site_name: 'Warehouse', name: 'ERP database', kind: 'tcp', config: { host: '10.20.0.15', port: 1433 }, target: '10.20.0.15:1433', agent_id: 'a-2', runner_agent_id: 'a-2', runner_hostname: 'acme-fs01', runner_online: true, state: 'down', state_since: ago(23), fail_count: 23, last_at: ago(1), last_ms: null, last_message: '10.20.0.15:1433: connection refused', open_alerts: 1, uptime_24h: 98.4, uptime_30d: 99.12 },
 	{ ...monitorBase, id: 'um-dns', client_id: 'c-globex', client_name: 'Globex', site_id: 's-globex', site_name: 'Main', name: 'Mail MX record', kind: 'dns', interval_secs: 300, config: { name: 'globex.example', record: 'MX', server: null, expect: ['10 mail.globex.example'] }, target: 'globex.example MX', agent_id: null, runner_agent_id: 'a-5', runner_hostname: 'globex-app01', runner_online: true, state: 'up', state_since: ago(60 * 24 * 80), last_at: ago(3), last_ms: 12, last_message: '10 mail.globex.example', uptime_24h: 100, uptime_30d: 100 },
+	{ ...monitorBase, id: 'um-shop', runner: 'server', client_id: 'c-acme', client_name: 'Acme Corp', site_id: 's-acme-hq', site_name: 'Head office', name: 'Acme web shop', kind: 'http', config: { url: 'https://shop.acme.example/', method: 'get', statuses: [], keyword: null, keyword_absent: false, verify_tls: true }, target: 'https://shop.acme.example/', agent_id: null, runner_agent_id: null, runner_hostname: null, runner_online: true, state: 'down', state_since: ago(16), fail_count: 3, last_at: ago(1), last_ms: 640, last_message: 'HTTP 502 (expected 2xx or 3xx)', last_value: 502, open_alerts: 1, uptime_24h: 98.9, uptime_30d: 99.95 },
 	{ ...monitorBase, id: 'um-ping', client_id: 'c-initech', client_name: 'Initech', site_id: 's-initech', site_name: 'Main', name: 'Branch router', kind: 'ping', config: { host: '192.168.50.1' }, target: '192.168.50.1', agent_id: null, runner_agent_id: 'a-7', runner_hostname: 'initech-ws-12', runner_online: false, state: 'unknown', state_since: ago(60 * 5), last_at: ago(60 * 5 + 3), last_ms: 3, last_message: 'reply in 3 ms', uptime_24h: 100, uptime_30d: 99.99 }
 ];
 function monitorDetail(m: (typeof uptimeMonitors)[number]) {
@@ -1357,7 +1365,7 @@ function monitorDetail(m: (typeof uptimeMonitors)[number]) {
 		const failures = m.id === 'um-erp' && i === 89 ? 23 : m.id === 'um-web' && (i === 40 || i === 71) ? (i === 40 ? 4 : 19) : 0;
 		return { day, checks, failures, uptime: checks ? Math.round(((checks - failures) * 10000) / checks) / 100 : null };
 	}).filter((d) => d.checks);
-	const alerts = m.id === 'um-vpn' ? [{ id: 'al-mon-1', title: 'Certificate expires in 9 days: VPN gateway', severity: 'critical', kind: 'uptime', opened_at: ago(60 * 24 * 5), acknowledged_at: null }] : m.id === 'um-erp' ? [{ id: 'al-mon-2', title: 'Monitor down: ERP database', severity: 'critical', kind: 'uptime', opened_at: ago(22), acknowledged_at: null }] : [];
+	const alerts = m.id === 'um-vpn' ? [{ id: 'al-mon-1', title: 'Certificate expires in 9 days: VPN gateway', severity: 'critical', kind: 'uptime', opened_at: ago(60 * 24 * 5), acknowledged_at: null }] : m.id === 'um-erp' ? [{ id: 'al-mon-2', title: 'Monitor down: ERP database', severity: 'critical', kind: 'uptime', opened_at: ago(22), acknowledged_at: null }] : m.id === 'um-shop' ? [{ id: 'al-7', title: 'Monitor down: Acme web shop', severity: 'critical', kind: 'uptime', opened_at: ago(14), acknowledged_at: null }] : [];
 	const recent = Array.from({ length: 8 }, (_, i) => ({ ts: ago(i * (m.interval_secs / 60) + 1), ok: m.state !== 'down', ms: m.state === 'down' ? null : (m.last_ms ?? 20) + ((i * 7) % 5) * 3, message: m.last_message ?? '' }));
 	return { ...m, days, alerts, recent };
 }

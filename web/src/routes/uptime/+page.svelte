@@ -84,7 +84,7 @@
 	{/snippet}
 	{#snippet checkedCell(m: Monitor)}
 		<span class="text-muted whitespace-nowrap" title={m.last_message ?? ''}>{m.last_at ? ago(m.last_at) : 'never'}</span>
-		<div class="text-muted text-xs whitespace-nowrap">{m.runner_hostname ?? 'no agent'}{m.runner_hostname && !m.runner_online ? ' (offline)' : ''}</div>
+		<div class="text-muted text-xs whitespace-nowrap">{m.runner === 'server' ? 'the server' : (m.runner_hostname ?? 'no agent')}{m.runner_hostname && !m.runner_online ? ' (offline)' : ''}</div>
 	{/snippet}
 
 	<DataTable

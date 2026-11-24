@@ -34,7 +34,7 @@
 	const sevTone = { critical: 'danger', warning: 'warning', info: 'info' } as const;
 	const openAlerts = (d: Dashboard) => (d.alerts.critical ?? 0) + (d.alerts.warning ?? 0) + (d.alerts.info ?? 0);
 	function feed(d: Dashboard): Item[] {
-		const alerts: Item[] = d.open_alerts.map((a) => ({ key: `a-${a.id}`, kind: a.severity === 'critical' ? 'Critical' : a.severity === 'warning' ? 'Warning' : 'Info', tone: sevTone[a.severity], href: `/alerts/${a.id}`, title: `${a.hostname}: ${a.title}`, where: a.client_name, when: ago(a.opened_at) }));
+		const alerts: Item[] = d.open_alerts.map((a) => ({ key: `a-${a.id}`, kind: a.severity === 'critical' ? 'Critical' : a.severity === 'warning' ? 'Warning' : 'Info', tone: sevTone[a.severity], href: `/alerts/${a.id}`, title: a.hostname ? `${a.hostname}: ${a.title}` : a.title, where: a.client_name, when: ago(a.opened_at) }));
 		const disks: Item[] = d.high_disk.map((a) => ({ key: `d-${a.id}`, kind: `Disk ${a.disk_max_pct.toFixed(0)}%`, tone: 'danger', href: `/agents/${a.id}`, title: a.hostname, where: a.client_name, when: a.online ? 'now' : ago(a.last_seen_at) }));
 		const jobs: Item[] = d.failed_jobs.map((j: Job) => ({ key: `j-${j.id}`, kind: j.status === 'failed' || j.status === 'error' ? 'Job failed' : j.status === 'timed_out' ? 'Job timed out' : 'Job lost', tone: j.status === 'failed' || j.status === 'error' ? 'danger' : 'warning', href: `/jobs/${j.id}`, title: j.script_name ?? `Ad-hoc ${j.interpreter}`, where: j.hostname, when: ago(j.created_at) }));
 		const off: Item[] = d.offline.map((a) => ({ key: `o-${a.id}`, kind: 'Offline', tone: 'neutral', href: `/agents/${a.id}`, title: a.hostname, where: `${a.client_name} › ${a.site_name}`, when: ago(a.last_seen_at) }));
