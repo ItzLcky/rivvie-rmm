@@ -111,6 +111,14 @@ Needs a signed-in console user (a VM console session), not just the agent.
 7. Windows Firewall isolation: from the console, isolate the machine. Within seconds: the browser cannot reach the internet, the agent stays connected to the server (the console still shows it online and can run a job), DNS and DHCP still work. `netsh advfirewall show allprofiles` shows block inbound and outbound, and `RMM-isolation-*` rules exist. Reboot while isolated: still isolated when the agent starts (and the console's job still reaches it). Un-isolate: all three profiles return to the policy they had before (compare with the export `C:\ProgramData\RMM\isolation-firewall.wfw` taken first), the isolation rules are gone, and a custom firewall rule you made before is enabled again. Isolate twice in a row, then un-isolate: the original policy comes back, not the isolated one. A server on a changing IP (a DNS name that resolves differently): the agent re-resolves while isolated and stays connected. With Group Policy managing the firewall, note what wins.
 8. Triage and response: kill a process tree from the console (a `ping -t` started from cmd); collect a triage package: it lists processes, services, connections and autoruns and downloads.
 
+## 7a. Uptime and backups
+
+1. Uptime from a Windows agent: a ping monitor of the gateway (`IcmpSendEcho`) answers with a round trip; a ping of an address that doesn't exist fails with "no reply" within the timeout. HTTPS and TLS monitors of an internal site with a certificate from the domain's CA read as trusted (the Windows root store); a self-signed one as untrusted. A DNS monitor without a server uses the adapter's resolvers.
+2. Windows Server Backup: on a server with a schedule, after one good and one failed run (unplug the target disk), the Backups card shows the right last success and result, from `Get-WBSummary`; with the cmdlets removed, the same from the event log. Installed and never run: no job, no error.
+3. Veeam Backup & Replication and Veeam Agent for Windows: event 190 for a successful, a warning and a failed job gives the right name and result per job (the fixtures in `crates/rmm-agent/src/checks/backup/fixtures/` were written from documentation, not recorded: replace them with real exports). `auto` finds Veeam by its service.
+4. A `file_age` source on a UNC path (`\\nas\backups`) as SYSTEM: what the service account can and can't read.
+5. macOS (not Windows, but nowhere else to note it): Time Machine to a local disk and to a network destination, `tmutil latestbackup` and `tmutil status` while a backup runs.
+
 ## 8. Fix what breaks, record versions
 
 For each failed step, fix it with a test that reproduces it (unit tests against recorded output where the failure is parsing, the e2e where it is behaviour). Record in the README's Windows line which versions passed.

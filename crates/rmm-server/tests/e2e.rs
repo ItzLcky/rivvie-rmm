@@ -45,6 +45,10 @@
 //! quiet. Without it that section checks everything that doesn't need a device.
 //! `RMM_E2E_ONLY=network` runs only that section (after the enrollment it needs).
 //!
+//! `RMM_E2E_ONLY=uptime` and `RMM_E2E_ONLY=backups` run only those sections (uptime monitors
+//! against local HTTP, TCP, TLS and DNS listeners; backup alerts through the agent's fake
+//! provider, and a real restic repository when `restic` is on PATH).
+//!
 //! `RMM_E2E_ONLY=desk` runs only the core and service desk sections (faster while working on
 //! tickets, the portal and billing); `RMM_E2E_ONLY=api` only enrollment and the API keys and webhooks.
 //!
@@ -209,6 +213,8 @@ impl Agent {
                 .env("RMM_DESKTOP_FAKE", log_dir.join(format!("{name}-desktop.jsonl")))
                 // And report antivirus state from this file.
                 .env("RMM_SECURITY_FAKE", log_dir.join(format!("{name}-security.json")))
+                // And backup jobs from this one, while it exists.
+                .env("RMM_BACKUP_FAKE", log_dir.join(format!("{name}-backups.json")))
                 // The sensor runs unprivileged on scratch directories, with test-signed content.
                 .env("RMM_STATE_DIR", sensor_dir(log_dir, &name, "state"))
                 .env("RMM_CONTENT_PUBKEY", content_pubkey())
@@ -585,6 +591,17 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
         api_keys_and_webhooks(&url, &admin, db, &id1, a_id, b_id).await;
         fields_tags_notes_views(&url, &admin, db, dir, &id1, a_id, b_id).await;
     automation_tags_and_fields(&url, &admin, db, &id1, &id3, a_id, b_id).await;
+        a1.kill();
+        return Ok(());
+    }
+
+    if std::env::var("RMM_E2E_ONLY").as_deref() == Ok("uptime") {
+        uptime(&url, &admin, db, dir, &id1, a_id, a_site, b_id).await;
+        a1.kill();
+        return Ok(());
+    }
+    if std::env::var("RMM_E2E_ONLY").as_deref() == Ok("backups") {
+        backups(&url, &admin, db, dir, &id1, b_id).await;
         a1.kill();
         return Ok(());
     }
@@ -1207,6 +1224,10 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
     api_keys_and_webhooks(&url, &admin, db, &id1, a_id, b_id).await;
     fields_tags_notes_views(&url, &admin, db, dir, &id1, a_id, b_id).await;
     network(&url, &admin, db, &id1, a_id, a_site, b_id).await;
+    if all {
+        uptime(&url, &admin, db, dir, &id1, a_id, a_site, b_id).await;
+        backups(&url, &admin, db, dir, &id1, b_id).await;
+    }
     sso_and_passkeys(server, db, dir, &secret).await;
 
     // --- rate limits ------------------------------------------------------------------------------
@@ -8288,3 +8309,5 @@ async fn fields_tags_notes_views(url: &str, admin: &Api, db: &sqlx::PgPool, dir:
     assert!(s.is_success() && spec["paths"]["/agents/{id}/fields"]["put"]["operationId"] == "setAgentFields", "documented in the OpenAPI document");
     println!("tags, custom fields, notes, saved views: ok");
 }
+
+include!("e2e_parts/monitoring.rs");

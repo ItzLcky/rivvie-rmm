@@ -73,7 +73,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Package tools (to validate the generated .deb/.rpm)
-        run: sudo apt-get install -y --no-install-recommends rpm
+        run: sudo apt-get install -y --no-install-recommends rpm restic
       # Prometheus's own parser and linter, for the /metrics output.
       - name: promtool
         run: |
@@ -137,7 +137,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Package tools (to validate the generated .deb/.rpm)
-        run: sudo apt-get install -y --no-install-recommends rpm
+        run: sudo apt-get install -y --no-install-recommends rpm restic
       - run: cargo build -p rmm-agent
       - name: Restore drill
         run: scripts/restore-drill.sh

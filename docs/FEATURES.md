@@ -59,3 +59,8 @@ Built in parallel tracks and merged with full local checks (clippy incl. Windows
 - **Reach:** software deployment (`0032`, [design](design/software.md)); network discovery and SNMP (`0033`, [design](design/network.md)); Windows e2e sections and a [real-host test plan](design/windows-testing.md).
 
 Known gaps: no Windows run of any of it; SSO untested against real IdPs; no alerts for failed deployments; SNMP traps, LLDP and IPv6 scans not built; automations whose `field_value` no longer matches a select field's choices never fire.
+
+## Parity: monitoring reach
+
+- **Uptime monitors** (`0040`, [design](design/uptime.md)): ping, TCP, HTTP(S) with keyword, TLS certificate and DNS checks run by an agent; availability, latency and certificate alerts. Server-run checks (step C1b) are not built yet.
+- **Backup monitoring** (`0042`, [design](design/backups.md)): Windows Server Backup, Veeam, restic, Borg, Time Machine and backup files; failed and stale alerts.
