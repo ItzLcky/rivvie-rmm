@@ -49,6 +49,8 @@
 //! `RMM_E2E_ONLY=branding` runs only the white-labelling section (after the sign-in and tenancy).
 //! `RMM_E2E_ONLY=script_params` runs only enrollment and the script parameters section.
 //!
+//! `RMM_E2E_ONLY=identity` runs only identity management (a fake Active Directory on a second
+//! agent, Entra ID and Intune through the Graph stand-in, ticket templates and checklists).
 //! `RMM_E2E_ONLY=uptime` and `RMM_E2E_ONLY=backups` run only those sections (uptime monitors
 //! against local HTTP, TCP, TLS and DNS listeners; backup alerts through the agent's fake
 //! provider, and a real restic repository when `restic` is on PATH).
@@ -224,6 +226,8 @@ impl Agent {
                 .env("RMM_SECURITY_FAKE", log_dir.join(format!("{name}-security.json")))
                 // And backup jobs from this one, while it exists.
                 .env("RMM_BACKUP_FAKE", log_dir.join(format!("{name}-backups.json")))
+                // And an Active Directory from this one, if it exists when the agent starts.
+                .env("RMM_IDENTITY_FAKE", log_dir.join(format!("{name}-identity.json")))
                 // The sensor runs unprivileged on scratch directories, with test-signed content.
                 .env("RMM_STATE_DIR", sensor_dir(log_dir, &name, "state"))
                 .env("RMM_CONTENT_PUBKEY", content_pubkey())
@@ -637,6 +641,12 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
     }
     if std::env::var("RMM_E2E_ONLY").as_deref() == Ok("backups") {
         backups(&url, &admin, db, dir, &id1, b_id).await;
+        a1.kill();
+        return Ok(());
+    }
+
+    if std::env::var("RMM_E2E_ONLY").as_deref() == Ok("identity") {
+        identity(&url, &admin, db, dir, &token, &id1, a_id, b_id).await;
         a1.kill();
         return Ok(());
     }
@@ -1269,6 +1279,7 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
         uptime(&url, &admin, db, dir, &id1, a_id, a_site, b_id).await;
         backups(&url, &admin, db, dir, &id1, b_id).await;
     }
+    identity(&url, &admin, db, dir, &token, &id1, a_id, b_id).await;
     sso_and_passkeys(server, db, dir, &secret).await;
 
     // --- rate limits ------------------------------------------------------------------------------
@@ -1407,6 +1418,7 @@ const SEALED: &[(&str, &str, &str)] = &[
     ("net_credentials", "secret", "secret_sealed"),
     ("company_settings", "sms_token_enc", "sms_token_sealed"),
     ("push_keys", "private", "private_sealed"),
+    ("identity_sources", "secret", "secret_sealed"),
 ];
 
 async fn sealed_values(db: &sqlx::PgPool) -> Vec<(&'static str, Vec<u8>)> {
@@ -5323,6 +5335,8 @@ async fn graph_mock() -> (String, GraphMock) {
                 Code::ACCEPTED
             }),
         )
+        // Users, groups, roles and Intune devices (e2e_parts/identity.rs).
+        .merge(entra_routes())
         .with_state(mock.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
@@ -9392,3 +9406,4 @@ async fn push(url: &str, admin: &Api, db: &sqlx::PgPool, id1: &str, a_id: &str, 
 }
 
 include!("e2e_parts/monitoring.rs");
+include!("e2e_parts/identity.rs");
