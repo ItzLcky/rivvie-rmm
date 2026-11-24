@@ -15,6 +15,19 @@ back, restore the backup taken before the upgrade (see
 ### Added
 
 - **White-labelling** ([design](docs/design/branding.md), migration `0044`): Settings → Branding sets the product name, light and dark logos, a square icon, an accent colour (checked for 4.5:1 contrast in both themes), a support contact card, and the email sender name and footer. A client can override any of it for its own people (portal, mail to its contacts, its PDFs and packages, the consent prompt on its devices). Branded MSI `ProductName` and icon, package file names and descriptions, the Windows service display name, and the QBR and invoice PDF header logo. A "Licence and source" link (`RMM_SOURCE_URL`) is always shown.
+- **Wake-on-LAN.** Wake an offline device from its page, or many from the agents list, through
+  another online agent at its site (the site's designated network agent first, else one on the
+  same subnet). A patch policy can wake devices up to an hour before their install window
+  (`wake_before_minutes`), at most once in 12 hours. `POST /agents/{id}/wake`, `POST /agents/wake`
+  (public API `wakeAgent`, `wakeAgents`), audited as `agent.wake`; agent capability `wol`.
+  Migration `0043`. See [docs/design/wake-on-lan.md](docs/design/wake-on-lan.md).
+- **Scheduled and emailed reports.** The service desk, utilisation, profitability and QBR reports
+  as PDFs on a cron timetable (weekly, monthly, quarterly presets; last week, month, quarter or 30
+  days), mailed one message per recipient to users, client contacts (QBR and their own client's
+  service desk report only) and, for admins, other addresses. Each run uses its owner's access at
+  the time it's sent, and fails with the reason if that's gone. History with the PDFs (kept 400
+  days) and "send now" under Reports → Scheduled. Migration `0045`. See
+  [docs/design/scheduled-reports.md](docs/design/scheduled-reports.md).
 
 ## [0.2.0] - 2026-11-23
 

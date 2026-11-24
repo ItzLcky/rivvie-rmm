@@ -230,3 +230,22 @@ export interface TicketRef {
 	client_id: string | null;
 	client_name: string | null;
 }
+
+/** The reports a schedule can send (`report_schedules.report`). */
+export type ScheduledReport = 'service_desk' | 'utilisation' | 'profitability' | 'qbr';
+export type ScheduleRange = 'last_week' | 'last_month' | 'last_quarter' | 'last_30_days';
+
+export interface ReportSchedule {
+	id: string; name: string; report: ScheduledReport; client_id: string | null; client_name: string | null; params: { range?: ScheduleRange };
+	cron: string; timezone: string; user_ids: string[]; contact_ids: string[]; extra_emails: string[]; subject: string; message: string;
+	enabled: boolean; owner_id: string; owner_name: string; next_run_at: string | null; last_run_at: string | null;
+	last_status: 'sent' | 'failed' | null; last_error: string | null; created_at: string; updated_at: string;
+}
+
+export interface ReportRecipient { kind: 'user' | 'contact' | 'email'; id: string | null; email: string; status: 'queued' | 'skipped'; reason?: string }
+
+export interface ReportRun {
+	id: string; schedule_id: string; trigger: 'schedule' | 'manual'; started_at: string; finished_at: string | null;
+	status: 'running' | 'sent' | 'failed'; from_date: string | null; to_date: string | null; bytes: number | null;
+	recipients: ReportRecipient[]; error: string | null; started_by_name: string | null; stored: boolean;
+}

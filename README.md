@@ -717,7 +717,10 @@ give them to others under Users → Permissions). Technicians log time without s
   logged on the project and its tickets; a **schedule** of who works on what, when; **client
   documentation** pages with their history (Clients → a client → Docs); and **reports**: service desk
   volume, backlog age, response and resolution times, SLA attainment and satisfaction; utilisation;
-  client profitability; and a quarterly business review PDF per client.
+  client profitability; and a quarterly business review PDF per client. Any of them can be
+  **scheduled** (Reports → Scheduled): a PDF on a weekly, monthly or quarterly timetable, emailed
+  to users and the client's contacts, built with its owner's access at the time it's sent
+  ([design](docs/design/scheduled-reports.md)).
 
 ## Documentation and passwords
 
@@ -808,6 +811,8 @@ Design: [docs/design/audit-siem.md](docs/design/audit-siem.md).
 ## Network discovery and SNMP
 
 A site's designated agent scans its network (ICMP where it may, TCP, the ARP table, reverse DNS, mDNS, SNMP `sysDescr`) and lists what it finds under **Network**: hosts matched to agents by MAC or IP, and an *unmanaged devices* list with ignore, mark-as-known, monitor and deploy-an-agent actions. The same agent reads switches, firewalls and printers over SNMP v2c or v3 (uptime, interface status and traffic, CPU and memory, toner), with charts, hourly rollups and three new alert kinds: device down, interface down and thresholds. SNMP credentials are per client, sealed with `RMM_DATA_KEY`, and never shown again. Scans stay in private address space and are bounded. Design: [docs/design/network.md](docs/design/network.md).
+
+**Wake-on-LAN:** an offline device can be woken from its page (or many from the agents list) through another online agent at its site, which sends the magic packets to the subnet's broadcast address. A patch policy can wake devices before their install window (`wake_before_minutes`). The device's network adapter and BIOS must allow it, and most networks don't pass the broadcast between VLANs. `RMM_WOL_FAKE=<addr:port>` makes a debug agent send the packets there instead. Design: [docs/design/wake-on-lan.md](docs/design/wake-on-lan.md).
 
 ## Remote desktop
 

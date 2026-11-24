@@ -24,12 +24,13 @@ Follow the [manual plan](design/windows-testing.md) on Windows 10/11 and Server 
 - [ ] Security: Defender (including the EICAR detection the runner skips), Security Center with a third-party product, passive mode; the sensor's process/network polling, quarantine, Windows Firewall isolation.
 - [ ] Software deployment (winget, Chocolatey, MSI push) and automations on a real host.
 - [ ] Branding on Windows: the branded MSI's name and icon in *Apps and features*, the service display name, the consent prompt title ([plan](design/windows-testing.md) §2.6).
+- [ ] Wake-on-LAN on a real LAN: a machine actually waking (S3/S4/S5, Fast startup), senders on each OS, and how switches treat directed broadcasts across VLANs ([plan](design/windows-testing.md#wake-on-lan-any-os-real-network)).
 - [ ] Fix what breaks, and record the tested versions in the README.
 
 ### 2. Before the first real customer
 
 - [ ] **Security review** by someone outside the project: agent/server protocol, enrollment, the update and content signing chain, session handling, per-client scoping, the shell and desktop relays, the client portal, the password vault (envelope encryption, reveal auditing, rate limits), API keys and SSO.
-- [ ] **Try the integrations against the real services**, not stand-ins: AWS S3 (MinIO is done and in CI), Microsoft 365 over Graph, QuickBooks Online (sandbox company), Xero (demo organisation), OIDC with real Entra ID and Google tenants, and how real mail clients render our emails (including the branded sender name and footer).
+- [ ] **Try the integrations against the real services**, not stand-ins: AWS S3 (MinIO is done and in CI), Microsoft 365 over Graph, QuickBooks Online (sandbox company), Xero (demo organisation), OIDC with real Entra ID and Google tenants, and how real mail clients render our emails (including the branded sender name and footer, and scheduled report emails with their PDF attachments).
 
 ### 3. Gaps left by `v0.2.0`
 

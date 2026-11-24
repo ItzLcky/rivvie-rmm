@@ -121,6 +121,17 @@ pub static OPS: &[Op] = &[
         summary: "Ask an online agent to report its inventory now",
         note: "409 when the agent is offline.", query: NONE, paged: false, body: None, response: Resp::Object,
     },
+    Op {
+        id: "wakeAgent", method: "POST", path: "/agents/{id}/wake", group: "agents", summary: "Wake an offline agent with Wake-on-LAN",
+        note: "Another online agent of the site sends the magic packets. `outcome` is `sent`, `no_mac` (no usable MAC address in the inventory), \
+               `no_sender` (no online agent of the site can send) or `online` (nothing to do).",
+        query: NONE, paged: false, body: None, response: Resp::Object,
+    },
+    Op {
+        id: "wakeAgents", method: "POST", path: "/agents/wake", group: "agents", summary: "Wake many agents with Wake-on-LAN",
+        note: "Up to 5000 agents; every one must be visible to the key or nothing happens (404). One result per agent, as `wakeAgent`, and counts per outcome.",
+        query: NONE, paged: false, body: Some("WakeAgents"), response: Resp::Object,
+    },
     // ---- tags, custom fields and notes ---------------------------------------------------
     Op {
         id: "listTags", method: "GET", path: "/tags", group: "agents", summary: "List tags",
@@ -444,6 +455,13 @@ fn field_schemas() -> Value {
             "type": "object",
             "required": ["tag_ids"],
             "properties": { "tag_ids": { "type": "array", "items": { "type": "string", "format": "uuid" }, "maxItems": 50 } },
+        },
+        "WakeAgents": {
+            "type": "object",
+            "required": ["agent_ids"],
+            "properties": {
+                "agent_ids": { "type": "array", "items": { "type": "string", "format": "uuid" }, "minItems": 1, "maxItems": 5000 },
+            },
         },
         "BulkTags": {
             "type": "object",

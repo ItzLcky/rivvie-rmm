@@ -34,7 +34,7 @@ mod pm;
 pub(crate) mod policies;
 pub(crate) mod portal;
 pub(crate) mod public;
-mod reports;
+pub(crate) mod reports;
 mod search;
 mod scripts;
 mod security;
@@ -53,7 +53,9 @@ pub(crate) mod users;
 mod audit;
 mod siem;
 mod vault;
+mod report_schedules;
 mod views;
+mod wake;
 mod webhooks;
 
 pub use agents::refresh_health as refresh_agent_health;
@@ -138,6 +140,8 @@ pub fn router(attachment_max: u64) -> Router<Arc<AppState>> {
         .route("/tags", get(tags::list).post(tags::create))
         .route("/tags/{id}", axum::routing::put(tags::update).delete(tags::remove))
         .route("/agents/tags", post(tags::bulk))
+        .route("/agents/wake", post(wake::wake_many))
+        .route("/agents/{id}/wake", post(wake::wake_one))
         .route("/agents/{id}/tags", axum::routing::put(tags::set_for_agent))
         .route("/custom-fields", get(fields::list_defs).post(fields::create_def))
         .route("/custom-fields/{id}", axum::routing::put(fields::update_def).delete(fields::delete_def))
@@ -412,6 +416,11 @@ pub fn router(attachment_max: u64) -> Router<Arc<AppState>> {
         .route("/reports/utilisation", get(reports::utilisation))
         .route("/reports/profitability", get(reports::profitability))
         .route("/reports/qbr/{id}", get(reports::qbr))
+        .route("/report-schedules", get(report_schedules::list).post(report_schedules::create))
+        .route("/report-schedules/{id}", get(report_schedules::get).put(report_schedules::update).delete(report_schedules::remove))
+        .route("/report-schedules/{id}/run", post(report_schedules::run_now))
+        .route("/report-schedules/{id}/runs", get(report_schedules::runs))
+        .route("/report-runs/{id}/download", get(report_schedules::download))
         .route("/sites/{id}/network", get(network::site_settings).put(network::update_settings))
         .route("/sites/{id}/network/scan", post(network::scan))
         .route("/sites/{id}/network/scans", get(network::scans))

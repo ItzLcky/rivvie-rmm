@@ -597,6 +597,7 @@ async fn on_message(
             crate::netmon::ingest_scan(state, agent_id, scan_id, subnets, scanned, hosts, error).await?
         }
         AgentMsg::SnmpPollResult { poll_id, results } => crate::netmon::ingest_poll(state, agent_id, poll_id, results).await,
+        AgentMsg::WakeOnLanResult { request_id, sent, error } => crate::wol::complete(agent_id, request_id, sent, error),
         AgentMsg::Pong { .. } => {}
         AgentMsg::Enroll { .. } | AgentMsg::Auth { .. } => {}
     }
@@ -642,6 +643,7 @@ fn message_type(m: &AgentMsg) -> usize {
         AgentMsg::SoftwareResult(_) => 33,
         AgentMsg::NetScanResult { .. } => 34,
         AgentMsg::SnmpPollResult { .. } => 35,
+        AgentMsg::WakeOnLanResult { .. } => 36,
     }
 }
 

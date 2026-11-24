@@ -14,6 +14,12 @@ use uuid::Uuid;
 /// Agents listing this in `Auth.capabilities` understand the messages in this module.
 pub const CAPABILITY: &str = "network";
 
+/// Agents listing this in `Auth.capabilities` send Wake-on-LAN packets
+/// ([`crate::ServerMsg::WakeOnLan`]).
+pub const WOL_CAPABILITY: &str = "wol";
+/// The most machines one [`crate::ServerMsg::WakeOnLan`] wakes.
+pub const MAX_WOL_TARGETS: usize = 512;
+
 /// The most addresses one scan covers.
 pub const MAX_SCAN_HOSTS: u32 = 4096;
 /// The most devices in one poll request.
@@ -251,4 +257,18 @@ impl Default for Interface {
             hc: false,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Wake-on-LAN
+// ---------------------------------------------------------------------------
+
+/// A machine to wake: its MAC address (`aa:bb:cc:dd:ee:ff`) and the IPv4 addresses it last
+/// had (`10.0.0.5/24`, as in [`crate::NetInterface::addrs`]), so the sender can pick the
+/// interface on the same subnet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WolTarget {
+    pub mac: String,
+    #[serde(default)]
+    pub last_ip: Vec<String>,
 }

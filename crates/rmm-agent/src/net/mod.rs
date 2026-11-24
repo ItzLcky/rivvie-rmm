@@ -8,6 +8,9 @@ mod dns;
 mod icmp;
 pub mod poll;
 mod scan;
+mod wol;
+
+pub use wol::wake;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;

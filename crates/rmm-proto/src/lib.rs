@@ -292,6 +292,13 @@ pub enum AgentMsg {
         poll_id: Uuid,
         results: Vec<net::PollResult>,
     },
+    /// Answer to [`ServerMsg::WakeOnLan`]: how many targets had at least one packet go out.
+    WakeOnLanResult {
+        request_id: Uuid,
+        sent: u32,
+        #[serde(default)]
+        error: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -517,6 +524,12 @@ pub enum ServerMsg {
     SnmpPoll {
         poll_id: Uuid,
         targets: Vec<net::PollTarget>,
+    },
+    /// Send Wake-on-LAN magic packets for these machines (only to agents listing
+    /// [`net::WOL_CAPABILITY`]); answered with [`AgentMsg::WakeOnLanResult`].
+    WakeOnLan {
+        request_id: Uuid,
+        targets: Vec<net::WolTarget>,
     },
 }
 
@@ -948,6 +961,23 @@ mod tests {
         };
         assert!(matches!(decode::<ServerMsg>(&encode(&r).unwrap()).unwrap(), ServerMsg::ReputationResult { known } if known[0].source == "list:x"));
         assert_eq!(security::RealtimeMode::parse("block").map(security::RealtimeMode::as_str), Some("block"));
+    }
+
+    #[test]
+    fn wake_on_lan_roundtrips() {
+        let msg = ServerMsg::WakeOnLan {
+            request_id: Uuid::nil(),
+            targets: vec![net::WolTarget { mac: "aa:bb:cc:00:11:22".into(), last_ip: vec!["10.0.0.5/24".into()] }],
+        };
+        assert!(matches!(decode::<ServerMsg>(&encode(&msg).unwrap()).unwrap(), ServerMsg::WakeOnLan { targets, .. } if targets[0].last_ip == ["10.0.0.5/24"]));
+        // A result with only the id and count still decodes.
+        #[derive(Serialize)]
+        #[serde(tag = "t", rename_all = "snake_case")]
+        enum Old {
+            WakeOnLanResult { request_id: Uuid, sent: u32 },
+        }
+        let r: AgentMsg = decode(&encode(&Old::WakeOnLanResult { request_id: Uuid::nil(), sent: 2 }).unwrap()).unwrap();
+        assert!(matches!(r, AgentMsg::WakeOnLanResult { sent: 2, error: None, .. }));
     }
 
     #[test]

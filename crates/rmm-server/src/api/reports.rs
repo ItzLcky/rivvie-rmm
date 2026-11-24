@@ -122,11 +122,17 @@ async fn breakdown(st: &AppState, scope: Option<&[Uuid]>, client: Option<Uuid>, 
 
 pub async fn service_desk(State(st): State<Arc<AppState>>, u: User, Query(q): Query<Range>) -> ApiResult<Json<Value>> {
     let (from, to) = range(&q)?;
-    if let Some(c) = q.client_id {
-        super::access::client(&u, c)?;
+    Ok(Json(build_service_desk(&st, &u, q.client_id, from, to).await?))
+}
+
+/// The service desk report as `u` may see it (only `client` when given).
+pub(crate) async fn build_service_desk(st: &AppState, u: &User, client: Option<Uuid>, from: NaiveDate, to: NaiveDate) -> ApiResult<Value> {
+    if let Some(c) = client {
+        super::access::client(u, c)?;
     }
-    let t = desk_totals(&st, u.scope(), q.client_id, from, to).await?;
-    Ok(Json(json!({
+    let q = Range { from: Some(from), to: Some(to), client_id: client };
+    let t = desk_totals(st, u.scope(), q.client_id, from, to).await?;
+    Ok(json!({
         "from": from, "to": to,
         "opened": t.opened, "closed": t.closed, "backlog": t.backlog,
         "backlog_age": { "under_1d": t.age_1d, "1_3d": t.age_3d, "3_7d": t.age_7d, "7_30d": t.age_30d, "over_30d": t.age_older },
@@ -137,19 +143,72 @@ pub async fn service_desk(State(st): State<Arc<AppState>>, u: User, Query(q): Qu
             "resolve": { "met": t.resolve_met, "total": t.resolve_total, "pct": pct(t.resolve_met, t.resolve_total) },
         },
         "csat": { "good": t.csat_good, "bad": t.csat_bad, "pct": pct(t.csat_good, t.csat_good + t.csat_bad) },
-        "by_client": breakdown(&st, u.scope(), q.client_id, from, to, "client").await?,
-        "by_board": breakdown(&st, u.scope(), q.client_id, from, to, "board").await?,
-        "by_technician": breakdown(&st, u.scope(), q.client_id, from, to, "technician").await?,
-        "by_type": breakdown(&st, u.scope(), q.client_id, from, to, "type").await?,
-    })))
+        "by_client": breakdown(st, u.scope(), q.client_id, from, to, "client").await?,
+        "by_board": breakdown(st, u.scope(), q.client_id, from, to, "board").await?,
+        "by_technician": breakdown(st, u.scope(), q.client_id, from, to, "technician").await?,
+        "by_type": breakdown(st, u.scope(), q.client_id, from, to, "type").await?,
+    }))
+}
+
+fn opt_pct(v: &Value) -> String {
+    v.as_f64().map_or("–".into(), |p| format!("{p}%"))
+}
+
+fn breakdown_table(title: &str, first: &str, rows: &Value) -> Vec<Block> {
+    let rows = rows.as_array().cloned().unwrap_or_default();
+    if rows.is_empty() {
+        return Vec::new();
+    }
+    vec![
+        Block::Heading(title.into()),
+        Block::Table(
+            vec![first.into(), "Opened".into(), "Resolved".into()],
+            rows.iter().map(|r| vec![r["name"].as_str().unwrap_or_default().to_string(), r["opened"].to_string(), r["closed"].to_string()]).collect(),
+        ),
+    ]
+}
+
+/// The PDF form of [`build_service_desk`].
+pub(crate) fn blocks_service_desk(d: &Value) -> Vec<Block> {
+    let n = |v: &Value| v.as_i64().unwrap_or(0).to_string();
+    let age = &d["backlog_age"];
+    let mut out = vec![
+        Block::Heading("Summary".into()),
+        Block::Figures(vec![
+            ("Tickets opened".into(), n(&d["opened"])),
+            ("Tickets resolved".into(), n(&d["closed"])),
+            ("Open now".into(), n(&d["backlog"])),
+            ("Median first response".into(), mins(d["first_response_median_mins"].as_f64())),
+            ("Median resolution".into(), mins(d["resolution_median_mins"].as_f64())),
+            ("First response within SLA".into(), opt_pct(&d["sla"]["respond"]["pct"])),
+            ("Resolved within SLA".into(), opt_pct(&d["sla"]["resolve"]["pct"])),
+            ("Satisfaction".into(), d["csat"]["pct"].as_f64().map_or("–".into(), |p| format!("{p}% good"))),
+        ]),
+        Block::Heading("Open tickets by age".into()),
+        Block::Bars(
+            [("Under a day", "under_1d"), ("1–3 days", "1_3d"), ("3–7 days", "3_7d"), ("7–30 days", "7_30d"), ("Over 30 days", "over_30d")]
+                .iter()
+                .map(|(label, k)| (label.to_string(), age[*k].as_f64().unwrap_or(0.0), n(&age[*k])))
+                .collect(),
+        ),
+    ];
+    out.extend(breakdown_table("By client", "Client", &d["by_client"]));
+    out.extend(breakdown_table("By board", "Board", &d["by_board"]));
+    out.extend(breakdown_table("By technician", "Technician", &d["by_technician"]));
+    out.extend(breakdown_table("By type", "Type", &d["by_type"]));
+    out
 }
 
 /// Logged, billable and available hours per technician.
 pub async fn utilisation(State(st): State<Arc<AppState>>, u: User, Query(q): Query<Range>) -> ApiResult<Json<Value>> {
+    let (from, to) = range(&q)?;
+    Ok(Json(build_utilisation(&st, &u, from, to).await?))
+}
+
+pub(crate) async fn build_utilisation(st: &AppState, u: &User, from: NaiveDate, to: NaiveDate) -> ApiResult<Value> {
     if !u.has(Perm::TimeApprove) && !u.has(Perm::BillingRead) {
         return Err(ApiError::Forbidden);
     }
-    let (from, to) = range(&q)?;
     let days = (to - from).num_days() + 1;
     let rows: Vec<(Uuid, String, i32, i64, i64, i64)> = sqlx::query_as(
         "SELECT u.id, u.name, u.capacity_hours,
@@ -176,13 +235,49 @@ pub async fn utilisation(State(st): State<Arc<AppState>>, u: User, Query(q): Que
             })
         })
         .collect();
-    Ok(Json(json!({ "from": from, "to": to, "technicians": out })))
+    Ok(json!({ "from": from, "to": to, "technicians": out }))
+}
+
+fn hours(m: &Value) -> String {
+    qty(crate::billing::minutes_milli(m.as_i64().unwrap_or(0)))
+}
+
+/// The PDF form of [`build_utilisation`].
+pub(crate) fn blocks_utilisation(d: &Value) -> Vec<Block> {
+    let rows = d["technicians"].as_array().cloned().unwrap_or_default();
+    vec![
+        Block::Heading("Technicians".into()),
+        Block::Table(
+            vec!["Technician".into(), "Logged h".into(), "Billable h".into(), "Available h".into(), "Utilisation".into(), "Billable".into()],
+            rows.iter()
+                .map(|r| {
+                    vec![
+                        r["name"].as_str().unwrap_or_default().to_string(),
+                        hours(&r["logged_minutes"]),
+                        hours(&r["billable_minutes"]),
+                        hours(&r["available_minutes"]),
+                        opt_pct(&r["utilisation_pct"]),
+                        opt_pct(&r["billable_pct"]),
+                    ]
+                })
+                .collect(),
+        ),
+        Block::Bars(
+            rows.iter()
+                .map(|r| (r["name"].as_str().unwrap_or_default().to_string(), r["utilisation_pct"].as_f64().unwrap_or(0.0), opt_pct(&r["utilisation_pct"])))
+                .collect(),
+        ),
+    ]
 }
 
 /// Invoiced revenue against the cost of the time and products that went into it, per client.
 pub async fn profitability(State(st): State<Arc<AppState>>, u: User, Query(q): Query<Range>) -> ApiResult<Json<Value>> {
-    u.need(Perm::BillingRead)?;
     let (from, to) = range(&q)?;
+    Ok(Json(build_profitability(&st, &u, from, to).await?))
+}
+
+pub(crate) async fn build_profitability(st: &AppState, u: &User, from: NaiveDate, to: NaiveDate) -> ApiResult<Value> {
+    u.need(Perm::BillingRead)?;
     #[allow(clippy::type_complexity)]
     let rows: Vec<(Uuid, String, String, i64, i64, i64, i64)> = sqlx::query_as(
         "SELECT c.id, c.name, coalesce(c.currency, (SELECT currency FROM company_settings)),
@@ -210,10 +305,38 @@ pub async fn profitability(State(st): State<Arc<AppState>>, u: User, Query(q): Q
             })
         })
         .collect();
-    Ok(Json(json!({ "from": from, "to": to, "clients": out })))
+    Ok(json!({ "from": from, "to": to, "clients": out }))
 }
 
-fn last_quarter(today: NaiveDate) -> (NaiveDate, NaiveDate) {
+/// The PDF form of [`build_profitability`].
+pub(crate) fn blocks_profitability(d: &Value) -> Vec<Block> {
+    let rows = d["clients"].as_array().cloned().unwrap_or_default();
+    if rows.is_empty() {
+        return vec![Block::Paragraph("No invoices, time or products in the period.".into())];
+    }
+    let m = |r: &Value, k: &str| money(r[k].as_i64().unwrap_or(0), r["currency"].as_str().unwrap_or("USD"));
+    vec![
+        Block::Heading("Clients".into()),
+        Block::Table(
+            vec!["Client".into(), "Revenue".into(), "Hours".into(), "Time cost".into(), "Product cost".into(), "Margin".into(), "Margin %".into()],
+            rows.iter()
+                .map(|r| {
+                    vec![
+                        r["name"].as_str().unwrap_or_default().to_string(),
+                        m(r, "revenue"),
+                        hours(&r["minutes"]),
+                        m(r, "time_cost"),
+                        m(r, "product_cost"),
+                        m(r, "margin"),
+                        opt_pct(&r["margin_pct"]),
+                    ]
+                })
+                .collect(),
+        ),
+    ]
+}
+
+pub(crate) fn last_quarter(today: NaiveDate) -> (NaiveDate, NaiveDate) {
     let q = today.month0() / 3;
     let (y, q) = if q == 0 { (today.year() - 1, 3) } else { (today.year(), q - 1) };
     let start = NaiveDate::from_ymd_opt(y, q * 3 + 1, 1).expect("valid");
@@ -232,14 +355,42 @@ fn mins(m: Option<f64>) -> String {
 
 /// The quarterly business review for one client, as a PDF (default: last quarter).
 pub async fn qbr(State(st): State<Arc<AppState>>, u: User, Path(client): Path<Uuid>, Query(q): Query<Range>) -> ApiResult<Response> {
-    super::access::client(&u, client)?;
     let (from, to) = match (q.from, q.to) {
         (Some(_), Some(_)) => range(&q)?,
         _ => last_quarter(Utc::now().date_naive()),
     };
+    let r = build_qbr(&st, &u, client, from, to).await?;
+    super::billing::pdf_bytes_response(r.pdf(&st).await, &r.file)
+}
+
+/// A rendered report: what [`crate::pdf::report`] draws, and the file name to give it.
+pub(crate) struct Rendered {
+    pub title: String,
+    pub subtitle: String,
+    pub blocks: Vec<Block>,
+    /// Without `.pdf`.
+    pub file: String,
+    /// Whose branding (logo) the PDF carries; `None` is the instance's.
+    pub client: Option<Uuid>,
+}
+
+impl Rendered {
+    pub async fn pdf(&self, st: &AppState) -> Vec<u8> {
+        let logo = crate::branding::pdf_logo(st, self.client).await;
+        crate::pdf::report_with_logo(&self.title, &self.subtitle, &crate::email::brand(st), logo, &self.blocks)
+    }
+}
+
+fn file_part(s: &str) -> String {
+    s.chars().filter(|c| c.is_ascii_alphanumeric()).collect()
+}
+
+/// The quarterly business review for one client (any range).
+pub(crate) async fn build_qbr(st: &AppState, u: &User, client: Uuid, from: NaiveDate, to: NaiveDate) -> ApiResult<Rendered> {
+    super::access::client(u, client)?;
     let name: String =
         sqlx::query_scalar("SELECT name FROM clients WHERE id = $1").bind(client).fetch_optional(&st.db).await?.ok_or(ApiError::NotFound("client"))?;
-    let t = desk_totals(&st, None, Some(client), from, to).await?;
+    let t = desk_totals(st, None, Some(client), from, to).await?;
     let months: Vec<(NaiveDate, i64, i64)> = sqlx::query_as(
         "SELECT m::date, (SELECT count(*) FROM tickets t WHERE t.client_id = $1 AND t.merged_into IS NULL AND t.created_at >= m AND t.created_at < m + interval '1 month'),
                 (SELECT count(*) FROM tickets t WHERE t.client_id = $1 AND t.merged_into IS NULL AND t.resolved_at >= m AND t.resolved_at < m + interval '1 month')
@@ -250,7 +401,7 @@ pub async fn qbr(State(st): State<Arc<AppState>>, u: User, Path(client): Path<Uu
     .bind(to)
     .fetch_all(&st.db)
     .await?;
-    let types = breakdown(&st, None, Some(client), from, to, "type").await?;
+    let types = breakdown(st, None, Some(client), from, to, "type").await?;
     let (devices, servers, online, compliant, reboot): (i64, i64, i64, i64, i64) = sqlx::query_as(
         "SELECT count(*), count(*) FILTER (WHERE a.os_family = 'linux' OR a.os_name ILIKE '%server%'), count(*) FILTER (WHERE a.online),
                 count(*) FILTER (WHERE NOT EXISTS (SELECT 1 FROM patches p WHERE p.agent_id = a.id AND p.state IN ('missing', 'failed') AND p.approval <> 'declined')),
@@ -344,11 +495,95 @@ pub async fn qbr(State(st): State<Arc<AppState>>, u: User, Path(client): Path<Uu
         offline.0,
         offline.1.unwrap_or(0.0)
     )));
-    let subtitle = format!("{name} · {} – {}", from.format("%-d %B %Y"), to.format("%-d %B %Y"));
-    let logo = crate::branding::pdf_logo(&st, Some(client)).await;
-    let pdf = crate::pdf::report_with_logo("Quarterly business review", &subtitle, &crate::email::brand(&st), logo, &blocks);
-    let file = format!("QBR-{}-{}", name.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>(), from.format("%Y-%m"));
-    super::billing::pdf_bytes_response(pdf, &file)
+    let subtitle = format!("{name} · {}", period(from, to));
+    let file = format!("QBR-{}-{}", file_part(&name), from.format("%Y-%m"));
+    Ok(Rendered { title: "Quarterly business review".into(), subtitle, blocks, file, client: Some(client) })
+}
+
+fn period(from: NaiveDate, to: NaiveDate) -> String {
+    format!("{} – {}", from.format("%-d %B %Y"), to.format("%-d %B %Y"))
+}
+
+/// Which report a schedule sends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Kind {
+    ServiceDesk,
+    Utilisation,
+    Profitability,
+    Qbr,
+}
+
+impl Kind {
+    pub const ALL: [Kind; 4] = [Kind::ServiceDesk, Kind::Utilisation, Kind::Profitability, Kind::Qbr];
+
+    pub fn parse(s: &str) -> Option<Kind> {
+        Kind::ALL.into_iter().find(|k| k.as_str() == s)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Kind::ServiceDesk => "service_desk",
+            Kind::Utilisation => "utilisation",
+            Kind::Profitability => "profitability",
+            Kind::Qbr => "qbr",
+        }
+    }
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Kind::ServiceDesk => "Service desk report",
+            Kind::Utilisation => "Technician utilisation",
+            Kind::Profitability => "Client profitability",
+            Kind::Qbr => "Quarterly business review",
+        }
+    }
+}
+
+/// Any of the four reports as a PDF, with `u`'s access. Errors say why `u` can't have it.
+pub(crate) async fn render(st: &AppState, u: &User, kind: Kind, client: Option<Uuid>, from: NaiveDate, to: NaiveDate) -> ApiResult<Rendered> {
+    let client_name = match client {
+        Some(c) => Some(
+            sqlx::query_scalar::<_, String>("SELECT name FROM clients WHERE id = $1")
+                .bind(c)
+                .fetch_optional(&st.db)
+                .await?
+                .ok_or(ApiError::NotFound("client"))?,
+        ),
+        None => None,
+    };
+    let subtitle = match &client_name {
+        Some(n) => format!("{n} · {}", period(from, to)),
+        None => period(from, to),
+    };
+    let file = |what: &str| match &client_name {
+        Some(n) => format!("{what}-{}-{}", file_part(n), from.format("%Y-%m-%d")),
+        None => format!("{what}-{}", from.format("%Y-%m-%d")),
+    };
+    let r = match kind {
+        Kind::Qbr => return build_qbr(st, u, client.ok_or_else(|| ApiError::BadRequest("a QBR is for one client".into()))?, from, to).await,
+        Kind::ServiceDesk => Rendered {
+            title: kind.title().into(),
+            subtitle,
+            blocks: blocks_service_desk(&build_service_desk(st, u, client, from, to).await?),
+            file: file("ServiceDesk"),
+            client,
+        },
+        Kind::Utilisation => Rendered {
+            title: kind.title().into(),
+            subtitle,
+            blocks: blocks_utilisation(&build_utilisation(st, u, from, to).await?),
+            file: file("Utilisation"),
+            client,
+        },
+        Kind::Profitability => Rendered {
+            title: kind.title().into(),
+            subtitle,
+            blocks: blocks_profitability(&build_profitability(st, u, from, to).await?),
+            file: file("Profitability"),
+            client,
+        },
+    };
+    Ok(r)
 }
 
 /// Revenue figures need the billing permission; this is the overview the dashboard shows.

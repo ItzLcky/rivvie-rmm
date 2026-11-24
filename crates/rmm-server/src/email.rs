@@ -784,6 +784,30 @@ pub async fn queue_invoice(st: &AppState, client_id: Uuid, to: Vec<String>, subj
     .await
 }
 
+/// A scheduled report's PDF to one recipient (crate::reports). Returns the message id and
+/// whether it can go out (`false`: no mail server, so the outbox recorded it as failed).
+/// `client_id` is the report's client, whose branding (sender name, footer) the mail carries.
+pub async fn queue_report(st: &AppState, to: String, subject: String, body: String, pdf: (String, String), client_id: Option<Uuid>) -> Result<(Uuid, bool)> {
+    let mailbox = reply_mailbox(&st.db, None).await?;
+    let id = enqueue(
+        st,
+        Outgoing {
+            to: vec![to],
+            subject,
+            body,
+            reply_to: mailbox.as_ref().map(|m| m.1.clone()),
+            purpose: "report",
+            mailbox_id: mailbox.map(|m| m.0),
+            files: vec![(pdf.0, "application/pdf".into(), pdf.1)],
+            client_id,
+            ..Default::default()
+        },
+    )
+    .await?;
+    let ok: bool = sqlx::query_scalar("SELECT status <> 'failed' FROM email_messages WHERE id = $1").bind(id).fetch_one(&st.db).await?;
+    Ok((id, ok))
+}
+
 /// Tells an account manager a block-hours contract is running low.
 pub async fn queue_staff_note(st: &AppState, user_id: Uuid, subject: &str, body: &str) -> Result<()> {
     if !smtp_configured(st) {

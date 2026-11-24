@@ -195,6 +195,7 @@ export const fieldLabels: Record<string, string> = {
 	auto_install: 'Automatic install',
 	reboot_policy: 'Restart',
 	window: 'Install window',
+	wake_before_minutes: 'Wake before window',
 	sensor_enabled: 'Sensor',
 	quick_scan_hours: 'Quick scans',
 	full_scan_days: 'Full scans',

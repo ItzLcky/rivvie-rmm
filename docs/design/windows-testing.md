@@ -112,6 +112,15 @@ Needs a signed-in console user (a VM console session), not just the agent.
 7. Windows Firewall isolation: from the console, isolate the machine. Within seconds: the browser cannot reach the internet, the agent stays connected to the server (the console still shows it online and can run a job), DNS and DHCP still work. `netsh advfirewall show allprofiles` shows block inbound and outbound, and `RMM-isolation-*` rules exist. Reboot while isolated: still isolated when the agent starts (and the console's job still reaches it). Un-isolate: all three profiles return to the policy they had before (compare with the export `C:\ProgramData\RMM\isolation-firewall.wfw` taken first), the isolation rules are gone, and a custom firewall rule you made before is enabled again. Isolate twice in a row, then un-isolate: the original policy comes back, not the isolated one. A server on a changing IP (a DNS name that resolves differently): the agent re-resolves while isolated and stays connected. With Group Policy managing the firewall, note what wins.
 8. Triage and response: kill a process tree from the console (a `ping -t` started from cmd); collect a triage package: it lists processes, services, connections and autoruns and downloads.
 
+## Wake-on-LAN (any OS, real network)
+
+The e2e test only proves the packet bytes reach a socket on loopback. On a real LAN with two machines at one site (one online with the agent, one with Wake-on-LAN enabled in its BIOS/UEFI and NIC driver, shut down or asleep):
+
+1. Wake the sleeping machine from its page: it powers on and the agent reconnects. Repeat from S5 (shut down), S3 (sleep) and S4 (hibernate); Windows "Fast startup" often blocks waking from shutdown, note it.
+2. Sender on Windows, Linux and macOS in turn (the directed broadcast and `255.255.255.255` both go out; note which interface the packet left on with Wireshark).
+3. A target on another VLAN than the sender: expected to fail on most switches (directed broadcasts are dropped); note whether it does, and that the designated agent on the target's VLAN works.
+4. A patch policy with an install window opening in 20 minutes and `wake_before_minutes` 30, an approved update and the machine asleep: it wakes once, installs in the window, and isn't woken again for 12 hours.
+
 ## 8. Fix what breaks, record versions
 
 For each failed step, fix it with a test that reproduces it (unit tests against recorded output where the failure is parsing, the e2e where it is behaviour). Record in the README's Windows line which versions passed.

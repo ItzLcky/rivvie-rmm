@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
-	import { BellOff, CloudDownload, Copy, LifeBuoy, MonitorUp, Pencil, Pin, Play, RefreshCw, Search, SquareTerminal, Tag, Trash2 } from '@lucide/svelte';
+	import { BellOff, CloudDownload, Copy, LifeBuoy, MonitorUp, Pencil, Pin, Play, Power, RefreshCw, Search, SquareTerminal, Tag, Trash2 } from '@lucide/svelte';
 	import { api } from '#lib/api.js';
 	import { confirmAction } from '#lib/confirm.svelte.js';
 	import { ago, bytes, datetime, duration, ms, num, pct } from '#lib/format.js';
@@ -12,6 +12,7 @@
 	import { attempt, toast } from '#lib/toast.svelte.js';
 	import type { AgentDetail, AuditRow, Job, MetricPoint, Page, Release, Software } from '#lib/types.js';
 	import { param, setParams } from '#lib/url.svelte.js';
+	import { wake } from '#lib/wake.js';
 	import Async from '#lib/ui/Async.svelte';
 	import Badge from '#lib/ui/Badge.svelte';
 	import Button from '#lib/ui/Button.svelte';
@@ -104,6 +105,12 @@
 			const r = await api.post<{ version: string }>(`/agents/${id}/update`);
 			toast.success(`Update to v${r.version} sent. The agent downloads it, waits for running jobs, then restarts.`);
 		});
+	}
+	let waking = $state(false);
+	async function wakeAgent() {
+		waking = true;
+		await wake([id]);
+		waking = false;
 	}
 	async function refreshInventory() {
 		await attempt(() => api.post(`/agents/${id}/inventory/refresh`), 'Inventory refresh requested; it updates in a few seconds.');
@@ -251,6 +258,7 @@
 			{/snippet}
 			{#snippet actions()}
 				{#if can('technician')}
+					{#if !a.online}<Button icon={Power} loading={waking} onclick={wakeAgent} title="Send a Wake-on-LAN packet through another online agent at the site">Wake</Button>{/if}
 					<Button icon={SquareTerminal} disabled={!a.online} onclick={() => setParams({ tab: 'terminal' })} title={a.online ? undefined : 'The agent is offline'}>Terminal</Button>
 					<Button icon={MonitorUp} class="max-sm:hidden" disabled={!!desktopBlocked(a)} onclick={() => setParams({ tab: 'desktop' })} title={desktopBlocked(a)}>Remote desktop</Button>
 					<Button variant="primary" icon={Play} onclick={() => (running = true)}>Run script</Button>

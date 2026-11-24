@@ -123,7 +123,8 @@ const pages: [string, string][] = [
 	['network-device-down', '/network/devices/nd-2'],
 	['network-device-printer', '/network/devices/nd-3'],
 	['network-settings', '/network/settings?client=c-acme'],
-	['settings-branding', '/settings/branding']
+	['settings-branding', '/settings/branding'],
+	['reports-scheduled', '/reports?tab=scheduled']
 ];
 const phone: [string, string][] = [
 	['dashboard', '/'],
@@ -469,6 +470,21 @@ for (const theme of ['light', 'dark'] as const) {
 			await expect(page).toHaveURL(/\/tickets\/t-1$/);
 			await page.waitForTimeout(400);
 			await expect(page).toHaveScreenshot(`${theme}-ticket-doc.png`);
+		});
+
+		test('report schedule drawer', async ({ page }) => {
+			await mockApi(page);
+			await page.goto('/reports?tab=scheduled');
+			await settle(page);
+			await page.getByRole('button', { name: 'Acme quarterly review' }).click();
+			const drawer = page.getByRole('dialog', { name: 'Report schedule' });
+			await expect(drawer.getByRole('heading', { name: 'Acme quarterly review', level: 2 })).toBeVisible();
+			await expect(drawer.getByRole('checkbox', { name: /Ann Lopez/ })).toBeChecked();
+			await expect(drawer.getByRole('link', { name: /PDF/ }).first()).toHaveAttribute('href', '/api/report-runs/rr-2/download');
+			await page.waitForTimeout(400);
+			await expect(page).toHaveScreenshot(`${theme}-report-schedule.png`);
+			const r = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa']).analyze();
+			expect(r.violations.filter((v) => v.impact === 'serious' || v.impact === 'critical').map((v) => v.id)).toEqual([]);
 		});
 
 		test('credential card', async ({ page }) => {

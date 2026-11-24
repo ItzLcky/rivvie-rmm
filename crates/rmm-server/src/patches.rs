@@ -542,6 +542,45 @@ pub async fn scheduler_tick(st: &AppState) -> anyhow::Result<()> {
         let (run_id, sent) = start_run(st, agent_id, &ids, reboot, Trigger::Policy).await?;
         info!(%agent_id, %run_id, updates = ids.len(), sent, "automatic patch install");
     }
+    wake_before_window(st).await?;
+    Ok(())
+}
+
+/// A device is woken before a patch window at most this often, so one that never wakes
+/// isn't sent packets every minute.
+pub const WAKE_EVERY_HOURS: i32 = 12;
+
+/// Wake-on-LAN before a patch window (the patch policy's `wake_before_minutes`): offline
+/// devices that install automatically, have something eligible to install, and whose window
+/// opens within that many minutes (or is open now), unless they were woken in the last
+/// [`WAKE_EVERY_HOURS`].
+pub async fn wake_before_window(st: &AppState) -> anyhow::Result<()> {
+    let sql = format!(
+        "SELECT a.id FROM agents a
+           JOIN agent_patch_policy pol ON pol.agent_id = a.id
+           JOIN policy_effective e ON e.set_id = a.policy_set_id AND e.item_id = pol.id
+          WHERE NOT a.online AND pol.auto_install AND cardinality(pol.maint_days) > 0
+            AND coalesce((e.config ->> 'wake_before_minutes')::int, 0) > 0
+            AND (a.wol_sent_at IS NULL OR a.wol_sent_at < now() - make_interval(hours => $1))
+            AND (in_maintenance_window(pol.maint_days, pol.maint_start, pol.maint_minutes, pol.maint_tz, now())
+                 OR next_maintenance_window(pol.maint_days, pol.maint_start, pol.maint_tz, now())
+                    <= now() + make_interval(mins => (e.config ->> 'wake_before_minutes')::int))
+            AND EXISTS (SELECT 1 FROM patches p WHERE p.agent_id = a.id AND {ELIGIBLE})
+          LIMIT 1000"
+    );
+    let due: Vec<Uuid> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql)).bind(WAKE_EVERY_HOURS).fetch_all(&st.db).await?;
+    if due.is_empty() {
+        return Ok(());
+    }
+    let woken = crate::wol::wake(st, &due, None).await?;
+    // Tried, whatever came of it: a device with no MAC or no sender waits as long as one that
+    // was sent packets.
+    sqlx::query("UPDATE agents SET wol_sent_at = now() WHERE id = ANY($1)")
+        .bind(&due)
+        .execute(&st.db)
+        .await?;
+    let sent = woken.iter().filter(|w| w.outcome == crate::wol::Outcome::Sent).count();
+    info!(devices = due.len(), sent, "woke devices before their patch window");
     Ok(())
 }
 
