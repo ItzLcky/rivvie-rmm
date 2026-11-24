@@ -2,7 +2,8 @@
 	import { Monitor, Moon, Sun } from '@lucide/svelte';
 	import { api } from '#lib/api.js';
 	import { prefs, setPref, type Density, type Theme } from '#lib/prefs.svelte.js';
-	import { session } from '#lib/session.svelte.js';
+	import { brand, company, session } from '#lib/session.svelte.js';
+	import SourceLink from '#lib/components/branding/SourceLink.svelte';
 	import { toast } from '#lib/toast.svelte.js';
 	import { cx } from '#lib/format.js';
 	import Button from '#lib/ui/Button.svelte';
@@ -121,5 +122,12 @@
 		</section>
 
 		<div class="lg:col-span-2"><ApiKeys /></div>
+
+		<section class="card p-5 lg:col-span-2" aria-labelledby="about-heading">
+			<h2 id="about-heading" class="font-semibold">About</h2>
+			<p class="text-muted mt-0.5 text-sm">
+				{brand()} runs on free software under the GNU Affero General Public License, version 3 or later. You can get the source code of this server: <SourceLink class="link" href={company.branding?.source_url} />.
+			</p>
+		</section>
 	{/if}
 </div>

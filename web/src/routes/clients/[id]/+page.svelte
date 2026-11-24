@@ -13,6 +13,7 @@
 	import ClientDocs from '#lib/components/docs/ClientDocs.svelte';
 	import ClientVault from '#lib/components/vault/ClientVault.svelte';
 	import ClientBilling from '#lib/components/billing/ClientBilling.svelte';
+	import BrandingEditor from '#lib/components/branding/BrandingEditor.svelte';
 	import { attempt, toast } from '#lib/toast.svelte.js';
 	import type { AgentSummary, Client, Contact, Dashboard, Site, SlaPolicy, Ticket } from '#lib/types.js';
 	import { param, qs, setParams, sortState } from '#lib/url.svelte.js';
@@ -448,6 +449,10 @@
 					<p class="text-muted text-sm">Whether they're allowed, and whether the person at the machine is asked first, is part of the remote access policy. Give {c.name}'s devices a policy set that changes it on the <a class="link" href="?tab=policies">Policies</a> tab.</p>
 				</section>
 			</div>
+			<section class="mt-8" aria-labelledby="branding-heading">
+				<h2 id="branding-heading" class="mb-3 text-lg font-semibold">Branding</h2>
+				<BrandingEditor clientId={c.id} clientName={c.name} />
+			</section>
 		{/if}
 
 		{#if newSet}<SetDialog mode="new" client={c.id} onclose={() => (newSet = false)} ondone={(r) => goto(setHref(r.id))} />{/if}

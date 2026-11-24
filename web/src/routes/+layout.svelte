@@ -14,7 +14,7 @@
 	import { loadPrefs } from '#lib/prefs.svelte.js';
 	import { prefs } from '#lib/prefs.svelte.js';
 	import { loadClients, withClient } from '#lib/scope.svelte.js';
-	import { brand, loadCompany, session } from '#lib/session.svelte.js';
+	import { brand, company, loadCompany, session } from '#lib/session.svelte.js';
 	import { toast } from '#lib/toast.svelte.js';
 	import type { AgentSummary, User } from '#lib/types.js';
 	import { cx } from '#lib/format.js';
@@ -132,7 +132,7 @@
 <svelte:window {onkeydown} />
 
 <svelte:head>
-	<link rel="icon" href={favicon} />
+	<link rel="icon" href={company.branding?.icon ?? favicon} />
 	<title>{brand()}</title>
 </svelte:head>
 

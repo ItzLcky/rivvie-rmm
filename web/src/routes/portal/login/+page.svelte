@@ -11,6 +11,9 @@
 	import Field from '#lib/ui/Field.svelte';
 	import Input from '#lib/ui/Input.svelte';
 	import Spinner from '#lib/ui/Spinner.svelte';
+	import Logo from '#lib/components/branding/Logo.svelte';
+	import SourceLink from '#lib/components/branding/SourceLink.svelte';
+	import { applyBranding } from '#lib/branding.js';
 
 	type Mode = 'link' | 'sent' | 'password' | 'code' | 'verifying';
 
@@ -30,7 +33,10 @@
 	onMount(() => {
 		fetch('/api/portal/info', { credentials: 'same-origin' })
 			.then((r) => (r.ok ? r.json() : null))
-			.then((d) => (info = d))
+			.then((d) => {
+				info = d;
+				applyBranding(d?.branding);
+			})
 			.catch(() => {});
 		const t = page.url.searchParams.get('token');
 		if (t) {
@@ -136,8 +142,12 @@
 <div class="bg-surface flex min-h-dvh flex-col items-center justify-center px-4 py-10">
 	<main class="w-full max-w-md">
 		<div class="mb-6 flex items-center gap-2.5">
-			<img src={favicon} alt="" class="size-8" />
-			<span class="text-[0.9375rem] font-semibold tracking-tight">{company ? `${company} support` : 'Support portal'}</span>
+			{#if info?.branding?.logo_light || info?.branding?.logo_dark}
+				<Logo branding={info.branding} alt={info.branding.product_name || company || 'Support portal'} class="h-10 max-w-[16rem]" />
+			{:else}
+				<img src={info?.branding?.icon ?? favicon} alt="" class="size-8" />
+				<span class="text-[0.9375rem] font-semibold tracking-tight">{company ? `${company} support` : 'Support portal'}</span>
+			{/if}
 		</div>
 		<div class="card p-6 sm:p-8">
 			<h1 class="text-2xl font-semibold tracking-tight">{heading}</h1>
@@ -197,5 +207,6 @@
 				</div>
 			{/if}
 		</div>
+		<p class="text-muted mt-6 text-center text-xs"><SourceLink href={info?.branding?.source_url} /></p>
 	</main>
 </div>

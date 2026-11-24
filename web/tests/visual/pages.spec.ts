@@ -122,7 +122,9 @@ const pages: [string, string][] = [
 	['network-device', '/network/devices/nd-1?port=1'],
 	['network-device-down', '/network/devices/nd-2'],
 	['network-device-printer', '/network/devices/nd-3'],
-	['network-settings', '/network/settings?client=c-acme']
+	['network-settings', '/network/settings?client=c-acme'],
+	['settings-branding', '/settings/branding'],
+	['client-branding', '/clients/c-acme?tab=settings']
 ];
 const phone: [string, string][] = [
 	['dashboard', '/'],
@@ -221,6 +223,26 @@ for (const theme of ['light', 'dark'] as const) {
 			await settle(page);
 			await expect(page).toHaveScreenshot(`${theme}-login.png`);
 		});
+
+		// White-labelling: the rail, the sign-in page and the portal with a branded instance
+		// (logos, accent, product name) and Acme's override (its support card).
+		for (const [name, path] of [
+			['branded-login', '/login'],
+			['branded-dashboard', '/'],
+			['branded-portal-login', '/portal/login'],
+			['branded-portal', '/portal']
+		] as const) {
+			test(name, async ({ page }) => {
+				await mockApi(page, { signedIn: name !== 'branded-login', branded: true });
+				await page.goto(path);
+				await settle(page);
+				if (name === 'branded-portal') await expect(page.getByRole('region', { name: 'Support contact' })).toContainText('acme-desk@northwind.example');
+				await expect(page.getByRole('link', { name: 'Licence and source' }).first()).toBeVisible();
+				await expect(page).toHaveScreenshot(`${theme}-${name}.png`, { fullPage: name === 'branded-portal' });
+				const r = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa']).analyze();
+				expect(r.violations.filter((v) => v.impact === 'serious' || v.impact === 'critical').map((v) => v.id)).toEqual([]);
+			});
+		}
 
 		test('login with SSO required', async ({ page }) => {
 			await mockApi(page, { signedIn: false, ssoRequired: true });
