@@ -3,7 +3,8 @@
 	import { Check, Copy, ExternalLink, Eye, EyeOff, KeyRound, RefreshCw, StickyNote, Timer } from '@lucide/svelte';
 	import { cx } from '#lib/format.js';
 	import { webUrl } from '#lib/docs/markdown.js';
-	import type { TotpCode, VaultItem } from '#lib/docs/types.js';
+	import { managedKindLabel, type TotpCode, type VaultItem } from '#lib/docs/types.js';
+	import Badge from '#lib/ui/Badge.svelte';
 	import { REVEAL_MS, reveal, secretError, totpCode } from '#lib/docs/vault.js';
 	import Button from '#lib/ui/Button.svelte';
 	import CopyButton from '#lib/ui/CopyButton.svelte';
@@ -124,6 +125,12 @@
 		<div class="min-w-0 flex-1">
 			{#if label && label.toLowerCase() !== item.name.toLowerCase()}<p class="text-muted text-xs">{label}</p>{/if}
 			<h4 id="{uid}-name" class="font-sans text-sm font-semibold tracking-normal break-words">{item.name}</h4>
+			{#if item.managed_kind}
+				<p class="mt-0.5 flex flex-wrap items-center gap-1.5 text-xs">
+					<Badge tone="info">Managed</Badge>
+					<span class="text-muted">{managedKindLabel[item.managed_kind]}{#if item.agent_id} · {#if item.agent_hostname}<a class="link" href="/agents/{item.agent_id}">{item.agent_hostname}</a>{:else}device{/if}{/if}{#if item.managed_state} · {item.managed_state}{/if}</span>
+				</p>
+			{/if}
 			{#if item.url}
 				{#if link}
 					<a class="link text-xs break-all" href={link} target="_blank" rel="noopener noreferrer">{item.url}<ExternalLink class="ml-0.5 inline size-3 align-[-1px]" aria-hidden="true" /><span class="sr-only"> (opens in a new tab)</span></a>

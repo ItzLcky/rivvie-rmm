@@ -91,13 +91,16 @@
 	</Field>
 	<div class="grid gap-4 sm:grid-cols-2">
 		<Field label="Username" id="{uid}-user">
-			<Input id="{uid}-user" bind:value={f.username} maxlength={200} autocomplete="off" spellcheck="false" />
+			<Input id="{uid}-user" bind:value={f.username} maxlength={200} autocomplete="off" spellcheck="false" disabled={!!it?.managed_kind} />
 		</Field>
 		<Field label="URL or host" id="{uid}-url" hint="Web addresses open as links; host names and rdp:// are shown as text.">
 			<Input id="{uid}-url" bind:value={f.url} maxlength={2000} placeholder="https://10.0.0.1:4443" spellcheck="false" />
 		</Field>
 	</div>
 
+	{#if it?.managed_kind}
+		<p class="border-border bg-sunken text-muted rounded-md border px-3 py-2 text-sm">The server keeps this password up to date: it and the username can’t be edited here.</p>
+	{:else}
 	<Field label="Password" id="{uid}-pw" hint={it?.has_password && !clear.password ? 'Leave empty to keep the current password. A changed password goes into the history.' : undefined}>
 		{#if clear.password}
 			<div class="border-border-strong bg-sunken flex h-9 items-center justify-between rounded-md border border-dashed px-3 text-sm">
@@ -126,6 +129,7 @@
 			{#if it?.has_password}<button type="button" class="link mt-1 text-xs" onclick={() => ((clear.password = true), (f.password = ''))}>Remove the password</button>{/if}
 		{/if}
 	</Field>
+	{/if}
 	{#if generating && !clear.password}
 		<PasswordGenerator
 			onclose={() => (generating = false)}
