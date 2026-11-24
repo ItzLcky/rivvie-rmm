@@ -41,12 +41,15 @@
 		const alerted = new Set(d.open_alerts.map((a) => `${a.kind}:${a.agent_id}`));
 		return [...alerts, ...disks.filter((x) => !alerted.has(`disk:${x.key.slice(2)}`)), ...jobs, ...off.filter((x) => !alerted.has(`offline:${x.key.slice(2)}`))];
 	}
+	import OnCallChip from '#lib/oncall/OnCallChip.svelte';
 </script>
 
 <PageHeader
 	title={scoped ? scoped.name : 'Dashboard'}
 	description={scoped ? 'Dashboard for this client. Pick “All clients” at the top to see everything.' : 'Fleet health across every client, worst first.'}
 />
+
+<div class="mb-4"><OnCallChip /></div>
 
 <Async {res}>
 	{#snippet skeleton()}

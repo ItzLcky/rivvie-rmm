@@ -17,6 +17,7 @@
 	import Skeleton from '#lib/ui/Skeleton.svelte';
 	import AlertStateBadge from '#lib/components/AlertStateBadge.svelte';
 	import SeverityBadge from '#lib/components/SeverityBadge.svelte';
+	import PageTimeline from '#lib/oncall/PageTimeline.svelte';
 
 	const id = $derived(page.params.id!);
 	const res = resource(() => api.get<AlertDetail>(`/alerts/${id}`), { keep: false });
@@ -94,6 +95,7 @@
 			</section>
 
 			<div class="min-w-0 space-y-4">
+				<PageTimeline alertId={a.id} version={res.data ? Date.parse(a.acknowledged_at ?? a.resolved_at ?? a.opened_at) : 0} />
 				{#if a.kind === 'log'}
 					<section class="card" aria-label="Matched log entries">
 						<header class="border-border flex items-center justify-between min-h-12 border-b px-4 py-3">
@@ -140,5 +142,12 @@
 				</section>
 			</div>
 		</div>
+		{#if can('technician') && a.state !== 'resolved'}
+			<!-- Phones: the actions stay in reach while scrolling. -->
+			<div class="bg-surface border-border sticky bottom-[var(--bottom-bar,0px)] z-30 -mx-3 mt-4 flex gap-2 border-t px-3 py-2 sm:hidden">
+				{#if a.state === 'open'}<Button class="min-h-11 flex-1" icon={Check} onclick={() => act('acknowledge')}>Acknowledge</Button>{/if}
+				<Button class="min-h-11 flex-1" variant="primary" icon={CheckCheck} onclick={() => act('resolve')}>Resolve</Button>
+			</div>
+		{/if}
 	{/snippet}
 </Async>

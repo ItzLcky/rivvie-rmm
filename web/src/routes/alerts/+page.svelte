@@ -22,6 +22,7 @@
 	import AlertStateBadge from '#lib/components/AlertStateBadge.svelte';
 	import SeverityBadge from '#lib/components/SeverityBadge.svelte';
 	import MaintenanceWindows from '#lib/components/MaintenanceWindows.svelte';
+	import OnCallChip from '#lib/oncall/OnCallChip.svelte';
 
 	const sort = sortState('opened', 'desc');
 	let q = $state(param('q'));
@@ -65,6 +66,8 @@
 >
 	{#snippet actions()}<Button icon={ShieldCheck} href={withClient('/policies')}>Policies</Button>{/snippet}
 </PageHeader>
+
+<div class="mb-3"><OnCallChip /></div>
 
 <Tabs
 	label="State"

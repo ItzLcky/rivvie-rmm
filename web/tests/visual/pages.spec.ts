@@ -49,6 +49,7 @@ const pages: [string, string][] = [
 	['schedules', '/schedules'],
 	['schedule', '/schedules/sc-2'],
 	['notifications', '/settings/notifications'],
+	['settings-oncall', '/settings/oncall'],
 	['agent-patches', '/agents/a-3?tab=patches'],
 	['agent-deployments', '/agents/a-1?tab=deployments'],
 	['policy-set-software', '/policies/sets/ps-acme-win?section=software'],
@@ -267,6 +268,28 @@ for (const theme of ['light', 'dark'] as const) {
 			await expect(page.getByRole('dialog').getByLabel('Group').first()).toHaveValue('0b8d1f64-2e7a-4a53-9c1b-6f1d3a7e9c02');
 			await expect(page).toHaveScreenshot(`${theme}-sso-mappings.png`);
 			r = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa']).analyze();
+			expect(r.violations.filter((v) => v.impact === 'serious' || v.impact === 'critical').map((v) => v.id)).toEqual([]);
+		});
+
+		test('escalation policy editor', async ({ page }) => {
+			await mockApi(page);
+			await page.goto('/settings/oncall');
+			await settle(page);
+			await page.getByRole('button', { name: 'Edit Servers, out of hours' }).click();
+			await expect(page.getByRole('dialog').getByLabel('Name')).toHaveValue('Servers, out of hours');
+			await expect(page).toHaveScreenshot(`${theme}-oncall-policy-editor.png`);
+			const r = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa']).analyze();
+			expect(r.violations.filter((v) => v.impact === 'serious' || v.impact === 'critical').map((v) => v.id)).toEqual([]);
+		});
+
+		test('on-call channel form', async ({ page }) => {
+			await mockApi(page);
+			await page.goto('/settings/notifications');
+			await settle(page);
+			await page.getByRole('button', { name: 'Edit Page on-call' }).click();
+			await expect(page.getByRole('dialog').getByLabel('Business hours')).toBeVisible();
+			await expect(page).toHaveScreenshot(`${theme}-oncall-channel-form.png`);
+			const r = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa']).analyze();
 			expect(r.violations.filter((v) => v.impact === 'serious' || v.impact === 'critical').map((v) => v.id)).toEqual([]);
 		});
 

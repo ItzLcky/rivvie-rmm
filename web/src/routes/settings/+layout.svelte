@@ -8,11 +8,16 @@
 
 	let { children }: LayoutProps = $props();
 
-	// Admins see every section; people with billing permissions only the Billing one.
-	const billingOnly = $derived(!can('admin') && allowed('billing.read'));
-	const ok = $derived(can('admin') || (billingOnly && page.url.pathname === '/settings/billing'));
+	// Admins see every section; others only the sections they have a part in: Billing with
+	// billing permissions, On-call for technicians (to put themselves on call).
+	const limited = $derived(
+		can('admin')
+			? null
+			: [...(can('technician') ? [{ value: '/settings/oncall', label: 'On-call' }] : []), ...(allowed('billing.read') ? [{ value: '/settings/billing', label: 'Billing' }] : [])]
+	);
+	const ok = $derived(!limited || limited.some((t) => t.value === page.url.pathname));
 	$effect(() => {
-		if (session.user && !ok) goto(billingOnly ? '/settings/billing' : '/');
+		if (session.user && !ok) goto(limited?.[0]?.value ?? '/');
 	});
 </script>
 
@@ -22,11 +27,12 @@
 	class="mb-5"
 	value={page.url.pathname}
 	onchange={(v) => goto(v)}
-	items={billingOnly ? [{ value: '/settings/billing', label: 'Billing' }] : [
+	items={limited ?? [
 		{ value: '/settings', label: 'General' },
 		{ value: '/settings/users', label: 'Users' },
 		{ value: '/settings/sso', label: 'Single sign-on' },
 		{ value: '/settings/notifications', label: 'Notifications' },
+		{ value: '/settings/oncall', label: 'On-call' },
 		{ value: '/settings/service-desk', label: 'Service desk' },
 		{ value: '/settings/sla', label: 'SLAs' },
 		{ value: '/settings/documentation', label: 'Documentation' },
