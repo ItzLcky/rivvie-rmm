@@ -76,6 +76,7 @@ pub async fn enroll(server_url: &str, token: &str, previous: Option<&Config>) ->
 pub async fn run_forever(cfg: Config, config_path: std::path::PathBuf, mut shutdown: watch::Receiver<bool>) {
     let tracker = Arc::new(jobs::Tracker::open());
     let watchers = Arc::new(LogWatchers::default());
+    let checks = Arc::new(crate::checks::Checks::default());
     let patches = Arc::new(patch::Manager::new());
     let software = Arc::new(deploy::Manager::new(
         deploy::Server { url: cfg.server_url.clone(), agent_id: cfg.agent_id, secret: cfg.secret.clone() },
@@ -98,7 +99,7 @@ pub async fn run_forever(cfg: Config, config_path: std::path::PathBuf, mut shutd
     loop {
         let started = std::time::Instant::now();
         tokio::select! {
-            res = session(&cfg, collector.clone(), tracker.clone(), updater.clone(), watchers.clone(), patches.clone(), software.clone(), security.clone()) => match res {
+            res = session(&cfg, collector.clone(), tracker.clone(), updater.clone(), watchers.clone(), checks.clone(), patches.clone(), software.clone(), security.clone()) => match res {
                 Ok(()) => info!("connection closed"),
                 Err(e) => warn!("connection error: {e:#}"),
             },
@@ -130,6 +131,7 @@ async fn session(
     tracker: Arc<jobs::Tracker>,
     updater: Arc<Updater>,
     watchers: Arc<LogWatchers>,
+    checks: Arc<crate::checks::Checks>,
     patches: Arc<patch::Manager>,
     software: Arc<deploy::Manager>,
     security: Arc<security::Manager>,
@@ -187,9 +189,10 @@ async fn session(
     let heartbeat = tokio::spawn(periodic(tx.clone(), collector.clone(), heartbeat_secs.max(5), false));
     let inventory = tokio::spawn(periodic(tx.clone(), collector.clone(), inventory_secs.max(300), true));
     watchers.attach(tx.clone());
+    checks.attach(tx.clone());
     let (services_refresh, refresh_rx) = mpsc::channel(4);
     let services = tokio::spawn(services::watch(tx.clone(), refresh_rx));
-    let ctx = Ctx { tx: tx.clone(), collector, tracker: tracker.clone(), updater: updater.clone(), watchers: watchers.clone(), patches: patches.clone(), software: software.clone(), security: security.clone(), services_refresh };
+    let ctx = Ctx { tx: tx.clone(), collector, tracker: tracker.clone(), updater: updater.clone(), watchers: watchers.clone(), checks: checks.clone(), patches: patches.clone(), software: software.clone(), security: security.clone(), services_refresh };
 
     let mut shells: HashMap<Uuid, ShellSession> = HashMap::new();
     let mut desktops: HashMap<Uuid, DesktopSession> = HashMap::new();
@@ -218,6 +221,7 @@ async fn session(
     tracker.detach();
     updater.detach();
     watchers.detach();
+    checks.detach();
     services.abort();
     security_watch.abort();
     security.detach();
@@ -245,6 +249,7 @@ struct Ctx {
     tracker: Arc<jobs::Tracker>,
     updater: Arc<Updater>,
     watchers: Arc<LogWatchers>,
+    checks: Arc<crate::checks::Checks>,
     patches: Arc<patch::Manager>,
     software: Arc<deploy::Manager>,
     security: Arc<security::Manager>,
@@ -308,6 +313,7 @@ async fn handle(msg: ServerMsg, ctx: &Ctx, shells: &mut HashMap<Uuid, ShellSessi
             tokio::spawn(services::control(request_id, name, action, tx.clone(), ctx.services_refresh.clone()));
         }
         ServerMsg::Watchers { watchers } => ctx.watchers.set(watchers).await,
+        ServerMsg::Checks { checks, run_now } => ctx.checks.set(checks, run_now).await,
         ServerMsg::PatchScan { request_id } => {
             tokio::spawn(ctx.patches.clone().scan(Some(request_id)));
         }
@@ -415,6 +421,7 @@ fn capabilities() -> Vec<String> {
         rmm_proto::net::CAPABILITY.to_string(),
         rmm_proto::net::WOL_CAPABILITY.to_string(),
         rmm_proto::SCRIPT_ENV_CAPABILITY.to_string(),
+        rmm_proto::checks::CAPABILITY.to_string(),
     ];
     if cfg!(any(target_os = "linux", windows)) || std::env::var_os("RMM_DESKTOP_FAKE").is_some() {
         caps.push(rmm_proto::desktop::CAPABILITY.to_string());

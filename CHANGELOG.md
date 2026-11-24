@@ -12,7 +12,7 @@ back, restore the backup taken before the upgrade (see
 
 ## [Unreleased]
 
-Migrations `0036`, `0037` and `0043` to `0047` are new.
+Migrations `0036`, `0037`, `0040` and `0042` to `0047` are new.
 
 ### Added
 
@@ -57,6 +57,17 @@ Migrations `0036`, `0037` and `0043` to `0047` are new.
   Acknowledge action, per-event notification preferences (push and email) and a lock-screen
   privacy switch, and a tab bar at the bottom when installed on a phone. See
   [docs/design/pwa.md](docs/design/pwa.md).
+- **Uptime monitors.** Ping, TCP port, HTTP(S) status and keyword, TLS certificate expiry and DNS
+  checks, run on a schedule by an agent (the one a monitor names, or the site's designated agent),
+  with state, a 90-day availability bar, latency history and certificate details at `/uptime`. An
+  `uptime` alert kind on the runner's policy set opens alerts after a number of failed checks in a
+  row, for certificates near expiry and for slow answers; they don't count against the runner's
+  health. New crate `rmm-checks` holds the checks. See [docs/design/uptime.md](docs/design/uptime.md).
+- **Backup monitoring.** Agents read the last result of Windows Server Backup, Veeam, restic, Borg
+  and Time Machine jobs, or the newest file in a backup folder, every hour; `/backups` lists every
+  job, devices show a Backups card, and the `backup` alert kind (also an automation trigger) opens
+  alerts for failed and stale jobs. See [docs/design/backups.md](docs/design/backups.md).
+- QBR blocks "Availability" and "Backup success".
 
 ## [0.2.0] - 2026-11-23
 

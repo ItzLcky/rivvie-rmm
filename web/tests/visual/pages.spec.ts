@@ -76,6 +76,8 @@ const pages: [string, string][] = [
 	['security-content', '/security?tab=content'],
 	['security-settings', '/security?tab=settings'],
 	['policy-new-security', '/policies/sets/00000000-0000-4000-8001-000000000000?section=alerts&item=new&kind=security'],
+	['policy-new-uptime', '/policies/sets/00000000-0000-4000-8001-000000000000?section=alerts&item=new&kind=uptime'],
+	['policy-new-backup', '/policies/sets/00000000-0000-4000-8001-000000000000?section=alerts&item=new&kind=backup'],
 	['patches', '/patches'],
 	['patches-update', '/patches?update=b3c1d2e4-0001'],
 	['patches-compliance', '/patches?tab=compliance'],
@@ -126,7 +128,12 @@ const pages: [string, string][] = [
 	['network-device-printer', '/network/devices/nd-3'],
 	['network-settings', '/network/settings?client=c-acme'],
 	['settings-branding', '/settings/branding'],
-	['reports-scheduled', '/reports?tab=scheduled']
+	['reports-scheduled', '/reports?tab=scheduled'],
+	['uptime', '/uptime'],
+	['uptime-monitor', '/uptime/um-vpn'],
+	['uptime-monitor-down', '/uptime/um-erp'],
+	['backups', '/backups'],
+	['agent-backups', '/agents/a-2']
 ];
 const phone: [string, string][] = [
 	['dashboard', '/'],
@@ -163,7 +170,10 @@ const phone: [string, string][] = [
 	['settings-webhooks', '/settings/webhooks'],
 	['settings-siem', '/settings/siem'],
 	['network', '/network'],
-	['network-device', '/network/devices/nd-1']
+	['network-device', '/network/devices/nd-1'],
+	['uptime', '/uptime'],
+	['uptime-monitor', '/uptime/um-web'],
+	['backups', '/backups']
 ];
 
 const jpeg = readFileSync(new URL('./fixtures/desktop.jpg', import.meta.url));
@@ -210,6 +220,17 @@ for (const theme of ['light', 'dark'] as const) {
 				await expect(page).toHaveScreenshot(`${theme}-${name}.png`, { fullPage: true });
 			});
 		}
+
+		test('uptime monitor form', async ({ page }) => {
+			await mockApi(page);
+			await page.goto('/uptime/um-web');
+			await settle(page);
+			await page.getByRole('button', { name: 'Edit' }).click();
+			const drawer = page.getByRole('dialog', { name: 'Edit Acme website' });
+			await expect(drawer.getByLabel('URL')).toHaveValue('https://www.acme.example/');
+			await settle(page);
+			await expect(page).toHaveScreenshot(`${theme}-uptime-form.png`);
+		});
 
 		test('gallery', async ({ page }) => {
 			await mockApi(page, { signedIn: false });
@@ -857,6 +878,24 @@ test.describe('vault', () => {
 		expect(calls).toEqual([{ method: 'PUT', path: `/vault/${fw}`, body: { name: 'FortiGate admin', username: 'fgadmin', url: 'https://10.0.0.1:4443' } }]);
 		await expect(drawer).toBeVisible();
 		await expect(drawer.getByText('fgadmin')).toBeVisible();
+	});
+});
+
+test.describe('uptime', () => {
+	test('add a monitor', async ({ page }) => {
+		await mockApi(page);
+		const calls = await routeApi(page, (method, path) => (method === 'POST' && path === '/uptime/monitors' ? { json: { id: 'um-web' } } : undefined));
+		await page.goto('/uptime');
+		await settle(page);
+		await page.getByRole('button', { name: 'Add monitor' }).click();
+		const drawer = page.getByRole('dialog', { name: 'Add an uptime monitor' });
+		await drawer.getByRole('radio', { name: /TCP port/ }).click();
+		await drawer.getByLabel('Name').fill('Mail server');
+		await drawer.getByLabel('Host').fill('mail.acme.example');
+		await drawer.getByLabel('Port').fill('25');
+		await drawer.getByRole('button', { name: 'Add monitor' }).click();
+		await expect(page).toHaveURL(/\/uptime\/um-web$/);
+		expect(calls[0]).toMatchObject({ method: 'POST', path: '/uptime/monitors', body: { name: 'Mail server', kind: 'tcp', config: { host: 'mail.acme.example', port: 25 }, agent_id: null } });
 	});
 });
 

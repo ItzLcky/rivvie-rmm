@@ -69,3 +69,5 @@ Known gaps: no Windows run of any of it; SSO untested against real IdPs; no aler
 - **Managed vault items** (`0037`, [design](design/vault-managed.md)): the system write path (`vault::put_managed`) that disk encryption escrow, LAPS and identity resets use.
 - **On-call and paging** (`0046`, [design](design/oncall.md)): schedules, escalation policies, the `oncall` channel kind, text message, PagerDuty and Opsgenie channels.
 - **Installable app and Web Push** (`0047`, [design](design/pwa.md)): manifest, service worker, push for alerts, pages and tickets, phone tab bar.
+- **Uptime monitors** (`0040`, [design](design/uptime.md)): ping, TCP, HTTP(S) with keyword, TLS certificate and DNS checks run by an agent; availability, latency and certificate alerts. Server-run checks (step C1b) are not built yet.
+- **Backup monitoring** (`0042`, [design](design/backups.md)): Windows Server Backup, Veeam, restic, Borg, Time Machine and backup files; failed and stale alerts.

@@ -1,7 +1,9 @@
 mod accounting;
 mod agent_ws;
+mod backups;
 mod billing;
 mod branding;
+mod checks;
 mod pdf;
 mod policy;
 mod alerts;
@@ -46,6 +48,7 @@ mod vault;
 mod params;
 mod totp;
 mod updates;
+mod uptime;
 mod webauthn;
 mod wol;
 
@@ -402,6 +405,7 @@ async fn serve(db: sqlx::PgPool, args: ServeArgs) -> Result<()> {
     tokio::spawn(reports::run(state.clone()));
     tokio::spawn(oncall::run(state.clone()));
     tokio::spawn(push::run(state.clone()));
+    tokio::spawn(uptime::run(state.clone()));
     if state.cfg.metrics_token.is_some() {
         info!("metrics: GET /metrics (bearer token required)");
     }
@@ -544,6 +548,9 @@ async fn housekeeping(state: Arc<AppState>) {
         if let Err(e) = netmon::rollup(db).await {
             warn!("housekeeping: rolling up network samples: {e}");
         }
+        if let Err(e) = uptime::rollup(db).await {
+            warn!("housekeeping: rolling up uptime results: {e}");
+        }
         // The rest is bulk deletion; hourly is plenty.
         if runs.is_multiple_of(12) {
             state.limits.prune();
@@ -561,6 +568,12 @@ async fn housekeeping(state: Arc<AppState>) {
             );
             if let Err(e) = netmon::prune(db, state.cfg.metrics_raw_days as i32, state.cfg.metrics_retention_days as i32).await {
                 warn!("housekeeping: pruning network samples: {e}");
+            }
+            if let Err(e) = uptime::prune(db, state.cfg.metrics_raw_days as i32, state.cfg.metrics_retention_days as i32).await {
+                warn!("housekeeping: pruning uptime results: {e}");
+            }
+            if let Err(e) = backups::prune(db).await {
+                warn!("housekeeping: pruning backup jobs: {e}");
             }
             if let Err(e) = patches::prune(db).await {
                 warn!("housekeeping: pruning patches: {e}");

@@ -286,7 +286,7 @@ fn hundred() -> i32 {
 }
 
 /// The alert kinds `alert_opened` can name (the `kind` of an alert item).
-pub const ALERT_KINDS: &[&str] = &["offline", "cpu", "memory", "disk", "service", "job_failed", "log", "security", "patch"];
+pub const ALERT_KINDS: &[&str] = &["offline", "cpu", "memory", "disk", "service", "job_failed", "log", "security", "patch", "backup"];
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -893,6 +893,7 @@ pub async fn changed(st: &Arc<AppState>, ch: Change) {
         });
     }
     crate::alerts::push_watchers(st, agents).await;
+    crate::checks::push(st, agents, &[]).await;
     crate::security::push_policies_to(st, agents).await;
     let res = async { crate::patches::apply_policies(&mut *st.db.acquire().await?, agents).await }.await;
     if let Err(e) = res {

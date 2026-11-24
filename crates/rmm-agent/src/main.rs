@@ -1,3 +1,4 @@
+mod checks;
 mod collect;
 mod config;
 mod conn;

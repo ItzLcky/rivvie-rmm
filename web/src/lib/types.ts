@@ -150,7 +150,7 @@ export interface Session { id: string; created_at: string; last_seen_at: string;
 
 export type Severity = 'critical' | 'warning' | 'info';
 export type AlertState = 'open' | 'acknowledged' | 'resolved';
-export type PolicyKind = 'offline' | 'cpu' | 'memory' | 'disk' | 'service' | 'job_failed' | 'log' | 'security' | 'patch' | 'net_down' | 'net_interface' | 'net_threshold';
+export type PolicyKind = 'offline' | 'cpu' | 'memory' | 'disk' | 'service' | 'job_failed' | 'log' | 'security' | 'patch' | 'net_down' | 'net_interface' | 'net_threshold' | 'uptime' | 'backup';
 export type LogLevel = 'critical' | 'error' | 'warning' | 'info';
 
 export interface Alert {

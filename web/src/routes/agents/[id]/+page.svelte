@@ -1,4 +1,5 @@
 <script lang="ts">
+	import AgentBackups from '#lib/components/agent/AgentBackups.svelte';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import { BellOff, CloudDownload, Copy, LifeBuoy, MonitorUp, Pencil, Pin, Play, Power, RefreshCw, Search, SquareTerminal, Tag, Trash2 } from '@lucide/svelte';
@@ -354,6 +355,7 @@
 					</dl>
 				</section>
 				{#key a.id}<FieldsCard entity="agent" id={a.id} />{/key}
+				{#key a.id}<AgentBackups agentId={a.id} />{/key}
 				</div>
 
 				<div class="min-w-0 space-y-4">

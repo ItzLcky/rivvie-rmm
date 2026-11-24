@@ -40,4 +40,4 @@ export function withClient(href: string, id = clientId()): string {
 }
 
 /** Pages whose lists the switcher filters in place; elsewhere it goes to the dashboard. */
-export const SCOPED_PAGES = ['/', '/agents', '/jobs', '/clients', '/scripts', '/alerts', '/network', '/policies', '/schedules', '/tickets', '/projects', '/billing', '/contracts'];
+export const SCOPED_PAGES = ['/', '/agents', '/jobs', '/clients', '/scripts', '/alerts', '/network', '/uptime', '/backups', '/policies', '/schedules', '/tickets', '/projects', '/billing', '/contracts'];

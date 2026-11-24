@@ -25,6 +25,7 @@ Follow the [manual plan](design/windows-testing.md) on Windows 10/11 and Server 
 - [ ] Software deployment (winget, Chocolatey, MSI push) and automations on a real host.
 - [ ] Branding on Windows: the branded MSI's name and icon in *Apps and features*, the service display name, the consent prompt title ([plan](design/windows-testing.md) §2.6).
 - [ ] Wake-on-LAN on a real LAN: a machine actually waking (S3/S4/S5, Fast startup), senders on each OS, and how switches treat directed broadcasts across VLANs ([plan](design/windows-testing.md#wake-on-lan-any-os-real-network)).
+- [ ] Uptime and backups on real hosts: ICMP through `IcmpSendEcho`, Windows Server Backup and Veeam event logs from real installs, Time Machine on a Mac (section 7a of the plan).
 - [ ] Fix what breaks, and record the tested versions in the README.
 
 ### 2. Before the first real customer

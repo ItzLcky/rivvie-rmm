@@ -1329,6 +1329,40 @@ const netPorts = Array.from({ length: 8 }, (_, i) => ({
 function oper(i: number) {
 	return [0, 0, 0, 1, 0, 0, 1, 1][i];
 }
+// --- uptime monitors and backup jobs ------------------------------------------------------------
+const monitorBase = { runner: 'agent', interval_secs: 60, timeout_secs: 10, enabled: true, fail_count: 0, cert: null as unknown, cert_not_after: null as string | null, last_value: null as number | null, created_at: ago(60 * 24 * 40), open_alerts: 0 };
+const uptimeMonitors = [
+	{ ...monitorBase, id: 'um-web', client_id: 'c-acme', client_name: 'Acme Corp', site_id: 's-acme-hq', site_name: 'Head office', name: 'Acme website', kind: 'http', config: { url: 'https://www.acme.example/', method: 'get', statuses: [], keyword: 'Welcome', keyword_absent: false, verify_tls: true }, target: 'https://www.acme.example/', agent_id: null, runner_agent_id: 'a-1', runner_hostname: 'acme-dc01', runner_online: true, state: 'up', state_since: ago(60 * 24 * 6), last_at: ago(1), last_ms: 182, last_message: 'HTTP 200', last_value: 200, cert_not_after: ago(-60 * 24 * 61), cert: { subject: 'CN=www.acme.example', issuer: 'C=US, O=Let’s Encrypt, CN=R11', sans: ['www.acme.example', 'acme.example'], not_before: ago(60 * 24 * 29), not_after: ago(-60 * 24 * 61), untrusted: null }, uptime_24h: 100, uptime_30d: 99.97 },
+	{ ...monitorBase, id: 'um-vpn', client_id: 'c-acme', client_name: 'Acme Corp', site_id: 's-acme-hq', site_name: 'Head office', name: 'VPN gateway', kind: 'tls', config: { host: 'vpn.acme.example', port: 443, server_name: null }, target: 'vpn.acme.example:443', agent_id: null, runner_agent_id: 'a-1', runner_hostname: 'acme-dc01', runner_online: true, state: 'up', state_since: ago(60 * 24 * 20), last_at: ago(2), last_ms: 41, last_message: 'certificate valid for 9 more days (TLSv1.3)', last_value: 9, cert_not_after: ago(-60 * 24 * 9 - 60), cert: { subject: 'CN=vpn.acme.example, O=Acme Corp', issuer: 'C=US, O=DigiCert Inc, CN=DigiCert TLS RSA SHA256 2020 CA1', sans: ['vpn.acme.example'], not_before: ago(60 * 24 * 356), not_after: ago(-60 * 24 * 9 - 60), untrusted: null }, open_alerts: 1, uptime_24h: 100, uptime_30d: 100 },
+	{ ...monitorBase, id: 'um-erp', client_id: 'c-acme', client_name: 'Acme Corp', site_id: 's-acme-wh', site_name: 'Warehouse', name: 'ERP database', kind: 'tcp', config: { host: '10.20.0.15', port: 1433 }, target: '10.20.0.15:1433', agent_id: 'a-2', runner_agent_id: 'a-2', runner_hostname: 'acme-fs01', runner_online: true, state: 'down', state_since: ago(23), fail_count: 23, last_at: ago(1), last_ms: null, last_message: '10.20.0.15:1433: connection refused', open_alerts: 1, uptime_24h: 98.4, uptime_30d: 99.12 },
+	{ ...monitorBase, id: 'um-dns', client_id: 'c-globex', client_name: 'Globex', site_id: 's-globex', site_name: 'Main', name: 'Mail MX record', kind: 'dns', interval_secs: 300, config: { name: 'globex.example', record: 'MX', server: null, expect: ['10 mail.globex.example'] }, target: 'globex.example MX', agent_id: null, runner_agent_id: 'a-5', runner_hostname: 'globex-app01', runner_online: true, state: 'up', state_since: ago(60 * 24 * 80), last_at: ago(3), last_ms: 12, last_message: '10 mail.globex.example', uptime_24h: 100, uptime_30d: 100 },
+	{ ...monitorBase, id: 'um-ping', client_id: 'c-initech', client_name: 'Initech', site_id: 's-initech', site_name: 'Main', name: 'Branch router', kind: 'ping', config: { host: '192.168.50.1' }, target: '192.168.50.1', agent_id: null, runner_agent_id: 'a-7', runner_hostname: 'initech-ws-12', runner_online: false, state: 'unknown', state_since: ago(60 * 5), last_at: ago(60 * 5 + 3), last_ms: 3, last_message: 'reply in 3 ms', uptime_24h: 100, uptime_30d: 99.99 }
+];
+function monitorDetail(m: (typeof uptimeMonitors)[number]) {
+	const today = new Date(Date.UTC(NOW.getUTCFullYear(), NOW.getUTCMonth(), NOW.getUTCDate()));
+	const days = Array.from({ length: 90 }, (_, i) => {
+		const day = new Date(today.getTime() - (89 - i) * 86_400_000).toISOString();
+		const checks = i < 12 && m.id !== 'um-web' ? 0 : 1440;
+		const failures = m.id === 'um-erp' && i === 89 ? 23 : m.id === 'um-web' && (i === 40 || i === 71) ? (i === 40 ? 4 : 19) : 0;
+		return { day, checks, failures, uptime: checks ? Math.round(((checks - failures) * 10000) / checks) / 100 : null };
+	}).filter((d) => d.checks);
+	const alerts = m.id === 'um-vpn' ? [{ id: 'al-mon-1', title: 'Certificate expires in 9 days: VPN gateway', severity: 'critical', kind: 'uptime', opened_at: ago(60 * 24 * 5), acknowledged_at: null }] : m.id === 'um-erp' ? [{ id: 'al-mon-2', title: 'Monitor down: ERP database', severity: 'critical', kind: 'uptime', opened_at: ago(22), acknowledged_at: null }] : [];
+	const recent = Array.from({ length: 8 }, (_, i) => ({ ts: ago(i * (m.interval_secs / 60) + 1), ok: m.state !== 'down', ms: m.state === 'down' ? null : (m.last_ms ?? 20) + ((i * 7) % 5) * 3, message: m.last_message ?? '' }));
+	return { ...m, days, alerts, recent };
+}
+const uptimePoints = (id: string) =>
+	Array.from({ length: 96 }, (_, i) => {
+		const down = id === 'um-erp' && i >= 94;
+		return { ts: new Date(NOW.getTime() - (95 - i) * 15 * 60_000).toISOString(), checks: 15, failures: down ? 15 : 0, avg_ms: down ? null : (id === 'um-web' ? 170 : 40) + ((i * 11) % 9) * 6, max_ms: down ? null : (id === 'um-web' ? 260 : 70) };
+	});
+const backupJobsMock = [
+	{ agent_id: 'a-2', hostname: 'acme-fs01', online: true, client_id: 'c-acme', client_name: 'Acme Corp', site_name: 'Head office', provider: 'veeam', job: 'Nightly file server', last_run_at: ago(60 * 7), last_success_at: ago(60 * 31), last_result: 'failed', message: 'Error: There is not enough space on the disk.', size_bytes: null, updated_at: ago(12), alerting: true },
+	{ agent_id: 'a-2', hostname: 'acme-fs01', online: true, client_id: 'c-acme', client_name: 'Acme Corp', site_name: 'Head office', provider: 'wsb', job: 'Windows Server Backup', last_run_at: ago(60 * 6), last_success_at: ago(60 * 6), last_result: 'success', message: '14 versions', size_bytes: null, updated_at: ago(12), alerting: false },
+	{ agent_id: 'a-1', hostname: 'acme-dc01', online: true, client_id: 'c-acme', client_name: 'Acme Corp', site_name: 'Head office', provider: 'wsb', job: 'Windows Server Backup', last_run_at: ago(60 * 5), last_success_at: ago(60 * 5), last_result: 'warning', message: 'One of the volumes was skipped.', size_bytes: null, updated_at: ago(20), alerting: false },
+	{ agent_id: 'a-6', hostname: 'globex-db01', online: true, client_id: 'c-globex', client_name: 'Globex', site_name: 'Main', provider: 'restic', job: 'sftp:backup@nas.globex.example:/srv/restic/db01', last_run_at: ago(60 * 3), last_success_at: ago(60 * 3), last_result: 'success', message: 'snapshot 5e4f3a2b of /var/lib/postgresql', size_bytes: 52_428_800_000, updated_at: ago(40), alerting: false },
+	{ agent_id: 'a-5', hostname: 'globex-app01', online: true, client_id: 'c-globex', client_name: 'Globex', site_name: 'Main', provider: 'file_age', job: '/srv/dumps/*.sql.gz', last_run_at: ago(60 * 50), last_success_at: ago(60 * 50), last_result: 'success', message: 'newest file app-2026-06-13.sql.gz', size_bytes: 734_003_200, updated_at: ago(33), alerting: true }
+];
+
 const netDevices = [
 	netDev(1, 'Core switch', 'switch', '192.168.10.2', 'up', { sys_descr: 'Cisco IOS Software, Catalyst L3 Switch Software (CAT9K_IOSXE), Version 17.9.4', vendor: 'Cisco Systems', mac: '00:1b:54:aa:10:02', cpu_percent: 17, mem_used: 612_000_000, mem_total: 2_000_000_000, interfaces: 8, interfaces_up: 5, storage: [{ descr: 'flash:', kind: 'disk', used: 410_000_000, total: 1_600_000_000 }] }),
 	netDev(2, 'Edge firewall', 'firewall', '192.168.10.1', 'down', { sys_descr: 'Fortinet FortiGate-60F v7.4.3', vendor: 'Fortinet', mac: '90:6c:ac:11:22:33', interfaces: 4, interfaces_up: 0 }),
@@ -1736,6 +1770,22 @@ export async function mockApi(p: Page, opts: { signedIn?: boolean; ssoRequired?:
 		if (path === '/settings/smtp') return json({ host: 'smtp.office365.com', port: 587, security: 'starttls', username: 'rmm@northwind.example', password_set: true, from: 'Northwind RMM <rmm@northwind.example>' });
 		if (path === '/api-keys') return json(q.get('all') ? allApiKeys : apiKeys);
 		if (path === '/api-keys/options') return json({ groups: [{ id: 'clients', label: 'Clients and sites' }, { id: 'agents', label: 'Agents, inventory and metrics' }, { id: 'jobs', label: 'Jobs and results' }, { id: 'scripts', label: 'Script library' }, { id: 'alerts', label: 'Alerts' }, { id: 'tickets', label: 'Tickets' }, { id: 'security', label: 'Endpoint protection (needs the security.read permission)' }], permissions: admin.permissions, can_write: true, default_rate_limit: 600 });
+		if (path === '/uptime/summary') {
+			const ms = uptimeMonitors.filter((m) => !q.get('client_id') || m.client_id === q.get('client_id'));
+			return json({ monitors: ms.length, up: ms.filter((m) => m.state === 'up').length, down: ms.filter((m) => m.state === 'down').length, unknown: ms.filter((m) => m.state === 'unknown').length, disabled: 0, uptime_30d: 99.71 });
+		}
+		if (path === '/uptime/monitors') return json(uptimeMonitors.filter((m) => (!q.get('client_id') || m.client_id === q.get('client_id')) && (!q.get('state') || m.state === q.get('state')) && (!q.get('kind') || m.kind === q.get('kind'))));
+		if ((m = path.match(/^\/uptime\/monitors\/([^/]+)\/results$/))) return json(uptimePoints(m[1]));
+		if ((m = path.match(/^\/uptime\/monitors\/([^/]+)$/))) {
+			const mon = uptimeMonitors.find((x) => x.id === m![1]);
+			return mon ? json(monitorDetail(mon)) : json({ error: 'monitor not found' }, 404);
+		}
+		if (path === '/backups') {
+			const rank: Record<string, number> = { failed: 0, warning: 1, unknown: 2, running: 3, success: 4 };
+			const rows = backupJobsMock.filter((j) => (!q.get('client_id') || j.client_id === q.get('client_id')) && (!q.get('result') || q.get('result')!.split(',').includes(j.last_result)) && (!q.get('alerting') || j.alerting));
+			return json(page([...rows].sort((a, b) => rank[a.last_result] - rank[b.last_result]), Number(q.get('limit') ?? 50)));
+		}
+		if ((m = path.match(/^\/agents\/([^/]+)\/backups$/))) return json(backupJobsMock.filter((j) => j.agent_id === m![1]));
 		if (path === '/network/summary') return json({ unmanaged: discoveredHosts.filter((d) => d.state === 'unmanaged' && d.online).length, devices: netDevices.length, down: netDevices.filter((d) => d.state === 'down').length });
 		if (path === '/network/devices')
 			return json(netDevices.filter((d) => (!q.get('state') || d.state === q.get('state')) && (!q.get('kind') || d.kind === q.get('kind')) && (!q.get('client_id') || d.client_id === q.get('client_id'))));

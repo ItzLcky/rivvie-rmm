@@ -8,6 +8,7 @@
 //! Everything is multiplexed over that one connection: metrics, jobs,
 //! interactive shells, patching, remote desktop streams and endpoint protection.
 
+pub mod checks;
 pub mod desktop;
 pub mod net;
 pub mod patch;
@@ -299,6 +300,10 @@ pub enum AgentMsg {
         #[serde(default)]
         error: Option<String>,
     },
+    /// Outcomes of [`ServerMsg::Checks`], batched (see [`checks`]).
+    CheckResults {
+        results: Vec<checks::CheckResult>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -530,6 +535,14 @@ pub enum ServerMsg {
     WakeOnLan {
         request_id: Uuid,
         targets: Vec<net::WolTarget>,
+    },
+    /// The complete set of checks this agent runs, replacing any earlier set (only to agents
+    /// listing [`checks::CAPABILITY`]). Sent after connecting and whenever it changes. Checks
+    /// in `run_now` run at once, whatever their schedule ("check now").
+    Checks {
+        checks: Vec<checks::CheckSpec>,
+        #[serde(default)]
+        run_now: Vec<Uuid>,
     },
 }
 
@@ -1081,6 +1094,65 @@ mod tests {
         assert!(LogLevel::Critical < LogLevel::Error && LogLevel::Warning < LogLevel::Info);
         assert_eq!(LogLevel::from_syslog(3), LogLevel::Error);
         assert_eq!(LogLevel::from_windows(3), LogLevel::Warning);
+    }
+
+    #[test]
+    fn checks_round_trip_and_default() {
+        use checks::*;
+        let spec = CheckSpec {
+            id: Uuid::new_v4(),
+            interval_secs: 60,
+            timeout_secs: 10,
+            kind: CheckKind::Http { url: "https://example.com".into(), method: HttpMethod::Head, statuses: vec![200], keyword: None, keyword_absent: false, verify_tls: true },
+        };
+        let msg = ServerMsg::Checks { checks: vec![spec.clone()], run_now: vec![] };
+        match decode::<ServerMsg>(&encode(&msg).unwrap()).unwrap() {
+            ServerMsg::Checks { checks, run_now } => assert!(checks == [spec.clone()] && run_now.is_empty()),
+            other => panic!("{other:?}"),
+        }
+        // A server that predates `run_now`, and an HTTP check that leaves out its options.
+        #[derive(Serialize)]
+        struct Old {
+            t: &'static str,
+            checks: Vec<serde_json::Value>,
+        }
+        let old = Old { t: "checks", checks: vec![serde_json::json!({ "id": spec.id, "interval_secs": 60, "timeout_secs": 5, "kind": { "type": "http", "url": "http://x" } })] };
+        match decode::<ServerMsg>(&encode(&old).unwrap()).unwrap() {
+            ServerMsg::Checks { checks, run_now } => {
+                assert!(run_now.is_empty());
+                assert!(matches!(&checks[0].kind, CheckKind::Http { verify_tls: true, method: HttpMethod::Get, .. }), "{checks:?}");
+            }
+            other => panic!("{other:?}"),
+        }
+        let job = BackupJob {
+            provider: "restic".into(),
+            job: "/srv/repo".into(),
+            last_run_at: Some(Utc::now()),
+            last_success_at: None,
+            last_result: BackupResult::Failed,
+            message: "exit 1".into(),
+            size_bytes: Some(10),
+        };
+        let res = AgentMsg::CheckResults {
+            results: vec![CheckResult {
+                check_id: spec.id,
+                at: Utc::now(),
+                ok: false,
+                latency_ms: None,
+                value: Some(3.0),
+                message: "failed".into(),
+                data: Some(CheckData::Backups { jobs: vec![job.clone()], errors: vec![("wsb".into(), "not installed".into())] }),
+            }],
+        };
+        match decode::<AgentMsg>(&encode(&res).unwrap()).unwrap() {
+            AgentMsg::CheckResults { results } => match &results[0].data {
+                Some(CheckData::Backups { jobs, errors }) => assert!(jobs == &[job] && errors.len() == 1),
+                other => panic!("{other:?}"),
+            },
+            other => panic!("{other:?}"),
+        }
+        // An unknown result from a newer agent reads as unknown.
+        assert_eq!(serde_json::from_str::<BackupResult>("\"partial\"").unwrap(), BackupResult::Unknown);
     }
 
     #[test]

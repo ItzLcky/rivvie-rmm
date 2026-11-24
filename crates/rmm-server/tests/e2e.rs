@@ -49,6 +49,10 @@
 //! `RMM_E2E_ONLY=branding` runs only the white-labelling section (after the sign-in and tenancy).
 //! `RMM_E2E_ONLY=script_params` runs only enrollment and the script parameters section.
 //!
+//! `RMM_E2E_ONLY=uptime` and `RMM_E2E_ONLY=backups` run only those sections (uptime monitors
+//! against local HTTP, TCP, TLS and DNS listeners; backup alerts through the agent's fake
+//! provider, and a real restic repository when `restic` is on PATH).
+//!
 //! `RMM_E2E_ONLY=desk` runs only the core and service desk sections (faster while working on
 //! tickets, the portal and billing); `RMM_E2E_ONLY=api` only enrollment and the API keys and webhooks.
 //!
@@ -218,6 +222,8 @@ impl Agent {
                 .env("RMM_DESKTOP_FAKE", log_dir.join(format!("{name}-desktop.jsonl")))
                 // And report antivirus state from this file.
                 .env("RMM_SECURITY_FAKE", log_dir.join(format!("{name}-security.json")))
+                // And backup jobs from this one, while it exists.
+                .env("RMM_BACKUP_FAKE", log_dir.join(format!("{name}-backups.json")))
                 // The sensor runs unprivileged on scratch directories, with test-signed content.
                 .env("RMM_STATE_DIR", sensor_dir(log_dir, &name, "state"))
                 .env("RMM_CONTENT_PUBKEY", content_pubkey())
@@ -621,6 +627,16 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
     }
     if std::env::var("RMM_E2E_ONLY").as_deref() == Ok("push") {
         push(&url, &admin, db, &id1, a_id, b_id).await;
+        a1.kill();
+        return Ok(());
+    }
+    if std::env::var("RMM_E2E_ONLY").as_deref() == Ok("uptime") {
+        uptime(&url, &admin, db, dir, &id1, a_id, a_site, b_id).await;
+        a1.kill();
+        return Ok(());
+    }
+    if std::env::var("RMM_E2E_ONLY").as_deref() == Ok("backups") {
+        backups(&url, &admin, db, dir, &id1, b_id).await;
         a1.kill();
         return Ok(());
     }
@@ -1249,6 +1265,10 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
     wake_on_lan(&url, &admin, db, dir, &id1, a_id, a_site).await;
     oncall(&url, &admin, db, &id1, a_id).await;
     push(&url, &admin, db, &id1, a_id, b_id).await;
+    if all {
+        uptime(&url, &admin, db, dir, &id1, a_id, a_site, b_id).await;
+        backups(&url, &admin, db, dir, &id1, b_id).await;
+    }
     sso_and_passkeys(server, db, dir, &secret).await;
 
     // --- rate limits ------------------------------------------------------------------------------
@@ -6255,7 +6275,7 @@ async fn scheduled_reports(url: &str, admin: &Api, db: &sqlx::PgPool, a_id: &str
     let ok = tech.post(&format!("/report-schedules/{margins_id}/run"), json!({})).await;
     assert_eq!(ok["status"], "sent", "{ok}");
     // Its mail leaves through the outbox; let it arrive before counting what comes after.
-    wait_mail(&mail, "the margins report", |to, _| to.iter().any(|t| t == "reports-tech@e2e.test")).await;
+    wait_mail(mail, "the margins report", |to, _| to.iter().any(|t| t == "reports-tech@e2e.test")).await;
     // The owner loses billing.read: the next run fails, saying why, and mails nothing.
     admin.put(&format!("/users/{tech_id}/permissions"), json!({ "permissions": ["security.read"] })).await;
     let sent_before = mail.lock().unwrap().len();
@@ -9370,3 +9390,5 @@ async fn push(url: &str, admin: &Api, db: &sqlx::PgPool, id1: &str, a_id: &str, 
     assert_eq!(tech.get("/push/subscriptions").await.as_array().unwrap().len(), 0);
     admin.delete_policy(item["id"].as_str().unwrap()).await;
 }
+
+include!("e2e_parts/monitoring.rs");

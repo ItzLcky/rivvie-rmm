@@ -16,6 +16,8 @@ export type LiveEvent =
 	| { type: 'patches'; agent_id: string }
 	| { type: 'software'; agent_id: string }
 	| { type: 'security'; agent_id: string }
+	| { type: 'monitor'; id: string }
+	| { type: 'backups'; agent_id: string }
 	| { type: 'ticket'; id: string };
 
 export const live = $state<{ status: 'connecting' | 'live' | 'offline' }>({ status: 'connecting' });

@@ -4,9 +4,9 @@
 
 mod addr;
 mod arp;
-mod dns;
-mod icmp;
 pub mod poll;
+// Moved to `rmm-checks`, which the uptime checks share.
+use rmm_checks::{dns, ping as icmp};
 mod scan;
 mod wol;
 
