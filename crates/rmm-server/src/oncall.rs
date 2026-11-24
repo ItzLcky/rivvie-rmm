@@ -198,14 +198,12 @@ fn boundaries(tz: Tz, layers: &[Layer], overrides: &[Override], from: DateTime<U
     out.insert(from);
     for l in layers {
         let first = l.shift_at(tz, from).map(|(n, _, _)| n).unwrap_or(0);
-        let mut n = first;
-        for _ in 0..5000 {
+        for n in (first..).take(5000) {
             let s = l.shift_start(tz, n);
             if s >= to {
                 break;
             }
             out.insert(s);
-            n += 1;
         }
         let mut day = from.with_timezone(&tz).date_naive() - Dur::days(1);
         let last = to.with_timezone(&tz).date_naive();

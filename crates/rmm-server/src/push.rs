@@ -199,7 +199,7 @@ fn extra_hosts() -> &'static [String] {
 pub fn endpoint_allowed(endpoint: &str, extra: &[String]) -> Result<reqwest::Url, String> {
     let url = reqwest::Url::parse(endpoint).map_err(|_| "the subscription endpoint is not a URL".to_string())?;
     let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
-    if extra.iter().any(|h| *h == host) && matches!(url.scheme(), "http" | "https") {
+    if extra.contains(&host) && matches!(url.scheme(), "http" | "https") {
         return Ok(url);
     }
     let known = host == "fcm.googleapis.com"
@@ -343,7 +343,8 @@ pub async fn alert_opened(st: &AppState, alert_id: Uuid) {
 /// A staff ticket mail point (`email.rs`): a push to that person when they want one. Returns
 /// whether they still want the email.
 pub async fn ticket_event(st: &AppState, user: Uuid, event: &str, ticket_id: Uuid, what: &str) -> bool {
-    let row: Option<(Option<bool>, Option<bool>, bool, bool, i64, String)> = match sqlx::query_as(
+    type Row = (Option<bool>, Option<bool>, bool, bool, i64, String);
+    let row: Option<Row> = match sqlx::query_as(
         "SELECT p.push, p.email, u.push_hide_details, EXISTS (SELECT 1 FROM push_subscriptions s WHERE s.user_id = u.id), t.number, t.subject
            FROM users u CROSS JOIN tickets t LEFT JOIN user_notification_prefs p ON p.user_id = u.id AND p.event = $3
           WHERE u.id = $1 AND t.id = $2 AND NOT u.disabled",
