@@ -1276,7 +1276,6 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
     if all {
         uptime(&url, &admin, db, dir, &id1, a_id, a_site, b_id).await;
         backups(&url, &admin, db, dir, &id1, b_id).await;
-        tray(server, &admin, db, dir, &id1, a_id).await;
     }
     sso_and_passkeys(server, db, dir, &secret).await;
 
@@ -1328,6 +1327,10 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
     assert_eq!(limited, Some(20));
 
     observability(&url, dir).await;
+    // After the counters are checked: it stops the server to queue a request offline.
+    if all {
+        tray(server, &admin, db, dir, &id1, a_id).await;
+    }
     // After the counters are checked: it restarts the server.
     audit_export_siem_sealing(server, &admin, &tech, db).await;
     // Last but the drill: it restarts the server, which would reset the counters checked above.
