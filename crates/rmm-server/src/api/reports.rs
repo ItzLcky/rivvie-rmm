@@ -575,6 +575,9 @@ pub(crate) async fn build_qbr(st: &AppState, u: &User, client: Uuid, from: Naive
     )));
     availability_blocks(st, client, from, to, &mut blocks).await?;
     backup_blocks(st, client, from, to, &mut blocks).await?;
+    if u.has(Perm::SecurityRead) {
+        super::vulns::qbr_blocks(st, client, from, to, &mut blocks).await?;
+    }
     let subtitle = format!("{name} · {}", period(from, to));
     let file = format!("QBR-{}-{}", file_part(&name), from.format("%Y-%m"));
     Ok(Rendered { title: "Quarterly business review".into(), subtitle, blocks, file, client: Some(client) })

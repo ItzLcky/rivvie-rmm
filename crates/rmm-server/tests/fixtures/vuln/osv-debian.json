@@ -1,0 +1,25 @@
+{
+  "id": "DEBIAN-CVE-2024-6119",
+  "modified": "2024-11-20T08:14:31.000000Z",
+  "published": "2024-09-03T16:15:07Z",
+  "upstream": ["CVE-2024-6119"],
+  "details": "Issue summary: Applications performing certificate name checks (e.g., TLS clients checking server certificates) may attempt to read an invalid memory address resulting in abnormal termination of the application process.",
+  "affected": [
+    {
+      "package": { "ecosystem": "Debian:12", "name": "openssl", "purl": "pkg:deb/debian/openssl?arch=source" },
+      "ranges": [ { "type": "ECOSYSTEM", "events": [ { "introduced": "0" }, { "fixed": "3.0.14-1~deb12u2" } ] } ],
+      "ecosystem_specific": { "urgency": "medium" },
+      "versions": ["3.0.11-1~deb12u1", "3.0.11-1~deb12u2"]
+    },
+    {
+      "package": { "ecosystem": "Debian:13", "name": "openssl" },
+      "ranges": [ { "type": "ECOSYSTEM", "events": [ { "introduced": "0" }, { "fixed": "3.3.2-1" } ] } ]
+    },
+    {
+      "package": { "ecosystem": "Debian:12", "name": "openssl" },
+      "ranges": [ { "type": "GIT", "repo": "https://github.com/openssl/openssl", "events": [ { "introduced": "0" } ] } ]
+    }
+  ],
+  "references": [ { "type": "ADVISORY", "url": "https://security-tracker.debian.org/tracker/CVE-2024-6119" } ],
+  "schema_version": "1.6.0"
+}

@@ -251,6 +251,37 @@ impl Default for BackupRule {
     }
 }
 
+fn critical() -> String {
+    "critical".into()
+}
+
+/// Vulnerable software on the device ([`crate::vuln`]): one alert per device, with counts and
+/// the top five CVEs in its details, not one per CVE.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VulnerabilityRule {
+    /// critical, high, medium or low: findings at least this severe count.
+    #[serde(default = "critical")]
+    pub min_severity: String,
+    /// Only CVEs in CISA's known-exploited catalogue.
+    #[serde(default)]
+    pub kev_only: bool,
+    /// Only findings with a fixed version to install.
+    #[serde(default = "yes")]
+    pub fix_available_only: bool,
+    /// Only findings first seen at least this many days ago (time to patch normally).
+    #[serde(default = "fourteen")]
+    pub older_than_days: i32,
+    /// Only CVEs with an EPSS score at least this (0-1). None: any.
+    #[serde(default)]
+    pub min_epss: Option<f64>,
+}
+
+impl Default for VulnerabilityRule {
+    fn default() -> Self {
+        VulnerabilityRule { min_severity: critical(), kev_only: false, fix_available_only: true, older_than_days: 14, min_epss: None }
+    }
+}
+
 /// What a policy checks: `kind` and `params` columns together.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "params", rename_all = "snake_case")]
@@ -272,6 +303,7 @@ pub enum Rule {
     NetThreshold(NetThresholdRule),
     Uptime(UptimeRule),
     Backup(BackupRule),
+    Vulnerability(VulnerabilityRule),
 }
 
 impl Rule {
@@ -377,6 +409,18 @@ impl Rule {
                 Ok(())
             }
             Rule::Backup(r) => crate::backups::validate(r),
+            Rule::Vulnerability(r) => {
+                if !["critical", "high", "medium", "low"].contains(&r.min_severity.as_str()) {
+                    return Err("min_severity is critical, high, medium or low".into());
+                }
+                if !(0..=365).contains(&r.older_than_days) {
+                    return Err("older_than_days must be 0-365".into());
+                }
+                if r.min_epss.is_some_and(|e| !(0.0..=1.0).contains(&e)) {
+                    return Err("min_epss is a probability, 0-1".into());
+                }
+                Ok(())
+            }
             Rule::Patch(r) => {
                 if r.reboot_hours.is_some_and(|h| !(1..=8760).contains(&h)) {
                     return Err("restart pending must be 1-8760 hours".into());
@@ -773,6 +817,7 @@ pub async fn recheck_item(st: &AppState, item_id: Uuid) {
     crate::netalerts::recheck_item(st, item_id).await;
     crate::uptime::recheck_item(st, item_id).await;
     crate::backups::recheck_item(st, item_id).await;
+    crate::vuln::matcher::recheck_item(st, item_id).await;
     let rows: sqlx::Result<Vec<(Uuid, Uuid)>> = sqlx::query_as(
         "SELECT ap.agent_id, a.policy_set_id FROM agent_policy ap JOIN agents a ON a.id = ap.agent_id
           WHERE ap.item_id = $1 AND ap.module = 'alert' AND ap.enabled
@@ -797,6 +842,7 @@ pub async fn recheck_agent(st: &AppState, agent_id: Uuid) {
     crate::netalerts::recheck_agent(st, agent_id).await;
     crate::uptime::recheck_agent(st, agent_id).await;
     crate::backups::recheck_agent(st, agent_id).await;
+    vulns_changed(st, agent_id).await;
     for kind in ["service", "security", "patch"] {
         match policies_for(st, agent_id, kind).await {
             Ok(ps) => {
@@ -1566,6 +1612,12 @@ async fn check_patches(st: &AppState, p: &Policy, agent_id: Uuid) -> sqlx::Resul
     clear(st, p, agent_id, None, &keep).await
 }
 
+/// The device's vulnerability findings changed (an evaluation, an acceptance): its
+/// `vulnerability` alerts again.
+pub async fn vulns_changed(st: &AppState, agent_id: Uuid) {
+    crate::vuln::matcher::check_alerts(st, agent_id).await;
+}
+
 /// The agent's patch state changed (a scan, an install's result).
 pub async fn patches_changed(st: &AppState, agent_id: Uuid) {
     let res: sqlx::Result<()> = async {
@@ -1815,6 +1867,18 @@ mod tests {
         assert!(Rule::Security(SecurityRule { stale_hours: Some(1), ..rule.clone() }).validate().is_err());
         let f = security_findings(&rule, &[], &[], &[], None, &r(true, h(30), h(40)), now);
         assert_eq!(f.iter().map(|f| f.0.as_str()).collect::<Vec<_>>(), ["stale"]);
+    }
+
+    #[test]
+    fn vulnerability_rule() {
+        let r = Rule::parse("vulnerability", &json!({})).unwrap();
+        assert_eq!(r, Rule::Vulnerability(VulnerabilityRule::default()));
+        assert_eq!(r.params(), json!({ "min_severity": "critical", "kev_only": false, "fix_available_only": true, "older_than_days": 14, "min_epss": null }));
+        assert!(r.validate().is_ok());
+        assert!(Rule::parse("vulnerability", &json!({ "min_severity": "urgent" })).unwrap().validate().is_err());
+        assert!(Rule::parse("vulnerability", &json!({ "older_than_days": 400 })).unwrap().validate().is_err());
+        assert!(Rule::parse("vulnerability", &json!({ "min_epss": 1.5 })).unwrap().validate().is_err());
+        assert!(Rule::parse("vulnerability", &json!({ "min_severity": "high", "kev_only": true, "min_epss": 0.1, "older_than_days": 0 })).unwrap().validate().is_ok());
     }
 
     #[test]

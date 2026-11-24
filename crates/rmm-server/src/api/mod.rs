@@ -11,6 +11,7 @@ mod attachments;
 mod alerts;
 mod apikeys;
 mod backups;
+mod vulns;
 mod billing;
 mod branding;
 mod channels;
@@ -458,6 +459,21 @@ pub fn router(attachment_max: u64) -> Router<Arc<AppState>> {
         .route("/backups", get(backups::list))
         .route("/agents/{id}/backups", get(backups::for_agent))
         .route("/agents/{id}/backups/check", post(backups::check_now))
+        .route("/vulnerabilities", get(vulns::list))
+        .route("/vulnerabilities/summary", get(vulns::summary))
+        .route("/vulnerabilities/software", get(vulns::software))
+        .route("/vulnerabilities/agents", get(vulns::agents))
+        .route("/vulnerabilities/unassessed", get(vulns::unassessed))
+        .route("/vulnerabilities/acceptances", post(vulns::accept))
+        .route("/vulnerabilities/acceptances/{id}", axum::routing::delete(vulns::unaccept))
+        .route("/vulnerabilities/feeds", get(vulns::feeds))
+        .route("/vulnerabilities/feeds/{name}", axum::routing::put(vulns::update_feed))
+        .route("/vulnerabilities/sync", post(vulns::sync))
+        .route("/vulnerabilities/products", get(vulns::products).post(vulns::create_product))
+        .route("/vulnerabilities/products/{id}", axum::routing::put(vulns::update_product).delete(vulns::delete_product))
+        .route("/vulnerabilities/{id}", get(vulns::get))
+        .route("/vulnerabilities/{id}/devices", get(vulns::devices))
+        .route("/agents/{id}/vulnerabilities", get(vulns::for_agent))
         .route("/network/summary", get(network::summary))
         .route("/network/discovered", get(network::list_discovered))
         .route("/network/discovered/bulk", post(network::bulk_discovered))

@@ -286,7 +286,7 @@ fn hundred() -> i32 {
 }
 
 /// The alert kinds `alert_opened` can name (the `kind` of an alert item).
-pub const ALERT_KINDS: &[&str] = &["offline", "cpu", "memory", "disk", "service", "job_failed", "log", "security", "patch", "backup"];
+pub const ALERT_KINDS: &[&str] = &["offline", "cpu", "memory", "disk", "service", "job_failed", "log", "security", "patch", "backup", "vulnerability"];
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

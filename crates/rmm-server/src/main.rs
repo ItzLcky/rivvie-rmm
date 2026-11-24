@@ -49,6 +49,7 @@ mod params;
 mod totp;
 mod updates;
 mod uptime;
+mod vuln;
 mod webauthn;
 mod wol;
 
@@ -107,6 +108,13 @@ enum Cmd {
         /// Count what would change and check that the old key opens everything; write nothing.
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Load vulnerability feed files saved from the internet, for servers that can't reach the
+    /// feeds: OSV `all.zip` dumps (named after their ecosystem: `Debian/all.zip` or
+    /// `Debian.zip`), the Arch tracker's `all.json`, saved NVD API pages, CISA's KEV catalogue
+    /// and the EPSS CSV. A running server re-evaluates its devices within seconds.
+    VulnImport {
+        dir: PathBuf,
     },
     /// Store a managed vault item through the system write path (vault::put_managed), as disk
     /// encryption escrow and LAPS do. For tests and break-glass imports; needs RMM_DATA_KEY. The
@@ -304,6 +312,15 @@ async fn main() -> Result<()> {
             println!("{id}");
             Ok(())
         }
+        Cmd::VulnImport { dir } => {
+            let added = vuln::seed_products(&db).await?;
+            if added > 0 {
+                println!("{added} built-in Windows product mappings added");
+            }
+            println!("{}", vuln::feeds::import_dir(&db, &dir).await?);
+            auth::audit(&db, None, "vuln.sync", None, serde_json::json!({ "via": "cli", "dir": dir.display().to_string() })).await;
+            Ok(())
+        }
         Cmd::Serve(args) => serve(db, args).await,
     }
 }
@@ -406,6 +423,7 @@ async fn serve(db: sqlx::PgPool, args: ServeArgs) -> Result<()> {
     tokio::spawn(oncall::run(state.clone()));
     tokio::spawn(push::run(state.clone()));
     tokio::spawn(uptime::run(state.clone()));
+    tokio::spawn(vuln::run(state.clone()));
     if state.cfg.metrics_token.is_some() {
         info!("metrics: GET /metrics (bearer token required)");
     }

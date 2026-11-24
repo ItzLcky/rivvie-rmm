@@ -640,6 +640,11 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
         a1.kill();
         return Ok(());
     }
+    if std::env::var("RMM_E2E_ONLY").as_deref() == Ok("vulnerabilities") {
+        vulnerabilities(server, &url, &admin, db, &id1, &id3, a_id, b_id).await;
+        a1.kill();
+        return Ok(());
+    }
 
     if std::env::var("RMM_E2E_ONLY").as_deref() == Ok("network") {
         network(&url, &admin, db, &id1, a_id, a_site, b_id).await;
@@ -1268,6 +1273,7 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
     if all {
         uptime(&url, &admin, db, dir, &id1, a_id, a_site, b_id).await;
         backups(&url, &admin, db, dir, &id1, b_id).await;
+        vulnerabilities(server, &url, &admin, db, &id1, &id3, a_id, b_id).await;
     }
     sso_and_passkeys(server, db, dir, &secret).await;
 
@@ -9392,3 +9398,4 @@ async fn push(url: &str, admin: &Api, db: &sqlx::PgPool, id1: &str, a_id: &str, 
 }
 
 include!("e2e_parts/monitoring.rs");
+include!("e2e_parts/vulnerabilities.rs");
