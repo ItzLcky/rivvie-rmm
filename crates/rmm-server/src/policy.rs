@@ -114,7 +114,7 @@ const ALERT_FIELDS: &[&str] = &[
     "ticket_auto_resolve",
     "run_script_id",
 ];
-const PATCH_FIELDS: &[&str] = &["auto_approve_severities", "auto_approve_categories", "deferral_days", "auto_install", "reboot_policy", "window"];
+const PATCH_FIELDS: &[&str] = &["auto_approve_severities", "auto_approve_categories", "deferral_days", "auto_install", "reboot_policy", "window", "wake_before_minutes"];
 const SECURITY_FIELDS: &[&str] = &[
     "sensor_enabled",
     "quick_scan_hours",
@@ -417,6 +417,10 @@ pub struct PatchConfig {
     pub auto_install: bool,
     pub reboot_policy: String,
     pub window: Option<PatchWindow>,
+    /// Wake offline devices with Wake-on-LAN this many minutes before the window opens (0-60;
+    /// `None` or 0: don't). See [`crate::patches::wake_before_window`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake_before_minutes: Option<i32>,
 }
 
 impl PatchConfig {
@@ -435,6 +439,9 @@ impl PatchConfig {
         }
         if let Some(w) = &self.window {
             validate_window(w)?;
+        }
+        if self.wake_before_minutes.is_some_and(|m| !(0..=60).contains(&m)) {
+            return Err("wake_before_minutes must be 0-60".into());
         }
         Ok(())
     }

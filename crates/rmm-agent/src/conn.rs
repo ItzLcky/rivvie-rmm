@@ -364,6 +364,9 @@ async fn handle(msg: ServerMsg, ctx: &Ctx, shells: &mut HashMap<Uuid, ShellSessi
         ServerMsg::SnmpPoll { poll_id, targets } => {
             tokio::spawn(crate::net::snmp_poll(poll_id, targets, tx.clone()));
         }
+        ServerMsg::WakeOnLan { request_id, targets } => {
+            tokio::spawn(crate::net::wake(request_id, targets, tx.clone()));
+        }
         ServerMsg::DesktopOpen { session_id, settings, consent } => {
             if desktops.len() >= MAX_DESKTOPS {
                 let reason = Some(format!("this machine already has {MAX_DESKTOPS} remote desktop sessions open"));
@@ -410,6 +413,7 @@ fn capabilities() -> Vec<String> {
         rmm_proto::security::SIGDB_CAPABILITY.to_string(),
         rmm_proto::tools::CAPABILITY.to_string(),
         rmm_proto::net::CAPABILITY.to_string(),
+        rmm_proto::net::WOL_CAPABILITY.to_string(),
     ];
     if cfg!(any(target_os = "linux", windows)) || std::env::var_os("RMM_DESKTOP_FAKE").is_some() {
         caps.push(rmm_proto::desktop::CAPABILITY.to_string());
