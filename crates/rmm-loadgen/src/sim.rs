@@ -122,6 +122,8 @@ pub fn system(hostname: &str, windows: bool) -> SystemInfo {
         agent_version: "0.1.0".into(),
         machine_id: Some(format!("loadgen-{hostname}")),
         platform: Some(if windows { rmm_proto::Platform::Workstation } else { rmm_proto::Platform::Server }),
+        os_id: (!windows).then(|| "ubuntu".into()),
+        os_version_id: (!windows).then(|| "24.04".into()),
     }
 }
 
@@ -187,6 +189,7 @@ fn inventory(cred: &Cred, shape: &Shape) -> Inventory {
                 version: format!("{}.{}.{}-1ubuntu{}", i % 7, i % 13, i % 100, i % 4),
                 publisher: Some(if i % 2 == 0 { "Ubuntu Developers".into() } else { "Example Software Ltd".into() }),
                 source: if cred.windows { "registry".into() } else { "dpkg".into() },
+                source_name: None,
             })
             .collect(),
         logged_in_users: vec!["alice".into()],

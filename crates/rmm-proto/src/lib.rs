@@ -846,6 +846,13 @@ pub struct SystemInfo {
     /// None from builds that predate it (the server then guesses from the OS name).
     #[serde(default)]
     pub platform: Option<Platform>,
+    /// `ID` and `VERSION_ID` from `/etc/os-release` (Linux only): which distribution's
+    /// vulnerability feed applies (`debian` + `12`, `ubuntu` + `24.04`). None elsewhere and from
+    /// builds that predate it.
+    #[serde(default)]
+    pub os_id: Option<String>,
+    #[serde(default)]
+    pub os_version_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -907,8 +914,13 @@ pub struct Software {
     pub name: String,
     pub version: String,
     pub publisher: Option<String>,
-    /// e.g. "dpkg", "rpm", "pacman", "registry", "msi".
+    /// e.g. "dpkg", "rpm", "pacman", "apk", "registry", "msi".
     pub source: String,
+    /// The source package it was built from, when the package manager knows it and it differs
+    /// from `name` (dpkg `${source:Package}`, rpm `%{SOURCERPM}`). Debian's and Ubuntu's
+    /// vulnerability data is keyed by source package.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_name: Option<String>,
 }
 
 #[cfg(test)]
@@ -989,8 +1001,31 @@ mod tests {
         let old = Old { hostname: "h", os_family: OsFamily::Windows, os_name: "Windows", os_version: "", kernel_version: "", arch: "x86_64", agent_version: "0.1.0", machine_id: None };
         let s: SystemInfo = decode(&encode(&old).unwrap()).unwrap();
         assert_eq!((s.hostname.as_str(), s.platform), ("h", None));
-        let new = SystemInfo { platform: Some(Platform::Server), ..s };
-        assert_eq!(decode::<SystemInfo>(&encode(&new).unwrap()).unwrap().platform, Some(Platform::Server));
+        assert_eq!((s.os_id.as_deref(), s.os_version_id.as_deref()), (None, None));
+        let new = SystemInfo { platform: Some(Platform::Server), os_id: Some("debian".into()), os_version_id: Some("12".into()), ..s };
+        let back = decode::<SystemInfo>(&encode(&new).unwrap()).unwrap();
+        assert_eq!(back.platform, Some(Platform::Server));
+        assert_eq!((back.os_id.as_deref(), back.os_version_id.as_deref()), (Some("debian"), Some("12")));
+    }
+
+    #[test]
+    fn software_without_source_name_decodes() {
+        // What builds before vulnerability reporting send, and the reverse: a new agent's extra
+        // field is ignored by an old server's struct (serde skips unknown map keys).
+        #[derive(Serialize, Deserialize)]
+        struct Old {
+            name: String,
+            version: String,
+            publisher: Option<String>,
+            source: String,
+        }
+        let old = Old { name: "libssl3".into(), version: "3.0.11-1".into(), publisher: None, source: "dpkg".into() };
+        let s: Software = decode(&encode(&old).unwrap()).unwrap();
+        assert_eq!((s.name.as_str(), s.source_name), ("libssl3", None));
+        let new = Software { source_name: Some("openssl".into()), ..s };
+        assert_eq!(decode::<Software>(&encode(&new).unwrap()).unwrap().source_name.as_deref(), Some("openssl"));
+        let as_old: Old = decode(&encode(&new).unwrap()).unwrap();
+        assert_eq!(as_old.name, "libssl3");
     }
 
     #[test]
@@ -1250,6 +1285,8 @@ mod tests {
             machine_id: None,
             agent_version: String::new(),
             platform: None,
+            os_id: None,
+            os_version_id: None,
         };
         let buf = encode(&Old::Enroll { protocol: 1, token: "t".into(), system }).unwrap();
         assert!(matches!(decode::<AgentMsg>(&buf).unwrap(), AgentMsg::Enroll { previous: None, .. }));

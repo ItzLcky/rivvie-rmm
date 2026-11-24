@@ -124,7 +124,32 @@ pub fn system_info() -> SystemInfo {
         agent_version: AGENT_VERSION.to_string(),
         machine_id: machine_id(),
         platform: platform(),
+        os_id: os_release("ID"),
+        os_version_id: os_release("VERSION_ID"),
     }
+}
+
+/// A field of `/etc/os-release` (or `/usr/lib/os-release`), Linux only.
+fn os_release(key: &str) -> Option<String> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    let text = ["/etc/os-release", "/usr/lib/os-release"].iter().find_map(|p| std::fs::read_to_string(p).ok())?;
+    os_release_field(&text, key)
+}
+
+/// `KEY=value`, `KEY="value"` or `KEY='value'` (shell-style, without expansions).
+fn os_release_field(text: &str, key: &str) -> Option<String> {
+    text.lines().find_map(|l| {
+        let (k, v) = l.trim().split_once('=')?;
+        if k.trim() != key {
+            return None;
+        }
+        let v = v.trim();
+        let v = v.strip_prefix('"').and_then(|v| v.strip_suffix('"')).or_else(|| v.strip_prefix('\'').and_then(|v| v.strip_suffix('\''))).unwrap_or(v);
+        let v = v.replace("\\\"", "\"").trim().to_string();
+        (!v.is_empty()).then_some(v)
+    })
 }
 
 fn is_loopback(name: &str) -> bool {
@@ -242,6 +267,16 @@ fn platform() -> Option<Platform> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn os_release_fields() {
+        let text = "NAME=\"Ubuntu\"\nID=ubuntu\nID_LIKE=debian\nVERSION_ID=\"24.04\"\nVARIANT_ID='server'\nEMPTY=\n";
+        assert_eq!(os_release_field(text, "ID").as_deref(), Some("ubuntu"));
+        assert_eq!(os_release_field(text, "VERSION_ID").as_deref(), Some("24.04"));
+        assert_eq!(os_release_field(text, "VARIANT_ID").as_deref(), Some("server"));
+        assert_eq!(os_release_field(text, "EMPTY"), None);
+        assert_eq!(os_release_field(text, "BUILD_ID"), None);
+    }
 
     #[test]
     fn linux_platform_from_chassis_and_target() {
