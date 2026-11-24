@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { CloudDownload, FolderInput, Play, Plus, Search, Tags, X } from '@lucide/svelte';
+	import { CloudDownload, FolderInput, Play, Plus, Power, Search, Tags, X } from '@lucide/svelte';
 	import { api } from '#lib/api.js';
 	import { ago, num, plural } from '#lib/format.js';
 	import { liveReload, onLive } from '#lib/live.svelte.js';
@@ -9,6 +9,7 @@
 	import { can } from '#lib/session.svelte.js';
 	import { attempt, toast } from '#lib/toast.svelte.js';
 	import { confirmAction } from '#lib/confirm.svelte.js';
+	import { wake } from '#lib/wake.js';
 	import type { AgentSummary, CustomField, Page, Release, Tag } from '#lib/types.js';
 	import type { Category } from '#lib/policy/types.js';
 	import CategoryChange from '#lib/components/policy/CategoryChange.svelte';
@@ -88,6 +89,15 @@
 		for (const id of [...picked.keys()]) if (!selected.has(id)) picked.delete(id);
 	});
 	let running = $state(false);
+	let waking = $state(false);
+	/** Wake-on-LAN for the selected offline agents (online ones are left alone). */
+	async function wakeSelected() {
+		const ids = [...selected].filter((id) => picked.get(id)?.online !== true);
+		if (!ids.length) return toast.info('The selected agents are online already.');
+		waking = true;
+		await wake(ids);
+		waking = false;
+	}
 	/** Every agent matching the filters, remembered for Run script. */
 	async function selectAll() {
 		const all = await list.all();
@@ -308,6 +318,7 @@
 			{#if can('technician')}<Button size="sm" variant="primary" icon={Play} onclick={() => (running = true)}>Run script</Button>{/if}
 			{#if can('technician')}<Button size="sm" icon={FolderInput} onclick={() => (categorizing = true)}>Change category</Button>{/if}
 			{#if can('technician')}<Button size="sm" icon={Tags} onclick={() => (tagging = true)}>Tags</Button>{/if}
+			{#if can('technician')}<Button size="sm" icon={Power} loading={waking} onclick={wakeSelected} title="Wake-on-LAN for the selected offline agents">Wake</Button>{/if}
 			{#if can('admin') && outdated > 0}<Button size="sm" icon={CloudDownload} onclick={() => rollout([...selected])}>Update agent{n === 1 ? '' : 's'}</Button>{/if}
 		{/snippet}
 		{#snippet empty()}

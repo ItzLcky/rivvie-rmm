@@ -4,7 +4,7 @@
 
 	type Draft = {
 		sevs: PatchSeverity[]; cats: PatchCategory[]; deferral: string; autoInstall: boolean; reboot: RebootPolicy;
-		ownWindow: boolean; days: number[]; start: string; hours: string; tz: string;
+		ownWindow: boolean; days: number[]; start: string; hours: string; tz: string; wake: string;
 	};
 	type Window = { days: number[]; start: string; minutes: number; tz: string } | null;
 
@@ -13,13 +13,15 @@
 		return {
 			sevs: [...((c.auto_approve_severities as PatchSeverity[]) ?? [])], cats: [...((c.auto_approve_categories as PatchCategory[]) ?? [])],
 			deferral: String(c.deferral_days ?? 0), autoInstall: !!c.auto_install, reboot: (c.reboot_policy as RebootPolicy) ?? 'never',
-			ownWindow: !!w, days: w?.days ?? [6], start: w?.start ?? '02:00', hours: String(w ? w.minutes / 60 : 3), tz: w?.tz ?? 'site'
+			ownWindow: !!w, days: w?.days ?? [6], start: w?.start ?? '02:00', hours: String(w ? w.minutes / 60 : 3), tz: w?.tz ?? 'site',
+			wake: String(c.wake_before_minutes ?? 0)
 		};
 	}
 	function toConfig(d: Draft): Config {
 		return {
 			auto_approve_severities: d.sevs, auto_approve_categories: d.cats, deferral_days: Number(d.deferral), auto_install: d.autoInstall, reboot_policy: d.reboot,
-			window: d.ownWindow ? { days: d.days, start: d.start.trim(), minutes: Math.round(Number(d.hours) * 60), tz: d.tz.trim() || 'site' } : null
+			window: d.ownWindow ? { days: d.days, start: d.start.trim(), minutes: Math.round(Number(d.hours) * 60), tz: d.tz.trim() || 'site' } : null,
+			wake_before_minutes: Number(d.wake)
 		};
 	}
 	export const normalize = (c: Config) => toConfig(fromConfig(c));
@@ -43,11 +45,12 @@
 	const errors = $derived({
 		deferral: Number.isInteger(Number(d.deferral)) && Number(d.deferral) >= 0 && Number(d.deferral) <= 365 ? undefined : 'A whole number of days, 0–365',
 		start: !d.ownWindow || /^\d{1,2}:\d{2}$/.test(d.start.trim()) ? undefined : 'A time like 02:00',
-		hours: !d.ownWindow || (Number(d.hours) >= 0.25 && Number(d.hours) <= 24) ? undefined : 'Between 0.25 and 24 hours'
+		hours: !d.ownWindow || (Number(d.hours) >= 0.25 && Number(d.hours) <= 24) ? undefined : 'Between 0.25 and 24 hours',
+		wake: Number.isInteger(Number(d.wake)) && Number(d.wake) >= 0 && Number(d.wake) <= 60 ? undefined : 'A whole number of minutes, 0–60'
 	});
 	$effect(() => {
 		const c = toConfig(d);
-		const ok = !errors.deferral && !errors.start && !errors.hours;
+		const ok = !errors.deferral && !errors.start && !errors.hours && !errors.wake;
 		untrack(() => onchange(c, ok));
 	});
 
@@ -127,6 +130,16 @@
 				<p class="hint">Set per site under Patches › Maintenance windows. Sites without one install as soon as updates are eligible.</p>
 			{/if}
 		</fieldset>
+	</PField>
+
+	<PField
+		path="wake_before_minutes"
+		label="Wake devices before the window"
+		id="pol-wake"
+		hint="Offline devices with approved updates are woken with Wake-on-LAN, through another online agent at their site, this many minutes before the window opens. 0: don’t."
+		error={errors.wake}
+	>
+		<div class="flex items-center gap-2"><Input id="pol-wake" inputmode="numeric" class="w-24" bind:value={d.wake} invalid={!!errors.wake} /><span class="text-muted text-sm">minutes</span></div>
 	</PField>
 
 	<PField path="reboot_policy" label="Restart after installing" id="pol-reboot" hint={rebootPolicies.find((r) => r.value === d.reboot)?.hint}>

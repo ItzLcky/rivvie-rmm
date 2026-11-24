@@ -430,6 +430,28 @@ const contacts = [
 	{ id: 'ct-ann', client_id: 'c-acme', client_name: 'Acme Corp', site_id: 's-acme-hq', site_name: 'Head office', name: 'Ann Lopez', email: 'ann@acme.example', phone: '+1 555 0101', job_title: 'Office manager', notes: '', is_primary: true, portal_enabled: false, open_tickets: 2, created_at: ago(60 * 24 * 100), updated_at: ago(60 * 24 * 100) },
 	{ id: 'ct-raj', client_id: 'c-acme', client_name: 'Acme Corp', site_id: 's-acme-wh', site_name: 'Warehouse', name: 'Raj Patel', email: 'raj@acme.example', phone: '', job_title: 'Warehouse lead', notes: '', is_primary: false, portal_enabled: false, open_tickets: 0, created_at: ago(60 * 24 * 60), updated_at: ago(60 * 24 * 60) }
 ];
+/** Scheduled reports (`/report-schedules`). */
+const reportSchedule = (id: string, name: string, report: string, client: string | null, cron: string, range: string, extra: Record<string, unknown> = {}) => ({
+	id, name, report, client_id: client, client_name: clients.find((c) => c.id === client)?.name ?? null, params: { range }, cron, timezone: 'Europe/London',
+	user_ids: ['u-1'], contact_ids: [], extra_emails: [], subject: '', message: '', enabled: true, owner_id: 'u-1', owner_name: 'Dana Admin',
+	next_run_at: new Date(Date.UTC(2026, 6, 1, 6, 0)).toISOString(), last_run_at: ago(60 * 24 * 23), last_status: 'sent', last_error: null,
+	created_at: ago(60 * 24 * 90), updated_at: ago(60 * 24 * 30), ...extra
+});
+const reportSchedules = [
+	reportSchedule('rs-qbr', 'Acme quarterly review', 'qbr', 'c-acme', '0 7 1 1,4,7,10 *', 'last_quarter', { contact_ids: ['ct-ann'], message: 'Your review for last quarter is attached.' }),
+	reportSchedule('rs-desk', 'Service desk, weekly', 'service_desk', null, '0 7 * * 1', 'last_week', { user_ids: ['u-1', 'u-2'], next_run_at: new Date(Date.UTC(2026, 5, 22, 6, 0)).toISOString(), last_run_at: ago(60 * 24 * 2) }),
+	reportSchedule('rs-profit', 'Margins for the partners', 'profitability', null, '0 7 1 * *', 'last_month', {
+		owner_id: 'u-2', owner_name: 'Terry Tech', last_status: 'failed', last_error: 'the owner lacks the billing.read permission', extra_emails: ['partners@northwind.example']
+	}),
+	reportSchedule('rs-off', 'Utilisation (paused)', 'utilisation', null, '0 7 1 * *', 'last_month', { enabled: false, next_run_at: null, last_run_at: null, last_status: null })
+];
+const reportRuns = [
+	{ id: 'rr-2', schedule_id: 'rs-qbr', trigger: 'manual', started_at: ago(60 * 3), finished_at: ago(60 * 3), status: 'sent', from_date: '2026-01-01', to_date: '2026-03-31', bytes: 48_211,
+	  recipients: [{ kind: 'user', id: 'u-1', email: 'dana@northwind.example', status: 'queued' }, { kind: 'contact', id: 'ct-ann', email: 'ann@acme.example', status: 'queued' }], error: null, started_by_name: 'Dana Admin', stored: true },
+	{ id: 'rr-1', schedule_id: 'rs-qbr', trigger: 'schedule', started_at: ago(60 * 24 * 85), finished_at: ago(60 * 24 * 85), status: 'sent', from_date: '2026-01-01', to_date: '2026-03-31', bytes: 47_002,
+	  recipients: [{ kind: 'user', id: 'u-1', email: 'dana@northwind.example', status: 'queued' }, { kind: 'contact', id: 'ct-old', email: '', status: 'skipped', reason: 'the contact was deleted' }], error: null, started_by_name: null, stored: true }
+];
+
 type T = Record<string, unknown> & { id: string; client_id: string | null };
 function ticket(i: number, subject: string, clientId: string | null, cat: string, prio: number, extra: Partial<T> = {}): T {
 	const c = clients.find((x) => x.id === clientId);
@@ -1331,6 +1353,10 @@ export async function mockApi(p: Page, opts: { signedIn?: boolean; ssoRequired?:
 		}
 		if (route.request().method() === 'POST' && /^\/vault\/[^/]+\/reveal$/.test(path)) return json({ value: 'Tr0ub4dor&3-hx9Q' });
 		if (route.request().method() === 'POST' && /^\/vault\/[^/]+\/totp$/.test(path)) return json({ code: '492039', digits: 6, period: 30, remaining: 17 });
+		if (route.request().method() === 'POST' && path === '/agents/wake')
+			return json({ results: [{ agent_id: 'a-5', outcome: 'sent', sender_id: 'a-3' }], sent: 1, no_mac: 0, no_sender: 0, online: 0 });
+		if (route.request().method() === 'POST' && /^\/agents\/[^/]+\/wake$/.test(path))
+			return json({ results: [{ agent_id: path.split('/')[2], outcome: 'sent', sender_id: 'a-3' }], sent: 1, no_mac: 0, no_sender: 0, online: 0, outcome: 'sent' });
 		if (route.request().method() !== 'GET') return json({ ok: true });
 		let m: RegExpMatchArray | null;
 		if (path === '/settings/public') return json({ company_name: 'Northwind IT' });
@@ -1566,6 +1592,9 @@ export async function mockApi(p: Page, opts: { signedIn?: boolean; ssoRequired?:
 		if (path === '/tickets/meta') return json({ boards, types: ticketTypes, technicians: [{ id: 'u-1', name: 'Dana Admin', email: admin.email, client_ids: null }, { id: 'u-2', name: 'Terry Tech', email: 'terry@northwind.example', client_ids: ['c-acme', 'c-globex'] }], teams: [] });
 		if (path === '/tickets') return json(page(ticketList(q), Number(q.get('limit') ?? 50)));
 		if ((m = path.match(/^\/tickets\/([^/]+)$/))) return json(ticketDetail(tickets.find((t) => t.id === m![1])!));
+		if (path === '/report-schedules') return json(reportSchedules);
+		if ((m = path.match(/^\/report-schedules\/([^/]+)\/runs$/))) return json(reportRuns.filter((r) => r.schedule_id === m![1]));
+		if ((m = path.match(/^\/report-schedules\/([^/]+)$/))) return json(reportSchedules.find((r) => r.id === m![1]));
 		if (path === '/contacts') return json(contacts.filter((c) => !q.get('client_id') || c.client_id === q.get('client_id')));
 		if (path === '/boards') return json(boards);
 		if (path === '/mailboxes') return json(mailboxes);
