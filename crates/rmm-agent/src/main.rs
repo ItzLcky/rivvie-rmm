@@ -17,6 +17,7 @@ mod services;
 mod shell;
 mod software;
 mod tools;
+mod tray;
 mod update;
 #[cfg(windows)]
 mod winjob;
@@ -93,6 +94,9 @@ enum Cmd {
         #[arg(long)]
         run: Option<String>,
     },
+    /// The help desk app for the person at the machine: an icon on Windows, a request form on
+    /// Linux. Runs as the signed-in user and talks to the agent service.
+    Tray(tray::Args),
     /// Remote desktop capture and input, started by the agent inside the user's session.
     #[command(hide = true)]
     DesktopHelper,
@@ -128,6 +132,17 @@ fn main() -> Result<()> {
             .without_time()
             .init();
         return desktop::helper_main();
+    }
+
+    if let Cmd::Tray(args) = cli.cmd {
+        // A GUI process: no console on Windows, so warnings go to stderr if anyone is looking.
+        tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()))
+            .with_writer(std::io::stderr)
+            .with_ansi(false)
+            .without_time()
+            .init();
+        return tray::main(args);
     }
 
     if let Cmd::Sensor = cli.cmd {
@@ -231,7 +246,7 @@ fn main() -> Result<()> {
         }
         Cmd::Patches { install, no_refresh } => patch::cli(&install, !no_refresh),
         Cmd::Security { run } => security::cli(run.as_deref()),
-        Cmd::Service | Cmd::UpdateWatchdog | Cmd::DesktopHelper | Cmd::Sensor | Cmd::SuperviseSensor => unreachable!(),
+        Cmd::Service | Cmd::UpdateWatchdog | Cmd::DesktopHelper | Cmd::Sensor | Cmd::SuperviseSensor | Cmd::Tray(_) => unreachable!(),
     }
 }
 

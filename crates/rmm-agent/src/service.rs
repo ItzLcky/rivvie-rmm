@@ -168,7 +168,7 @@ mod imp {
             service_type: ServiceType::OWN_PROCESS,
             start_type: ServiceStartType::AutoStart,
             error_control: ServiceErrorControl::Normal,
-            executable_path: exe,
+            executable_path: exe.clone(),
             launch_arguments: vec!["--config".into(), config.as_os_str().to_owned(), "service".into()],
             dependencies: vec![],
             account_name: None, // LocalSystem
@@ -195,6 +195,10 @@ mod imp {
         })?;
         svc.set_failure_actions_on_non_crash_failures(true)?;
         svc.start::<&str>(&[])?;
+        // The tray app for whoever signs in (the MSI writes the same value).
+        if let Err(e) = crate::tray::win::set_run_key(&exe) {
+            tracing::warn!("{e:#}");
+        }
         println!("RmmAgent service installed and started");
         Ok(())
     }
@@ -227,6 +231,7 @@ mod imp {
         let svc = mgr.open_service(NAME, ServiceAccess::STOP | ServiceAccess::DELETE | ServiceAccess::QUERY_STATUS)?;
         let _ = svc.stop();
         svc.delete()?;
+        crate::tray::win::remove_run_key();
         println!("RmmAgent service removed");
         Ok(())
     }
