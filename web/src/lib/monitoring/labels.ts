@@ -13,7 +13,9 @@ export const kindLabels: Record<PolicyKind, string> = {
 	patch: 'Patches',
 	net_down: 'Network device down',
 	net_interface: 'Network interface down',
-	net_threshold: 'Network device threshold'
+	net_threshold: 'Network device threshold',
+	uptime: 'Uptime monitor',
+	backup: 'Backups'
 };
 
 export const kindHelp: Record<PolicyKind, string> = {
@@ -28,7 +30,9 @@ export const kindHelp: Record<PolicyKind, string> = {
 	patch: 'An update fails to install, or a restart to finish updates stays pending.',
 	net_down: 'A switch, firewall, printer or other device read over SNMP stops answering.',
 	net_interface: 'A monitored port that is switched on has no link.',
-	net_threshold: 'A device’s CPU, memory, port traffic or toner level crosses a limit.'
+	net_threshold: 'A device’s CPU, memory, port traffic or toner level crosses a limit.',
+	uptime: 'A website, port, host or DNS name stops answering, answers slowly, or its certificate nears expiry.',
+	backup: 'A backup job fails, or hasn’t succeeded for too long.'
 };
 
 export const severityTone: Record<Severity, Tone> = { critical: 'danger', warning: 'warning', info: 'info' };
@@ -94,6 +98,19 @@ export function describePolicy(p: { kind: PolicyKind; params: Record<string, unk
 			const m = q.metric as string;
 			if (m === 'supply') return `Toner or ink at or below ${q.threshold}%`;
 			return `${m === 'interface_util' ? 'Port use' : kindLabels[m as 'cpu' | 'memory']} ≥ ${q.threshold}% for ${q.minutes} min`;
+		}
+		case 'uptime': {
+			const bits = [`down after ${q.failures ?? 2} failed checks`];
+			if (Number(q.cert_days ?? 14) > 0) bits.push(`certificate within ${q.cert_days ?? 14} days`);
+			if (q.latency_ms) bits.push(`slower than ${q.latency_ms} ms`);
+			const k = list(q.kinds);
+			return bits.join(', ') + (k.length ? ` (${k.join(', ')})` : '');
+		}
+		case 'backup': {
+			const p = list(q.providers).map((x) => (x === 'auto' ? 'detected products' : x));
+			const s = Array.isArray(q.sources) ? q.sources.length : 0;
+			const what = [...p, s ? `${s} source${s === 1 ? '' : 's'}` : ''].filter(Boolean).join(', ');
+			return `Failed, or no success for ${q.max_age_hours ?? 26} h${what ? ` (${what})` : ''}${q.require ? '; one must exist' : ''}`;
 		}
 		case 'log': {
 			const bits = [`${String(q.min_level ?? 'error')} or worse`];
