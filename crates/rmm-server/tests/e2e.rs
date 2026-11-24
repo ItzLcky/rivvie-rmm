@@ -6254,6 +6254,8 @@ async fn scheduled_reports(url: &str, admin: &Api, db: &sqlx::PgPool, a_id: &str
     assert!(admin.get("/report-schedules").await.as_array().unwrap().len() >= 3, "admins see all");
     let ok = tech.post(&format!("/report-schedules/{margins_id}/run"), json!({})).await;
     assert_eq!(ok["status"], "sent", "{ok}");
+    // Its mail leaves through the outbox; let it arrive before counting what comes after.
+    wait_mail(&mail, "the margins report", |to, _| to.iter().any(|t| t == "reports-tech@e2e.test")).await;
     // The owner loses billing.read: the next run fails, saying why, and mails nothing.
     admin.put(&format!("/users/{tech_id}/permissions"), json!({ "permissions": ["security.read"] })).await;
     let sent_before = mail.lock().unwrap().len();
