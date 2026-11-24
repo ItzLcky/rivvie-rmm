@@ -25,6 +25,7 @@ Follow the [manual plan](design/windows-testing.md) on Windows 10/11 and Server 
 - [ ] Software deployment (winget, Chocolatey, MSI push) and automations on a real host.
 - [ ] Branding on Windows: the branded MSI's name and icon in *Apps and features*, the service display name, the consent prompt title ([plan](design/windows-testing.md) §2.6).
 - [ ] Wake-on-LAN on a real LAN: a machine actually waking (S3/S4/S5, Fast startup), senders on each OS, and how switches treat directed broadcasts across VLANs ([plan](design/windows-testing.md#wake-on-lan-any-os-real-network)).
+- [ ] Vulnerabilities on Windows: the registry titles and `DisplayVersion`s of the mapped applications on real installs match the product map and compare with NVD's ranges ([plan](design/windows-testing.md) section 7b).
 - [ ] Uptime and backups on real hosts: ICMP through `IcmpSendEcho`, Windows Server Backup and Veeam event logs from real installs, Time Machine on a Mac (section 7a of the plan).
 - [ ] Fix what breaks, and record the tested versions in the README.
 
@@ -32,6 +33,7 @@ Follow the [manual plan](design/windows-testing.md) on Windows 10/11 and Server 
 
 - [ ] **Security review** by someone outside the project: agent/server protocol, enrollment, the update and content signing chain, session handling, per-client scoping, the shell and desktop relays, the client portal, the password vault (envelope encryption, reveal auditing, rate limits), API keys and SSO.
 - [ ] **Try the integrations against the real services**, not stand-ins: AWS S3 (MinIO is done and in CI), Microsoft 365 over Graph, QuickBooks Online (sandbox company), Xero (demo organisation), OIDC with real Entra ID and Google tenants, and how real mail clients render our emails (including the branded sender name and footer, and scheduled report emails with their PDF attachments).
+- [ ] **Vulnerability feeds at full size** ([design](design/vulnerabilities.md)): one manual sync of the real OSV dumps (Debian and Ubuntu are hundreds of MB), the Arch tracker, NVD with and without an API key, KEV and EPSS; time the first import and measure the database; check Red Hat's OSV naming against a real RHEL host, and the built-in product map's CPE names against the NVD dictionary.
 - [ ] **Paging and push on real services** ([oncall](design/oncall.md), [pwa](design/pwa.md)): texts through a real Twilio number (and A2P 10DLC registration), PagerDuty and Opsgenie incidents opened and closed, Web Push delivered by Chrome, Firefox, Edge and Safari, the Acknowledge action from a lock screen, and the installed app on iOS 16.4+ and Android.
 
 ### 3. Gaps left by `v0.2.0`

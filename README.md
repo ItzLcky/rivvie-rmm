@@ -101,6 +101,10 @@ quiet) is passed as `RMM_E2E_SNMP=<ip>:<container>`. The recipe, with the users 
 needs, is in `crates/rmm-snmp/tests/netsnmp.rs`, which also tests the SNMP client against it.
 Without `RMM_E2E_SNMP` the section checks what doesn't need a device.
 
+`RMM_E2E_ONLY=vulnerabilities` runs just the vulnerabilities section: a mock feed server stands in
+for OSV, the Arch tracker, NVD, KEV and EPSS, serving an advisory for a real package of the host's
+own inventory (pacman on Arch, dpkg on Debian and Ubuntu).
+
 `tests/e2e_windows.rs` is the Windows counterpart: it installs the agent from the generated MSI as
 a real service and runs PowerShell and cmd jobs, a Job Object tree kill, a service restart, an
 upgrade, ConPTY terminals, Event Log watchers, a Windows Update scan, Defender, the sensor, a
@@ -842,6 +846,18 @@ Limits: Wayland sessions aren't supported yet (the agent says so; choose an Xorg
 sign-in screen), there's no clipboard sync or session recording, and the Windows side is
 compile-checked only, like the rest of the Windows agent. `RMM_DESKTOP_FAKE=<file>` makes the
 agent serve a synthetic screen and log input to `<file>`, for testing without a display.
+
+## Vulnerabilities
+
+Installed software is checked against known vulnerabilities: Linux packages against their
+distribution's own advisories (OSV for Debian, Ubuntu, AlmaLinux, Rocky Linux, Red Hat, SUSE,
+openSUSE and Alpine, and the Arch security tracker), Windows applications against NVD through a
+curated product map (Vulnerabilities → Feeds & products; titles are never guessed), with CISA's
+known-exploited catalogue and EPSS to rank them. The feeds are mirrored into the database daily,
+only for the systems in the fleet, so no inventory leaves the server. Set `RMM_NVD_API_KEY` (free
+from nvd.nist.gov) for faster NVD syncs. A server without internet access loads saved copies of
+the same files with `rmm-server vuln-import <dir>`. The `vulnerability` alert kind opens one alert
+per device. See [docs/design/vulnerabilities.md](docs/design/vulnerabilities.md).
 
 ## Endpoint protection
 

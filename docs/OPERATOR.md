@@ -224,6 +224,8 @@ that fails to parse falls back to its default.
 | `RMM_TICKET_CLOSE_DAYS` | `7` | Resolved tickets move to Closed after this |
 | `RMM_SESSION_IDLE_HOURS` | `12` | Idle dashboard sessions are signed out (overridable in Company settings; 7 days at most) |
 | `RMM_MAIL_POLL_SECS` | `60` | How often IMAP support mailboxes are checked |
+| `RMM_NVD_API_KEY` | empty | **Secret.** An NVD API key (free, nvd.nist.gov): NVD is then fetched at 50 requests in 30 seconds instead of 5 |
+| `RMM_VULN_SYNC_HOURS` | `24` | How old a vulnerability feed may get before the hourly check syncs it again (only feeds the fleet needs; the first check is an hour after start). `0` turns the automatic sync off: use **Sync now** or `rmm-server vuln-import <dir>` |
 | `RMM_SOURCE_URL` | the upstream repository | Where the console and portal's "Licence and source" link points (AGPL-3.0 §13). Set it to your own copy if you run modified code |
 
 **Observability**
@@ -243,6 +245,11 @@ that fails to parse falls back to its default.
 | `RMM_GRAPH_URL`, `RMM_GRAPH_LOGIN_URL`, `RMM_GRAPH_SCOPE` | Microsoft public cloud | Microsoft 365 mailboxes through Graph |
 | `RMM_PAGERDUTY_URL` | `https://events.pagerduty.com` | PagerDuty Events API v2 (PagerDuty channels) |
 | `RMM_OPSGENIE_URL` | the channel's region (`api.opsgenie.com`, `api.eu.opsgenie.com`) | Opsgenie channels; replaces both regions |
+| `RMM_VULN_OSV_URL` | `https://osv-vulnerabilities.storage.googleapis.com` | OSV dumps (`<url>/<Ecosystem>/all.zip`) for Linux vulnerability data |
+| `RMM_VULN_ARCH_URL` | `https://security.archlinux.org/issues/all.json` | The Arch Linux security tracker |
+| `RMM_VULN_NVD_URL` | `https://services.nvd.nist.gov/rest/json/cves/2.0` | NVD API 2.0, for Windows applications in the product map |
+| `RMM_VULN_KEV_URL` | CISA's `known_exploited_vulnerabilities.json` | Known exploited vulnerabilities |
+| `RMM_VULN_EPSS_URL` | `https://epss.empiricalsecurity.com/epss_scores-current.csv.gz` | EPSS scores |
 | `RMM_PUSH_ALLOW_HOSTS` | empty | Extra host names, comma-separated, Web Push subscriptions may point at (http allowed). Tests only: by default only Google, Mozilla, Microsoft and Apple push services are accepted |
 
 QuickBooks and Xero redirect to `<RMM_PUBLIC_URL>/api/billing/accounting/qbo/callback` (and

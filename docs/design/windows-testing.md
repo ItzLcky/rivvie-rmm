@@ -130,6 +130,15 @@ The e2e test only proves the packet bytes reach a socket on loopback. On a real 
 4. A `file_age` source on a UNC path (`\\nas\backups`) as SYSTEM: what the service account can and can't read.
 5. macOS (not Windows, but nowhere else to note it): Time Machine to a local disk and to a network destination, `tmutil latestbackup` and `tmutil status` while a backup runs.
 
+## 7b. Vulnerabilities
+
+The e2e test proves the Windows path with a seeded inventory and a mock NVD. On a real Windows 10/11 host with a few mapped applications installed (Chrome, Firefox and Firefox ESR, 7-Zip, Notepad++, VLC, Adobe Acrobat Reader, Zoom):
+
+1. The device's Vulnerabilities tab says it is assessed as Windows applications, and each mapped application's installed title and `DisplayVersion` (Software tab) match its mapping (Firefox ESR goes to `firefox_esr`, not `firefox`).
+2. With an old version of one installed (an old 7-Zip or VLC), its known CVEs appear with the fixed version; after upgrading through the catalog's "Upgrade with" and a fresh inventory, they resolve.
+3. Applications not in the map show under Not assessed; mapping one (with its real CPE) brings in its NVD data on the next sync.
+4. Check the version formats: Zoom's, Adobe's and Office's `DisplayVersion`s against the NVD ranges for them, and note any product whose versions don't compare (as Python's and Java's don't, which is why they aren't mapped).
+
 ## 8. Fix what breaks, record versions
 
 For each failed step, fix it with a test that reproduces it (unit tests against recorded output where the failure is parsing, the e2e where it is behaviour). Record in the README's Windows line which versions passed.

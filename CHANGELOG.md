@@ -12,7 +12,7 @@ back, restore the backup taken before the upgrade (see
 
 ## [Unreleased]
 
-Migrations `0036`, `0037`, `0040` and `0042` to `0047` are new.
+Migrations `0036`, `0037`, `0040` and `0042` to `0048` are new.
 
 ### Added
 
@@ -68,6 +68,19 @@ Migrations `0036`, `0037`, `0040` and `0042` to `0047` are new.
   job, devices show a Backups card, and the `backup` alert kind (also an automation trigger) opens
   alerts for failed and stale jobs. See [docs/design/backups.md](docs/design/backups.md).
 - QBR blocks "Availability" and "Backup success".
+- **Vulnerabilities.** Installed software is matched against a local mirror of the
+  distributions' advisories (OSV for Debian, Ubuntu, AlmaLinux, Rocky Linux, Red Hat, SUSE,
+  openSUSE and Alpine; the Arch security tracker) and, for Windows applications in a curated
+  product map (about 150 built in, admin-editable), NVD; ranked by CISA KEV and EPSS. Feeds sync
+  daily for the systems in the fleet (no inventory leaves the server); `rmm-server vuln-import
+  <dir>` loads them offline. `/vulnerabilities` by CVE, device and software, what isn't assessed,
+  feed status; a CVE page with the fix per device (approve the pending update, or upgrade with the
+  catalog package) and accept-risk with expiry; a Vulnerabilities tab on devices; a dashboard
+  line; the `vulnerability` alert kind (one alert per device); a QBR block. The agent now reports
+  source packages, rpm epochs, Alpine packages and `/etc/os-release` ids, and no longer lists
+  removed dpkg packages; older agents read as "not assessed". New environment variables
+  `RMM_VULN_*_URL`, `RMM_NVD_API_KEY`, `RMM_VULN_SYNC_HOURS`. Migration `0048`. See
+  [docs/design/vulnerabilities.md](docs/design/vulnerabilities.md).
 
 ## [0.2.0] - 2026-11-23
 
