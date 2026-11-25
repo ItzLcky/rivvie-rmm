@@ -354,9 +354,31 @@ pub async fn run(job: ScriptJob, tracker: Arc<Tracker>) {
         .await;
 }
 
+/// The longest environment value the server may send, and all of them together.
+const ENV_VALUE_MAX: usize = 8 * 1024;
+const ENV_TOTAL_MAX: usize = 24 * 1024;
+
+/// Checks the job's environment again (the server built it): only `RMM_[A-Z0-9_]+` names, so a
+/// job can't set `PATH` or `LD_PRELOAD`, and bounded values (a Windows environment block is
+/// limited). Errors never include a value: some are secrets.
+fn check_env(env: &[(String, String)]) -> Result<()> {
+    let mut total = 0;
+    for (k, v) in env {
+        let name_ok = k.strip_prefix("RMM_").is_some_and(|r| !r.is_empty() && r.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_'));
+        anyhow::ensure!(name_ok, "refusing environment variable {k:?}: only RMM_ names may be set");
+        anyhow::ensure!(v.len() <= ENV_VALUE_MAX && !v.contains('\0'), "the value of {k} is too long (or holds a NUL)");
+        total += k.len() + v.len() + 2;
+    }
+    anyhow::ensure!(total <= ENV_TOTAL_MAX, "the script's environment is larger than {} KiB", ENV_TOTAL_MAX / 1024);
+    Ok(())
+}
+
 async fn execute(job: &ScriptJob, tracker: &Arc<Tracker>) -> Result<(JobStatus, Option<i32>)> {
+    check_env(&job.env)?;
     let script = ScriptFile::create(job)?;
     let mut cmd = command_for(job.interpreter, &script.path)?;
+    // Parameters reach the script only as environment variables (never in its text or argv).
+    cmd.envs(job.env.iter().map(|(k, v)| (k, v)));
     cmd.args(&job.args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -669,6 +691,37 @@ mod tests {
         assert!(t.ids().await.is_empty());
         assert!(!dir.join(id.to_string()).exists(), "unreadable job directories are cleaned up");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn env_is_checked() {
+        let ok = vec![("RMM_PARAM_X".to_string(), "$(touch /tmp/x)".to_string()), ("RMM_JOB_ID".into(), "1".into())];
+        assert!(check_env(&ok).is_ok());
+        for bad in ["PATH", "LD_PRELOAD", "RMM_", "RMM_param", "RMM_A-B", "RMM_A=B"] {
+            assert!(check_env(&[(bad.to_string(), "v".to_string())]).is_err(), "{bad}");
+        }
+        let e = check_env(&[("RMM_PARAM_X".into(), "s".repeat(ENV_VALUE_MAX + 1))]).unwrap_err().to_string();
+        assert!(!e.contains("sss"), "no value in the error");
+        let many: Vec<(String, String)> = (0..4).map(|i| (format!("RMM_PARAM_{i}"), "v".repeat(ENV_VALUE_MAX))).collect();
+        assert!(check_env(&many).is_err(), "the total is capped");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn parameters_arrive_as_environment_values() {
+        let t = Arc::new(Tracker::default());
+        let job = ScriptJob {
+            job_id: Uuid::new_v4(),
+            interpreter: Interpreter::Sh,
+            script: "printf '%s' \"$RMM_PARAM_X\"".into(),
+            args: vec![],
+            timeout_secs: 10,
+            env: vec![("RMM_PARAM_X".into(), "$(echo injected); \"`".into())],
+        };
+        t.start(job.job_id).await;
+        let (status, _) = execute(&job, &t).await.unwrap();
+        assert_eq!(status, JobStatus::Succeeded);
+        assert_eq!(t.jobs.lock().await[&job.job_id].stdout, b"$(echo injected); \"`");
     }
 
     #[test]

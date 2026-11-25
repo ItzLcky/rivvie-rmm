@@ -144,7 +144,7 @@
 					</div>
 				</header>
 				{#each groups(p) as g (g.m)}
-					<h3 class="bg-sunken/60 text-muted border-border border-b px-4 py-1.5 text-xs font-semibold tracking-wide uppercase">{g.label}{g.m !== 'settings' ? ` · ${num(g.list.length)}` : ''}</h3>
+					<h3 class="bg-sunken/60 text-muted border-border border-b px-4 py-1.5 text-xs font-medium">{g.label}{g.m !== 'settings' ? ` · ${num(g.list.length)}` : ''}</h3>
 					<ul class="divide-border border-border divide-y border-b last:border-b-0">
 						{#each g.list as v (v.id)}
 							{@const along = overriddenAlong(v, p.chain)}

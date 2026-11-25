@@ -1,17 +1,21 @@
 <script lang="ts">
+	import AgentBackups from '#lib/components/agent/AgentBackups.svelte';
+	import AgentDiskEncryption from '#lib/components/agent/AgentDiskEncryption.svelte';
+	import AgentLocalAdmin from '#lib/components/agent/AgentLocalAdmin.svelte';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
-	import { BellOff, CloudDownload, Copy, LifeBuoy, MonitorUp, Pencil, Pin, Play, RefreshCw, Search, SquareTerminal, Tag, Trash2 } from '@lucide/svelte';
+	import { BellOff, CloudDownload, Copy, LifeBuoy, MonitorUp, Pencil, Pin, Play, Power, RefreshCw, Search, SquareTerminal, Tag, Trash2 } from '@lucide/svelte';
 	import { api } from '#lib/api.js';
 	import { confirmAction } from '#lib/confirm.svelte.js';
 	import { ago, bytes, datetime, duration, ms, num, pct } from '#lib/format.js';
 	import { liveReload, onLive } from '#lib/live.svelte.js';
 	import { forgetAgent, rememberAgent } from '#lib/recent.js';
 	import { resource } from '#lib/resource.svelte.js';
-	import { can } from '#lib/session.svelte.js';
+	import { allowed, can } from '#lib/session.svelte.js';
 	import { attempt, toast } from '#lib/toast.svelte.js';
 	import type { AgentDetail, AuditRow, Job, MetricPoint, Page, Release, Software } from '#lib/types.js';
 	import { param, setParams } from '#lib/url.svelte.js';
+	import { wake } from '#lib/wake.js';
 	import Async from '#lib/ui/Async.svelte';
 	import Badge from '#lib/ui/Badge.svelte';
 	import Button from '#lib/ui/Button.svelte';
@@ -42,6 +46,7 @@
 	import TagChip from '#lib/components/tags/TagChip.svelte';
 	import TagPicker from '#lib/components/tags/TagPicker.svelte';
 	import AgentSecurity from '#lib/components/agent/AgentSecurity.svelte';
+	import AgentVulnerabilities from '#lib/components/agent/AgentVulnerabilities.svelte';
 	import AgentServices from '#lib/components/agent/AgentServices.svelte';
 	import NewTicket from '#lib/components/ticket/NewTicket.svelte';
 	import TicketTable from '#lib/components/ticket/TicketTable.svelte';
@@ -104,6 +109,12 @@
 			const r = await api.post<{ version: string }>(`/agents/${id}/update`);
 			toast.success(`Update to v${r.version} sent. The agent downloads it, waits for running jobs, then restarts.`);
 		});
+	}
+	let waking = $state(false);
+	async function wakeAgent() {
+		waking = true;
+		await wake([id]);
+		waking = false;
 	}
 	async function refreshInventory() {
 		await attempt(() => api.post(`/agents/${id}/inventory/refresh`), 'Inventory refresh requested; it updates in a few seconds.');
@@ -251,6 +262,7 @@
 			{/snippet}
 			{#snippet actions()}
 				{#if can('technician')}
+					{#if !a.online}<Button icon={Power} loading={waking} onclick={wakeAgent} title="Send a Wake-on-LAN packet through another online agent at the site">Wake</Button>{/if}
 					<Button icon={SquareTerminal} disabled={!a.online} onclick={() => setParams({ tab: 'terminal' })} title={a.online ? undefined : 'The agent is offline'}>Terminal</Button>
 					<Button icon={MonitorUp} class="max-sm:hidden" disabled={!!desktopBlocked(a)} onclick={() => setParams({ tab: 'desktop' })} title={desktopBlocked(a)}>Remote desktop</Button>
 					<Button variant="primary" icon={Play} onclick={() => (running = true)}>Run script</Button>
@@ -297,6 +309,7 @@
 					{ value: 'patches', label: 'Patches', count: a.patches_overdue || a.patches_failed ? num(a.patches_overdue + a.patches_failed) : undefined, title: a.patches_overdue || a.patches_failed ? 'Overdue security updates and failed installs' : undefined },
 					{ value: 'deployments', label: 'Deployments' },
 					{ value: 'security', label: 'Security' },
+					{ value: 'vulnerabilities', label: 'Vulnerabilities', hidden: !allowed('security.read') },
 					{ value: 'jobs', label: 'Jobs' },
 					{ value: 'files', label: 'Files', hidden: !can('technician') }
 				] },
@@ -346,6 +359,8 @@
 					</dl>
 				</section>
 				{#key a.id}<FieldsCard entity="agent" id={a.id} />{/key}
+				{#key a.id}<AgentBackups agentId={a.id} />{/key}
+				{#key a.id}<AgentLocalAdmin agentId={a.id} online={a.online} hostname={a.hostname} />{/key}
 				</div>
 
 				<div class="min-w-0 space-y-4">
@@ -443,6 +458,7 @@
 						</tbody>
 					</table>
 				</section>
+				<div class="xl:col-span-2">{#key a.id}<AgentDiskEncryption agentId={a.id} online={a.online} hostname={a.hostname} />{/key}</div>
 			</div>
 		{:else if tab === 'software'}
 			{#snippet nameCell(s: Software)}<span class="font-medium">{s.name}</span>{/snippet}
@@ -532,6 +548,8 @@
 			</TicketTable>
 		{:else if tab === 'security'}
 			<AgentSecurity agentId={a.id} hostname={a.hostname} os={a.os_family} />
+		{:else if tab === 'vulnerabilities'}
+			<AgentVulnerabilities agentId={a.id} hostname={a.hostname} clientId={a.client_id} clientName={a.client_name} />
 		{:else if tab === 'services'}
 			<AgentServices agentId={a.id} online={a.online} hostname={a.hostname} />
 		{:else if tab === 'logs'}

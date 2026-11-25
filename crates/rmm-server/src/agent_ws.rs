@@ -278,7 +278,12 @@ async fn run_session(
         let state = state.clone();
         tokio::spawn(async move { crate::automation::on_connect(&state, agent_id, first_connect, last_seen).await });
     }
-    let dispatched = dispatch_queued(&state, agent_id, &tx).await.unwrap_or_else(|e| {
+    // What it supports decides what the queued jobs may carry (patches::on_connect stores it
+    // too, later).
+    if let Err(e) = sqlx::query("UPDATE agents SET capabilities = $2 WHERE id = $1").bind(agent_id).bind(&capabilities).execute(&state.db).await {
+        warn!(%agent_id, "storing capabilities: {e}");
+    }
+    let dispatched = dispatch_queued(&state, agent_id, client_id, &tx).await.unwrap_or_else(|e| {
         warn!(%agent_id, "dispatching queued jobs: {e}");
         0
     });
@@ -294,6 +299,9 @@ async fn run_session(
     if let Err(e) = crate::security::on_connect(&state, agent_id, client_id, &capabilities, &held.security_actions).await {
         warn!(%agent_id, "security state on connect: {e:#}");
     }
+    crate::checks::on_connect(&state, agent_id, &capabilities, &tx).await;
+    crate::localadmin::on_connect(&state, agent_id, &capabilities).await;
+    crate::helpdesk_agent::on_connect(&state, agent_id, client_id, &capabilities, &tx).await;
     // Replies to this connection only (job acks). Weak, so the writer still ends when the
     // hub drops the agent (kick) and every other sender is gone.
     let reply = tx.downgrade();
@@ -369,8 +377,9 @@ pub async fn mark_lost(db: &sqlx::PgPool, agent_id: Uuid, held: &[Uuid]) -> sqlx
     Ok(n)
 }
 
-/// Sends every queued job to a freshly connected agent; returns how many.
-pub async fn dispatch_queued(state: &AppState, agent_id: Uuid, tx: &mpsc::Sender<ServerMsg>) -> anyhow::Result<usize> {
+/// Sends every queued job to a freshly connected agent; returns how many. Each gets its
+/// environment (parameters included) now; one that can't run on this agent ends as `error`.
+pub async fn dispatch_queued(state: &AppState, agent_id: Uuid, client_id: Uuid, tx: &mpsc::Sender<ServerMsg>) -> anyhow::Result<usize> {
     let rows: Vec<(Uuid, String, String, serde_json::Value, i32)> = sqlx::query_as(
         "UPDATE jobs SET status = 'sent', sent_at = now()
           WHERE agent_id = $1 AND status = 'queued'
@@ -380,14 +389,25 @@ pub async fn dispatch_queued(state: &AppState, agent_id: Uuid, tx: &mpsc::Sender
     .fetch_all(&state.db)
     .await?;
     let n = rows.len();
+    let ids: Vec<Uuid> = rows.iter().map(|r| r.0).collect();
+    let mut envs = if ids.is_empty() { Default::default() } else { crate::params::job_env(state, &ids).await? };
     for (job_id, interp, body, args, timeout) in rows {
         let Some(interpreter) = parse_interpreter(&interp) else { continue };
+        let env = match envs.remove(&job_id) {
+            Some(Ok(env)) => env,
+            Some(Err(why)) => {
+                crate::api::end_job_with_error(state, job_id, agent_id, client_id, &why).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+                continue;
+            }
+            None => vec![],
+        };
         let job = ScriptJob {
             job_id,
             interpreter,
             script: body,
             args: serde_json::from_value(args).unwrap_or_default(),
             timeout_secs: timeout.max(1) as u32,
+            env,
         };
         let _ = tx.send(ServerMsg::RunScript(job)).await;
     }
@@ -597,6 +617,25 @@ async fn on_message(
             crate::netmon::ingest_scan(state, agent_id, scan_id, subnets, scanned, hosts, error).await?
         }
         AgentMsg::SnmpPollResult { poll_id, results } => crate::netmon::ingest_poll(state, agent_id, poll_id, results).await,
+        AgentMsg::WakeOnLanResult { request_id, sent, error } => crate::wol::complete(agent_id, request_id, sent, error),
+        AgentMsg::CheckResults { results } => crate::checks::ingest(state, agent_id, results).await?,
+        AgentMsg::IdentityReply { request_id, reply } => state.hub.complete_identity(agent_id, request_id, reply),
+        AgentMsg::DiskEncryption(report) => crate::diskenc::ingest_report(state, agent_id, client_id, report).await?,
+        AgentMsg::DiskRecoveryKey { request_id, volume_id, protector_id, key, error } => {
+            crate::diskenc::ingest_key(state, agent_id, request_id, volume_id, protector_id, key.map(|k| k.0), error).await?
+        }
+        AgentMsg::DiskProtectorResult { request_id, ok, message } => crate::diskenc::ingest_protector_result(state, agent_id, request_id, ok, message).await,
+        AgentMsg::LocalAdminResult { request_id, ok, created, status, message } => {
+            crate::localadmin::ingest_result(state, agent_id, request_id, ok, created, status, message).await?
+        }
+        AgentMsg::HelpRequest { request_id, user, session, subject, body, context, screenshot_len } => {
+            let req = crate::helpdesk_agent::Request { request_id, user, session, subject, body, context, screenshot_len };
+            crate::helpdesk_agent::on_request(state, agent_id, client_id, reply, req).await
+        }
+        AgentMsg::HelpAttachment { request_id, offset, data, done } => {
+            let piece = crate::helpdesk_agent::Piece { request_id, offset, data, done };
+            crate::helpdesk_agent::on_attachment(state, agent_id, client_id, reply, piece).await
+        }
         AgentMsg::Pong { .. } => {}
         AgentMsg::Enroll { .. } | AgentMsg::Auth { .. } => {}
     }
@@ -642,6 +681,15 @@ fn message_type(m: &AgentMsg) -> usize {
         AgentMsg::SoftwareResult(_) => 33,
         AgentMsg::NetScanResult { .. } => 34,
         AgentMsg::SnmpPollResult { .. } => 35,
+        AgentMsg::WakeOnLanResult { .. } => 36,
+        AgentMsg::CheckResults { .. } => 37,
+        AgentMsg::IdentityReply { .. } => 42,
+        AgentMsg::DiskEncryption(_) => 38,
+        AgentMsg::DiskRecoveryKey { .. } => 39,
+        AgentMsg::DiskProtectorResult { .. } => 40,
+        AgentMsg::LocalAdminResult { .. } => 41,
+        AgentMsg::HelpRequest { .. } => 43,
+        AgentMsg::HelpAttachment { .. } => 44,
     }
 }
 
@@ -714,5 +762,6 @@ async fn store_inventory(state: &Arc<AppState>, agent_id: Uuid, inv: &Inventory)
         info!(%agent_id, from = %before, to = %after, "agent moved to another policy set");
         crate::policy::changed(state, crate::policy::Change::agents(vec![agent_id])).await;
     }
+    crate::vuln::inventory_stored(state, agent_id, inv).await;
     Ok(())
 }

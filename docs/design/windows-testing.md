@@ -54,7 +54,8 @@ saw, `C:\ProgramData\RMM\logs\*.log`, and the Event Viewer entry if there is one
 3. Repair: delete `C:\Program Files\RMM\rmm-agent.exe` while the service is stopped, run `msiexec /fa rmm-agent.msi /qn`: the file returns and the service runs. Then clear the recovery actions (`sc failure RmmAgent reset= 0 actions= ""`) and repair again; note whether they come back (only the binary is a repaired component, so probably not) and, if not, that re-running the MSI install (not repair) restores them.
 4. Install with the MSI while a user has a PowerShell terminal open through the console (shell relay): the install completes, the terminal ends, nothing is left running from the old binary.
 5. Uninstall (`msiexec /x`): service gone, `rmm-agent.exe`, `rmm-agent.old.exe` and `rmm-agent.new.exe` gone from Program Files, `C:\ProgramData\RMM\agent.toml` kept, agent shows offline. Reinstall: it re-enrolls under the same identity.
-6. An install with no network to the server: the install itself succeeds (`install.log` says enrollment failed), the service is installed, and enrolling later with `rmm-agent enroll` works.
+6. Branding (Settings → Branding, [design](branding.md)): with a product name and a square icon set, download the MSI. *Apps and features* lists "<product> Agent" with the icon; `services.msc` shows the display name "<product> Agent" (service id still `RmmAgent`); `agent.toml` has `product_name`. Install it over an unbranded install: one entry, renamed. Clear the branding and upgrade again: note whether the service keeps the branded name (it does until `product_name` is removed from `agent.toml`). The remote-desktop consent prompt's title starts with the product name.
+7. An install with no network to the server: the install itself succeeds (`install.log` says enrollment failed), the service is installed, and enrolling later with `rmm-agent enroll` works.
 
 ## 3. Self-update
 
@@ -75,6 +76,7 @@ CI covers the signed path and a rollback on a server image. On real hosts, add w
 4. Services page: the list shows what `Get-Service` shows (names, display names, state, start type, the account). Stop, start and restart a harmless service (Print Spooler) from the console, and a service that depends on others (the dependents are listed, the stop fails with the SCM's message and the console shows it). A service name with a space or `$` (`MSSQL$SQLEXPRESS` on a box with SQL Express) works.
 5. Event Log watchers: an alert policy with `channels: ["System"]`, `event_ids: [7036]`, `min_level: info`, `pattern: "Print Spooler"`. Stop the spooler: one alert within ~35 s. A policy with no channel reads System and Application. A policy on the `Security` channel for event 4625 (failed logon): fail a logon (wrong password at `runas`) and the entry arrives with the right source ("Microsoft-Windows-Security-Auditing"). A localized Windows (German): the message text is the localized one, matched by a localized pattern; event ids still match.
 6. The Event Log's own limits: write 50 matching events in a minute; the watcher sends 20 and reports the rest as suppressed.
+7. Script parameters ([design](script-params.md)): a PowerShell script `Write-Output "[$env:RMM_PARAM_TARGET]"` and a cmd script `echo [%RMM_PARAM_TARGET%]` with the value `$(calc) & calc "%PATH%"` print it verbatim and start nothing; `$env:RMM_AGENT_HOSTNAME` is the machine's name; a secret parameter's value is printed by the script but `jobs.params` shows `•••`; a value of 8 KiB arrives whole, a set of values over 24 KiB is refused by the agent with an error naming no value.
 
 ## 5. Patches
 
@@ -100,6 +102,19 @@ Needs a signed-in console user (a VM console session), not just the agent.
 8. Frame rate and CPU: a video playing full screen at 1080p stays above ~10 fps over a LAN and the agent's CPU stays reasonable (note the number). Closing the session ends the helper process (`Get-Process rmm-agent` shows only the service).
 9. The relay's other half: file browser and transfer to a path with spaces and non-ASCII characters; a 1 GB upload; browsing `C:\Users` as SYSTEM.
 
+## 6a. Tray app
+
+CI (`e2e_windows`, section `tray`) checks the Run value after MSI install and its removal on uninstall, and drives `rmm-agent tray --request` over the named pipe as the runner's elevated user. Everything with a window is manual:
+
+1. Sign in as a standard user after installing the MSI: the icon appears (the branding icon if one is set, else the stock application icon), with the product name as its tooltip. Explorer restarted (`taskkill /f /im explorer.exe`, then start it): the icon comes back.
+2. Menu → Request help: the form opens on top; the screenshot was taken before it opened (the form isn't in the picture). Tab moves between fields, Enter sends, Esc cancels. The ticket has the screenshot, the device, "From device", and `DOMAIN\user` (or `AzureAD\user@…`) in the context note; for an Entra user whose UPN matches a contact's email, the ticket is that contact's.
+3. Unplug the network, send a request: "saved and will be sent"; plug it back in: one ticket. Six requests in an hour: the sixth is refused with the reason.
+4. Contact the help desk…: the card from Settings → Branding (the client's override if it has one). Links open in the default browser; an `http(s)` link only.
+5. Consent on: start a remote desktop session; the Allow/Deny box comes from the tray (title "<product>: remote support request") and closes itself after the timeout as a deny. Quit the tray ("Hide until next sign-in") and try again: the `WTSSendMessage` prompt is used instead. During the session a balloon says a technician is connected, and another when they leave.
+6. A terminal server with two users signed in: each has an icon; a consent prompt for the console session goes to the console user only.
+7. Policy `tray.enabled` off: the icon disappears within a minute; on again: it comes back. Self-update the agent: the tray restarts itself from the new binary (check its version in Task Manager → Details → command line, or `Get-Process rmm-agent | fl Path,StartTime`).
+8. As a standard user, try to create a second server instance of `\\.\pipe\rmm-agent-tray` (PowerShell `New-Object System.IO.Pipes.NamedPipeServerStream('rmm-agent-tray')`): access denied.
+
 ## 7. Security
 
 1. Defender, normal mode: the Security tab shows enabled, real-time, tamper protection, the signature version and age, and the last quick and full scan. Run a quick scan, a full scan and a signature update from the console; each ends with the real result. Drop the EICAR file in `C:\Users\Public`: the detection appears with the right name, severity and resource, an alert opens by policy, and clearing the threat (`Remove-MpThreat`) resolves it.
@@ -110,6 +125,57 @@ Needs a signed-in console user (a VM console session), not just the agent.
 6. The sensor beside Defender: both running, the sensor's scans do not slow the machine visibly; stopping the sensor (policy off) removes the process within seconds; killing it (`taskkill /f`) is noticed and it comes back, with an alert if so configured.
 7. Windows Firewall isolation: from the console, isolate the machine. Within seconds: the browser cannot reach the internet, the agent stays connected to the server (the console still shows it online and can run a job), DNS and DHCP still work. `netsh advfirewall show allprofiles` shows block inbound and outbound, and `RMM-isolation-*` rules exist. Reboot while isolated: still isolated when the agent starts (and the console's job still reaches it). Un-isolate: all three profiles return to the policy they had before (compare with the export `C:\ProgramData\RMM\isolation-firewall.wfw` taken first), the isolation rules are gone, and a custom firewall rule you made before is enabled again. Isolate twice in a row, then un-isolate: the original policy comes back, not the isolated one. A server on a changing IP (a DNS name that resolves differently): the agent re-resolves while isolated and stays connected. With Group Policy managing the firewall, note what wins.
 8. Triage and response: kill a process tree from the console (a `ping -t` started from cmd); collect a triage package: it lists processes, services, connections and autoruns and downloads.
+
+## Wake-on-LAN (any OS, real network)
+
+The e2e test only proves the packet bytes reach a socket on loopback. On a real LAN with two machines at one site (one online with the agent, one with Wake-on-LAN enabled in its BIOS/UEFI and NIC driver, shut down or asleep):
+
+1. Wake the sleeping machine from its page: it powers on and the agent reconnects. Repeat from S5 (shut down), S3 (sleep) and S4 (hibernate); Windows "Fast startup" often blocks waking from shutdown, note it.
+2. Sender on Windows, Linux and macOS in turn (the directed broadcast and `255.255.255.255` both go out; note which interface the packet left on with Wireshark).
+3. A target on another VLAN than the sender: expected to fail on most switches (directed broadcasts are dropped); note whether it does, and that the designated agent on the target's VLAN works.
+4. A patch policy with an install window opening in 20 minutes and `wake_before_minutes` 30, an approved update and the machine asleep: it wakes once, installs in the window, and isn't woken again for 12 hours.
+
+## 7a. Uptime and backups
+
+1. Uptime from a Windows agent: a ping monitor of the gateway (`IcmpSendEcho`) answers with a round trip; a ping of an address that doesn't exist fails with "no reply" within the timeout. HTTPS and TLS monitors of an internal site with a certificate from the domain's CA read as trusted (the Windows root store); a self-signed one as untrusted. A DNS monitor without a server uses the adapter's resolvers.
+2. Windows Server Backup: on a server with a schedule, after one good and one failed run (unplug the target disk), the Backups card shows the right last success and result, from `Get-WBSummary`; with the cmdlets removed, the same from the event log. Installed and never run: no job, no error.
+3. Veeam Backup & Replication and Veeam Agent for Windows: event 190 for a successful, a warning and a failed job gives the right name and result per job (the fixtures in `crates/rmm-agent/src/checks/backup/fixtures/` were written from documentation, not recorded: replace them with real exports). `auto` finds Veeam by its service.
+4. A `file_age` source on a UNC path (`\\nas\backups`) as SYSTEM: what the service account can and can't read.
+5. macOS (not Windows, but nowhere else to note it): Time Machine to a local disk and to a network destination, `tmutil latestbackup` and `tmutil status` while a backup runs.
+
+## 7b. Disk encryption and local admin rotation
+
+The CI runner has no BitLocker and isn't domain-joined; these need real hosts ([disk-encryption](disk-encryption.md), [local-admin](local-admin.md)).
+
+1. BitLocker on a TPM laptop (Windows 11 Pro): `C:` reports `encrypted` with TPM and a recovery password; with escrow on, the vault gets `BitLocker recovery: HOST C:` and its reveal matches `manage-bde -protectors -get C:`. Rotate from the Inventory tab: a new numerical password replaces the old one on the machine and in the vault (the old one in its history). Suspend (`manage-bde -protectors -disable C:`): `suspended`, and the alert after the grace period; resume clears it.
+2. A data drive with only a startup key and `add_recovery_protector` on: a recovery password is added and escrowed. With the GPO "Do not allow 48-digit recovery password" set: the refusal shows on the volume and isn't retried for a day.
+3. Encryption in progress (`manage-bde -on D:`): `encrypting` with a percentage, no alert. A USB disk with BitLocker To Go: not listed.
+4. Windows Home and Server without the BitLocker feature: fixed drives listed as unencrypted, no error. A non-English Windows where CIM is blocked: the `manage-bde` fallback (English parser) returns nothing; note what it shows.
+5. Local admin rotation on a domain-joined workstation: the account is local, rotation works, and a domain account of the same name is untouched. On a domain controller: `unsupported`.
+6. Windows LAPS on the same machine managing `rmmadmin` (`AdministratorAccountName`): `conflict` and the alert; managing only the built-in Administrator: no conflict.
+7. A localised Windows (German, French): the account joins *Administratoren*/*Administrateurs* (looked up by SID). A local password policy stricter than the default (length 24): the failure message names the policy, the device keeps its previous password.
+8. Linux as root (Ubuntu with `sudo`, Rocky with `wheel`): the account is created, can `sudo`, and `chpasswd` sets the vault's password; on a host without `chpasswd`: `unsupported`.
+
+## 7c. Identity: Active Directory on a domain controller
+
+The e2e drives a fake directory; none of the PowerShell has run against a real DC. On a lab domain (one DC is enough; two to see replication), with the agent installed on a DC:
+
+1. The agent lists `identity_ad` in its capabilities (`ProductType` `LanmanNT`); a member server and a workstation don't.
+2. Add the client's AD directory and sync: every user and group appear, with last logon, password set and expiry (a "never expires" account shows none), locked accounts, `adminCount` users and Domain Admins members as privileged, and membership. Change a user in ADUC and sync again: a delta picks it up. Delete a user: it's marked gone after the next full sync (edit and save the directory to force one).
+3. Lock an account (bad passwords), unlock it from the console; with two DCs, note how long until the other DC sees it.
+4. Reset to the vault and shown once; sign in with it and get asked to change it. A fine-grained password policy (or the domain policy's length) refusing a short typed password gives the directory's message. Check the ActiveDirectory module's event logs and PowerShell script block logging (event 4104) for whether the password appears anywhere: it is in the stdin JSON, not the script, but logging policies vary.
+5. Disable, enable, remove from groups (including a group in another domain of the forest, expected to fail with a message).
+6. The built-in Administrator and krbtgt are refused even when the server is made to ask (send the op from a debug build).
+7. Windows PowerShell 5.1 on Server 2016, 2019, 2022 and 2025.
+
+## 7d. Vulnerabilities
+
+The e2e test proves the Windows path with a seeded inventory and a mock NVD. On a real Windows 10/11 host with a few mapped applications installed (Chrome, Firefox and Firefox ESR, 7-Zip, Notepad++, VLC, Adobe Acrobat Reader, Zoom):
+
+1. The device's Vulnerabilities tab says it is assessed as Windows applications, and each mapped application's installed title and `DisplayVersion` (Software tab) match its mapping (Firefox ESR goes to `firefox_esr`, not `firefox`).
+2. With an old version of one installed (an old 7-Zip or VLC), its known CVEs appear with the fixed version; after upgrading through the catalog's "Upgrade with" and a fresh inventory, they resolve.
+3. Applications not in the map show under Not assessed; mapping one (with its real CPE) brings in its NVD data on the next sync.
+4. Check the version formats: Zoom's, Adobe's and Office's `DisplayVersion`s against the NVD ranges for them, and note any product whose versions don't compare (as Python's and Java's don't, which is why they aren't mapped).
 
 ## 8. Fix what breaks, record versions
 

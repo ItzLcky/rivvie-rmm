@@ -17,6 +17,7 @@
 	import Stat from '#lib/ui/Stat.svelte';
 	import Badge from '#lib/ui/Badge.svelte';
 	import OsIcon from '#lib/components/OsIcon.svelte';
+	import VulnStrip from '#lib/components/vulns/VulnStrip.svelte';
 
 	const res = resource(() => api.get<Dashboard>(`/dashboard${qs({ client_id: clientId() })}`));
 	liveReload(() => res.reload(), (e) => e.type === 'jobs' || e.type === 'alert' || (e.type === 'job' && !e.output) || (e.type === 'agent' && !e.last_metrics), {
@@ -33,7 +34,7 @@
 	const sevTone = { critical: 'danger', warning: 'warning', info: 'info' } as const;
 	const openAlerts = (d: Dashboard) => (d.alerts.critical ?? 0) + (d.alerts.warning ?? 0) + (d.alerts.info ?? 0);
 	function feed(d: Dashboard): Item[] {
-		const alerts: Item[] = d.open_alerts.map((a) => ({ key: `a-${a.id}`, kind: a.severity === 'critical' ? 'Critical' : a.severity === 'warning' ? 'Warning' : 'Info', tone: sevTone[a.severity], href: `/alerts/${a.id}`, title: `${a.hostname}: ${a.title}`, where: a.client_name, when: ago(a.opened_at) }));
+		const alerts: Item[] = d.open_alerts.map((a) => ({ key: `a-${a.id}`, kind: a.severity === 'critical' ? 'Critical' : a.severity === 'warning' ? 'Warning' : 'Info', tone: sevTone[a.severity], href: `/alerts/${a.id}`, title: a.hostname ? `${a.hostname}: ${a.title}` : a.title, where: a.client_name, when: ago(a.opened_at) }));
 		const disks: Item[] = d.high_disk.map((a) => ({ key: `d-${a.id}`, kind: `Disk ${a.disk_max_pct.toFixed(0)}%`, tone: 'danger', href: `/agents/${a.id}`, title: a.hostname, where: a.client_name, when: a.online ? 'now' : ago(a.last_seen_at) }));
 		const jobs: Item[] = d.failed_jobs.map((j: Job) => ({ key: `j-${j.id}`, kind: j.status === 'failed' || j.status === 'error' ? 'Job failed' : j.status === 'timed_out' ? 'Job timed out' : 'Job lost', tone: j.status === 'failed' || j.status === 'error' ? 'danger' : 'warning', href: `/jobs/${j.id}`, title: j.script_name ?? `Ad-hoc ${j.interpreter}`, where: j.hostname, when: ago(j.created_at) }));
 		const off: Item[] = d.offline.map((a) => ({ key: `o-${a.id}`, kind: 'Offline', tone: 'neutral', href: `/agents/${a.id}`, title: a.hostname, where: `${a.client_name} › ${a.site_name}`, when: ago(a.last_seen_at) }));
@@ -41,12 +42,15 @@
 		const alerted = new Set(d.open_alerts.map((a) => `${a.kind}:${a.agent_id}`));
 		return [...alerts, ...disks.filter((x) => !alerted.has(`disk:${x.key.slice(2)}`)), ...jobs, ...off.filter((x) => !alerted.has(`offline:${x.key.slice(2)}`))];
 	}
+	import OnCallChip from '#lib/oncall/OnCallChip.svelte';
 </script>
 
 <PageHeader
 	title={scoped ? scoped.name : 'Dashboard'}
 	description={scoped ? 'Dashboard for this client. Pick “All clients” at the top to see everything.' : 'Fleet health across every client, worst first.'}
 />
+
+<div class="mb-4"><OnCallChip /></div>
 
 <Async {res}>
 	{#snippet skeleton()}
@@ -76,6 +80,7 @@
 				<Stat label="Failed jobs (24 h)" icon={CircleSlash} value={failedCount(d)} tone="danger" href={link('/jobs?status=failed')} />
 				<Stat label="Disks over 90%" icon={HardDrive} value={d.high_disk.length} capped={d.high_disk.length >= 10} tone="danger" href={link('/agents?sort=disk&dir=desc')} />
 			</section>
+			<VulnStrip clientId={clientId()} class="mt-4" />
 
 			{@const items = feed(d)}
 			<div class="mt-6 grid items-start gap-6 xl:grid-cols-[minmax(0,7fr)_minmax(0,5fr)]">

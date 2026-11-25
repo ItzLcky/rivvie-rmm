@@ -88,7 +88,7 @@ pub async fn on_connect(st: &AppState, agent_id: Uuid, first: bool, last_seen: O
 /// no script runs on the poller for it, the same as `run_script_id`.
 pub async fn alert_opened(st: &AppState, alert_id: Uuid) {
     let row: sqlx::Result<Option<(Uuid, String, String)>> =
-        sqlx::query_as("SELECT agent_id, kind, title FROM alerts WHERE id = $1 AND device_id IS NULL").bind(alert_id).fetch_optional(&st.db).await;
+        sqlx::query_as("SELECT agent_id, kind, title FROM alerts WHERE id = $1 AND device_id IS NULL AND agent_id IS NOT NULL").bind(alert_id).fetch_optional(&st.db).await;
     match row {
         Ok(Some((agent_id, kind, title))) => {
             fire(st, agent_id, Trigger::AlertOpened, Event { alert_kind: Some(kind.clone()), ..Default::default() }, json!({ "alert_id": alert_id, "alert_kind": kind, "title": title }))
@@ -353,12 +353,16 @@ async fn launch(st: &AppState, run_id: Uuid) -> anyhow::Result<()> {
     };
     let timeout = c.timeout_secs.unwrap_or(script_timeout).clamp(1, 86400);
     let job_id = Uuid::new_v4();
+    let (params, sealed, why) = match crate::params::env_for(st, c.script_id, &c.params, agent_id, client_id, job_id, "automation").await? {
+        Ok((p, s)) => (p, s, None),
+        Err(why) => (json!({}), None, Some(why)),
+    };
     let mut tx = st.db.begin().await?;
     // The job's schedule_id is the item: the jobs lists name the automation, and the job
     // retention (`retain_days`) applies.
     sqlx::query(
-        "INSERT INTO jobs (id, agent_id, script_id, interpreter, body, args, timeout_secs, schedule_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+        "INSERT INTO jobs (id, agent_id, script_id, interpreter, body, args, timeout_secs, schedule_id, params, env_sealed)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
     )
     .bind(job_id)
     .bind(agent_id)
@@ -368,6 +372,8 @@ async fn launch(st: &AppState, run_id: Uuid) -> anyhow::Result<()> {
     .bind(json!(c.args))
     .bind(timeout)
     .bind(item)
+    .bind(params)
+    .bind(sealed)
     .execute(&mut *tx)
     .await?;
     let claimed = sqlx::query(
@@ -383,7 +389,12 @@ async fn launch(st: &AppState, run_id: Uuid) -> anyhow::Result<()> {
         return Ok(());
     }
     tx.commit().await?;
-    let job = rmm_proto::ScriptJob { job_id, interpreter, script: body, args: c.args, timeout_secs: timeout as u32 };
+    if let Some(why) = why {
+        // Settles the run through automation::job_finished, like any failed job.
+        crate::api::end_job_with_error(st, job_id, agent_id, client_id, &why).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+        return Ok(());
+    }
+    let job = rmm_proto::ScriptJob { job_id, interpreter, script: body, args: c.args, timeout_secs: timeout as u32, env: vec![] };
     let status = crate::api::deliver_job(st, agent_id, client_id, job).await.map_err(|e| anyhow::anyhow!("{e}"))?;
     info!(%item, %agent_id, %job_id, attempt = attempts + 1, status, "automation started");
     Ok(())

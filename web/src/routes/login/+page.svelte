@@ -2,7 +2,8 @@
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import { api, ApiError } from '#lib/api.js';
-	import { brand, session } from '#lib/session.svelte.js';
+	import { brand, company, session } from '#lib/session.svelte.js';
+	import SourceLink from '#lib/components/branding/SourceLink.svelte';
 	import type { User } from '#lib/types.js';
 	import favicon from '#lib/assets/favicon.svg';
 	import { loadPrefs } from '#lib/prefs.svelte.js';
@@ -117,27 +118,31 @@
 
 <div class="bg-raised grid min-h-dvh lg:grid-cols-[minmax(0,5fr)_minmax(0,6fr)]">
 	<!-- Brand panel: navy like the navigation rail. Hidden on small screens, where the form is all there is. -->
-	<aside class="brand-panel bg-nav text-nav-fg relative hidden flex-col justify-between overflow-hidden p-10 lg:flex xl:p-14">
+	<aside class="bg-nav text-nav-fg relative hidden flex-col justify-between overflow-hidden p-10 lg:flex xl:p-14">
 		<div class="relative flex items-center gap-3">
-			<img src={favicon} alt="" class="size-8" />
-			<span class="text-[0.9375rem] font-semibold tracking-tight text-white">{brand()}</span>
+			{#if company.branding?.logo_dark || company.branding?.logo_light}
+				<img src={company.branding.logo_dark ?? company.branding.logo_light} alt={brand()} class="h-10 max-w-[16rem] object-contain object-left" />
+			{:else}
+				<img src={company.branding?.icon ?? favicon} alt="" class="size-8" />
+				<span class="text-[0.9375rem] font-semibold tracking-tight text-white">{brand()}</span>
+			{/if}
 		</div>
 		<div class="relative max-w-md">
-			<h2 class="text-3xl leading-tight font-semibold tracking-tight text-white xl:text-4xl">Monitor, patch and support every client device from one console.</h2>
+			<h2 class="text-3xl leading-tight font-medium tracking-tight text-white xl:text-4xl">Monitor, patch and support every client device from one console.</h2>
 			<ul class="text-nav-muted mt-8 space-y-3 text-sm">
 				<li class="flex items-center gap-3"><Activity class="text-nav-indicator size-4 shrink-0" />Live health, alerts and remote sessions</li>
 				<li class="flex items-center gap-3"><PackageCheck class="text-nav-indicator size-4 shrink-0" />Patch policies with maintenance windows</li>
 				<li class="flex items-center gap-3"><LifeBuoy class="text-nav-indicator size-4 shrink-0" />Tickets linked to the machines they are about</li>
 			</ul>
 		</div>
-		<p class="text-nav-label relative text-xs">Authorized technicians only. Sign-ins are recorded in the audit log.</p>
+		<p class="text-nav-label relative text-xs">Authorized technicians only. Sign-ins are recorded in the audit log. · <SourceLink href={company.branding?.source_url} /></p>
 	</aside>
 
 	<main class="flex flex-col items-center justify-center px-4 py-10 sm:px-8">
 		<div class="w-full max-w-sm">
 			<div class="mb-8">
-				<img src={favicon} alt="" class="mb-6 size-9 lg:hidden" />
-				<h1 class="text-2xl font-semibold tracking-tight">{second ? 'Two-factor verification' : 'Sign in'}</h1>
+				<img src={company.branding?.icon ?? favicon} alt="" class="mb-6 size-9 lg:hidden" />
+				<h1 class="text-2xl font-medium">{second ? 'Two-factor verification' : 'Sign in'}</h1>
 				<p class="text-muted mt-1.5 text-sm">
 					{#if !second}Use your {brand()} account.
 					{:else if second.passkey && second.totp}Use a passkey, or enter the code from your authenticator app.
@@ -179,19 +184,7 @@
 					{/if}
 				</form>
 			{/if}
+			<p class="text-muted mt-10 text-center text-xs lg:hidden"><SourceLink href={company.branding?.source_url} /></p>
 		</div>
 	</main>
 </div>
-
-<style>
-	/* A soft light source in the top corner, in the accent's hue: depth without decoration. */
-	.brand-panel::before {
-		content: '';
-		position: absolute;
-		inset: 0;
-		background:
-			radial-gradient(60% 50% at 100% 0%, rgb(91 154 255 / 0.22), transparent 70%),
-			radial-gradient(50% 40% at 0% 100%, rgb(91 154 255 / 0.08), transparent 70%);
-		pointer-events: none;
-	}
-</style>

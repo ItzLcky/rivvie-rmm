@@ -223,6 +223,10 @@ pub async fn update_settings(State(st): State<Arc<AppState>>, u: User, Path(site
         sqlx::query("UPDATE net_devices SET last_poll_at = NULL, state = CASE WHEN state = 'down' THEN 'unknown' ELSE state END WHERE site_id = $1").bind(site_id).execute(&mut *tx).await?;
     }
     tx.commit().await?;
+    if before != b.agent_id {
+        // Uptime monitors that use the site's designated agent move with it.
+        crate::checks::push_soon(&st, Some(before.into_iter().chain(b.agent_id).collect()));
+    }
     auth::audit(&st.db, Some(u.id), "network.settings", Some(("site", site_id)), json!({ "agent_id": b.agent_id, "subnets": subnets, "discovery_hours": b.discovery_hours, "poll_secs": b.poll_secs })).await;
     Ok(Json(json!({ "ok": true })))
 }

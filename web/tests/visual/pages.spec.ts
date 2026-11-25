@@ -22,6 +22,7 @@ const pages: [string, string][] = [
 	['agent-desktop-unsupported', '/agents/a-6?tab=desktop'],
 	['alerts', '/alerts'],
 	['alert', '/alerts/al-5'],
+	['alert-agentless', '/alerts/al-7'],
 	['policies', '/policies'],
 	['policies-categories', '/policies?tab=categories'],
 	['policies-assignments', '/policies?tab=assignments&client=c-acme'],
@@ -31,6 +32,7 @@ const pages: [string, string][] = [
 	['policy-set-patching', '/policies/sets/ps-acme-tills?section=patching'],
 	['policy-set-security', '/policies/sets/00000000-0000-4000-8001-000000000000?section=security'],
 	['policy-set-remote', '/policies/sets/ps-acme-tills?section=remote'],
+	['policy-set-tray', '/policies/sets/00000000-0000-4000-8001-000000000000?section=tray'],
 	['policy-set-schedule', '/policies/sets/00000000-0000-4000-8001-000000000002?section=schedules&item=sc-1'],
 	['policy-set-schedules-empty', '/policies/sets/ps-dc?section=schedules'],
 	['policy-set-automations', '/policies/sets/00000000-0000-4000-8001-000000000000?section=automations'],
@@ -49,6 +51,7 @@ const pages: [string, string][] = [
 	['schedules', '/schedules'],
 	['schedule', '/schedules/sc-2'],
 	['notifications', '/settings/notifications'],
+	['settings-oncall', '/settings/oncall'],
 	['agent-patches', '/agents/a-3?tab=patches'],
 	['agent-deployments', '/agents/a-1?tab=deployments'],
 	['policy-set-software', '/policies/sets/ps-acme-win?section=software'],
@@ -75,6 +78,8 @@ const pages: [string, string][] = [
 	['security-content', '/security?tab=content'],
 	['security-settings', '/security?tab=settings'],
 	['policy-new-security', '/policies/sets/00000000-0000-4000-8001-000000000000?section=alerts&item=new&kind=security'],
+	['policy-new-uptime', '/policies/sets/00000000-0000-4000-8001-000000000000?section=alerts&item=new&kind=uptime'],
+	['policy-new-backup', '/policies/sets/00000000-0000-4000-8001-000000000000?section=alerts&item=new&kind=backup'],
 	['patches', '/patches'],
 	['patches-update', '/patches?update=b3c1d2e4-0001'],
 	['patches-compliance', '/patches?tab=compliance'],
@@ -105,6 +110,7 @@ const pages: [string, string][] = [
 	['client-docs-edit', '/clients/c-acme?tab=docs&doc=d-network&edit=1'],
 	['client-passwords', '/clients/c-acme?tab=passwords'],
 	['client-password', '/clients/c-acme?tab=passwords&item=6f1c0c1e-9a51-4c0e-b6c9-0a4de1f3a111'],
+	['client-password-managed', '/clients/c-acme?tab=passwords&item=6f1c0c1e-9a51-4c0e-b6c9-0a4de1f3a1f0'],
 	['settings-documentation', '/settings/documentation'],
 	['agent-tickets', '/agents/a-3?tab=tickets'],
 	['agent-notes', '/agents/a-3?tab=notes'],
@@ -122,7 +128,34 @@ const pages: [string, string][] = [
 	['network-device', '/network/devices/nd-1?port=1'],
 	['network-device-down', '/network/devices/nd-2'],
 	['network-device-printer', '/network/devices/nd-3'],
-	['network-settings', '/network/settings?client=c-acme']
+	['network-settings', '/network/settings?client=c-acme'],
+	['settings-branding', '/settings/branding'],
+	['reports-scheduled', '/reports?tab=scheduled'],
+	['uptime', '/uptime'],
+	['uptime-monitor', '/uptime/um-vpn'],
+	['uptime-monitor-down', '/uptime/um-erp'],
+	['uptime-monitor-server', '/uptime/um-shop'],
+	['backups', '/backups'],
+	['agent-backups', '/agents/a-2'],
+	['client-users', '/clients/c-acme?tab=users'],
+	['client-mobile', '/clients/c-acme?tab=mobile'],
+	['agent-disk-encryption', '/agents/a-2?tab=inventory'],
+	['agent-local-admin-failed', '/agents/a-1'],
+	['security-disk-encryption', '/security?tab=encryption'],
+	['policy-set-disk-encryption', '/policies/sets/00000000-0000-4000-8001-000000000000?section=encryption'],
+	['policy-set-local-admin', '/policies/sets/00000000-0000-4000-8001-000000000001?section=localadmin'],
+	['policy-new-disk-encryption', '/policies/sets/00000000-0000-4000-8001-000000000000?section=alerts&item=new&kind=disk_encryption'],
+	['vulnerabilities', '/vulnerabilities'],
+	['vulnerabilities-devices', '/vulnerabilities?tab=devices'],
+	['vulnerabilities-software', '/vulnerabilities?tab=software'],
+	['vulnerabilities-unassessed', '/vulnerabilities?tab=unassessed'],
+	['vulnerabilities-feeds', '/vulnerabilities?tab=feeds'],
+	['vulnerability', '/vulnerabilities/CVE-2024-6387'],
+	['vulnerability-windows', '/vulnerabilities/CVE-2024-7971'],
+	['agent-vulnerabilities', '/agents/a-3?tab=vulnerabilities'],
+	['agent-vulnerabilities-windows', '/agents/a-1?tab=vulnerabilities'],
+	['agent-vulnerabilities-unassessed', '/agents/a-7?tab=vulnerabilities'],
+	['policy-new-vulnerability', '/policies/sets/00000000-0000-4000-8001-000000000000?section=alerts&item=new&kind=vulnerability']
 ];
 const phone: [string, string][] = [
 	['dashboard', '/'],
@@ -159,7 +192,16 @@ const phone: [string, string][] = [
 	['settings-webhooks', '/settings/webhooks'],
 	['settings-siem', '/settings/siem'],
 	['network', '/network'],
-	['network-device', '/network/devices/nd-1']
+	['network-device', '/network/devices/nd-1'],
+	['uptime', '/uptime'],
+	['uptime-monitor', '/uptime/um-web'],
+	['backups', '/backups'],
+	['client-users', '/clients/c-acme?tab=users'],
+	['security-disk-encryption', '/security?tab=encryption'],
+	['agent-disk-encryption', '/agents/a-2?tab=inventory'],
+	['vulnerabilities', '/vulnerabilities'],
+	['vulnerability', '/vulnerabilities/CVE-2024-6387'],
+	['agent-vulnerabilities', '/agents/a-3?tab=vulnerabilities']
 ];
 
 const jpeg = readFileSync(new URL('./fixtures/desktop.jpg', import.meta.url));
@@ -207,6 +249,44 @@ for (const theme of ['light', 'dark'] as const) {
 			});
 		}
 
+		test('uptime monitor form', async ({ page }) => {
+			await mockApi(page);
+			await page.goto('/uptime/um-web');
+			await settle(page);
+			await page.getByRole('button', { name: 'Edit' }).click();
+			const drawer = page.getByRole('dialog', { name: 'Edit Acme website' });
+			await expect(drawer.getByLabel('URL')).toHaveValue('https://www.acme.example/');
+			await settle(page);
+			await expect(page).toHaveScreenshot(`${theme}-uptime-form.png`);
+		});
+
+		test('identity user drawer', async ({ page }) => {
+			await mockApi(page);
+			await page.goto('/clients/c-acme?tab=users&iu=iu-03');
+			await settle(page);
+			await expect(page.getByRole('dialog', { name: 'Directory account' }).getByRole('heading', { name: 'IT Admin', exact: true })).toBeVisible();
+			await expect(page).toHaveScreenshot(`${theme}-client-user.png`);
+			const r = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa']).analyze();
+			expect(r.violations.filter((v) => v.impact === 'serious' || v.impact === 'critical').map((v) => v.id)).toEqual([]);
+		});
+
+		test('identity reset dialog', async ({ page }) => {
+			await mockApi(page);
+			await page.goto('/clients/c-acme?tab=users&iu=iu-02');
+			await settle(page);
+			await page.getByRole('button', { name: 'Reset password' }).click();
+			const dialog = page.getByRole('dialog', { name: 'Reset Raj Patel’s password' });
+			await dialog.getByRole('radio', { name: /Show it to me once/ }).click();
+			await settle(page);
+			await expect(page).toHaveScreenshot(`${theme}-identity-reset.png`);
+			const r = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa']).analyze();
+			expect(r.violations.filter((v) => v.impact === 'serious' || v.impact === 'critical').map((v) => v.id)).toEqual([]);
+			await dialog.getByRole('button', { name: 'Reset password' }).click();
+			await expect(dialog.getByTestId('shown-password')).toHaveText('Kq7#vRm2xP9-tLw4');
+			await settle(page);
+			await expect(page).toHaveScreenshot(`${theme}-identity-reset-shown.png`);
+		});
+
 		test('gallery', async ({ page }) => {
 			await mockApi(page, { signedIn: false });
 			await page.goto('/dev/ui');
@@ -221,6 +301,27 @@ for (const theme of ['light', 'dark'] as const) {
 			await settle(page);
 			await expect(page).toHaveScreenshot(`${theme}-login.png`);
 		});
+
+		// White-labelling: the rail, the sign-in page and the portal with a branded instance
+		// (logos, accent, product name) and Acme's override (its support card).
+		for (const [name, path] of [
+			['branded-login', '/login'],
+			['branded-dashboard', '/'],
+			['branded-portal-login', '/portal/login'],
+			['branded-portal', '/portal']
+		] as const) {
+			test(name, async ({ page }) => {
+				await mockApi(page, { signedIn: name !== 'branded-login', branded: true });
+				await page.goto(path);
+				await settle(page);
+				if (name === 'branded-portal') await expect(page.getByRole('region', { name: 'Support contact' })).toContainText('acme-desk@northwind.example');
+				// The AGPL source offer: on the sign-in pages and in the portal (the console has it on Account).
+				if (name !== 'branded-dashboard') await expect(page.getByRole('link', { name: 'Licence and source' }).first()).toBeVisible();
+				await expect(page).toHaveScreenshot(`${theme}-${name}.png`, { fullPage: name === 'branded-portal' });
+				const r = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa']).analyze();
+				expect(r.violations.filter((v) => v.impact === 'serious' || v.impact === 'critical').map((v) => v.id)).toEqual([]);
+			});
+		}
 
 		test('login with SSO required', async ({ page }) => {
 			await mockApi(page, { signedIn: false, ssoRequired: true });
@@ -267,6 +368,41 @@ for (const theme of ['light', 'dark'] as const) {
 			await expect(page.getByRole('dialog').getByLabel('Group').first()).toHaveValue('0b8d1f64-2e7a-4a53-9c1b-6f1d3a7e9c02');
 			await expect(page).toHaveScreenshot(`${theme}-sso-mappings.png`);
 			r = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa']).analyze();
+			expect(r.violations.filter((v) => v.impact === 'serious' || v.impact === 'critical').map((v) => v.id)).toEqual([]);
+		});
+
+		test('run a script with parameters', async ({ page }) => {
+			await mockApi(page);
+			await page.goto('/agents/a-1');
+			await settle(page);
+			await page.getByRole('button', { name: 'Run script' }).first().click();
+			const dialog = page.getByRole('dialog');
+			await dialog.getByRole('button', { name: 'Show options' }).click();
+			await page.getByRole('option', { name: /Restart print spooler/ }).click();
+			await dialog.locator('#rs-p-printer').fill('PRN-{{agent.hostname}}');
+			await expect(dialog.getByText('$RMM_PARAM_ADMIN_PASSWORD')).toBeVisible();
+			await expect(page).toHaveScreenshot(`${theme}-run-script-params.png`);
+		});
+
+		test('escalation policy editor', async ({ page }) => {
+			await mockApi(page);
+			await page.goto('/settings/oncall');
+			await settle(page);
+			await page.getByRole('button', { name: 'Edit Servers, out of hours' }).click();
+			await expect(page.getByRole('dialog').getByLabel('Name')).toHaveValue('Servers, out of hours');
+			await expect(page).toHaveScreenshot(`${theme}-oncall-policy-editor.png`);
+			const r = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa']).analyze();
+			expect(r.violations.filter((v) => v.impact === 'serious' || v.impact === 'critical').map((v) => v.id)).toEqual([]);
+		});
+
+		test('on-call channel form', async ({ page }) => {
+			await mockApi(page);
+			await page.goto('/settings/notifications');
+			await settle(page);
+			await page.getByRole('button', { name: 'Edit Page on-call' }).click();
+			await expect(page.getByRole('dialog').getByLabel('Business hours')).toBeVisible();
+			await expect(page).toHaveScreenshot(`${theme}-oncall-channel-form.png`);
+			const r = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa']).analyze();
 			expect(r.violations.filter((v) => v.impact === 'serious' || v.impact === 'critical').map((v) => v.id)).toEqual([]);
 		});
 
@@ -447,6 +583,21 @@ for (const theme of ['light', 'dark'] as const) {
 			await expect(page).toHaveURL(/\/tickets\/t-1$/);
 			await page.waitForTimeout(400);
 			await expect(page).toHaveScreenshot(`${theme}-ticket-doc.png`);
+		});
+
+		test('report schedule drawer', async ({ page }) => {
+			await mockApi(page);
+			await page.goto('/reports?tab=scheduled');
+			await settle(page);
+			await page.getByRole('button', { name: 'Acme quarterly review' }).click();
+			const drawer = page.getByRole('dialog', { name: 'Report schedule' });
+			await expect(drawer.getByRole('heading', { name: 'Acme quarterly review', level: 2 })).toBeVisible();
+			await expect(drawer.getByRole('checkbox', { name: /Ann Lopez/ })).toBeChecked();
+			await expect(drawer.getByRole('link', { name: /PDF/ }).first()).toHaveAttribute('href', '/api/report-runs/rr-2/download');
+			await page.waitForTimeout(400);
+			await expect(page).toHaveScreenshot(`${theme}-report-schedule.png`);
+			const r = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa']).analyze();
+			expect(r.violations.filter((v) => v.impact === 'serious' || v.impact === 'critical').map((v) => v.id)).toEqual([]);
 		});
 
 		test('credential card', async ({ page }) => {
@@ -782,6 +933,24 @@ test.describe('vault', () => {
 		expect(calls).toEqual([{ method: 'PUT', path: `/vault/${fw}`, body: { name: 'FortiGate admin', username: 'fgadmin', url: 'https://10.0.0.1:4443' } }]);
 		await expect(drawer).toBeVisible();
 		await expect(drawer.getByText('fgadmin')).toBeVisible();
+	});
+});
+
+test.describe('uptime', () => {
+	test('add a monitor', async ({ page }) => {
+		await mockApi(page);
+		const calls = await routeApi(page, (method, path) => (method === 'POST' && path === '/uptime/monitors' ? { json: { id: 'um-web' } } : undefined));
+		await page.goto('/uptime');
+		await settle(page);
+		await page.getByRole('button', { name: 'Add monitor' }).click();
+		const drawer = page.getByRole('dialog', { name: 'Add an uptime monitor' });
+		await drawer.getByRole('radio', { name: /TCP port/ }).click();
+		await drawer.getByLabel('Name').fill('Mail server');
+		await drawer.getByLabel('Host').fill('mail.acme.example');
+		await drawer.getByLabel('Port').fill('25');
+		await drawer.getByRole('button', { name: 'Add monitor' }).click();
+		await expect(page).toHaveURL(/\/uptime\/um-web$/);
+		expect(calls[0]).toMatchObject({ method: 'POST', path: '/uptime/monitors', body: { name: 'Mail server', kind: 'tcp', config: { host: 'mail.acme.example', port: 25 }, agent_id: null } });
 	});
 });
 

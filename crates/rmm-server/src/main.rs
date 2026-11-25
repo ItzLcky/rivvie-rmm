@@ -1,6 +1,9 @@
 mod accounting;
 mod agent_ws;
+mod backups;
 mod billing;
+mod branding;
+mod checks;
 mod pdf;
 mod policy;
 mod alerts;
@@ -8,6 +11,7 @@ mod automation;
 mod apikeys;
 mod webhooks;
 mod desktop_ws;
+mod diskenc;
 mod api;
 mod auth;
 mod email;
@@ -15,31 +19,45 @@ mod error;
 mod events;
 mod fields;
 mod hub;
+mod localadmin;
 mod metrics;
 mod netalerts;
 mod netmon;
 mod notify;
+mod oncall;
+mod push;
+mod pwa;
 mod oui;
 mod oidc;
 mod paging;
 mod patches;
 mod software;
 mod ratelimit;
+mod reports;
 mod rotate;
 mod siem;
 mod scheduler;
 mod crypto;
 mod csat;
 mod graph;
+mod entra;
+mod identity;
+mod mdm;
+mod helpdesk_agent;
 mod security;
 mod sla;
 mod shell_ws;
 mod state;
 mod storage;
 mod tickets;
+mod vault;
+mod params;
 mod totp;
 mod updates;
+mod uptime;
+mod vuln;
 mod webauthn;
+mod wol;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -96,6 +114,36 @@ enum Cmd {
         /// Count what would change and check that the old key opens everything; write nothing.
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Load vulnerability feed files saved from the internet, for servers that can't reach the
+    /// feeds: OSV `all.zip` dumps (named after their ecosystem: `Debian/all.zip` or
+    /// `Debian.zip`), the Arch tracker's `all.json`, saved NVD API pages, CISA's KEV catalogue
+    /// and the EPSS CSV. A running server re-evaluates its devices within seconds.
+    VulnImport {
+        dir: PathBuf,
+    },
+    /// Store a managed vault item through the system write path (vault::put_managed), as disk
+    /// encryption escrow and LAPS do. For tests and break-glass imports; needs RMM_DATA_KEY. The
+    /// password comes from RMM_VAULT_PASSWORD (never the command line).
+    #[command(hide = true)]
+    VaultPutManaged {
+        #[arg(long)]
+        client: uuid::Uuid,
+        /// disk_recovery, local_admin or identity.
+        #[arg(long)]
+        kind: String,
+        #[arg(long)]
+        reference: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long, default_value = "")]
+        username: String,
+        #[arg(long)]
+        agent: Option<uuid::Uuid>,
+        #[arg(long)]
+        state: Option<String>,
+        #[arg(long, env = "RMM_VAULT_PASSWORD", hide_env_values = true)]
+        password: String,
     },
 }
 
@@ -261,6 +309,24 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
+        Cmd::VaultPutManaged { client, kind, reference, name, username, agent, state, password } => {
+            let key = std::env::var("RMM_DATA_KEY").ok().filter(|k| !k.trim().is_empty()).context(vault::NEEDS_KEY)?;
+            let key = crypto::DataKey::parse(key.trim()).context("RMM_DATA_KEY")?;
+            let kind = vault::ManagedKind::parse(&kind).context("kind must be disk_recovery, local_admin or identity")?;
+            let m = vault::Managed { kind, agent_id: agent, reference, name, username, state, ..Default::default() };
+            let id = vault::put_managed_with(&db, &key, client, m, &password, vault::Source::system("cli")).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!("{id}");
+            Ok(())
+        }
+        Cmd::VulnImport { dir } => {
+            let added = vuln::seed_products(&db).await?;
+            if added > 0 {
+                println!("{added} built-in Windows product mappings added");
+            }
+            println!("{}", vuln::feeds::import_dir(&db, &dir).await?);
+            auth::audit(&db, None, "vuln.sync", None, serde_json::json!({ "via": "cli", "dir": dir.display().to_string() })).await;
+            Ok(())
+        }
         Cmd::Serve(args) => serve(db, args).await,
     }
 }
@@ -300,8 +366,10 @@ async fn serve(db: sqlx::PgPool, args: ServeArgs) -> Result<()> {
             warn!("{n} client vault(s) are encrypted with RMM_DATA_KEY, which isn't set: the vault is unavailable until it is");
         }
     }
+    let branding = branding::Cache::load(&db).await.context("loading branding")?;
     let state = Arc::new(AppState {
         storage,
+        branding,
         company: company.into(),
         db,
         hub: Default::default(),
@@ -323,6 +391,9 @@ async fn serve(db: sqlx::PgPool, args: ServeArgs) -> Result<()> {
             metrics_raw_days: args.metrics_raw_days.max(1),
             alert_retention_days: args.alert_retention_days.max(1),
             alert_eval_secs: args.alert_eval_secs,
+            // Read here rather than as a flag, like RMM_SOURCE_URL: a server on the public internet
+            // must not let monitors probe its own network, so it's off unless asked for.
+            uptime_allow_private: std::env::var("RMM_UPTIME_ALLOW_PRIVATE").is_ok_and(|v| matches!(v.trim(), "1" | "true" | "yes")),
             ticket_close_days: args.ticket_close_days.max(1),
             email_raw_days: args.email_raw_days.max(1),
             content_soak_minutes: args.content_soak_minutes,
@@ -330,6 +401,13 @@ async fn serve(db: sqlx::PgPool, args: ServeArgs) -> Result<()> {
             data_key,
             attachment_max_mb: args.attachment_max_mb.max(1),
             metrics_token: args.metrics_token.clone().map(|t| t.trim().to_string()).filter(|t| !t.is_empty()),
+            // Where the console and portal offer this server's source code (AGPL-3.0 §13). Read
+            // here rather than as a flag: it only matters to operators running modified code.
+            source_url: std::env::var("RMM_SOURCE_URL")
+                .ok()
+                .map(|u| u.trim().to_string())
+                .filter(|u| !u.is_empty())
+                .unwrap_or_else(|| branding::DEFAULT_SOURCE_URL.to_string()),
         },
         triage: Default::default(),
         oidc: oidc::Cache::new(),
@@ -350,6 +428,14 @@ async fn serve(db: sqlx::PgPool, args: ServeArgs) -> Result<()> {
     tokio::spawn(updates::run(state.clone()));
     tokio::spawn(siem::run(state.clone()));
     tokio::spawn(netmon::run(state.clone()));
+    tokio::spawn(reports::run(state.clone()));
+    tokio::spawn(oncall::run(state.clone()));
+    tokio::spawn(push::run(state.clone()));
+    tokio::spawn(uptime::run(state.clone()));
+    tokio::spawn(identity::run(state.clone()));
+    tokio::spawn(diskenc::run(state.clone()));
+    tokio::spawn(localadmin::run(state.clone()));
+    tokio::spawn(vuln::run(state.clone()));
     if state.cfg.metrics_token.is_some() {
         info!("metrics: GET /metrics (bearer token required)");
     }
@@ -369,6 +455,9 @@ async fn serve(db: sqlx::PgPool, args: ServeArgs) -> Result<()> {
         .route("/api/agent/ws", get(agent_ws::handler))
         .route("/healthz", get(|| async { "ok" }))
         .route("/metrics", get(metrics::handler))
+        // The installable app's manifest, and the short link in on-call text messages.
+        .route("/manifest.webmanifest", get(pwa::handler))
+        .route("/a/{token}", get(oncall::short_link))
         .nest("/api", api::router(state.cfg.attachment_max_bytes()))
         // The same routes under a version: what API keys and integrations should use.
         .nest("/api/v1", api::router(state.cfg.attachment_max_bytes()))
@@ -489,6 +578,9 @@ async fn housekeeping(state: Arc<AppState>) {
         if let Err(e) = netmon::rollup(db).await {
             warn!("housekeeping: rolling up network samples: {e}");
         }
+        if let Err(e) = uptime::rollup(db).await {
+            warn!("housekeeping: rolling up uptime results: {e}");
+        }
         // The rest is bulk deletion; hourly is plenty.
         if runs.is_multiple_of(12) {
             state.limits.prune();
@@ -506,6 +598,12 @@ async fn housekeeping(state: Arc<AppState>) {
             );
             if let Err(e) = netmon::prune(db, state.cfg.metrics_raw_days as i32, state.cfg.metrics_retention_days as i32).await {
                 warn!("housekeeping: pruning network samples: {e}");
+            }
+            if let Err(e) = uptime::prune(db, state.cfg.metrics_raw_days as i32, state.cfg.metrics_retention_days as i32).await {
+                warn!("housekeeping: pruning uptime results: {e}");
+            }
+            if let Err(e) = backups::prune(db).await {
+                warn!("housekeeping: pruning backup jobs: {e}");
             }
             if let Err(e) = patches::prune(db).await {
                 warn!("housekeeping: pruning patches: {e}");

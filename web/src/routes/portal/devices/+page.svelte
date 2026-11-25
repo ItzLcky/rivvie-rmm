@@ -32,7 +32,7 @@
 
 <div class="space-y-6">
 	<div>
-		<h1 class="text-2xl font-semibold tracking-tight">Devices</h1>
+		<h1 class="text-2xl font-medium">Devices</h1>
 		<p class="text-muted mt-1 text-sm">
 			{#if devices?.length}{plural(devices.length, 'device')} we look after for {me.data?.contact.client_name}, {online} online now.{:else}The computers we look after for you.{/if}
 		</p>

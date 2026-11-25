@@ -3,7 +3,7 @@
 	import { ago, datetime, num, plural } from '#lib/format.js';
 	import { liveReload } from '#lib/live.svelte.js';
 	import { acknowledge, alertCounts, resolve } from '#lib/monitoring/alerts.svelte.js';
-	import { kindLabels } from '#lib/monitoring/labels.js';
+	import { alertPlace as place, kindLabels } from '#lib/monitoring/labels.js';
 	import { inBatches, paged } from '#lib/paged.svelte.js';
 	import { clientId, currentClient, withClient } from '#lib/scope.svelte.js';
 	import { can } from '#lib/session.svelte.js';
@@ -22,6 +22,7 @@
 	import AlertStateBadge from '#lib/components/AlertStateBadge.svelte';
 	import SeverityBadge from '#lib/components/SeverityBadge.svelte';
 	import MaintenanceWindows from '#lib/components/MaintenanceWindows.svelte';
+	import OnCallChip from '#lib/oncall/OnCallChip.svelte';
 
 	const sort = sortState('opened', 'desc');
 	let q = $state(param('q'));
@@ -66,6 +67,8 @@
 	{#snippet actions()}<Button icon={ShieldCheck} href={withClient('/policies')}>Policies</Button>{/snippet}
 </PageHeader>
 
+<div class="mb-3"><OnCallChip /></div>
+
 <Tabs
 	label="State"
 	class="mb-3"
@@ -80,15 +83,21 @@
 	{#snippet sevCell(a: Alert)}<SeverityBadge severity={a.severity} />{/snippet}
 	{#snippet titleCell(a: Alert)}
 		<a class="hover:text-accent font-medium" href="/alerts/{a.id}">{a.title}</a>
-		<div class="text-muted max-w-md truncate text-xs"><span class="sm:hidden">{a.hostname} · {a.severity} · {ago(a.opened_at)}</span><span class="hidden sm:inline">{a.policy_name ?? kindLabels[a.kind]}</span>{a.occurrences > 1 ? ` · ${num(a.occurrences)} times` : ''}</div>
+		<div class="text-muted max-w-md truncate text-xs"><span class="sm:hidden">{a.hostname ?? a.monitor_name ?? a.client_name} · {a.severity} · {ago(a.opened_at)}</span><span class="hidden sm:inline">{a.policy_name ?? kindLabels[a.kind]}</span>{a.occurrences > 1 ? ` · ${num(a.occurrences)} times` : ''}</div>
 	{/snippet}
 	{#snippet agentCell(a: Alert)}
 		{#if a.device_id}
 			<a class="hover:text-accent font-medium" href="/network/devices/{a.device_id}">{a.device_name ?? 'Network device'}</a>
-			<div class="text-muted truncate text-xs">{a.client_name} › {a.site_name} · read by {a.hostname}</div>
-		{:else}
+			<div class="text-muted truncate text-xs">{place(a)} · read by {a.hostname}</div>
+		{:else if a.monitor_id}
+			<a class="hover:text-accent font-medium" href="/uptime/{a.monitor_id}">{a.monitor_name ?? 'Uptime monitor'}</a>
+			<div class="text-muted truncate text-xs">{place(a)} · {a.hostname ? `checked by ${a.hostname}` : 'checked by the server'}</div>
+		{:else if a.agent_id}
 			<a class="hover:text-accent font-medium" href="/agents/{a.agent_id}?tab=alerts">{a.hostname}</a>
-			<div class="text-muted truncate text-xs">{a.client_name} › {a.site_name}</div>
+			<div class="text-muted truncate text-xs">{place(a)}</div>
+		{:else}
+			<span class="text-muted">No device</span>
+			<div class="text-muted truncate text-xs">{place(a)}</div>
 		{/if}
 	{/snippet}
 	{#snippet stateCell(a: Alert)}<AlertStateBadge alert={a} />{/snippet}

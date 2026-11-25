@@ -10,6 +10,8 @@ rmm-proto.workspace = true
 rmm-content.workspace = true
 # The signature database format only (no YARA engine on the server).
 rmm-scan.workspace = true
+# URL rules for uptime monitors now; the checks themselves when the server runs them (step C1b).
+rmm-checks = { path = "../rmm-checks" }
 anyhow.workspace = true
 thiserror.workspace = true
 serde.workspace = true
@@ -35,6 +37,8 @@ sha1 = "0.11"
 data-encoding = "2"
 tar = { version = "0.4", default-features = false }
 flate2 = "1"
+# Branding images: dimension checks and the PDF and .ico forms of uploaded logos.
+png = "0.18"
 rpm = { version = "0.30", default-features = false, features = ["payload", "gzip-compression"] }
 msi = "0.11"
 cab = "0.6"
@@ -55,6 +59,8 @@ ring = "0.17"
 webauthn-rs = "0.6"
 
 [dev-dependencies]
+# Certificates for the uptime e2e's TLS listeners (valid, expiring, expired).
+rcgen = "0.14"
 # A software authenticator for the passkey tests.
 webauthn-authenticator-rs = { version = "0.6", features = ["softpasskey"] }
 ed25519-dalek.workspace = true

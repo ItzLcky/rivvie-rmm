@@ -511,6 +511,8 @@ struct Outgoing<'a> {
     mailbox_id: Option<Uuid>,
     /// Stored files to attach: (name, content type, storage key).
     files: Vec<(String, String, String)>,
+    /// Whose people it goes to: their client's branding (sender name, footer) applies.
+    client_id: Option<Uuid>,
 }
 
 
@@ -536,10 +538,12 @@ async fn enqueue(st: &AppState, o: Outgoing<'_>) -> Result<Uuid> {
     let message_id = format!("{}@{}", Uuid::new_v4().simple(), id_domain(st));
     let c = st.company();
     let configured = smtp_configured(st) || sends_via_graph(&st.db, o.mailbox_id).await?;
+    let brand = crate::branding::resolve(st, o.client_id);
+    let body = with_footer(&o.body, brand.email_footer.as_deref());
     sqlx::query(
         "INSERT INTO email_messages (id, direction, ticket_id, event_id, message_id, in_reply_to, \"references\", from_addr, to_addrs,
-                                     reply_to, subject, body, status, purpose, last_error, mailbox_id, files)
-         VALUES ($1, 'out', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
+                                     reply_to, subject, body, status, purpose, last_error, mailbox_id, files, from_name)
+         VALUES ($1, 'out', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)",
     )
     .bind(id)
     .bind(o.ticket_id)
@@ -551,18 +555,27 @@ async fn enqueue(st: &AppState, o: Outgoing<'_>) -> Result<Uuid> {
     .bind(&o.to)
     .bind(&o.reply_to)
     .bind(&o.subject)
-    .bind(&o.body)
+    .bind(&body)
     .bind(if configured { "pending" } else { "failed" })
     .bind(o.purpose)
     .bind((!configured).then_some("no mail server: set one up under Company settings → Notifications"))
     .bind(o.mailbox_id)
     .bind(serde_json::Value::Array(o.files.iter().map(|(n, c, k)| json!({ "name": n, "content_type": c, "key": k })).collect()))
+    .bind(&brand.email_from_name)
     .execute(&st.db)
     .await?;
     if configured {
         st.notify_wake.notify_one();
     }
     Ok(id)
+}
+
+/// The branding footer under a plain-text body, after the usual "-- " separator.
+fn with_footer(body: &str, footer: Option<&str>) -> String {
+    match footer.map(str::trim).filter(|f| !f.is_empty()) {
+        Some(f) => format!("{}\n\n-- \n{f}\n", body.trim_end()),
+        None => body.to_string(),
+    }
 }
 
 /// The thread so far, for In-Reply-To and References: the last message, and up to 20 ids.
@@ -583,6 +596,7 @@ struct ReplyCtx {
     number: i64,
     subject: String,
     mailbox_id: Option<Uuid>,
+    client_id: Option<Uuid>,
     recipient: Option<String>,
 }
 
@@ -590,7 +604,7 @@ struct ReplyCtx {
 /// Returns `None` when there's nobody to send it to.
 pub async fn queue_reply(st: &AppState, ticket_id: Uuid, event_id: i64, body: &str, author: &str) -> Result<Option<Uuid>> {
     let c: ReplyCtx = sqlx::query_as(
-        "SELECT t.number, t.subject, t.mailbox_id,
+        "SELECT t.number, t.subject, t.mailbox_id, t.client_id,
                 coalesce(nullif(co.email, ''), nullif(t.requester_email, '')) AS recipient
            FROM tickets t LEFT JOIN contacts co ON co.id = t.contact_id WHERE t.id = $1",
     )
@@ -621,6 +635,7 @@ pub async fn queue_reply(st: &AppState, ticket_id: Uuid, event_id: i64, body: &s
             purpose: "reply",
             mailbox_id: mailbox.map(|m| m.0),
             files: vec![],
+            client_id: c.client_id,
         },
     )
     .await?;
@@ -639,8 +654,8 @@ async fn queue_acknowledgement(st: &AppState, ticket_id: Uuid, to: &str, in_repl
         info!(%to, "not acknowledging: rate limit");
         return Ok(());
     }
-    let (number, subject, mailbox): (i64, String, Option<Uuid>) =
-        sqlx::query_as("SELECT number, subject, mailbox_id FROM tickets WHERE id = $1").bind(ticket_id).fetch_one(&st.db).await?;
+    let (number, subject, mailbox, client_id): (i64, String, Option<Uuid>, Option<Uuid>) =
+        sqlx::query_as("SELECT number, subject, mailbox_id, client_id FROM tickets WHERE id = $1").bind(ticket_id).fetch_one(&st.db).await?;
     let brand = brand(st);
     let mailbox = reply_mailbox(&st.db, mailbox).await?;
     enqueue(
@@ -660,6 +675,7 @@ async fn queue_acknowledgement(st: &AppState, ticket_id: Uuid, to: &str, in_repl
             purpose: "auto_reply",
             mailbox_id: mailbox.map(|m| m.0),
             files: vec![],
+            client_id,
         },
     )
     .await?;
@@ -669,6 +685,15 @@ async fn queue_acknowledgement(st: &AppState, ticket_id: Uuid, to: &str, in_repl
 /// Emails a technician about a ticket: `subject` and `lead` get the ticket's number and
 /// subject appended, and the body links to it. A no-op without a mail server.
 async fn queue_staff(st: &AppState, ticket_id: Uuid, user_id: Uuid, subject: &str, lead: &str, purpose: &str) -> Result<()> {
+    // The person's devices, and whether they still want the email (Account → Notifications).
+    let event = match purpose {
+        "assigned" => "ticket_assigned",
+        "client_message" => "ticket_reply",
+        _ => "sla_warning",
+    };
+    if !crate::push::ticket_event(st, user_id, event, ticket_id, subject).await {
+        return Ok(());
+    }
     if !smtp_configured(st) {
         return Ok(()); // nothing to do without a mail server, and no point recording failures
     }
@@ -721,7 +746,7 @@ pub async fn queue_sla(st: &AppState, ticket_id: Uuid, user_id: Uuid, events: &[
 }
 
 /// A portal sign-in link or invitation.
-pub async fn queue_portal_link(st: &AppState, to: &str, name: &str, url: &str, invite: bool) -> Result<()> {
+pub async fn queue_portal_link(st: &AppState, client_id: Uuid, to: &str, name: &str, url: &str, invite: bool) -> Result<()> {
     let brand = brand(st);
     let (subject, lead) = if invite {
         (format!("You're invited to the {brand} support portal"), format!("Hello {name},\n\n{brand} invited you to its support portal, where you can open tickets, follow them and reply."))
@@ -740,6 +765,7 @@ pub async fn queue_portal_link(st: &AppState, to: &str, name: &str, url: &str, i
             ),
             purpose: "portal_link",
             mailbox_id: mailbox.map(|m| m.0),
+            client_id: Some(client_id),
             ..Default::default()
         },
     )
@@ -748,7 +774,7 @@ pub async fn queue_portal_link(st: &AppState, to: &str, name: &str, url: &str, i
 }
 
 /// An invoice (or credit note) with its PDF, to the client's billing contacts.
-pub async fn queue_invoice(st: &AppState, to: Vec<String>, subject: String, body: String, pdf: (String, String)) -> Result<Uuid> {
+pub async fn queue_invoice(st: &AppState, client_id: Uuid, to: Vec<String>, subject: String, body: String, pdf: (String, String)) -> Result<Uuid> {
     let mailbox = reply_mailbox(&st.db, None).await?;
     enqueue(
         st,
@@ -760,10 +786,35 @@ pub async fn queue_invoice(st: &AppState, to: Vec<String>, subject: String, body
             purpose: "invoice",
             mailbox_id: mailbox.map(|m| m.0),
             files: vec![(pdf.0, "application/pdf".into(), pdf.1)],
+            client_id: Some(client_id),
             ..Default::default()
         },
     )
     .await
+}
+
+/// A scheduled report's PDF to one recipient (crate::reports). Returns the message id and
+/// whether it can go out (`false`: no mail server, so the outbox recorded it as failed).
+/// `client_id` is the report's client, whose branding (sender name, footer) the mail carries.
+pub async fn queue_report(st: &AppState, to: String, subject: String, body: String, pdf: (String, String), client_id: Option<Uuid>) -> Result<(Uuid, bool)> {
+    let mailbox = reply_mailbox(&st.db, None).await?;
+    let id = enqueue(
+        st,
+        Outgoing {
+            to: vec![to],
+            subject,
+            body,
+            reply_to: mailbox.as_ref().map(|m| m.1.clone()),
+            purpose: "report",
+            mailbox_id: mailbox.map(|m| m.0),
+            files: vec![(pdf.0, "application/pdf".into(), pdf.1)],
+            client_id,
+            ..Default::default()
+        },
+    )
+    .await?;
+    let ok: bool = sqlx::query_scalar("SELECT status <> 'failed' FROM email_messages WHERE id = $1").bind(id).fetch_one(&st.db).await?;
+    Ok((id, ok))
 }
 
 /// Tells an account manager a block-hours contract is running low.
@@ -781,8 +832,8 @@ pub async fn queue_staff_note(st: &AppState, user_id: Uuid, subject: &str, body:
 
 /// "How did we do?" after a ticket is resolved, with one-click links.
 pub async fn queue_survey(st: &AppState, ticket_id: Uuid, to: &str, token: &str) -> Result<()> {
-    let (number, subject, mailbox): (i64, String, Option<Uuid>) =
-        sqlx::query_as("SELECT number, subject, mailbox_id FROM tickets WHERE id = $1").bind(ticket_id).fetch_one(&st.db).await?;
+    let (number, subject, mailbox, client_id): (i64, String, Option<Uuid>, Option<Uuid>) =
+        sqlx::query_as("SELECT number, subject, mailbox_id, client_id FROM tickets WHERE id = $1").bind(ticket_id).fetch_one(&st.db).await?;
     let brand = brand(st);
     let base = format!("{}/feedback/{token}", st.cfg.public_url);
     let mailbox = reply_mailbox(&st.db, mailbox).await?;
@@ -798,6 +849,7 @@ pub async fn queue_survey(st: &AppState, ticket_id: Uuid, to: &str, token: &str)
             reply_to: mailbox.as_ref().map(|m| m.1.clone()),
             purpose: "survey",
             mailbox_id: mailbox.map(|m| m.0),
+            client_id,
             ..Default::default()
         },
     )
@@ -825,6 +877,7 @@ struct OutRow {
     attempts: i32,
     mailbox_id: Option<Uuid>,
     files: serde_json::Value,
+    from_name: Option<String>,
 }
 
 const OUTBOX_BATCH: i64 = 20;
@@ -835,7 +888,7 @@ pub async fn drain_outbox(st: &AppState) -> Result<usize> {
         "UPDATE email_messages SET attempts = attempts + 1, next_attempt_at = now() + interval '10 minutes'
           WHERE id IN (SELECT id FROM email_messages WHERE direction = 'out' AND status = 'pending' AND next_attempt_at <= now()
                         ORDER BY created_at LIMIT $1 FOR UPDATE SKIP LOCKED)
-          RETURNING id, event_id, message_id, in_reply_to, \"references\", to_addrs, reply_to, subject, body, purpose, attempts, mailbox_id, files",
+          RETURNING id, event_id, message_id, in_reply_to, \"references\", to_addrs, reply_to, subject, body, purpose, attempts, mailbox_id, files, from_name",
     )
     .bind(OUTBOX_BATCH)
     .fetch_all(&st.db)
@@ -891,7 +944,9 @@ async fn send(st: &AppState, r: &OutRow) -> Result<(), String> {
             (Some(m), f)
         }
     };
-    let from = LMailbox::new(Some(brand(st)), from.email);
+    // Queued before branding existed: the instance's sender name.
+    let name = r.from_name.clone().filter(|n| !n.trim().is_empty()).unwrap_or_else(|| crate::branding::resolve(st, None).email_from_name);
+    let from = LMailbox::new(Some(name), from.email);
     let mut b = lettre::Message::builder().from(from).subject(&r.subject).message_id(Some(format!("<{}>", r.message_id)));
     for t in &r.to_addrs {
         b = b.to(t.parse().map_err(|_| format!("{t} is not an email address"))?);

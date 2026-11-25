@@ -18,6 +18,8 @@
 	import IconButton from '#lib/ui/IconButton.svelte';
 	import Input from '#lib/ui/Input.svelte';
 	import Modal from '#lib/ui/Modal.svelte';
+	import Badge from '#lib/ui/Badge.svelte';
+	import Segmented from '#lib/ui/Segmented.svelte';
 	import CredentialCard from './CredentialCard.svelte';
 	import VaultForm from './VaultForm.svelte';
 	import VaultState from './VaultState.svelte';
@@ -26,7 +28,9 @@
 	let { clientId, clientName }: { clientId: string; clientName: string } = $props();
 
 	const access = vaultAccess();
-	const list = resource(() => (access === 'ok' ? api.get<VaultItem[]>(`/clients/${clientId}/vault`) : Promise.resolve([] as VaultItem[])));
+	// All, or only what the server keeps (recovery keys, rotated passwords), or only people's.
+	let kind = $state<'all' | 'managed' | 'manual'>('all');
+	const list = resource(() => (access === 'ok' ? api.get<VaultItem[]>(`/clients/${clientId}/vault${kind === 'all' ? '' : `?kind=${kind}`}`) : Promise.resolve([] as VaultItem[])));
 	const problem = $derived(access === 'mfa' ? 'mfa' : access === 'none' ? 'perm' : list.error ? vaultProblem(list.error) : null);
 	const manage = canManageVault();
 
@@ -93,7 +97,7 @@
 
 {#snippet nameCell(r: VaultItem)}
 	<a class="hover:text-accent flex items-center gap-2 font-medium" href="?tab=passwords&item={r.id}">
-		<KeyRound class="text-subtle size-3.5 shrink-0" aria-hidden="true" />{r.name}
+		<KeyRound class="text-subtle size-3.5 shrink-0" aria-hidden="true" />{r.name}{#if r.managed_kind}<Badge tone="info">Managed</Badge>{/if}
 	</a>
 {/snippet}
 {#snippet userCell(r: VaultItem)}<span class="font-mono text-xs">{r.username}</span>{/snippet}
@@ -125,6 +129,7 @@
 		key={(r) => r.id} loading={list.loading} busy={list.busy} rowHref={(r) => `?tab=passwords&item=${r.id}`} scroll={false}>
 		{#snippet toolbar()}
 			<Input icon={Search} class="w-full max-w-xs" bind:value={q} placeholder="Filter by name, username or URL" aria-label="Filter passwords" />
+			<Segmented label="Kind of credential" value={kind} onchange={(v) => (kind = v)} options={[{ value: 'all', label: 'All' }, { value: 'managed', label: 'Managed' }, { value: 'manual', label: 'Added by people' }]} />
 			{#if manage}<Button variant="primary" icon={Plus} class="ml-auto sm:ml-0" onclick={() => (form = { item: null })}>New password</Button>{/if}
 		{/snippet}
 		{#snippet empty()}

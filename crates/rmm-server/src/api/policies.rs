@@ -31,8 +31,11 @@ fn may_edit(u: &User, owner: Option<Uuid>) -> ApiResult<()> {
 
 fn may_edit_module(u: &User, owner: Option<Uuid>, module: Module) -> ApiResult<()> {
     may_edit(u, owner)?;
-    if module == Module::Security {
-        u.need(Perm::SecurityManage)?;
+    match module {
+        Module::Security | Module::DiskEncryption => u.need(Perm::SecurityManage)?,
+        // It decides which accounts get passwords the vault keeps.
+        Module::LocalAdmin => u.need(Perm::VaultManage)?,
+        _ => {}
     }
     Ok(())
 }
@@ -620,8 +623,8 @@ async fn item_views(st: &AppState, u: &User, chain: &[ChainEntry], agent: Option
                    FROM agents xa JOIN sites xs ON xs.id = xa.site_id
                   WHERE xa.id = ANY(i.excluded_agents) AND ($2::uuid[] IS NULL OR xs.client_id = ANY($2))) AS excluded,
                 i.excluded_agents, e.enabled AS eff_enabled, e.config AS eff_config,
-                (SELECT count(*) FROM alerts al JOIN agents aa ON aa.id = al.agent_id JOIN sites sa ON sa.id = aa.site_id
-                  WHERE al.policy_id = i.id AND al.resolved_at IS NULL AND ($2::uuid[] IS NULL OR sa.client_id = ANY($2))
+                (SELECT count(*) FROM alerts al
+                  WHERE al.policy_id = i.id AND al.resolved_at IS NULL AND ($2::uuid[] IS NULL OR al.client_id = ANY($2))
                     AND ($3::uuid IS NULL OR al.agent_id = $3)) AS open_alerts,
                 ss.next_run_at, ss.last_run_at,
                 CASE WHEN i.module = 'automation' THEN (
@@ -634,7 +637,7 @@ async fn item_views(st: &AppState, u: &User, chain: &[ChainEntry], agent: Option
            LEFT JOIN clients c ON c.id = i.client_id LEFT JOIN sites si ON si.id = i.site_id
            LEFT JOIN policy_schedule_state ss ON ss.item_id = i.id
           WHERE e.set_id = $1 AND ($2::uuid[] IS NULL OR i.client_id IS NULL OR i.client_id = ANY($2))
-          ORDER BY array_position(ARRAY['alert', 'schedule', 'patch', 'security', 'remote_access', 'agent', 'automation'], i.module), lower(i.name)",
+          ORDER BY array_position(ARRAY['alert', 'schedule', 'patch', 'security', 'remote_access', 'agent', 'tray', 'automation'], i.module), lower(i.name)",
     )
     .bind(here.id)
     .bind(u.scope())
@@ -792,11 +795,13 @@ async fn check_refs(st: &AppState, u: &User, module: Module, config: &Value, own
             if let Some(s) = uuid(config.get("script_id")) {
                 script_ok(s).await?;
             }
+            vault_params_ok(u, config)?;
         }
         Module::Automation => {
             if let Some(s) = uuid(config.get("script_id")) {
                 script_ok(s).await?;
             }
+            vault_params_ok(u, config)?;
             if let Some(t) = uuid(config.get("tag_id")) {
                 let exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM tags WHERE id = $1)").bind(t).fetch_one(&st.db).await?;
                 if !exists {
@@ -837,6 +842,17 @@ async fn check_refs(st: &AppState, u: &User, module: Module, config: &Value, own
             }
         }
         _ => {}
+    }
+    Ok(())
+}
+
+/// A schedule or automation whose parameters name vault items is written by someone who may use
+/// the vault (and not through an API key: the vault isn't in the public API). Which client the
+/// items belong to is checked with the merged configs (params::check_policy).
+fn vault_params_ok(u: &User, config: &Value) -> ApiResult<()> {
+    let names_vault = config.get("params").and_then(Value::as_object).is_some_and(|m| m.values().any(|v| v.as_str().and_then(crate::params::vault_ref).is_some()));
+    if names_vault && (u.api_key.is_some() || !super::vault::can_read(u)) {
+        return Err(ApiError::Denied("taking a parameter from the vault needs vault access (and two-factor authentication)".into()));
     }
     Ok(())
 }
@@ -933,6 +949,7 @@ pub async fn create_item(State(st): State<Arc<AppState>>, u: User, Path(set_id):
         schedule_state(&mut tx, id, &config).await?;
     }
     policy::rebuild(&mut tx, Some(&[id])).await?;
+    policy::validate_effective(&mut tx, &[id]).await?.map_err(bad)?;
     let agents = policy::agents_reached(&mut tx, &[id]).await?;
     tx.commit().await?;
     auth::audit(

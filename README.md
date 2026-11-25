@@ -101,9 +101,14 @@ quiet) is passed as `RMM_E2E_SNMP=<ip>:<container>`. The recipe, with the users 
 needs, is in `crates/rmm-snmp/tests/netsnmp.rs`, which also tests the SNMP client against it.
 Without `RMM_E2E_SNMP` the section checks what doesn't need a device.
 
+`RMM_E2E_ONLY=vulnerabilities` runs just the vulnerabilities section: a mock feed server stands in
+for OSV, the Arch tracker, NVD, KEV and EPSS, serving an advisory for a real package of the host's
+own inventory (pacman on Arch, dpkg on Debian and Ubuntu).
+
 `tests/e2e_windows.rs` is the Windows counterpart: it installs the agent from the generated MSI as
 a real service and runs PowerShell and cmd jobs, a Job Object tree kill, a service restart, an
-upgrade, ConPTY terminals, Event Log watchers, a Windows Update scan, Defender, the sensor, a
+upgrade, ConPTY terminals, Event Log watchers, a Windows Update scan, Defender, the sensor, a disk
+encryption report, a local admin account created and rotated through the NetUser APIs, a
 signed self-update with a forced rollback, and an uninstall. `RMM_E2E_ONLY` / `RMM_E2E_SKIP` pick
 sections. It changes the machine it runs on, so it runs in CI (`windows-latest`) or on a throwaway
 VM; see the file for the command. What CI can't cover (real hardware, RDP, third-party antivirus,
@@ -327,6 +332,7 @@ The settings most installs touch; [docs/OPERATOR.md](docs/OPERATOR.md#environmen
 | `RMM_TRUSTED_PROXIES` | empty | Reverse proxies whose `X-Forwarded-For` gives the client IP (for rate limiting and the audit log): comma-separated addresses/CIDRs, or `private` for loopback + RFC 1918 + IPv6 ULA. The bundled compose stack sets `private` for Caddy |
 | `RMM_ATTACHMENT_MAX_MB` | `100` | Largest ticket or portal attachment, per file. Uploads and downloads stream to and from storage (S3 multipart over 8 MB), so this bounds disk use, not server memory. Replies email attachments up to 15 MB in total; larger files go as links (the portal for contacts who can sign in, otherwise a download link valid for 30 days) |
 | `RMM_METRICS_TOKEN` | empty | Turns on `GET /metrics` (see [Monitoring the server](#monitoring-the-server)); without it the route answers 404 |
+| `RMM_SOURCE_URL` | the upstream repository | The "Licence and source" link in the console and portal (AGPL-3.0 §13); point it at your own copy if you change the code. Branding (Settings → Branding) never hides it |
 | `RMM_LOG_FORMAT` | `text` | `json`: one JSON object per log line |
 
 ## Monitoring the server
@@ -716,7 +722,10 @@ give them to others under Users → Permissions). Technicians log time without s
   logged on the project and its tickets; a **schedule** of who works on what, when; **client
   documentation** pages with their history (Clients → a client → Docs); and **reports**: service desk
   volume, backlog age, response and resolution times, SLA attainment and satisfaction; utilisation;
-  client profitability; and a quarterly business review PDF per client.
+  client profitability; and a quarterly business review PDF per client. Any of them can be
+  **scheduled** (Reports → Scheduled): a PDF on a weekly, monthly or quarterly timetable, emailed
+  to users and the client's contacts, built with its owner's access at the time it's sent
+  ([design](docs/design/scheduled-reports.md)).
 
 ## Documentation and passwords
 
@@ -808,6 +817,12 @@ Design: [docs/design/audit-siem.md](docs/design/audit-siem.md).
 
 A site's designated agent scans its network (ICMP where it may, TCP, the ARP table, reverse DNS, mDNS, SNMP `sysDescr`) and lists what it finds under **Network**: hosts matched to agents by MAC or IP, and an *unmanaged devices* list with ignore, mark-as-known, monitor and deploy-an-agent actions. The same agent reads switches, firewalls and printers over SNMP v2c or v3 (uptime, interface status and traffic, CPU and memory, toner), with charts, hourly rollups and three new alert kinds: device down, interface down and thresholds. SNMP credentials are per client, sealed with `RMM_DATA_KEY`, and never shown again. Scans stay in private address space and are bounded. Design: [docs/design/network.md](docs/design/network.md).
 
+**Wake-on-LAN:** an offline device can be woken from its page (or many from the agents list) through another online agent at its site, which sends the magic packets to the subnet's broadcast address. A patch policy can wake devices before their install window (`wake_before_minutes`). The device's network adapter and BIOS must allow it, and most networks don't pass the broadcast between VLANs. `RMM_WOL_FAKE=<addr:port>` makes a debug agent send the packets there instead. Design: [docs/design/wake-on-lan.md](docs/design/wake-on-lan.md).
+
+## Identity and Intune
+
+A client's **Users** tab manages its directories: Active Directory through our agent on one of its domain controllers (directory operations travel as dedicated agent messages, never as scripts, and the built-in Administrator and krbtgt are never touched), and Entra ID through Microsoft Graph with an app registration in the customer's tenant. Unlock, reset a password (shown once and stored nowhere, or saved in the client's vault), disable and enable, remove from groups and revoke sessions; `identity.read` and `identity.manage`, two-factor authentication for actions and an admin for privileged accounts. Ticket templates ("New starter", "Leaver") carry checklists whose items run those actions. With `DeviceManagementManagedDevices.Read.All` the same Entra connection reads the tenant's Intune devices (read-only) for the **Mobile and Intune** tab. Graph endpoints follow `RMM_GRAPH_URL` and `RMM_GRAPH_LOGIN_URL` (national clouds, tests). `RMM_IDENTITY_FAKE=<file>` makes a debug agent act as a domain controller backed by that JSON file. Design: [docs/design/identity.md](docs/design/identity.md), [docs/design/mdm.md](docs/design/mdm.md).
+
 ## Remote desktop
 
 Open an agent and choose **Remote desktop** (technicians and admins). The agent starts a helper
@@ -836,6 +851,32 @@ Limits: Wayland sessions aren't supported yet (the agent says so; choose an Xorg
 sign-in screen), there's no clipboard sync or session recording, and the Windows side is
 compile-checked only, like the rest of the Windows agent. `RMM_DESKTOP_FAKE=<file>` makes the
 agent serve a synthetic screen and log input to `<file>`, for testing without a display.
+
+## Vulnerabilities
+
+Installed software is checked against known vulnerabilities: Linux packages against their
+distribution's own advisories (OSV for Debian, Ubuntu, AlmaLinux, Rocky Linux, Red Hat, SUSE,
+openSUSE and Alpine, and the Arch security tracker), Windows applications against NVD through a
+curated product map (Vulnerabilities → Feeds & products; titles are never guessed), with CISA's
+known-exploited catalogue and EPSS to rank them. The feeds are mirrored into the database daily,
+only for the systems in the fleet, so no inventory leaves the server. Set `RMM_NVD_API_KEY` (free
+from nvd.nist.gov) for faster NVD syncs. A server without internet access loads saved copies of
+the same files with `rmm-server vuln-import <dir>`. The `vulnerability` alert kind opens one alert
+per device. See [docs/design/vulnerabilities.md](docs/design/vulnerabilities.md).
+
+## Tray app
+
+`rmm-agent tray` is the help desk app for the person at the machine, running as them and
+talking to the agent service over a local socket (`/run/rmm-agent/tray.sock`, or the named pipe
+`\\.\pipe\rmm-agent-tray` on Windows). On Windows it's an icon in the notification area,
+started at sign-in by the MSI's `Run` value: Request help (subject, description, an optional
+screenshot), the branded contact card and the links from the device's **Tray app** policy. On
+Linux the deb and rpm add a "Request help" launcher (zenity or kdialog) and an autostart entry
+that shows consent prompts and the "technician connected" notice. A request becomes a ticket for
+the device's client ("From device") on the board chosen in Settings → Service desk, with the
+device linked, the screenshot and a context note; made offline, it's sent when the agent is back.
+For scripts and tests: `rmm-agent tray --request --subject "…" [--body "…"] [--screenshot
+file.png]` and `rmm-agent tray --show-config`. See [docs/design/tray.md](docs/design/tray.md).
 
 ## Endpoint protection
 

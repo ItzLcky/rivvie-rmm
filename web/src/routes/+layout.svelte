@@ -14,7 +14,7 @@
 	import { loadPrefs } from '#lib/prefs.svelte.js';
 	import { prefs } from '#lib/prefs.svelte.js';
 	import { loadClients, withClient } from '#lib/scope.svelte.js';
-	import { brand, loadCompany, session } from '#lib/session.svelte.js';
+	import { brand, company, loadCompany, session } from '#lib/session.svelte.js';
 	import { toast } from '#lib/toast.svelte.js';
 	import type { AgentSummary, User } from '#lib/types.js';
 	import { cx } from '#lib/format.js';
@@ -23,6 +23,8 @@
 	import CommandPalette from '#lib/shell/CommandPalette.svelte';
 	import ShortcutsHelp from '#lib/shell/ShortcutsHelp.svelte';
 	import { nav } from '#lib/shell/nav.js';
+	import BottomNav from '#lib/shell/BottomNav.svelte';
+	import { standalone as isStandalone } from '#lib/push.js';
 	import Drawer from '#lib/ui/Drawer.svelte';
 	import Toaster from '#lib/ui/Toaster.svelte';
 	import ConfirmHost from '#lib/ui/ConfirmHost.svelte';
@@ -73,6 +75,15 @@
 	});
 
 	let drawer = $state(false);
+	// Installed as an app: a tab bar at the bottom on phones.
+	let standalone = $state(false);
+	$effect(() => {
+		standalone = isStandalone();
+		const mq = window.matchMedia('(display-mode: standalone)');
+		const on = () => (standalone = isStandalone());
+		mq.addEventListener?.('change', on);
+		return () => mq.removeEventListener?.('change', on);
+	});
 	let palette = $state(false);
 	let shortcuts = $state(false);
 	let runOn = $state<AgentSummary | null>(null);
@@ -132,7 +143,7 @@
 <svelte:window {onkeydown} />
 
 <svelte:head>
-	<link rel="icon" href={favicon} />
+	<link rel="icon" href={company.branding?.icon ?? favicon} />
 	<title>{brand()}</title>
 </svelte:head>
 
@@ -141,7 +152,7 @@
 		{@render children()}
 	{:else if session.user}
 		<a href="#main" class="bg-accent text-on-accent sr-only z-[80] rounded-md px-3 py-2 focus:not-sr-only focus:fixed focus:top-2 focus:left-2">Skip to content</a>
-		<div class="flex min-h-dvh">
+		<div class="flex min-h-dvh" style={standalone ? '--bottom-bar: calc(3.5rem + env(safe-area-inset-bottom))' : undefined}>
 			<!-- The navy column runs the full page height; the rail inside it stays pinned. -->
 			<div class={cx('bg-nav border-nav-border hidden shrink-0 border-r lg:block', prefs.sidebarCollapsed ? 'w-16' : 'w-64')}>
 				<aside class="sticky top-0 h-dvh">
@@ -155,9 +166,10 @@
 				{#if !session.user.mfa_setup_required}
 					<TopBar onmenu={() => (drawer = true)} onsearch={() => (palette = true)} onshortcuts={() => (shortcuts = true)} />
 				{/if}
-				<main id="main" class="mx-auto w-full max-w-[1600px] min-w-0 flex-1 px-3 py-4 sm:px-6 sm:py-6 lg:px-8 lg:py-7">{@render children()}</main>
+				<main id="main" class={cx('mx-auto w-full max-w-[1600px] min-w-0 flex-1 px-3 py-4 sm:px-6 sm:py-6 lg:px-8 lg:py-7', standalone && 'pb-24 lg:pb-7')}>{@render children()}</main>
 			</div>
 		</div>
+		{#if standalone && !session.user.mfa_setup_required}<BottomNav onmore={() => (drawer = true)} />{/if}
 		<CommandPalette bind:open={palette} onrun={openRun} onshortcuts={() => (shortcuts = true)} />
 		{#if shortcuts}<ShortcutsHelp onclose={() => (shortcuts = false)} />{/if}
 		{#if runOn}<RunScript agents={[runOn]} onclose={() => (runOn = null)} />{/if}

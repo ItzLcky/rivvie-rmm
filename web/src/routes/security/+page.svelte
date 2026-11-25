@@ -35,6 +35,7 @@
 	import SignatureDatabases from '#lib/components/security/SignatureDatabases.svelte';
 	import SecurityHunt from '#lib/components/security/SecurityHunt.svelte';
 	import SecurityQuarantine from '#lib/components/security/SecurityQuarantine.svelte';
+	import DiskEncryptionFleet from '#lib/components/security/DiskEncryptionFleet.svelte';
 	import SecurityRules from '#lib/components/security/SecurityRules.svelte';
 	import SecuritySettings from '#lib/components/security/SecuritySettings.svelte';
 
@@ -124,6 +125,7 @@
 		{ value: 'agents', label: 'Agents' },
 		{ value: 'detections', label: 'Detections', count: summary.data?.active_threats ? num(summary.data.active_threats) : undefined },
 		{ value: 'quarantine', label: 'Quarantine' },
+		{ value: 'encryption', label: 'Disk encryption' },
 		{ value: 'hunt', label: 'Hunt' },
 		{ value: 'rules', label: 'Rules' },
 		{ value: 'content', label: 'Content' },
@@ -307,6 +309,8 @@
 	{/if}
 {:else if tab === 'quarantine'}
 	<SecurityQuarantine />
+{:else if tab === 'encryption'}
+	<DiskEncryptionFleet />
 {:else if tab === 'hunt'}
 	<SecurityHunt />
 {:else if tab === 'rules'}

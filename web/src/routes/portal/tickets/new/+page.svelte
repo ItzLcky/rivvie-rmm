@@ -42,7 +42,7 @@
 <div class="mx-auto max-w-2xl space-y-6">
 	<div>
 		<a href="/portal" class="text-muted hover:text-fg inline-flex items-center gap-1 text-sm"><ArrowLeft class="size-4" aria-hidden="true" />All requests</a>
-		<h1 class="mt-2 text-2xl font-semibold tracking-tight">New request</h1>
+		<h1 class="mt-2 text-2xl font-medium">New request</h1>
 		<p class="text-muted mt-1 text-sm">Tell us what's going on. The more detail, the faster we can help.</p>
 	</div>
 

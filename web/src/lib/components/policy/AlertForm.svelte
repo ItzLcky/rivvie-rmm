@@ -14,7 +14,12 @@
 		patch_failed: boolean; reboot_check: boolean; reboot_hours: number;
 		renotify: boolean; renotify_minutes: number;
 		metric: 'cpu' | 'memory' | 'interface_util' | 'supply'; net_kinds: string; net_names: string;
+		up_failures: number; up_kinds: string; up_cert: boolean; up_cert_days: number; up_latency: boolean; up_latency_ms: number;
+		bk_providers: string[]; bk_sources: BackupSource[]; bk_jobs: string; bk_max_age: number; bk_warning: boolean; bk_require: boolean;
+		de_volumes: 'os' | 'all_fixed'; de_escrow: boolean; de_grace: number; la_overdue: number;
+		vu_severity: 'critical' | 'high' | 'medium' | 'low'; vu_kev: boolean; vu_fix: boolean; vu_days: number; vu_epss_check: boolean; vu_epss: number;
 	};
+	export type BackupSource = { provider: 'restic' | 'borg' | 'file_age'; env_file: string; repo: string; path: string; glob: string };
 	const defaults: Record<PolicyKind, Partial<Draft>> = {
 		offline: { minutes: 10 },
 		cpu: { threshold: 90, minutes: 15 },
@@ -27,13 +32,22 @@
 		patch: {},
 		net_down: { minutes: 5 },
 		net_interface: { minutes: 5 },
-		net_threshold: { threshold: 90, minutes: 10, metric: 'cpu' }
+		net_threshold: { threshold: 90, minutes: 10, metric: 'cpu' },
+		uptime: {},
+		backup: {},
+		disk_encryption: {},
+		local_admin: {},
+		vulnerability: {}
 	};
 	const blank = (kind: PolicyKind): Draft => ({
 		kind, severity: 'warning', channel_ids: [], notify_resolved: true, ticket_board_id: null, ticket_priority: 3, ticket_auto_resolve: true, run_script_id: '',
 		minutes: 10, threshold: 90, services: '', auto_only: false, exclude: '', script_id: '', min_level: 'error', channels: '', sources: '', event_ids: '', pattern: '',
 		unprotected: true, realtime_off: false, sensor_down: true, sig_check: true, sig_hours: 72, threats: 'active', sensor_realtime: true, database_stale: true,
 		stale_check: false, stale_hours: 24, patch_failed: true, reboot_check: true, reboot_hours: 72, renotify: false, renotify_minutes: 240, metric: 'cpu', net_kinds: '', net_names: '',
+		up_failures: 2, up_kinds: '', up_cert: true, up_cert_days: 14, up_latency: false, up_latency_ms: 1000,
+		bk_providers: ['auto'], bk_sources: [], bk_jobs: '*', bk_max_age: 26, bk_warning: false, bk_require: false,
+		de_volumes: 'os', de_escrow: true, de_grace: 24, la_overdue: 7,
+		vu_severity: 'critical', vu_kev: false, vu_fix: true, vu_days: 14, vu_epss_check: false, vu_epss: 10,
 		...defaults[kind]
 	});
 	const list = (s: string) => s.split(/[\n,]/).map((x) => x.trim()).filter(Boolean);
@@ -56,7 +70,18 @@
 			stale_check: q.stale_hours != null, stale_hours: Number(q.stale_hours ?? 24),
 			patch_failed: q.failed !== false, reboot_check: q.reboot_hours != null, reboot_hours: Number(q.reboot_hours ?? 72),
 			renotify: c.renotify_minutes != null, renotify_minutes: (c.renotify_minutes as number) ?? 240,
-			metric: (q.metric as Draft['metric']) ?? 'cpu', net_kinds: text(q.kinds).replaceAll('\n', ', '), net_names: text(q.names)
+			metric: (q.metric as Draft['metric']) ?? 'cpu', net_kinds: text(q.kinds).replaceAll('\n', ', '), net_names: text(q.names),
+			up_failures: Number(q.failures ?? 2), up_kinds: text(q.kinds).replaceAll('\n', ', '), up_cert: q.cert_days !== 0, up_cert_days: Number(q.cert_days || 14),
+			up_latency: q.latency_ms != null, up_latency_ms: Number(q.latency_ms ?? 1000),
+			bk_providers: Array.isArray(q.providers) ? (q.providers as string[]) : ['auto'],
+			bk_sources: Array.isArray(q.sources)
+				? (q.sources as Record<string, string | null>[]).map((s) => ({ provider: (s.provider as BackupSource['provider']) ?? 'restic', env_file: s.env_file ?? '', repo: s.repo ?? '', path: s.path ?? '', glob: s.glob ?? '' }))
+				: [],
+			bk_jobs: Array.isArray(q.jobs) ? (q.jobs as string[]).join('\n') : '*', bk_max_age: Number(q.max_age_hours ?? 26), bk_warning: !!q.warning_is_failure, bk_require: !!q.require,
+			de_volumes: q.volumes === 'all_fixed' ? 'all_fixed' : 'os', de_escrow: q.require_escrow !== false, de_grace: Number(q.grace_hours ?? 24),
+			la_overdue: Number(q.overdue_days ?? 7),
+			vu_severity: (q.min_severity as Draft['vu_severity']) ?? 'critical', vu_kev: !!q.kev_only, vu_fix: q.fix_available_only !== false,
+			vu_days: Number(q.older_than_days ?? 14), vu_epss_check: q.min_epss != null, vu_epss: Math.round(Number(q.min_epss ?? 0.1) * 100)
 		};
 	}
 	function params(d: Draft): Record<string, unknown> {
@@ -90,6 +115,28 @@
 				return { metric: d.metric, threshold: Number(d.threshold), minutes: Number(d.minutes), names: d.metric === 'interface_util' ? list(d.net_names) : [], kinds: list(d.net_kinds) };
 			case 'patch':
 				return { failed: d.patch_failed, reboot_hours: d.reboot_check ? Number(d.reboot_hours) : null };
+			case 'uptime':
+				return { failures: Number(d.up_failures), kinds: list(d.up_kinds), cert_days: d.up_cert ? Number(d.up_cert_days) : 0, latency_ms: d.up_latency ? Number(d.up_latency_ms) : null };
+			case 'disk_encryption':
+				return { volumes: d.de_volumes, require_escrow: d.de_escrow, grace_hours: Number(d.de_grace) };
+			case 'local_admin':
+				return { overdue_days: Number(d.la_overdue) };
+			case 'vulnerability':
+				return {
+					min_severity: d.vu_severity, kev_only: d.vu_kev, fix_available_only: d.vu_fix, older_than_days: Number(d.vu_days),
+					min_epss: d.vu_epss_check ? Number(d.vu_epss) / 100 : null
+				};
+			case 'backup': {
+				const opt = (s: string) => s.trim() || null;
+				return {
+					providers: d.bk_providers,
+					sources: d.bk_sources.map((s) => ({ provider: s.provider, env_file: s.provider === 'file_age' ? null : opt(s.env_file), repo: s.provider === 'file_age' ? null : opt(s.repo), path: s.provider === 'file_age' ? opt(s.path) : null, glob: s.provider === 'file_age' ? opt(s.glob) : null })),
+					jobs: list(d.bk_jobs).length ? list(d.bk_jobs) : ['*'],
+					max_age_hours: Number(d.bk_max_age),
+					warning_is_failure: d.bk_warning,
+					require: d.bk_require
+				};
+			}
 		}
 	}
 	function toConfig(d: Draft): Config {
@@ -160,6 +207,18 @@
 	}
 	function toggleChannel(id: string, on: boolean) {
 		draft.channel_ids = on ? [...draft.channel_ids, id] : draft.channel_ids.filter((c) => c !== id);
+	}
+	const backupProviders = [
+		{ value: 'auto', label: 'Detect', hint: 'Windows Server Backup and Veeam where installed; Time Machine on a Mac' },
+		{ value: 'wsb', label: 'Windows Server Backup' },
+		{ value: 'veeam', label: 'Veeam' },
+		{ value: 'timemachine', label: 'Time Machine' }
+	];
+	function toggleProvider(p: string, on: boolean) {
+		draft.bk_providers = on ? [...draft.bk_providers.filter((x) => x !== p), p] : draft.bk_providers.filter((x) => x !== p);
+	}
+	function addSource() {
+		draft.bk_sources = [...draft.bk_sources, { provider: 'restic', env_file: '', repo: '', path: '', glob: '' }];
 	}
 	const hours = (m: number) => (m < 60 ? `${m} minutes` : m < 1440 ? `${m / 60} hour${m === 60 ? '' : 's'}` : `${m / 1440} day${m === 1440 ? '' : 's'}`);
 </script>
@@ -309,6 +368,110 @@
 				{:else if draft.kind === 'net_interface'}Only ports that are switched on in the device’s configuration and have been seen up count; a port someone turned off isn’t a fault.
 				{:else}Evaluated whenever the designated agent reads the device. Add this item to the <em>designated agent’s</em> policy set; scope it with the item’s client and site.{/if}
 			</p>
+		{:else if draft.kind === 'uptime'}
+			<div class="grid gap-3 sm:grid-cols-2">
+				<PField path="params.failures" label="Down after (failed checks in a row)" id="p-fail" hint="One failure alone is often a blip.">
+					<Input id="p-fail" type="number" min="1" max="20" class="max-w-40" bind:value={draft.up_failures} />
+				</PField>
+				<PField path="params.kinds" label="Only these kinds of monitor" id="p-ukinds" hint="Comma-separated: ping, tcp, http, tls, dns. Empty: all.">
+					<Input id="p-ukinds" bind:value={draft.up_kinds} placeholder="http, tls" />
+				</PField>
+			</div>
+			<PField path="params.cert_days" name="Certificate expiry" hint="TLS monitors, and HTTP monitors of https:// addresses.">
+				<Switch bind:checked={draft.up_cert}>A certificate is about to expire</Switch>
+				{#if draft.up_cert}
+					<div class="mt-2 ml-11.5 flex items-center gap-2">
+						<span class="text-muted text-sm">Within</span>
+						<Input id="p-cert" type="number" min="1" max="365" class="w-24" aria-label="Days before expiry" bind:value={draft.up_cert_days} />
+						<span class="text-muted text-sm">days</span>
+					</div>
+				{/if}
+			</PField>
+			<PField path="params.latency_ms" name="Slow answers">
+				<Switch bind:checked={draft.up_latency}>Answers are slow</Switch>
+				{#if draft.up_latency}
+					<div class="mt-2 ml-11.5 flex items-center gap-2">
+						<span class="text-muted text-sm">Slower than</span>
+						<Input id="p-lat" type="number" min="1" max="120000" class="w-28" aria-label="Latency limit in milliseconds" bind:value={draft.up_latency_ms} />
+						<span class="text-muted text-sm">ms, as many checks in a row</span>
+					</div>
+				{/if}
+			</PField>
+			<p class="hint -mt-1">Add this item to the policy set of the <em>agents that run the monitors</em> (each monitor’s agent, or its site’s designated agent). A monitor whose agent is offline shows as unknown and doesn’t alert. Monitors are set up on the <a class="link" href="/uptime">Uptime</a> page.</p>
+		{:else if draft.kind === 'vulnerability'}
+			<PField path="params.min_severity" label="At least" id="p-vsev" hint="Findings this severe or worse count (CVSS, or the distribution’s own rating).">
+				<Select id="p-vsev" class="max-w-48" bind:value={draft.vu_severity} options={[{ value: 'critical', label: 'Critical' }, { value: 'high', label: 'High' }, { value: 'medium', label: 'Medium' }, { value: 'low', label: 'Low' }]} />
+			</PField>
+			<PField path="params.fix_available_only" name="Fixes"><Switch bind:checked={draft.vu_fix}>Only when a fixed version is available</Switch></PField>
+			<PField path="params.kev_only" name="Exploited"><Switch bind:checked={draft.vu_kev}>Only CVEs known to be exploited (CISA KEV)</Switch></PField>
+			<PField path="params.older_than_days" label="Open for at least (days)" id="p-vdays" hint="Time to patch the usual way first. 0: at once.">
+				<Input id="p-vdays" type="number" min="0" max="365" class="max-w-40" bind:value={draft.vu_days} />
+			</PField>
+			<PField path="params.min_epss" name="Likely to be exploited">
+				<Switch bind:checked={draft.vu_epss_check}>Only with an EPSS score of at least</Switch>
+				{#if draft.vu_epss_check}
+					<div class="mt-2 ml-11.5 flex items-center gap-2">
+						<Input id="p-vepss" type="number" min="0" max="100" class="w-24" aria-label="Minimum EPSS in percent" bind:value={draft.vu_epss} />
+						<span class="text-muted text-sm">% chance of exploitation in the next 30 days</span>
+					</div>
+				{/if}
+			</PField>
+			<p class="hint -mt-1">One alert per device, listing its worst CVEs; accepted risks don’t count. The <a class="link" href="/vulnerabilities">Vulnerabilities</a> page lists every finding.</p>
+		{:else if draft.kind === 'backup'}
+			<PField path="params.providers" name="Look for">
+				<div class="grid gap-1.5 sm:grid-cols-2">
+					{#each backupProviders as p (p.value)}
+						<Checkbox checked={draft.bk_providers.includes(p.value)} onchange={(on) => toggleProvider(p.value, on)}>
+							{p.label}{#if p.hint}<span class="text-muted block text-xs">{p.hint}</span>{/if}
+						</Checkbox>
+					{/each}
+				</div>
+			</PField>
+			<PField path="params.sources" name="Repositories and folders" hint="restic and Borg read an env file that is already on the machine (repository, password file or command); no secret comes from here. Backup files: the newest file in a folder.">
+				<div class="space-y-2">
+					{#each draft.bk_sources as s, i (i)}
+						<div class="border-border grid gap-2 rounded-md border p-2 sm:grid-cols-[9rem_1fr_1fr_auto]">
+							<Select id={`p-src-${i}`} aria-label="Source type" bind:value={s.provider} options={[{ value: 'restic', label: 'restic' }, { value: 'borg', label: 'Borg' }, { value: 'file_age', label: 'Backup files' }]} />
+							{#if s.provider === 'file_age'}
+								<Input id={`p-src-path-${i}`} aria-label="Folder" class="font-mono text-[13px]" bind:value={s.path} placeholder="D:\SQLBackups" />
+								<Input id={`p-src-glob-${i}`} aria-label="File names" class="font-mono text-[13px]" bind:value={s.glob} placeholder="*.bak" />
+							{:else}
+								<Input id={`p-src-env-${i}`} aria-label="Env file" class="font-mono text-[13px]" bind:value={s.env_file} placeholder="/etc/restic/env" />
+								<Input id={`p-src-repo-${i}`} aria-label="Repository (if not in the env file)" class="font-mono text-[13px]" bind:value={s.repo} placeholder="Repository (optional)" />
+							{/if}
+							<button type="button" class="btn btn-ghost btn-sm" aria-label="Remove source" onclick={() => (draft.bk_sources = draft.bk_sources.filter((_, j) => j !== i))}>Remove</button>
+						</div>
+					{/each}
+					<button type="button" class="btn btn-sm" onclick={addSource}>Add a source</button>
+				</div>
+			</PField>
+			<div class="grid gap-3 sm:grid-cols-2">
+				<PField path="params.max_age_hours" label="No success for (hours)" id="p-bage" hint="26 hours suits a nightly job.">
+					<Input id="p-bage" type="number" min="1" max="8760" class="max-w-40" bind:value={draft.bk_max_age} />
+				</PField>
+				<PField path="params.jobs" label="Jobs" id="p-bjobs" hint="Job names, one per line; * matches anything.">
+					<Textarea id="p-bjobs" rows={2} class="font-mono text-[13px]" bind:value={draft.bk_jobs} placeholder="*" />
+				</PField>
+			</div>
+			<PField path="params.warning_is_failure" name="Warnings"><Switch bind:checked={draft.bk_warning}>A job that finished with warnings counts as failed</Switch></PField>
+			<PField path="params.require" name="Required" hint="For server sets, where a backup must exist."><Switch bind:checked={draft.bk_require}>Alert when no backup job is found at all</Switch></PField>
+			<p class="hint -mt-1">The device reads its backups every hour. The <a class="link" href="/backups">Backups</a> page lists every job.</p>
+		{:else if draft.kind === 'disk_encryption'}
+			<PField path="params.volumes" label="Volumes" id="p-devol">
+				<Segmented label="Volumes" size="md" value={draft.de_volumes} onchange={(v) => (draft.de_volumes = v)} options={[{ value: 'os', label: 'System volume' }, { value: 'all_fixed', label: 'Every fixed volume' }]} />
+			</PField>
+			<PField path="params.require_escrow" name="Recovery keys" hint="BitLocker only: FileVault and LUKS keys can't be read back to escrow.">
+				<Switch bind:checked={draft.de_escrow}>Alert when a BitLocker recovery key isn't in the vault</Switch>
+			</PField>
+			<PField path="params.grace_hours" label="Suspended for more than (hours)" id="p-degrace" hint="Updates suspend BitLocker for a restart; 0 alerts at once.">
+				<Input id="p-degrace" type="number" min="0" max="720" class="max-w-40" bind:value={draft.de_grace} />
+			</PField>
+			<p class="hint -mt-1">One alert per volume. Encrypting isn't a finding. Escrow itself is set in the set's <em>Disk encryption</em> section.</p>
+		{:else if draft.kind === 'local_admin'}
+			<PField path="params.overdue_days" label="Overdue after (days)" id="p-laover" hint="Counted from when the rotation was due.">
+				<Input id="p-laover" type="number" min="1" max="365" class="max-w-40" bind:value={draft.la_overdue} />
+			</PField>
+			<p class="hint -mt-1">Also opens when a rotation fails or Windows LAPS manages the same account. Rotation itself is set in the set's <em>Local admin</em> section.</p>
 		{:else if draft.kind === 'patch'}
 			<div class="space-y-3">
 				<PField path="params.failed" name="Failed installs" hint="One alert per agent, listing the updates. It clears once they install, or once someone declines them.">

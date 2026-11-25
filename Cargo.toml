@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/rmm-proto", "crates/rmm-content", "crates/rmm-scan", "crates/rmm-agent", "crates/rmm-server", "crates/rmm-sign", "crates/rmm-loadgen", "crates/rmm-snmp"]
+members = ["crates/rmm-proto", "crates/rmm-content", "crates/rmm-scan", "crates/rmm-agent", "crates/rmm-server", "crates/rmm-sign", "crates/rmm-loadgen", "crates/rmm-snmp", "crates/rmm-checks"]
 
 [workspace.package]
 version = "0.2.0"

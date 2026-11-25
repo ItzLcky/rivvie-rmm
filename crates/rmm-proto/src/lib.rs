@@ -8,13 +8,18 @@
 //! Everything is multiplexed over that one connection: metrics, jobs,
 //! interactive shells, patching, remote desktop streams and endpoint protection.
 
+pub mod checks;
 pub mod desktop;
+pub mod identity;
+pub mod diskenc;
+pub mod localadmin;
 pub mod net;
 pub mod patch;
 pub mod security;
 pub mod software;
 pub mod telemetry;
 pub mod tools;
+pub mod tray;
 pub mod update;
 
 use chrono::{DateTime, Utc};
@@ -292,6 +297,78 @@ pub enum AgentMsg {
         poll_id: Uuid,
         results: Vec<net::PollResult>,
     },
+    /// Answer to [`ServerMsg::WakeOnLan`]: how many targets had at least one packet go out.
+    WakeOnLanResult {
+        request_id: Uuid,
+        sent: u32,
+        #[serde(default)]
+        error: Option<String>,
+    },
+    /// Outcomes of [`ServerMsg::Checks`], batched (see [`checks`]).
+    CheckResults {
+        results: Vec<checks::CheckResult>,
+    },
+    /// Answer to [`ServerMsg::Identity`].
+    IdentityReply {
+        request_id: Uuid,
+        reply: identity::Reply,
+    },
+    /// The encryption state of the fixed volumes (see [`diskenc`]).
+    DiskEncryption(diskenc::Report),
+    /// Answer to [`ServerMsg::DiskRecoveryRequest`]: the recovery password, or why not.
+    DiskRecoveryKey {
+        request_id: Uuid,
+        volume_id: String,
+        protector_id: String,
+        #[serde(default)]
+        key: Option<localadmin::Secret>,
+        #[serde(default)]
+        error: Option<String>,
+    },
+    /// Answer to [`ServerMsg::DiskProtector`].
+    DiskProtectorResult {
+        request_id: Uuid,
+        ok: bool,
+        #[serde(default)]
+        message: String,
+    },
+    /// Answer to [`ServerMsg::LocalAdminSet`].
+    LocalAdminResult {
+        request_id: Uuid,
+        ok: bool,
+        /// The account didn't exist and was created.
+        #[serde(default)]
+        created: bool,
+        status: localadmin::Outcome,
+        #[serde(default)]
+        message: String,
+    },
+    /// Someone at the machine asked for help through the tray (only from agents listing
+    /// [`tray::CAPABILITY`]). `screenshot_len` bytes follow in [`AgentMsg::HelpAttachment`]s;
+    /// answered with [`ServerMsg::HelpRequestResult`]. Resent with the same `request_id` until
+    /// answered, so the server makes one ticket per id.
+    HelpRequest {
+        request_id: Uuid,
+        /// The account name of whoever asked, as the operating system reports it.
+        user: String,
+        /// The local session id (Windows) or user id (Unix) it came from.
+        #[serde(default)]
+        session: u32,
+        subject: String,
+        body: String,
+        #[serde(default)]
+        context: tray::Context,
+        #[serde(default)]
+        screenshot_len: u32,
+    },
+    /// A piece of a help request's screenshot (the [`AgentMsg::TriageChunk`] pattern).
+    HelpAttachment {
+        request_id: Uuid,
+        offset: u32,
+        #[serde(with = "serde_bytes")]
+        data: Vec<u8>,
+        done: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -518,6 +595,61 @@ pub enum ServerMsg {
         poll_id: Uuid,
         targets: Vec<net::PollTarget>,
     },
+    /// Send Wake-on-LAN magic packets for these machines (only to agents listing
+    /// [`net::WOL_CAPABILITY`]); answered with [`AgentMsg::WakeOnLanResult`].
+    WakeOnLan {
+        request_id: Uuid,
+        targets: Vec<net::WolTarget>,
+    },
+    /// The complete set of checks this agent runs, replacing any earlier set (only to agents
+    /// listing [`checks::CAPABILITY`]). Sent after connecting and whenever it changes. Checks
+    /// in `run_now` run at once, whatever their schedule ("check now").
+    Checks {
+        checks: Vec<checks::CheckSpec>,
+        #[serde(default)]
+        run_now: Vec<Uuid>,
+    },
+    /// An Active Directory operation (only to agents listing [`identity::CAPABILITY`]);
+    /// answered with [`AgentMsg::IdentityReply`].
+    Identity {
+        request_id: Uuid,
+        op: identity::Op,
+    },
+    /// Report the disk encryption state now (only to agents listing [`diskenc::CAPABILITY`]).
+    DiskEncryptionRefresh,
+    /// Send the recovery password of this protector ([`AgentMsg::DiskRecoveryKey`]).
+    DiskRecoveryRequest {
+        request_id: Uuid,
+        volume_id: String,
+        protector_id: String,
+    },
+    /// Add or rotate a volume's recovery password ([`AgentMsg::DiskProtectorResult`]); a new
+    /// report follows, from which the server escrows the new key.
+    DiskProtector {
+        request_id: Uuid,
+        volume_id: String,
+        op: diskenc::ProtectorOp,
+    },
+    /// Set the managed local account's password, creating the account if `create` and it is
+    /// missing (only to agents listing [`localadmin::CAPABILITY`]).
+    LocalAdminSet {
+        request_id: Uuid,
+        account: String,
+        password: localadmin::Secret,
+        create: bool,
+    },
+    /// What the tray shows (only to agents listing [`tray::CAPABILITY`]). Sent after connecting
+    /// and whenever the device's tray policy or branding changes.
+    TrayConfig(tray::Config),
+    /// Answer to [`AgentMsg::HelpRequest`]: the ticket's number, or why there is none. An
+    /// error is final; the agent drops the request.
+    HelpRequestResult {
+        request_id: Uuid,
+        #[serde(default)]
+        ticket_number: Option<i64>,
+        #[serde(default)]
+        error: Option<String>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -707,7 +839,11 @@ impl UpdateState {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Agents listing this in `Auth.capabilities` set [`ScriptJob::env`] on the script's process.
+/// The server doesn't run a job with parameters on an agent without it.
+pub const SCRIPT_ENV_CAPABILITY: &str = "script_env";
+
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ScriptJob {
     pub job_id: Uuid,
     pub interpreter: Interpreter,
@@ -715,6 +851,24 @@ pub struct ScriptJob {
     #[serde(default)]
     pub args: Vec<String>,
     pub timeout_secs: u32,
+    /// Environment variables for the script (`RMM_*`: the built-ins and `RMM_PARAM_<NAME>`
+    /// parameters, some of them secrets). Older agents ignore it; older servers send none.
+    #[serde(default)]
+    pub env: Vec<(String, String)>,
+}
+
+/// Leaves the environment's values out: some are secrets.
+impl std::fmt::Debug for ScriptJob {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScriptJob")
+            .field("job_id", &self.job_id)
+            .field("interpreter", &self.interpreter)
+            .field("script_len", &self.script.len())
+            .field("args", &self.args.len())
+            .field("timeout_secs", &self.timeout_secs)
+            .field("env", &self.env.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>())
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -798,6 +952,13 @@ pub struct SystemInfo {
     /// None from builds that predate it (the server then guesses from the OS name).
     #[serde(default)]
     pub platform: Option<Platform>,
+    /// `ID` and `VERSION_ID` from `/etc/os-release` (Linux only): which distribution's
+    /// vulnerability feed applies (`debian` + `12`, `ubuntu` + `24.04`). None elsewhere and from
+    /// builds that predate it.
+    #[serde(default)]
+    pub os_id: Option<String>,
+    #[serde(default)]
+    pub os_version_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -859,8 +1020,13 @@ pub struct Software {
     pub name: String,
     pub version: String,
     pub publisher: Option<String>,
-    /// e.g. "dpkg", "rpm", "pacman", "registry", "msi".
+    /// e.g. "dpkg", "rpm", "pacman", "apk", "registry", "msi".
     pub source: String,
+    /// The source package it was built from, when the package manager knows it and it differs
+    /// from `name` (dpkg `${source:Package}`, rpm `%{SOURCERPM}`). Debian's and Ubuntu's
+    /// vulnerability data is keyed by source package.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_name: Option<String>,
 }
 
 #[cfg(test)]
@@ -889,9 +1055,39 @@ mod tests {
             script: "Get-Date".into(),
             args: vec![],
             timeout_secs: 30,
+            env: vec![("RMM_PARAM_TOKEN".into(), "s3cret".into())],
         });
         let buf = encode(&msg).unwrap();
-        assert!(matches!(decode::<ServerMsg>(&buf).unwrap(), ServerMsg::RunScript(_)));
+        let ServerMsg::RunScript(job) = decode::<ServerMsg>(&buf).unwrap() else { panic!("not a RunScript") };
+        assert_eq!(job.env, vec![("RMM_PARAM_TOKEN".to_string(), "s3cret".to_string())]);
+        assert!(!format!("{job:?}").contains("s3cret"), "Debug leaves values out");
+    }
+
+    #[test]
+    fn script_job_env_is_optional_both_ways() {
+        // What servers before parameters send: no `env`.
+        #[derive(Serialize)]
+        struct Old {
+            job_id: Uuid,
+            interpreter: Interpreter,
+            script: &'static str,
+            args: Vec<String>,
+            timeout_secs: u32,
+        }
+        let old = rmp_serde::to_vec_named(&Old { job_id: Uuid::nil(), interpreter: Interpreter::Bash, script: "true", args: vec![], timeout_secs: 5 }).unwrap();
+        let job: ScriptJob = decode(&old).unwrap();
+        assert!(job.env.is_empty());
+        // And an old agent's struct reads a new server's job (unknown fields are skipped).
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct OldAgent {
+            job_id: Uuid,
+            script: String,
+            timeout_secs: u32,
+        }
+        let new = encode(&ScriptJob { env: vec![("RMM_JOB_ID".into(), "x".into())], ..job }).unwrap();
+        let o: OldAgent = decode(&new).unwrap();
+        assert_eq!(o.script, "true");
     }
 
     #[test]
@@ -911,8 +1107,31 @@ mod tests {
         let old = Old { hostname: "h", os_family: OsFamily::Windows, os_name: "Windows", os_version: "", kernel_version: "", arch: "x86_64", agent_version: "0.1.0", machine_id: None };
         let s: SystemInfo = decode(&encode(&old).unwrap()).unwrap();
         assert_eq!((s.hostname.as_str(), s.platform), ("h", None));
-        let new = SystemInfo { platform: Some(Platform::Server), ..s };
-        assert_eq!(decode::<SystemInfo>(&encode(&new).unwrap()).unwrap().platform, Some(Platform::Server));
+        assert_eq!((s.os_id.as_deref(), s.os_version_id.as_deref()), (None, None));
+        let new = SystemInfo { platform: Some(Platform::Server), os_id: Some("debian".into()), os_version_id: Some("12".into()), ..s };
+        let back = decode::<SystemInfo>(&encode(&new).unwrap()).unwrap();
+        assert_eq!(back.platform, Some(Platform::Server));
+        assert_eq!((back.os_id.as_deref(), back.os_version_id.as_deref()), (Some("debian"), Some("12")));
+    }
+
+    #[test]
+    fn software_without_source_name_decodes() {
+        // What builds before vulnerability reporting send, and the reverse: a new agent's extra
+        // field is ignored by an old server's struct (serde skips unknown map keys).
+        #[derive(Serialize, Deserialize)]
+        struct Old {
+            name: String,
+            version: String,
+            publisher: Option<String>,
+            source: String,
+        }
+        let old = Old { name: "libssl3".into(), version: "3.0.11-1".into(), publisher: None, source: "dpkg".into() };
+        let s: Software = decode(&encode(&old).unwrap()).unwrap();
+        assert_eq!((s.name.as_str(), s.source_name), ("libssl3", None));
+        let new = Software { source_name: Some("openssl".into()), ..s };
+        assert_eq!(decode::<Software>(&encode(&new).unwrap()).unwrap().source_name.as_deref(), Some("openssl"));
+        let as_old: Old = decode(&encode(&new).unwrap()).unwrap();
+        assert_eq!(as_old.name, "libssl3");
     }
 
     #[test]
@@ -948,6 +1167,23 @@ mod tests {
         };
         assert!(matches!(decode::<ServerMsg>(&encode(&r).unwrap()).unwrap(), ServerMsg::ReputationResult { known } if known[0].source == "list:x"));
         assert_eq!(security::RealtimeMode::parse("block").map(security::RealtimeMode::as_str), Some("block"));
+    }
+
+    #[test]
+    fn wake_on_lan_roundtrips() {
+        let msg = ServerMsg::WakeOnLan {
+            request_id: Uuid::nil(),
+            targets: vec![net::WolTarget { mac: "aa:bb:cc:00:11:22".into(), last_ip: vec!["10.0.0.5/24".into()] }],
+        };
+        assert!(matches!(decode::<ServerMsg>(&encode(&msg).unwrap()).unwrap(), ServerMsg::WakeOnLan { targets, .. } if targets[0].last_ip == ["10.0.0.5/24"]));
+        // A result with only the id and count still decodes.
+        #[derive(Serialize)]
+        #[serde(tag = "t", rename_all = "snake_case")]
+        enum Old {
+            WakeOnLanResult { request_id: Uuid, sent: u32 },
+        }
+        let r: AgentMsg = decode(&encode(&Old::WakeOnLanResult { request_id: Uuid::nil(), sent: 2 }).unwrap()).unwrap();
+        assert!(matches!(r, AgentMsg::WakeOnLanResult { sent: 2, error: None, .. }));
     }
 
     #[test]
@@ -999,6 +1235,105 @@ mod tests {
         assert!(LogLevel::Critical < LogLevel::Error && LogLevel::Warning < LogLevel::Info);
         assert_eq!(LogLevel::from_syslog(3), LogLevel::Error);
         assert_eq!(LogLevel::from_windows(3), LogLevel::Warning);
+    }
+
+    #[test]
+    fn checks_round_trip_and_default() {
+        use checks::*;
+        let spec = CheckSpec {
+            id: Uuid::new_v4(),
+            interval_secs: 60,
+            timeout_secs: 10,
+            kind: CheckKind::Http { url: "https://example.com".into(), method: HttpMethod::Head, statuses: vec![200], keyword: None, keyword_absent: false, verify_tls: true },
+        };
+        let msg = ServerMsg::Checks { checks: vec![spec.clone()], run_now: vec![] };
+        match decode::<ServerMsg>(&encode(&msg).unwrap()).unwrap() {
+            ServerMsg::Checks { checks, run_now } => assert!(checks == [spec.clone()] && run_now.is_empty()),
+            other => panic!("{other:?}"),
+        }
+        // A server that predates `run_now`, and an HTTP check that leaves out its options.
+        #[derive(Serialize)]
+        struct Old {
+            t: &'static str,
+            checks: Vec<serde_json::Value>,
+        }
+        let old = Old { t: "checks", checks: vec![serde_json::json!({ "id": spec.id, "interval_secs": 60, "timeout_secs": 5, "kind": { "type": "http", "url": "http://x" } })] };
+        match decode::<ServerMsg>(&encode(&old).unwrap()).unwrap() {
+            ServerMsg::Checks { checks, run_now } => {
+                assert!(run_now.is_empty());
+                assert!(matches!(&checks[0].kind, CheckKind::Http { verify_tls: true, method: HttpMethod::Get, .. }), "{checks:?}");
+            }
+            other => panic!("{other:?}"),
+        }
+        let job = BackupJob {
+            provider: "restic".into(),
+            job: "/srv/repo".into(),
+            last_run_at: Some(Utc::now()),
+            last_success_at: None,
+            last_result: BackupResult::Failed,
+            message: "exit 1".into(),
+            size_bytes: Some(10),
+        };
+        let res = AgentMsg::CheckResults {
+            results: vec![CheckResult {
+                check_id: spec.id,
+                at: Utc::now(),
+                ok: false,
+                latency_ms: None,
+                value: Some(3.0),
+                message: "failed".into(),
+                data: Some(CheckData::Backups { jobs: vec![job.clone()], errors: vec![("wsb".into(), "not installed".into())] }),
+            }],
+        };
+        match decode::<AgentMsg>(&encode(&res).unwrap()).unwrap() {
+            AgentMsg::CheckResults { results } => match &results[0].data {
+                Some(CheckData::Backups { jobs, errors }) => assert!(jobs == &[job] && errors.len() == 1),
+                other => panic!("{other:?}"),
+            },
+            other => panic!("{other:?}"),
+        }
+        // An unknown result from a newer agent reads as unknown.
+        assert_eq!(serde_json::from_str::<BackupResult>("\"partial\"").unwrap(), BackupResult::Unknown);
+    }
+
+    #[test]
+    fn device_security_messages_round_trip() {
+        let report = diskenc::Report {
+            volumes: vec![diskenc::Volume {
+                volume_id: "C:".into(),
+                mount: "C:\\".into(),
+                kind: diskenc::Kind::Bitlocker,
+                role: diskenc::Role::Os,
+                status: diskenc::Status::Encrypted,
+                protectors: vec!["tpm".into(), "recovery_password".into()],
+                protection_on: true,
+                recovery_protector_id: Some("{AAAA}".into()),
+                ..Default::default()
+            }],
+            tpm: Some(diskenc::Tpm { present: true, ..Default::default() }),
+            error: None,
+        };
+        match decode::<AgentMsg>(&encode(&AgentMsg::DiskEncryption(report.clone())).unwrap()).unwrap() {
+            AgentMsg::DiskEncryption(r) => assert_eq!(r, report),
+            other => panic!("{other:?}"),
+        }
+        let id = Uuid::new_v4();
+        let key = AgentMsg::DiskRecoveryKey { request_id: id, volume_id: "C:".into(), protector_id: "{AAAA}".into(), key: Some(localadmin::Secret("111111-222222".into())), error: None };
+        assert!(!format!("{key:?}").contains("111111"), "keys stay out of logs");
+        match decode::<AgentMsg>(&encode(&key).unwrap()).unwrap() {
+            AgentMsg::DiskRecoveryKey { key: Some(k), .. } => assert_eq!(k.expose(), "111111-222222"),
+            other => panic!("{other:?}"),
+        }
+        let set = ServerMsg::LocalAdminSet { request_id: id, account: "rmmadmin".into(), password: localadmin::Secret("Pw-1".into()), create: true };
+        assert!(!format!("{set:?}").contains("Pw-1"));
+        match decode::<ServerMsg>(&encode(&set).unwrap()).unwrap() {
+            ServerMsg::LocalAdminSet { password, create: true, .. } => assert_eq!(password.expose(), "Pw-1"),
+            other => panic!("{other:?}"),
+        }
+        let res = AgentMsg::LocalAdminResult { request_id: id, ok: false, created: false, status: localadmin::Outcome::Conflict, message: "Windows LAPS".into() };
+        assert!(matches!(decode::<AgentMsg>(&encode(&res).unwrap()).unwrap(), AgentMsg::LocalAdminResult { status: localadmin::Outcome::Conflict, .. }));
+        let op = ServerMsg::DiskProtector { request_id: id, volume_id: "C:".into(), op: diskenc::ProtectorOp::RotateRecovery };
+        assert!(matches!(decode::<ServerMsg>(&encode(&op).unwrap()).unwrap(), ServerMsg::DiskProtector { op: diskenc::ProtectorOp::RotateRecovery, .. }));
     }
 
     #[test]
@@ -1096,6 +1431,8 @@ mod tests {
             machine_id: None,
             agent_version: String::new(),
             platform: None,
+            os_id: None,
+            os_version_id: None,
         };
         let buf = encode(&Old::Enroll { protocol: 1, token: "t".into(), system }).unwrap();
         assert!(matches!(decode::<AgentMsg>(&buf).unwrap(), AgentMsg::Enroll { previous: None, .. }));

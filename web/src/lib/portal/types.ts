@@ -1,3 +1,5 @@
+import type { Branding } from '#lib/branding.js';
+
 export type StatusCategory = 'new' | 'open' | 'waiting_client' | 'waiting_vendor' | 'resolved' | 'closed';
 
 export interface PortalContact {
@@ -21,11 +23,15 @@ export interface PortalMe {
 	totp_enabled: boolean;
 	/** RMM_ATTACHMENT_MAX_MB: the largest file a message can carry. */
 	attachment_max_mb?: number;
+	/** The contact's client's branding over the instance's (older servers: absent). */
+	branding?: Branding;
 }
 
 export interface PortalInfo {
 	company_name: string;
 	welcome: string;
+	/** The instance's branding (a client's applies only after sign-in). */
+	branding?: Branding;
 }
 
 export interface PortalTicket {

@@ -10,6 +10,8 @@ pub struct AppState {
     pub cfg: Settings,
     /// Cached `company_settings` row; written through by the settings API.
     pub company: RwLock<Company>,
+    /// Every `branding` row; read through [`crate::branding::resolve`].
+    pub branding: crate::branding::Cache,
     pub limits: crate::ratelimit::Limits,
     pub releases: crate::updates::Releases,
     /// When this process started (offline alerts allow agents time to reconnect).
@@ -49,6 +51,15 @@ pub struct Company {
     pub csat_enabled: bool,
     /// Password sign-in is refused for everyone but break-glass accounts.
     pub sso_required: bool,
+    /// Text messages (pages, `sms` channels): a Twilio-compatible Messages API.
+    pub sms_account_sid: String,
+    pub sms_from: String,
+    pub sms_base_url: String,
+    /// The auth token, sealed with RMM_DATA_KEY when the server has one (`sms_token_sealed`).
+    pub sms_token_enc: Option<Vec<u8>>,
+    pub sms_token_sealed: bool,
+    /// New P1 tickets page through this escalation policy.
+    pub p1_escalation_policy_id: Option<uuid::Uuid>,
 }
 
 impl Company {
@@ -59,7 +70,8 @@ impl Company {
     }
 
     pub const COLUMNS: &str = "company_name, session_idle_hours, require_2fa_all,
-        smtp_host, smtp_port, smtp_security, smtp_username, smtp_password_enc, smtp_password_sealed, smtp_from, csat_enabled, sso_required";
+        smtp_host, smtp_port, smtp_security, smtp_username, smtp_password_enc, smtp_password_sealed, smtp_from, csat_enabled, sso_required,
+        sms_account_sid, sms_from, sms_base_url, sms_token_enc, sms_token_sealed, p1_escalation_policy_id";
 
     pub async fn load(db: &PgPool) -> sqlx::Result<Self> {
         sqlx::query_as(sqlx::AssertSqlSafe(format!("SELECT {} FROM company_settings", Self::COLUMNS))).fetch_one(db).await
@@ -100,6 +112,9 @@ pub struct Settings {
     pub alert_retention_days: u32,
     /// How often polled alert policies (offline, CPU, memory, disk) are checked.
     pub alert_eval_secs: u32,
+    /// Uptime checks run by the server may reach loopback, private, link-local and metadata
+    /// addresses (RMM_UPTIME_ALLOW_PRIVATE=1). Off: only public addresses.
+    pub uptime_allow_private: bool,
     /// Resolved tickets move to Closed after this many days.
     pub ticket_close_days: u32,
     /// Raw inbound email (MIME) is deleted from storage after this many days.
@@ -114,6 +129,8 @@ pub struct Settings {
     pub attachment_max_mb: u32,
     /// Bearer token for `GET /metrics` (RMM_METRICS_TOKEN); the route is off without it.
     pub metrics_token: Option<String>,
+    /// The AGPL source offer shown in the console and portal (RMM_SOURCE_URL).
+    pub source_url: String,
 }
 
 impl Settings {

@@ -1,0 +1,13 @@
+{
+    "NextBackupTime":  "\/Date(1795831200000)\/",
+    "NumberOfVersions":  14,
+    "LastSuccessfulBackupTime":  "\/Date(1795658049000)\/",
+    "LastSuccessfulBackupTargetPath":  "\\\\?\\Volume{6d1f0e43-1b2a-4c55-9a77-2b34b2a1c0de}",
+    "LastSuccessfulBackupTargetLabel":  "FS01 2026_01_03 10:12 DISK_01",
+    "LastBackupTime":  "\/Date(1795744201000)\/",
+    "LastBackupTarget":  "FS01 2026_01_03 10:12 DISK_01",
+    "DetailedMessage":  "The shadow copy provider had an error.",
+    "LastBackupResultHR":  -2147212538,
+    "LastBackupResultDetailedHR":  -2147212538,
+    "CurrentOperationStatus":  0
+}

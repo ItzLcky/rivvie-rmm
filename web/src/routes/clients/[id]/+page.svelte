@@ -1,4 +1,5 @@
 <script lang="ts">
+	import VulnStrip from '#lib/components/vulns/VulnStrip.svelte';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import { CircleSlash, Contact as ContactIcon, ExternalLink, FolderPlus, FolderTree, KeyRound, LifeBuoy, MapPin, Monitor, Pencil, Plus, Star, Stethoscope, Trash2, UserPlus } from '@lucide/svelte';
@@ -12,7 +13,10 @@
 	import { allowed, can } from '#lib/session.svelte.js';
 	import ClientDocs from '#lib/components/docs/ClientDocs.svelte';
 	import ClientVault from '#lib/components/vault/ClientVault.svelte';
+	import UserList from '#lib/components/identity/UserList.svelte';
+	import MdmDevices from '#lib/components/identity/MdmDevices.svelte';
 	import ClientBilling from '#lib/components/billing/ClientBilling.svelte';
+	import BrandingEditor from '#lib/components/branding/BrandingEditor.svelte';
 	import { attempt, toast } from '#lib/toast.svelte.js';
 	import type { AgentSummary, Client, Contact, Dashboard, Site, SlaPolicy, Ticket } from '#lib/types.js';
 	import { param, qs, setParams, sortState } from '#lib/url.svelte.js';
@@ -208,6 +212,7 @@
 			<Stat label="Need attention" icon={Stethoscope} value={(dash.data?.health.attention ?? 0) + (dash.data?.health.unhealthy ?? 0)} tone={dash.data?.health.unhealthy ? 'danger' : 'warning'} href="/agents?client={c.id}&view=attention" />
 			<Stat label="Failed jobs (24 h)" icon={CircleSlash} value={dash.data?.failed_jobs.length ?? 0} capped={(dash.data?.failed_jobs.length ?? 0) >= 10} tone="danger" href="/jobs?client={c.id}&status=failed" />
 		</div>
+		<VulnStrip clientId={c.id} class="mb-4" />
 
 		<Tabs
 			label="Client sections"
@@ -222,6 +227,8 @@
 				{ value: 'fields', label: 'Fields' },
 				{ value: 'docs', label: 'Docs' },
 				{ value: 'passwords', label: 'Passwords', hidden: !allowed('vault.read') },
+				{ value: 'users', label: 'Users', hidden: !allowed('identity.read') },
+				{ value: 'mobile', label: 'Mobile and Intune', hidden: !allowed('identity.read') },
 				{ value: 'policies', label: 'Policies' },
 				{ value: 'billing', label: 'Billing', hidden: !allowed('billing.read') },
 				{ value: 'settings', label: 'Settings', hidden: !can('admin') }
@@ -382,6 +389,10 @@
 			<ClientDocs clientId={c.id} clientName={c.name} />
 		{:else if tab === 'passwords' && allowed('vault.read')}
 			<ClientVault clientId={c.id} clientName={c.name} />
+		{:else if tab === 'users' && allowed('identity.read')}
+			<UserList clientId={c.id} clientName={c.name} />
+		{:else if tab === 'mobile' && allowed('identity.read')}
+			<MdmDevices clientId={c.id} clientName={c.name} />
 		{:else if tab === 'policies'}
 			<div class="space-y-5">
 				<section class="card" aria-labelledby="assign-heading">
@@ -448,6 +459,10 @@
 					<p class="text-muted text-sm">Whether they're allowed, and whether the person at the machine is asked first, is part of the remote access policy. Give {c.name}'s devices a policy set that changes it on the <a class="link" href="?tab=policies">Policies</a> tab.</p>
 				</section>
 			</div>
+			<section class="mt-8" aria-labelledby="branding-heading">
+				<h2 id="branding-heading" class="mb-3 text-lg font-semibold">Branding</h2>
+				<BrandingEditor clientId={c.id} clientName={c.name} />
+			</section>
 		{/if}
 
 		{#if newSet}<SetDialog mode="new" client={c.id} onclose={() => (newSet = false)} ondone={(r) => goto(setHref(r.id))} />{/if}

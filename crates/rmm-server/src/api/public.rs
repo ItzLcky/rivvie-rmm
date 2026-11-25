@@ -121,6 +121,17 @@ pub static OPS: &[Op] = &[
         summary: "Ask an online agent to report its inventory now",
         note: "409 when the agent is offline.", query: NONE, paged: false, body: None, response: Resp::Object,
     },
+    Op {
+        id: "wakeAgent", method: "POST", path: "/agents/{id}/wake", group: "agents", summary: "Wake an offline agent with Wake-on-LAN",
+        note: "Another online agent of the site sends the magic packets. `outcome` is `sent`, `no_mac` (no usable MAC address in the inventory), \
+               `no_sender` (no online agent of the site can send) or `online` (nothing to do).",
+        query: NONE, paged: false, body: None, response: Resp::Object,
+    },
+    Op {
+        id: "wakeAgents", method: "POST", path: "/agents/wake", group: "agents", summary: "Wake many agents with Wake-on-LAN",
+        note: "Up to 5000 agents; every one must be visible to the key or nothing happens (404). One result per agent, as `wakeAgent`, and counts per outcome.",
+        query: NONE, paged: false, body: Some("WakeAgents"), response: Resp::Object,
+    },
     // ---- tags, custom fields and notes ---------------------------------------------------
     Op {
         id: "listTags", method: "GET", path: "/tags", group: "agents", summary: "List tags",
@@ -222,6 +233,11 @@ pub static OPS: &[Op] = &[
     Op {
         id: "getAlert", method: "GET", path: "/alerts/{id}", group: "alerts", summary: "Get an alert with its notifications and linked ticket",
         note: "", query: NONE, paged: false, body: None, response: Resp::One("Alert"),
+    },
+    Op {
+        id: "getOnCallNow", method: "GET", path: "/oncall/now", group: "alerts", summary: "Who is on call now, per schedule",
+        note: "Each entry: `schedule_id`, `schedule_name`, `user_id` and `user_name` (null when nobody is on), `until` (when their stretch ends, if within two weeks) and `source` (`layer` or `override`).",
+        query: NONE, paged: false, body: None, response: Resp::Object,
     },
     Op {
         id: "acknowledgeAlert", method: "POST", path: "/alerts/{id}/acknowledge", group: "alerts", summary: "Acknowledge an alert",
@@ -330,6 +346,77 @@ pub static OPS: &[Op] = &[
         note: "About 500 points whatever the range; beyond 48 hours from hourly rollups.",
         query: &[("hours", "integer", "How far back, 1-8784. Default 24.")], paged: false, body: None, response: Resp::List("NetworkDevicePoint"),
     },
+    // ---- uptime monitors (read) --------------------------------------------------------------
+    Op {
+        id: "listUptimeMonitors", method: "GET", path: "/uptime/monitors", group: "network", summary: "List uptime monitors",
+        note: "Ping, TCP, HTTP(S), TLS certificate and DNS checks run by an agent. `uptime_24h` and `uptime_30d` are the percent of checks that passed.",
+        query: &[
+            CLIENT_Q,
+            ("site_id", "uuid", "Only this site."),
+            ("state", "string", "`up`, `down` or `unknown`."),
+            ("kind", "string", "`ping`, `tcp`, `http`, `tls` or `dns`."),
+            ("q", "string", "Name, target or client."),
+        ],
+        paged: false, body: None, response: Resp::List("UptimeMonitor"),
+    },
+    Op {
+        id: "getUptimeMonitor", method: "GET", path: "/uptime/monitors/{id}", group: "network", summary: "Get a monitor with 90 days of availability, its open alerts and latest results",
+        note: "", query: NONE, paged: false, body: None, response: Resp::One("UptimeMonitorDetail"),
+    },
+    Op {
+        id: "getUptimeResults", method: "GET", path: "/uptime/monitors/{id}/results", group: "network", summary: "Checks, failures and latency of a monitor over time",
+        note: "About 500 points whatever the range; raw results for ranges within the last 48 hours, hourly rollups beyond.",
+        query: &[("from", "datetime", "Start (default: 24 hours before `to`)."), ("to", "datetime", "End (default: now).")],
+        paged: false, body: None, response: Resp::List("UptimePoint"),
+    },
+    // ---- backups (read) -------------------------------------------------------------------------
+    Op {
+        id: "listBackups", method: "GET", path: "/backups", group: "agents", summary: "List backup jobs across devices",
+        note: "The last result of each backup job the agents report (Windows Server Backup, Veeam, restic, borg, Time Machine, backup files).",
+        query: &[
+            CLIENT_Q,
+            ("result", "string", "Comma-separated: `success`, `warning`, `failed`, `running`, `unknown`."),
+            ("provider", "string", "`wsb`, `veeam`, `restic`, `borg`, `timemachine` or `file_age`."),
+            ("alerting", "boolean", "Only jobs with (or without) an open backup alert."),
+            ("q", "string", "Hostname or job."),
+        ],
+        paged: true, body: None, response: Resp::Paged("BackupJob"),
+    },
+    Op {
+        id: "listAgentBackups", method: "GET", path: "/agents/{id}/backups", group: "agents", summary: "An agent's backup jobs",
+        note: "", query: NONE, paged: false, body: None, response: Resp::List("BackupJob"),
+    },
+    // ---- Intune devices (read) -------------------------------------------------------------
+    Op {
+        id: "listMdmDevices", method: "GET", path: "/clients/{id}/mdm/devices", group: "agents", summary: "List a client's Intune managed devices",
+        note: "Read through the client's Entra ID connection, with the agent each is matched to. Needs the `identity.read` permission on the key.",
+        query: &[
+            ("compliance", "string", "Comma-separated Intune compliance states: `compliant`, `noncompliant`, `inGracePeriod`, `conflict`, `error`, `unknown`."),
+            ("os", "string", "Operating system as Intune names it (`Windows`, `iOS`, `Android`, `macOS`)."),
+            ("unmatched", "boolean", "Only devices with (or without) no matching agent."),
+            ("q", "string", "Device name, user or serial number."),
+        ],
+        paged: true, body: None, response: Resp::Paged("MdmDevice"),
+    },
+    // ---- disk encryption (read) ----------------------------------------------------------------
+    Op {
+        id: "listDiskEncryption", method: "GET", path: "/disk-encryption", group: "security", summary: "List the encryption state of volumes across devices",
+        note: "BitLocker, FileVault and LUKS state of each fixed volume as the agents last reported it. Recovery passwords are kept in the vault, which isn't in this API.",
+        query: &[
+            CLIENT_Q,
+            ("status", "string", "Comma-separated: `encrypted`, `encrypting`, `decrypting`, `unencrypted`, `suspended`, `unknown`."),
+            ("escrowed", "boolean", "Only BitLocker volumes whose recovery password is (or isn't) escrowed."),
+            ("os_only", "boolean", "Only system volumes."),
+            ("alerting", "boolean", "Only volumes with (or without) an open disk encryption alert."),
+            ("q", "string", "Hostname."),
+        ],
+        paged: true, body: None, response: Resp::Paged("DiskVolume"),
+    },
+    Op {
+        id: "getAgentDiskEncryption", method: "GET", path: "/agents/{id}/disk-encryption", group: "security", summary: "An agent's disk encryption",
+        note: "Its volumes, TPM, the time of its last report and whether its policy escrows recovery passwords.",
+        query: NONE, paged: false, body: None, response: Resp::One("AgentDiskEncryption"),
+    },
     Op {
         id: "listDiscoveredDevices", method: "GET", path: "/network/discovered", group: "network", summary: "List the hosts that network scans found",
         note: "`state` says whether a host is managed (an agent runs on it), monitored (read over SNMP), ignored, known or still unmanaged.",
@@ -357,6 +444,34 @@ pub static OPS: &[Op] = &[
             ("q", "string", "Search text."),
         ],
         paged: true, body: None, response: Resp::Paged("Detection"),
+    },
+    // ---- vulnerabilities (read) ---------------------------------------------------------
+    Op {
+        id: "listVulnerabilities", method: "GET", path: "/vulnerabilities", group: "security", summary: "Vulnerabilities in the fleet, one row per CVE",
+        note: "Needs the `security.read` permission on the key. Counts devices with the CVE open and not accepted.", query: &[
+            CLIENT_Q,
+            ("severity", "string", "Comma-separated: critical, high, medium, low, unknown."),
+            ("kev", "boolean", "Only (or never) CVEs in CISA's known-exploited catalog."),
+            ("fix", "boolean", "Only with (or without) a fixed version."),
+            ("accepted", "boolean", "Also CVEs every affected device has accepted."),
+            ("q", "string", "CVE, advisory, summary or package."),
+        ],
+        paged: true, body: None, response: Resp::Paged("VulnerabilityRow"),
+    },
+    Op {
+        id: "listVulnerabilityDevices", method: "GET", path: "/vulnerabilities/{id}/devices", group: "security",
+        summary: "The devices with a CVE (or advisory) open", note: "Needs the `security.read` permission on the key. At most 2000.",
+        query: &[CLIENT_Q], paged: false, body: None, response: Resp::List("VulnerabilityDevice"),
+    },
+    Op {
+        id: "listAgentVulnerabilities", method: "GET", path: "/agents/{id}/vulnerabilities", group: "security",
+        summary: "An agent's open vulnerability findings and whether it is assessed",
+        note: "Needs the `security.read` permission on the key.", query: NONE, paged: false, body: None, response: Resp::Object,
+    },
+    Op {
+        id: "listVulnerableSoftware", method: "GET", path: "/vulnerabilities/software", group: "security",
+        summary: "Vulnerable packages and Windows products, worst first", note: "Needs the `security.read` permission on the key. At most 500.",
+        query: &[CLIENT_Q, ("q", "string", "Package or installed title.")], paged: false, body: None, response: Resp::List("VulnerableSoftware"),
     },
     // ---- audit log (admins, or whoever holds audit.read) ----------------------------------
     Op {
@@ -445,6 +560,13 @@ fn field_schemas() -> Value {
             "required": ["tag_ids"],
             "properties": { "tag_ids": { "type": "array", "items": { "type": "string", "format": "uuid" }, "maxItems": 50 } },
         },
+        "WakeAgents": {
+            "type": "object",
+            "required": ["agent_ids"],
+            "properties": {
+                "agent_ids": { "type": "array", "items": { "type": "string", "format": "uuid" }, "minItems": 1, "maxItems": 5000 },
+            },
+        },
         "BulkTags": {
             "type": "object",
             "required": ["agent_ids"],
@@ -475,6 +597,21 @@ fn field_schemas() -> Value {
                 },
             },
         },
+        "VulnerabilityRow": object("A CVE (or an advisory without one) open on devices.", &[
+            ("key", "string"), ("cve", "string?"), ("advisories", "array"), ("summary", "string"), ("severity", "string"), ("cvss", "number?"),
+            ("epss", "number?"), ("kev", "boolean"), ("published", "datetime?"), ("devices", "integer"), ("accepted_devices", "integer"),
+            ("fix_available", "boolean"), ("packages", "array"), ("first_seen", "datetime"),
+        ]),
+        "VulnerabilityDevice": object("A device with a CVE open.", &[
+            ("agent_id", "uuid"), ("hostname", "string"), ("online", "boolean"), ("os_family", "string"), ("os_name", "string"), ("client_id", "uuid"),
+            ("client_name", "string"), ("site_name", "string"), ("vuln_id", "string"), ("package", "string"), ("software_name", "string"),
+            ("installed_version", "string"), ("fixed_version", "string?"), ("fix_available", "boolean"), ("first_seen", "datetime"),
+            ("accepted", "boolean"), ("product_id", "uuid?"), ("remediation", "object?"),
+        ]),
+        "VulnerableSoftware": object("A vulnerable package or Windows product.", &[
+            ("package", "string"), ("ecosystems", "array"), ("product_id", "uuid?"), ("product_name", "string?"), ("package_id", "uuid?"),
+            ("devices", "integer"), ("cves", "integer"), ("severity", "string"), ("kev", "boolean"), ("fix_available", "boolean"), ("fixed_versions", "array"),
+        ]),
         "Note": object("A note on an agent.", &[
             ("id", "uuid"), ("agent_id", "uuid"), ("body", "string"), ("author_id", "uuid?"), ("author_name", "string"), ("pinned", "boolean"),
             ("created_at", "datetime"), ("updated_at", "datetime"), ("can_edit", "boolean"),
@@ -547,11 +684,15 @@ fn base_schemas() -> Value {
                 "args": { "type": "array", "items": { "type": "string" } },
                 "timeout_secs": { "type": "integer", "description": "Default: the script's own." },
                 "ticket_id": { "type": "string", "format": "uuid", "description": "Run from this ticket: the result is added to its timeline." },
+                "params": {
+                    "type": "object", "additionalProperties": true,
+                    "description": "Values of the script's parameters, by name (see the script's `params`). Each reaches the script as the environment variable RMM_PARAM_<NAME>, never in its text. Text values may hold placeholders such as {{agent.hostname}} or {{field.<name>}}, expanded per agent. Secret values are never stored or shown; vault items can't be named through the API.",
+                },
             },
         },
         "Script": object("A saved script.", &[
             ("id", "uuid"), ("name", "string"), ("description", "string"), ("interpreter", "string"), ("body", "string"),
-            ("timeout_secs", "integer"), ("client_id", "uuid?"), ("client_name", "string?"), ("created_at", "datetime"), ("updated_at", "datetime"),
+            ("timeout_secs", "integer"), ("client_id", "uuid?"), ("client_name", "string?"), ("params", "array"), ("created_at", "datetime"), ("updated_at", "datetime"),
         ]),
         "Alert": object("An alert: something that needs attention on an agent.", &[
             ("id", "uuid"), ("policy_id", "uuid?"), ("policy_name", "string?"), ("agent_id", "uuid"), ("hostname", "string"),
@@ -663,6 +804,42 @@ fn base_schemas() -> Value {
         },
         "NetworkDevicePoint": object("One point of a device's history.", &[
             ("ts", "datetime"), ("reachable_pct", "number"), ("rtt_ms", "number?"), ("cpu_percent", "number?"), ("mem_used", "integer?"), ("mem_total", "integer?"),
+        ]),
+        "UptimeMonitor": object("A check run on a schedule by an agent.", &[
+            ("id", "uuid"), ("client_id", "uuid"), ("client_name", "string"), ("site_id", "uuid"), ("site_name", "string"), ("name", "string"),
+            ("kind", "string"), ("config", "object"), ("target", "string"), ("runner", "string"), ("agent_id", "uuid?"), ("runner_agent_id", "uuid?"),
+            ("runner_hostname", "string?"), ("runner_online", "boolean"), ("interval_secs", "integer"), ("timeout_secs", "integer"), ("enabled", "boolean"),
+            ("state", "string"), ("state_since", "datetime"), ("fail_count", "integer"), ("last_at", "datetime?"), ("last_ms", "integer?"),
+            ("last_message", "string?"), ("last_value", "number?"), ("cert_not_after", "datetime?"), ("cert", "object?"), ("open_alerts", "integer"),
+            ("uptime_24h", "number?"), ("uptime_30d", "number?"),
+        ]),
+        "UptimeMonitorDetail": {
+            "allOf": [reference("UptimeMonitor"), object("Daily availability, open alerts and the latest results.", &[("days", "array"), ("alerts", "array"), ("recent", "array")])],
+        },
+        "UptimePoint": object("One point of a monitor's history.", &[
+            ("ts", "datetime"), ("checks", "integer"), ("failures", "integer"), ("avg_ms", "number?"), ("max_ms", "integer?"),
+        ]),
+        "BackupJob": object("A backup job's last result on a device.", &[
+            ("agent_id", "uuid"), ("hostname", "string"), ("online", "boolean"), ("client_id", "uuid"), ("client_name", "string"), ("site_name", "string"),
+            ("provider", "string"), ("job", "string"), ("last_run_at", "datetime?"), ("last_success_at", "datetime?"), ("last_result", "string"),
+            ("message", "string"), ("size_bytes", "integer?"), ("updated_at", "datetime"), ("alerting", "boolean"),
+        ]),
+        "MdmDevice": object("A device Intune manages, as last read from the client's tenant.", &[
+            ("id", "uuid"), ("source_id", "uuid"), ("source_name", "string"), ("external_id", "string"), ("name", "string"), ("user_upn", "string"),
+            ("os", "string"), ("os_version", "string"), ("compliance", "string"), ("encrypted", "boolean?"), ("ownership", "string"), ("serial", "string"),
+            ("model", "string"), ("manufacturer", "string"), ("enrolled_at", "datetime?"), ("last_sync_at", "datetime?"), ("agent_id", "uuid?"),
+            ("agent_hostname", "string?"), ("agent_online", "boolean?"), ("synced_at", "datetime"),
+        ]),
+        "DiskVolume": object("A fixed volume's encryption state.", &[
+            ("agent_id", "uuid"), ("hostname", "string"), ("online", "boolean"), ("client_id", "uuid"), ("client_name", "string"), ("site_name", "string"),
+            ("volume_id", "string"), ("mount", "string"), ("device", "string"), ("kind", "string"), ("role", "string"), ("status", "string"),
+            ("percent", "number?"), ("method", "string?"), ("protectors", "array"), ("protection_on", "boolean"), ("locked", "boolean"),
+            ("recovery_protector_id", "string?"), ("escrowed", "boolean"), ("escrowed_at", "datetime?"), ("escrow_error", "string?"),
+            ("vault_item_id", "uuid?"), ("suspended_since", "datetime?"), ("updated_at", "datetime"), ("alerting", "boolean"),
+        ]),
+        "AgentDiskEncryption": object("A device's disk encryption.", &[
+            ("reported_at", "datetime?"), ("error", "string?"), ("tpm", "object?"), ("summary", "string?"), ("escrow_recovery_keys", "boolean"),
+            ("add_recovery_protector", "boolean"), ("volumes", "array"),
         ]),
         "DiscoveredDevice": object("A host a network scan found.", &[
             ("id", "uuid"), ("site_id", "uuid"), ("site_name", "string"), ("client_id", "uuid"), ("client_name", "string"), ("ip", "string"),

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use axum::Router;
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 
 use crate::state::AppState;
 
@@ -10,7 +10,11 @@ mod agents;
 mod attachments;
 mod alerts;
 mod apikeys;
+mod backups;
+mod diskenc;
+mod vulns;
 mod billing;
+mod branding;
 mod channels;
 mod auth;
 mod clients;
@@ -18,10 +22,14 @@ mod desk;
 mod docs;
 mod downloads;
 mod fields;
+mod identity;
 mod kb;
+mod localadmin;
 mod jobs;
 mod msi;
 mod notes;
+mod oncall;
+mod push;
 mod mutes;
 mod network;
 mod packages;
@@ -33,7 +41,7 @@ mod pm;
 pub(crate) mod policies;
 pub(crate) mod portal;
 pub(crate) mod public;
-mod reports;
+pub(crate) mod reports;
 mod search;
 mod scripts;
 mod security;
@@ -45,6 +53,8 @@ mod sso;
 pub(crate) mod sla;
 pub(crate) mod tickets;
 mod tags;
+mod ticket_templates;
+mod uptime;
 mod time;
 mod tools;
 mod totp;
@@ -52,11 +62,13 @@ pub(crate) mod users;
 mod audit;
 mod siem;
 mod vault;
+mod report_schedules;
 mod views;
+mod wake;
 mod webhooks;
 
 pub use agents::refresh_health as refresh_agent_health;
-pub use jobs::{FAILED as JOB_FAILED, deliver as deliver_job};
+pub use jobs::{FAILED as JOB_FAILED, deliver as deliver_job, end_with_error as end_job_with_error};
 pub use portal::PORTAL_LINK_MINUTES;
 pub use sso::seal_existing as seal_sso_secrets;
 pub use totp::{clear as clear_totp, seal_existing as seal_totp_secrets};
@@ -137,6 +149,8 @@ pub fn router(attachment_max: u64) -> Router<Arc<AppState>> {
         .route("/tags", get(tags::list).post(tags::create))
         .route("/tags/{id}", axum::routing::put(tags::update).delete(tags::remove))
         .route("/agents/tags", post(tags::bulk))
+        .route("/agents/wake", post(wake::wake_many))
+        .route("/agents/{id}/wake", post(wake::wake_one))
         .route("/agents/{id}/tags", axum::routing::put(tags::set_for_agent))
         .route("/custom-fields", get(fields::list_defs).post(fields::create_def))
         .route("/custom-fields/{id}", axum::routing::put(fields::update_def).delete(fields::delete_def))
@@ -228,6 +242,18 @@ pub fn router(attachment_max: u64) -> Router<Arc<AppState>> {
         .route("/audit/export", get(audit::export))
         .route("/settings", get(settings::get).put(settings::update))
         .route("/settings/public", get(settings::public))
+        .route("/settings/branding", get(branding::get).put(branding::update))
+        .route(
+            "/settings/branding/{variant}",
+            get(branding::instance_image).post(branding::upload_instance).delete(branding::remove_instance_image),
+        )
+        .route("/clients/{id}/branding", get(branding::get_client).put(branding::update_client).delete(branding::delete_client))
+        .route(
+            "/clients/{id}/branding/{variant}",
+            get(branding::client_image).post(branding::upload_client).delete(branding::remove_client_image),
+        )
+        .route("/branding/{variant}", get(branding::public_image))
+        .route("/portal/branding/{variant}", get(branding::portal_image))
         .route("/settings/sso", get(sso::settings).put(sso::set_required))
         .route("/settings/sso/providers", post(sso::create_provider))
         .route("/settings/sso/providers/{id}", axum::routing::put(sso::update_provider).delete(sso::delete_provider))
@@ -238,6 +264,28 @@ pub fn router(attachment_max: u64) -> Router<Arc<AppState>> {
         .route("/notification-channels/{id}", axum::routing::put(channels::update).delete(channels::remove))
         .route("/notification-channels/{id}/test", post(channels::test))
         .route("/notifications", get(channels::deliveries))
+        // On-call and paging.
+        .route("/oncall/people", get(oncall::people))
+        .route("/oncall/schedules", get(oncall::list_schedules).post(oncall::create_schedule))
+        .route("/oncall/schedules/{id}", get(oncall::get_schedule).put(oncall::update_schedule).delete(oncall::delete_schedule))
+        .route("/oncall/schedules/{id}/shifts", get(oncall::shifts))
+        .route("/oncall/now", get(oncall::now))
+        .route("/oncall/overrides", post(oncall::create_override))
+        .route("/oncall/overrides/{id}", delete(oncall::delete_override))
+        .route("/oncall/escalation-policies", get(oncall::list_policies).post(oncall::create_policy))
+        .route("/oncall/escalation-policies/{id}", get(oncall::get_policy).put(oncall::update_policy).delete(oncall::delete_policy))
+        .route("/oncall/settings", get(oncall::get_settings).put(oncall::update_settings))
+        .route("/oncall/pages", get(oncall::pages))
+        .route("/oncall/pages/{id}/ack", post(oncall::ack_page))
+        .route("/account/contact-methods", get(oncall::get_contact).put(oncall::update_contact))
+        .route("/account/phone/verify", post(oncall::verify_phone))
+        .route("/settings/sms", get(oncall::get_sms).put(oncall::update_sms))
+        .route("/settings/sms/test", post(oncall::test_sms))
+        // Web Push (the installed app).
+        .route("/push/key", get(push::key))
+        .route("/push/subscriptions", get(push::list).post(push::subscribe).delete(push::unsubscribe))
+        .route("/push/test", post(push::test))
+        .route("/account/notification-prefs", get(push::get_prefs).put(push::update_prefs))
         .route("/alerts", get(alerts::list))
         .route("/alerts/summary", get(alerts::summary_handler))
         .route("/alerts/bulk", post(alerts::bulk))
@@ -399,9 +447,60 @@ pub fn router(attachment_max: u64) -> Router<Arc<AppState>> {
         .route("/reports/utilisation", get(reports::utilisation))
         .route("/reports/profitability", get(reports::profitability))
         .route("/reports/qbr/{id}", get(reports::qbr))
+        .route("/report-schedules", get(report_schedules::list).post(report_schedules::create))
+        .route("/report-schedules/{id}", get(report_schedules::get).put(report_schedules::update).delete(report_schedules::remove))
+        .route("/report-schedules/{id}/run", post(report_schedules::run_now))
+        .route("/report-schedules/{id}/runs", get(report_schedules::runs))
+        .route("/report-runs/{id}/download", get(report_schedules::download))
         .route("/sites/{id}/network", get(network::site_settings).put(network::update_settings))
         .route("/sites/{id}/network/scan", post(network::scan))
         .route("/sites/{id}/network/scans", get(network::scans))
+        .route("/uptime/monitors", get(uptime::list).post(uptime::create))
+        .route("/uptime/monitors/{id}", get(uptime::get).put(uptime::update).delete(uptime::remove))
+        .route("/uptime/monitors/{id}/check", post(uptime::check_now))
+        .route("/uptime/monitors/{id}/results", get(uptime::results))
+        .route("/uptime/summary", get(uptime::summary))
+        .route("/backups", get(backups::list))
+        .route("/clients/{id}/identity-sources", get(identity::list_sources).post(identity::create_source))
+        .route("/identity-sources/{id}", put(identity::update_source).delete(identity::delete_source))
+        .route("/identity-sources/{id}/test", post(identity::test_source))
+        .route("/identity-sources/{id}/sync", post(identity::sync_source))
+        .route("/clients/{id}/identity/users", get(identity::list_users))
+        .route("/clients/{id}/identity/groups", get(identity::list_groups))
+        .route("/identity/users/{id}", get(identity::get_user))
+        .route("/identity/users/{id}/{action}", post(identity::act))
+        .route("/clients/{id}/mdm/devices", get(identity::list_devices))
+        .route("/clients/{id}/mdm/summary", get(identity::devices_summary))
+        .route("/mdm/devices/{id}", get(identity::get_device))
+        .route("/ticket-templates", get(ticket_templates::list).post(ticket_templates::create))
+        .route("/ticket-templates/{id}", put(ticket_templates::update).delete(ticket_templates::remove))
+        .route("/tickets/from-template", post(ticket_templates::from_template))
+        .route("/tickets/{id}/checklist", get(ticket_templates::get_checklist).put(ticket_templates::put_checklist))
+        .route("/tickets/{id}/checklist/{item}", post(ticket_templates::tick))
+        .route("/tickets/{id}/checklist/{item}/run", post(ticket_templates::run))
+        .route("/agents/{id}/backups", get(backups::for_agent))
+        .route("/agents/{id}/backups/check", post(backups::check_now))
+        .route("/disk-encryption", get(diskenc::list))
+        .route("/agents/{id}/disk-encryption", get(diskenc::for_agent))
+        .route("/agents/{id}/disk-encryption/refresh", post(diskenc::refresh))
+        .route("/agents/{id}/disk-encryption/{volume}/rotate-key", post(diskenc::rotate))
+        .route("/agents/{id}/local-admin", get(localadmin::for_agent))
+        .route("/agents/{id}/local-admin/rotate", post(localadmin::rotate))
+        .route("/vulnerabilities", get(vulns::list))
+        .route("/vulnerabilities/summary", get(vulns::summary))
+        .route("/vulnerabilities/software", get(vulns::software))
+        .route("/vulnerabilities/agents", get(vulns::agents))
+        .route("/vulnerabilities/unassessed", get(vulns::unassessed))
+        .route("/vulnerabilities/acceptances", post(vulns::accept))
+        .route("/vulnerabilities/acceptances/{id}", axum::routing::delete(vulns::unaccept))
+        .route("/vulnerabilities/feeds", get(vulns::feeds))
+        .route("/vulnerabilities/feeds/{name}", axum::routing::put(vulns::update_feed))
+        .route("/vulnerabilities/sync", post(vulns::sync))
+        .route("/vulnerabilities/products", get(vulns::products).post(vulns::create_product))
+        .route("/vulnerabilities/products/{id}", axum::routing::put(vulns::update_product).delete(vulns::delete_product))
+        .route("/vulnerabilities/{id}", get(vulns::get))
+        .route("/vulnerabilities/{id}/devices", get(vulns::devices))
+        .route("/agents/{id}/vulnerabilities", get(vulns::for_agent))
         .route("/network/summary", get(network::summary))
         .route("/network/discovered", get(network::list_discovered))
         .route("/network/discovered/bulk", post(network::bulk_discovered))

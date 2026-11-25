@@ -3,6 +3,7 @@
  * NOW (the page clock is frozen there), so every screenshot is the same on every run.
  */
 import type { Page, Route } from '@playwright/test';
+import { readFileSync } from 'node:fs';
 
 export const NOW = new Date('2026-06-15T14:30:00Z');
 const ago = (mins: number) => new Date(NOW.getTime() - mins * 60_000).toISOString();
@@ -67,6 +68,9 @@ agents[6].enrolled_at = ago(60 * 24 * 2);
 // Patch state that counts against health, and a snoozed machine.
 Object.assign(agents[2], { patches_overdue: 2, patches_failed: 1, reboot_pending: true, reboot_pending_since: ago(60 * 30) });
 agents[3].alerts_muted = true;
+// Disk encryption summaries (docs/design/disk-encryption.md).
+const encryptionOf: Record<string, 'encrypted' | 'partial' | 'none' | null> = { 'a-1': 'encrypted', 'a-2': 'partial', 'a-3': 'none', 'a-4': 'encrypted', 'a-5': 'encrypted', 'a-6': 'none', 'a-7': null };
+for (const a of agents) Object.assign(a, { encryption: encryptionOf[a.id] ?? null });
 
 // --- tags, custom fields, notes, saved views -----------------------------------------------------
 const tagList = [
@@ -139,13 +143,91 @@ const alerts = [
 	alert(5, 'p-job', 2, 'Job failed: Disk usage report', 160, { occurrences: 3, details: { job_id: 'j-1', status: 'failed', exit_code: 2, script: 'Disk usage report' } }),
 	alert(6, 'p-cpu', 0, 'CPU at or above 85% for 15 minutes', 60 * 26, { state: 'resolved', resolved_at: ago(60 * 25), resolution: 'cleared', details: { value: 92.4, threshold: 85, minutes: 15 } })
 ];
-for (const a of alerts) if (a.state !== 'resolved') agents.find((x) => x.id === a.agent_id)!.open_alerts++;
+// A monitor the server runs: an alert without an agent, of the client, at the monitor's site.
+alerts.push({
+	...alerts[0], id: 'al-7', policy_id: 'p-uptime', policy_name: 'Client websites', agent_id: null as unknown as string, hostname: null as unknown as string, client_id: 'c-acme', client_name: 'Acme Corp',
+	site_name: 'Head office', kind: 'uptime', severity: 'critical', title: 'Monitor down: Acme web shop', opened_at: ago(14), last_seen_at: ago(1),
+	details: { monitor: 'Acme web shop', kind: 'http', target: 'https://shop.acme.example/', failures: 3, message: 'HTTP 502' },
+	...({ monitor_id: 'um-shop', monitor_name: 'Acme web shop' } as Record<string, unknown>)
+});
+for (const a of alerts) if (a.state !== 'resolved' && a.agent_id) agents.find((x) => x.id === a.agent_id)!.open_alerts++;
 const channels = [
 	{ id: 'ch-mail', name: 'NOC mailbox', kind: 'email', enabled: true, policies: 2, has_secret: false, config: { to: ['noc@northwind.example', 'oncall@northwind.example'] } },
 	{ id: 'ch-teams', name: 'Teams: Escalations', kind: 'teams', enabled: true, policies: 1, has_secret: false, config: { url: 'https://northwind.webhook.office.com/webhookb2/abc' } },
 	{ id: 'ch-slack', name: 'Slack #alerts', kind: 'slack', enabled: true, policies: 1, has_secret: false, config: { url: 'https://hooks.slack.com/services/T000/B000/XXXX' } },
-	{ id: 'ch-hook', name: 'PSA webhook', kind: 'webhook', enabled: false, policies: 1, has_secret: true, config: { url: 'https://psa.northwind.example/hooks/rmm' } }
+	{ id: 'ch-hook', name: 'PSA webhook', kind: 'webhook', enabled: false, policies: 1, has_secret: true, config: { url: 'https://psa.northwind.example/hooks/rmm' } },
+	{ id: 'ch-page', name: 'Page on-call', kind: 'oncall', enabled: true, policies: 1, has_secret: false, config: { escalation_policy_id: 'ep-servers', when: 'outside_hours', calendar_id: 'cal-office' } },
+	{ id: 'ch-pd', name: 'PagerDuty: Infrastructure', kind: 'pagerduty', enabled: true, policies: 0, has_secret: true, config: {} }
 ].map((c, i) => ({ ...c, created_at: ago(60 * 24 * (20 - i)) }));
+// --- on-call and paging --------------------------------------------------------------------
+const day0 = new Date(Date.UTC(2026, 5, 15)).getTime();
+const at = (days: number, hours = 0) => new Date(day0 + (days * 24 + hours) * 3_600_000).toISOString();
+const oncallPeople = [
+	{ id: 'u-1', name: 'Dana Admin', email: 'dana@northwind.example', phone_verified: true },
+	{ id: 'u-2', name: 'Terry Tech', email: 'terry@northwind.example', phone_verified: true },
+	{ id: 'u-4', name: 'Priya Nair', email: 'priya@northwind.example', phone_verified: false }
+];
+const oncallSchedules = [
+	{
+		id: 'os-1', name: 'Out of hours', timezone: 'Europe/London',
+		layers: [
+			{ id: 'ol-1', position: 0, name: 'Weekly', user_ids: ['u-2', 'u-4'], start_at: at(-7, 9), shift_hours: 168, restrict: [] },
+			{ id: 'ol-2', position: 1, name: 'Weekdays', user_ids: ['u-1'], start_at: at(-7, 0), shift_hours: 24, restrict: [{ days: [0, 1, 2, 3, 4], start: 540, end: 1020 }] }
+		],
+		overrides: [{ id: 'oo-1', schedule_id: 'os-1', user_id: 'u-4', user_name: 'Priya Nair', starts_at: at(2, 17), ends_at: at(3, 9) }],
+		now: { schedule_id: 'os-1', schedule_name: 'Out of hours', user_id: 'u-1', user_name: 'Dana Admin', until: at(0, 17), source: 'layer' }
+	},
+	{ id: 'os-2', name: 'Security', timezone: 'UTC', layers: [], overrides: [], now: { schedule_id: 'os-2', schedule_name: 'Security', user_id: null, user_name: null, until: null, source: null } }
+];
+const seg = (user_id: string, start: string, end: string) => ({ user_id, user_name: oncallPeople.find((p) => p.id === user_id)!.name, start, end });
+const weekdays = [0, 1, 2, 3, 4].map((d) => seg('u-1', at(d, 9), at(d, 17)));
+const oncallShifts = {
+	from: at(0), to: at(7), timezone: 'Europe/London',
+	layers: [
+		{ id: 'ol-1', name: 'Weekly', position: 0, segments: [seg('u-2', at(0), at(0, 9)), seg('u-4', at(0, 9), at(7))] },
+		{ id: 'ol-2', name: 'Weekdays', position: 1, segments: weekdays }
+	],
+	overrides: [seg('u-4', at(2, 17), at(3, 9))],
+	final: [
+		seg('u-2', at(0), at(0, 9)), seg('u-1', at(0, 9), at(0, 17)), seg('u-4', at(0, 17), at(1, 9)), seg('u-1', at(1, 9), at(1, 17)), seg('u-4', at(1, 17), at(2, 9)),
+		seg('u-1', at(2, 9), at(2, 17)), seg('u-4', at(2, 17), at(3, 9)), seg('u-1', at(3, 9), at(3, 17)), seg('u-4', at(3, 17), at(4, 9)), seg('u-1', at(4, 9), at(4, 17)), seg('u-4', at(4, 17), at(7))
+	]
+};
+const escalationPolicies = [
+	{
+		id: 'ep-servers', name: 'Servers, out of hours', repeat: 1,
+		steps: [
+			{ delay_minutes: 10, targets: [{ schedule: 'os-1' }] },
+			{ delay_minutes: 15, targets: [{ user: 'u-1' }, { channel: 'ch-teams' }] }
+		],
+		channels: [{ id: 'ch-page', name: 'Page on-call' }]
+	}
+];
+const oncallPages = [
+	{
+		id: 'pg-1', alert_id: 'al-5', ticket_id: null, title: 'Job failed: Disk usage report on acme-web01', severity: 'warning', status: 'acknowledged', step: 1, round: 0,
+		policy_name: 'Servers, out of hours', acked_by_name: 'Dana Admin', acked_at: ago(140), resolved_at: null, created_at: ago(160), next_escalation_at: null,
+		deliveries: [
+			{ id: 'pd-1', user_name: 'Terry Tech', channel_name: null, method: 'push', step: 0, round: 0, status: 'sent', attempts: 1, error: null, created_at: ago(160), sent_at: ago(160), next_attempt_at: ago(160) },
+			{ id: 'pd-2', user_name: 'Terry Tech', channel_name: null, method: 'sms', step: 0, round: 0, status: 'sent', attempts: 1, error: null, created_at: ago(160), sent_at: ago(160), next_attempt_at: ago(160) },
+			{ id: 'pd-3', user_name: 'Dana Admin', channel_name: null, method: 'sms', step: 1, round: 0, status: 'sent', attempts: 1, error: null, created_at: ago(150), sent_at: ago(150), next_attempt_at: ago(150) },
+			{ id: 'pd-4', user_name: null, channel_name: 'Teams: Escalations', method: 'channel', step: 1, round: 0, status: 'sent', attempts: 0, error: null, created_at: ago(150), sent_at: ago(150), next_attempt_at: ago(150) },
+			{ id: 'pd-5', user_name: 'Dana Admin', channel_name: null, method: 'email', step: 1, round: 0, status: 'cancelled', attempts: 0, error: null, created_at: ago(150), sent_at: null, next_attempt_at: ago(145) }
+		]
+	}
+];
+const notificationPrefs = {
+	hide_details: false,
+	events: [
+		{ event: 'page', label: "I'm paged", push: true, email: true, email_applies: false },
+		{ event: 'alert_critical', label: 'Critical alerts', push: true, email: true, email_applies: false },
+		{ event: 'alert_warning', label: 'Warnings', push: false, email: true, email_applies: false },
+		{ event: 'ticket_assigned', label: 'A ticket is assigned to me', push: true, email: true, email_applies: true },
+		{ event: 'ticket_reply', label: 'A client replies on my ticket', push: false, email: true, email_applies: true },
+		{ event: 'sla_warning', label: 'SLA warnings and breaches on my tickets', push: false, email: false, email_applies: true }
+	]
+};
+
 const deliveries = [
 	{ id: 9, channel_id: 'ch-mail', channel_name: 'NOC mailbox', alert_id: 'al-4', alert_title: 'Service failed: nginx.service', hostname: 'acme-web01', event: 'opened', status: 'sent', attempts: 1, last_error: null, created_at: ago(22), sent_at: ago(22), next_attempt_at: ago(12) },
 	{ id: 8, channel_id: 'ch-hook', channel_name: 'PSA webhook', alert_id: 'al-5', alert_title: 'Job failed: Disk usage report', hostname: 'acme-web01', event: 'opened', status: 'failed', attempts: 5, last_error: 'HTTP 502 Bad Gateway: upstream unavailable', created_at: ago(160), sent_at: null, next_attempt_at: ago(10) },
@@ -229,13 +311,21 @@ const jobs = statuses.map((status, i) => {
 });
 const jobDetail = (j: (typeof jobs)[number]) => ({
 	...j, body: 'df -h --output=target,pcent | sort -k2 -rn', args: [], timeout_secs: 300,
+	params: j.id === 'j-1' ? { min_pct: 95, notify: 'ops@acme.example', token: '•••' } : {},
 	stdout: 'Mounted on Use%\n/          96%\n/var       66%\n/boot      12%\n', stderr: j.status === 'failed' ? 'warning: / is above 95%\n' : '',
 	stdout_len: 62, stderr_len: j.status === 'failed' ? 25 : 0
 });
 const scripts = [
-	{ id: 's-disk', name: 'Disk usage report', description: 'Free space per mount, fullest first', interpreter: 'bash', body: 'df -h --output=target,pcent | sort -k2 -rn', timeout_secs: 120, client_id: null, client_name: null, created_at: ago(9000), updated_at: ago(2000) },
-	{ id: 's-spool', name: 'Restart print spooler', description: 'Clears stuck print jobs', interpreter: 'powershell', body: 'Stop-Service Spooler -Force\nRemove-Item C:\\Windows\\System32\\spool\\PRINTERS\\* -Force\nStart-Service Spooler', timeout_secs: 60, client_id: 'c-acme', client_name: 'Acme Corp', created_at: ago(8000), updated_at: ago(300) },
-	{ id: 's-upd', name: 'Pending updates', description: '', interpreter: 'python', body: 'import subprocess\nprint(subprocess.run(["apt", "list", "--upgradable"], capture_output=True, text=True).stdout)', timeout_secs: 300, client_id: null, client_name: null, created_at: ago(7000), updated_at: ago(7000) }
+	{ id: 's-disk', name: 'Disk usage report', description: 'Free space per mount, fullest first', interpreter: 'bash', body: 'df -h --output=target,pcent | sort -k2 -rn', timeout_secs: 120, client_id: null, client_name: null,
+		params: [{ name: 'min_pct', label: 'Warn above (%)', type: 'number', required: false, default: 90, description: 'Mounts fuller than this are listed first' }], created_at: ago(9000), updated_at: ago(2000) },
+	{ id: 's-spool', name: 'Restart print spooler', description: 'Clears stuck print jobs', interpreter: 'powershell', body: 'Stop-Service Spooler -Force\nRemove-Item C:\\Windows\\System32\\spool\\PRINTERS\\* -Force\nStart-Service Spooler', timeout_secs: 60, client_id: 'c-acme', client_name: 'Acme Corp',
+		params: [
+			{ name: 'printer', label: 'Printer', type: 'text', required: true, description: 'Queue to clear, or * for all' },
+			{ name: 'mode', label: 'Mode', type: 'select', required: false, default: 'safe', choices: ['safe', 'force'], description: '' },
+			{ name: 'notify', label: 'Notify when done', type: 'bool', required: false, default: false, description: '' },
+			{ name: 'admin_password', label: 'Print server admin', type: 'secret', required: false, description: 'Only for remote queues' }
+		], created_at: ago(8000), updated_at: ago(300) },
+	{ id: 's-upd', name: 'Pending updates', description: '', interpreter: 'python', body: 'import subprocess\nprint(subprocess.run(["apt", "list", "--upgradable"], capture_output=True, text=True).stdout)', timeout_secs: 300, client_id: null, client_name: null, params: [], created_at: ago(7000), updated_at: ago(7000) }
 ];
 
 const page = <T>(items: T[], limit = 1000) => ({ items: items.slice(0, limit), next: null, prev: null, total: items.length, total_exact: true });
@@ -430,6 +520,28 @@ const contacts = [
 	{ id: 'ct-ann', client_id: 'c-acme', client_name: 'Acme Corp', site_id: 's-acme-hq', site_name: 'Head office', name: 'Ann Lopez', email: 'ann@acme.example', phone: '+1 555 0101', job_title: 'Office manager', notes: '', is_primary: true, portal_enabled: false, open_tickets: 2, created_at: ago(60 * 24 * 100), updated_at: ago(60 * 24 * 100) },
 	{ id: 'ct-raj', client_id: 'c-acme', client_name: 'Acme Corp', site_id: 's-acme-wh', site_name: 'Warehouse', name: 'Raj Patel', email: 'raj@acme.example', phone: '', job_title: 'Warehouse lead', notes: '', is_primary: false, portal_enabled: false, open_tickets: 0, created_at: ago(60 * 24 * 60), updated_at: ago(60 * 24 * 60) }
 ];
+/** Scheduled reports (`/report-schedules`). */
+const reportSchedule = (id: string, name: string, report: string, client: string | null, cron: string, range: string, extra: Record<string, unknown> = {}) => ({
+	id, name, report, client_id: client, client_name: clients.find((c) => c.id === client)?.name ?? null, params: { range }, cron, timezone: 'Europe/London',
+	user_ids: ['u-1'], contact_ids: [], extra_emails: [], subject: '', message: '', enabled: true, owner_id: 'u-1', owner_name: 'Dana Admin',
+	next_run_at: new Date(Date.UTC(2026, 6, 1, 6, 0)).toISOString(), last_run_at: ago(60 * 24 * 23), last_status: 'sent', last_error: null,
+	created_at: ago(60 * 24 * 90), updated_at: ago(60 * 24 * 30), ...extra
+});
+const reportSchedules = [
+	reportSchedule('rs-qbr', 'Acme quarterly review', 'qbr', 'c-acme', '0 7 1 1,4,7,10 *', 'last_quarter', { contact_ids: ['ct-ann'], message: 'Your review for last quarter is attached.' }),
+	reportSchedule('rs-desk', 'Service desk, weekly', 'service_desk', null, '0 7 * * 1', 'last_week', { user_ids: ['u-1', 'u-2'], next_run_at: new Date(Date.UTC(2026, 5, 22, 6, 0)).toISOString(), last_run_at: ago(60 * 24 * 2) }),
+	reportSchedule('rs-profit', 'Margins for the partners', 'profitability', null, '0 7 1 * *', 'last_month', {
+		owner_id: 'u-2', owner_name: 'Terry Tech', last_status: 'failed', last_error: 'the owner lacks the billing.read permission', extra_emails: ['partners@northwind.example']
+	}),
+	reportSchedule('rs-off', 'Utilisation (paused)', 'utilisation', null, '0 7 1 * *', 'last_month', { enabled: false, next_run_at: null, last_run_at: null, last_status: null })
+];
+const reportRuns = [
+	{ id: 'rr-2', schedule_id: 'rs-qbr', trigger: 'manual', started_at: ago(60 * 3), finished_at: ago(60 * 3), status: 'sent', from_date: '2026-01-01', to_date: '2026-03-31', bytes: 48_211,
+	  recipients: [{ kind: 'user', id: 'u-1', email: 'dana@northwind.example', status: 'queued' }, { kind: 'contact', id: 'ct-ann', email: 'ann@acme.example', status: 'queued' }], error: null, started_by_name: 'Dana Admin', stored: true },
+	{ id: 'rr-1', schedule_id: 'rs-qbr', trigger: 'schedule', started_at: ago(60 * 24 * 85), finished_at: ago(60 * 24 * 85), status: 'sent', from_date: '2026-01-01', to_date: '2026-03-31', bytes: 47_002,
+	  recipients: [{ kind: 'user', id: 'u-1', email: 'dana@northwind.example', status: 'queued' }, { kind: 'contact', id: 'ct-old', email: '', status: 'skipped', reason: 'the contact was deleted' }], error: null, started_by_name: null, stored: true }
+];
+
 type T = Record<string, unknown> & { id: string; client_id: string | null };
 function ticket(i: number, subject: string, clientId: string | null, cat: string, prio: number, extra: Partial<T> = {}): T {
 	const c = clients.find((x) => x.id === clientId);
@@ -852,6 +964,9 @@ const PATCH_ITEM = '00000000-0000-4000-8000-000000000001';
 const SECURITY_ITEM = '00000000-0000-4000-8000-000000000002';
 const REMOTE_ITEM = '00000000-0000-4000-8000-000000000003';
 const AGENT_ITEM = '00000000-0000-4000-8000-000000000004';
+const DISKENC_ITEM = '00000000-0000-4000-8000-000000000005';
+const LOCAL_ADMIN_ITEM = '00000000-0000-4000-8000-000000000006';
+const TRAY_ITEM = '00000000-0000-4000-8000-000000000007';
 interface PItem { id: string; set: string; module: string; name: string; enabled: boolean; config: Cfg; client_id: string | null; site_id: string | null; excluded: { id: string; hostname: string }[] }
 const alertSet: Record<string, string> = { 'p-off': SET.root, 'p-disk': SET.root, 'p-cpu': SET.root, 'p-svc': SET.root, 'p-job': SET.linux, 'p-log': SET.linux };
 const alertConfig = (p: (typeof policies)[number]): Cfg => ({
@@ -862,7 +977,7 @@ const items: PItem[] = [
 	...policies.map((p) => ({ id: p.id, set: alertSet[p.id], module: 'alert', name: p.name, enabled: p.enabled, config: alertConfig(p), client_id: p.client_id, site_id: p.site_id, excluded: p.excluded })),
 	{ id: 'p-veeam', set: SET.acmeWin, module: 'alert', name: 'Backup service stopped', enabled: true, client_id: 'c-acme', site_id: null, excluded: [],
 		config: { kind: 'service', params: { services: ['VeeamBackupSvc'], auto_only: false, exclude: [] }, severity: 'critical', channel_ids: ['ch-mail'], notify_resolved: true, renotify_minutes: null, ticket_board_id: 'b-alerts', ticket_priority: 2, ticket_auto_resolve: true, run_script_id: null } },
-	...schedules.map((x) => ({ id: x.id, set: x.set_id, module: 'schedule', name: x.name, enabled: x.enabled, client_id: x.client_id, site_id: x.site_id, excluded: [], config: { script_id: x.script_id, cron: x.cron, timezone: x.timezone, args: x.args, timeout_secs: x.timeout_secs, retain_days: x.retain_days } })),
+	...schedules.map((x) => ({ id: x.id, set: x.set_id, module: 'schedule', name: x.name, enabled: x.enabled, client_id: x.client_id, site_id: x.site_id, excluded: [], config: { script_id: x.script_id, cron: x.cron, timezone: x.timezone, args: x.args, ...(x.id === 'sc-1' ? { params: { min_pct: '95' } } : {}), timeout_secs: x.timeout_secs, retain_days: x.retain_days } })),
 	{ id: 'sw-req', set: SET.acmeWin, module: 'software', name: 'Firefox on Acme Windows devices', enabled: true, client_id: 'c-acme', site_id: null, excluded: [], config: { package_id: 'sw-ff', state: 'latest', bootstrap_choco: false, window: null } },
 	{ id: 'au-welcome', set: SET.root, module: 'automation', name: 'Welcome new devices', enabled: true, client_id: null, site_id: null, excluded: [],
 		config: { trigger: 'enrollment', script_id: 's-disk', args: [], timeout_secs: null, offline_minutes: null, alert_kind: null, retry_failed: true, max_attempts: 3, retry_minutes: 30, cooldown_minutes: 60, max_runs_per_hour: 100, respect_window: false, retain_days: 30 } },
@@ -881,7 +996,12 @@ const items: PItem[] = [
 	{ id: SECURITY_ITEM, set: SET.root, module: 'security', name: 'Security', enabled: true, client_id: null, site_id: null, excluded: [],
 		config: { sensor_enabled: true, quick_scan_hours: 24, full_scan_days: 7, auto_quarantine: true, prevention: true, canaries: true, telemetry_mb: 256, realtime: 'block', scan_on_write: true, archive_depth: 5, database_max_age_hours: 72 } },
 	{ id: REMOTE_ITEM, set: SET.root, module: 'remote_access', name: 'Remote access', enabled: true, client_id: null, site_id: null, excluded: [], config: { desktop_enabled: true, desktop_consent: false, shell_enabled: true, files_enabled: true } },
-	{ id: AGENT_ITEM, set: SET.root, module: 'agent', name: 'Agent', enabled: true, client_id: null, site_id: null, excluded: [], config: { auto_update: true } }
+	{ id: AGENT_ITEM, set: SET.root, module: 'agent', name: 'Agent', enabled: true, client_id: null, site_id: null, excluded: [], config: { auto_update: true } },
+	{ id: DISKENC_ITEM, set: SET.root, module: 'disk_encryption', name: 'Disk encryption', enabled: true, client_id: null, site_id: null, excluded: [], config: { escrow_recovery_keys: true, add_recovery_protector: false } },
+	{ id: LOCAL_ADMIN_ITEM, set: SET.root, module: 'local_admin', name: 'Local admin password', enabled: true, client_id: null, site_id: null, excluded: [],
+		config: { enabled: false, account: 'rmmadmin', create: true, rotate_days: 30, length: 20, rotate_after_reveal_hours: 24 } },
+	{ id: TRAY_ITEM, set: SET.root, module: 'tray', name: 'Tray app', enabled: true, client_id: null, site_id: null, excluded: [],
+		config: { enabled: true, request_help: true, contact_card: true, screenshot_default: true, links: [{ label: 'Service status', url: 'https://status.example.com' }] } }
 ];
 const overrides: { item: string; set: string; enabled: boolean | null; config: Cfg }[] = [
 	{ item: PATCH_ITEM, set: SET.acmeWin, enabled: null, config: { auto_approve_severities: ['critical'], deferral_days: 2, auto_install: true, reboot_policy: 'if_required' } },
@@ -894,7 +1014,8 @@ const overrides: { item: string; set: string; enabled: boolean | null; config: C
 	{ item: 'au-addon', set: SET.winSrv, enabled: null, config: { max_runs_per_hour: 10, respect_window: false } },
 	{ item: 'p-svc', set: SET.web01, enabled: false, config: {} },
 	{ item: AGENT_ITEM, set: SET.winSrv, enabled: null, config: { auto_update: false } },
-	{ item: PATCH_ITEM, set: SET.dc, enabled: null, config: { auto_install: false, reboot_policy: 'never' } }
+	{ item: PATCH_ITEM, set: SET.dc, enabled: null, config: { auto_install: false, reboot_policy: 'never' } },
+	{ item: LOCAL_ADMIN_ITEM, set: SET.win, enabled: null, config: { enabled: true, rotate_days: 14 } }
 ];
 
 const isObj = (v: unknown): v is Cfg => typeof v === 'object' && v !== null && !Array.isArray(v);
@@ -933,7 +1054,7 @@ function chainOf(id: string): PSet[] {
 	for (let s: PSet | undefined = setOf(id); s; s = s.parent_id ? setOf(s.parent_id) : undefined) out.unshift(s);
 	return out;
 }
-const moduleOrder = ['alert', 'schedule', 'software', 'automation', 'patch', 'security', 'remote_access', 'agent'];
+const moduleOrder = ['alert', 'schedule', 'software', 'automation', 'patch', 'security', 'remote_access', 'agent', 'tray'];
 function itemView(it: PItem, chain: PSet[], agent?: Agent) {
 	const ids = chain.map((c) => c.id);
 	const at = ids.indexOf(it.set);
@@ -1079,8 +1200,12 @@ const vaultItems = [
 	{ id: V.m365, name: 'Microsoft 365 global admin', username: 'admin@acmecorp.onmicrosoft.com', url: 'https://admin.microsoft.com', has_password: true, has_totp: true, has_notes: true, docs: 1, password_changed_at: ago(60 * 24 * 12) },
 	{ id: V.wifi, name: 'Staff Wi-Fi key', username: '', url: '', has_password: true, has_totp: false, has_notes: false, docs: 2, password_changed_at: ago(60 * 24 * 160) },
 	{ id: V.sw, name: 'Core switch', username: 'manager', url: '10.0.0.2', has_password: true, has_totp: false, has_notes: false, docs: 0, password_changed_at: ago(60 * 24 * 300) },
-	{ id: V.veeam, name: 'Veeam console', username: 'ACME\\svc-backup', url: 'rdp://acme-backup01', has_password: true, has_totp: false, has_notes: true, docs: 1, password_changed_at: null }
-].map((v, i) => ({ ...v, client_id: 'c-acme', updated_at: ago(60 * (30 + i * 200)), updated_by_name: i % 2 ? 'Terry Tech' : 'Dana Admin' }));
+	{ id: V.veeam, name: 'Veeam console', username: 'ACME\\svc-backup', url: 'rdp://acme-backup01', has_password: true, has_totp: false, has_notes: true, docs: 1, password_changed_at: null },
+	{ id: '6f1c0c1e-9a51-4c0e-b6c9-0a4de1f3a1f0', name: 'BitLocker recovery: acme-dc01 C:', username: '{3F2A6C1D-4B8E-4F0A-9C21-7D5E8B1A0C33}', url: '', has_password: true, has_totp: false, has_notes: false, docs: 0, password_changed_at: ago(60 * 24 * 3),
+		managed_kind: 'disk_recovery', agent_id: 'a-1', agent_hostname: 'acme-dc01', managed_state: null },
+	{ id: '7a2d1c3e-6b5f-4c8d-9e0a-1b2c3d4e5f60', name: 'Local admin: acme-fs01', username: 'rmmadmin', url: '', has_password: true, has_totp: false, has_notes: false, docs: 0, password_changed_at: ago(60 * 24 * 6),
+		managed_kind: 'local_admin', agent_id: 'a-2', agent_hostname: 'acme-fs01', managed_state: 'current' }
+].map((v, i) => ({ managed_kind: null, agent_id: null, agent_hostname: null, managed_state: null, ...v, client_id: 'c-acme', updated_at: ago(60 * (30 + i * 200)), updated_by_name: i % 2 ? 'Terry Tech' : 'Dana Admin' }));
 const vaultDetail = (id: string) => {
 	const v = vaultItems.find((x) => x.id === id)!;
 	return {
@@ -1205,7 +1330,7 @@ const docTemplates = [
 }));
 const categoryOut = (c: (typeof docCategories)[number]) => ({ ...c, docs: clientDocs.filter((d) => d.category_id === c.id).length, templates: docTemplates.filter((t) => t.category_id === c.id).length });
 
-const admin = { id: 'u-1', email: 'dana@northwind.example', name: 'Dana Admin', role: 'admin', totp_enabled: true, mfa_setup_required: false, client_ids: null, preferences: {}, permissions: ['security.read', 'security.respond', 'security.manage', 'vault.read', 'vault.manage'] };
+const admin = { id: 'u-1', email: 'dana@northwind.example', name: 'Dana Admin', role: 'admin', totp_enabled: true, mfa_setup_required: false, client_ids: null, preferences: {}, permissions: ['security.read', 'security.respond', 'security.manage', 'vault.read', 'vault.manage', 'identity.read', 'identity.manage'] };
 
 // --- Network discovery and SNMP devices ------------------------------------------------------------
 const netDev = (n: number, name: string, kind: string, host: string, state: 'up' | 'down', extra: Record<string, unknown> = {}) => ({
@@ -1225,6 +1350,154 @@ const netPorts = Array.from({ length: 8 }, (_, i) => ({
 function oper(i: number) {
 	return [0, 0, 0, 1, 0, 0, 1, 1][i];
 }
+// --- uptime monitors and backup jobs ------------------------------------------------------------
+const monitorBase = { runner: 'agent', interval_secs: 60, timeout_secs: 10, enabled: true, fail_count: 0, cert: null as unknown, cert_not_after: null as string | null, last_value: null as number | null, created_at: ago(60 * 24 * 40), open_alerts: 0 };
+const uptimeMonitors = [
+	{ ...monitorBase, id: 'um-web', client_id: 'c-acme', client_name: 'Acme Corp', site_id: 's-acme-hq', site_name: 'Head office', name: 'Acme website', kind: 'http', config: { url: 'https://www.acme.example/', method: 'get', statuses: [], keyword: 'Welcome', keyword_absent: false, verify_tls: true }, target: 'https://www.acme.example/', agent_id: null, runner_agent_id: 'a-1', runner_hostname: 'acme-dc01', runner_online: true, state: 'up', state_since: ago(60 * 24 * 6), last_at: ago(1), last_ms: 182, last_message: 'HTTP 200', last_value: 200, cert_not_after: ago(-60 * 24 * 61), cert: { subject: 'CN=www.acme.example', issuer: 'C=US, O=Let’s Encrypt, CN=R11', sans: ['www.acme.example', 'acme.example'], not_before: ago(60 * 24 * 29), not_after: ago(-60 * 24 * 61), untrusted: null }, uptime_24h: 100, uptime_30d: 99.97 },
+	{ ...monitorBase, id: 'um-vpn', client_id: 'c-acme', client_name: 'Acme Corp', site_id: 's-acme-hq', site_name: 'Head office', name: 'VPN gateway', kind: 'tls', config: { host: 'vpn.acme.example', port: 443, server_name: null }, target: 'vpn.acme.example:443', agent_id: null, runner_agent_id: 'a-1', runner_hostname: 'acme-dc01', runner_online: true, state: 'up', state_since: ago(60 * 24 * 20), last_at: ago(2), last_ms: 41, last_message: 'certificate valid for 9 more days (TLSv1.3)', last_value: 9, cert_not_after: ago(-60 * 24 * 9 - 60), cert: { subject: 'CN=vpn.acme.example, O=Acme Corp', issuer: 'C=US, O=DigiCert Inc, CN=DigiCert TLS RSA SHA256 2020 CA1', sans: ['vpn.acme.example'], not_before: ago(60 * 24 * 356), not_after: ago(-60 * 24 * 9 - 60), untrusted: null }, open_alerts: 1, uptime_24h: 100, uptime_30d: 100 },
+	{ ...monitorBase, id: 'um-erp', client_id: 'c-acme', client_name: 'Acme Corp', site_id: 's-acme-wh', site_name: 'Warehouse', name: 'ERP database', kind: 'tcp', config: { host: '10.20.0.15', port: 1433 }, target: '10.20.0.15:1433', agent_id: 'a-2', runner_agent_id: 'a-2', runner_hostname: 'acme-fs01', runner_online: true, state: 'down', state_since: ago(23), fail_count: 23, last_at: ago(1), last_ms: null, last_message: '10.20.0.15:1433: connection refused', open_alerts: 1, uptime_24h: 98.4, uptime_30d: 99.12 },
+	{ ...monitorBase, id: 'um-dns', client_id: 'c-globex', client_name: 'Globex', site_id: 's-globex', site_name: 'Main', name: 'Mail MX record', kind: 'dns', interval_secs: 300, config: { name: 'globex.example', record: 'MX', server: null, expect: ['10 mail.globex.example'] }, target: 'globex.example MX', agent_id: null, runner_agent_id: 'a-5', runner_hostname: 'globex-app01', runner_online: true, state: 'up', state_since: ago(60 * 24 * 80), last_at: ago(3), last_ms: 12, last_message: '10 mail.globex.example', uptime_24h: 100, uptime_30d: 100 },
+	{ ...monitorBase, id: 'um-shop', runner: 'server', client_id: 'c-acme', client_name: 'Acme Corp', site_id: 's-acme-hq', site_name: 'Head office', name: 'Acme web shop', kind: 'http', config: { url: 'https://shop.acme.example/', method: 'get', statuses: [], keyword: null, keyword_absent: false, verify_tls: true }, target: 'https://shop.acme.example/', agent_id: null, runner_agent_id: null, runner_hostname: null, runner_online: true, state: 'down', state_since: ago(16), fail_count: 3, last_at: ago(1), last_ms: 640, last_message: 'HTTP 502 (expected 2xx or 3xx)', last_value: 502, open_alerts: 1, uptime_24h: 98.9, uptime_30d: 99.95 },
+	{ ...monitorBase, id: 'um-ping', client_id: 'c-initech', client_name: 'Initech', site_id: 's-initech', site_name: 'Main', name: 'Branch router', kind: 'ping', config: { host: '192.168.50.1' }, target: '192.168.50.1', agent_id: null, runner_agent_id: 'a-7', runner_hostname: 'initech-ws-12', runner_online: false, state: 'unknown', state_since: ago(60 * 5), last_at: ago(60 * 5 + 3), last_ms: 3, last_message: 'reply in 3 ms', uptime_24h: 100, uptime_30d: 99.99 }
+];
+function monitorDetail(m: (typeof uptimeMonitors)[number]) {
+	const today = new Date(Date.UTC(NOW.getUTCFullYear(), NOW.getUTCMonth(), NOW.getUTCDate()));
+	const days = Array.from({ length: 90 }, (_, i) => {
+		const day = new Date(today.getTime() - (89 - i) * 86_400_000).toISOString();
+		const checks = i < 12 && m.id !== 'um-web' ? 0 : 1440;
+		const failures = m.id === 'um-erp' && i === 89 ? 23 : m.id === 'um-web' && (i === 40 || i === 71) ? (i === 40 ? 4 : 19) : 0;
+		return { day, checks, failures, uptime: checks ? Math.round(((checks - failures) * 10000) / checks) / 100 : null };
+	}).filter((d) => d.checks);
+	const alerts = m.id === 'um-vpn' ? [{ id: 'al-mon-1', title: 'Certificate expires in 9 days: VPN gateway', severity: 'critical', kind: 'uptime', opened_at: ago(60 * 24 * 5), acknowledged_at: null }] : m.id === 'um-erp' ? [{ id: 'al-mon-2', title: 'Monitor down: ERP database', severity: 'critical', kind: 'uptime', opened_at: ago(22), acknowledged_at: null }] : m.id === 'um-shop' ? [{ id: 'al-7', title: 'Monitor down: Acme web shop', severity: 'critical', kind: 'uptime', opened_at: ago(14), acknowledged_at: null }] : [];
+	const recent = Array.from({ length: 8 }, (_, i) => ({ ts: ago(i * (m.interval_secs / 60) + 1), ok: m.state !== 'down', ms: m.state === 'down' ? null : (m.last_ms ?? 20) + ((i * 7) % 5) * 3, message: m.last_message ?? '' }));
+	return { ...m, days, alerts, recent };
+}
+const uptimePoints = (id: string) =>
+	Array.from({ length: 96 }, (_, i) => {
+		const down = id === 'um-erp' && i >= 94;
+		return { ts: new Date(NOW.getTime() - (95 - i) * 15 * 60_000).toISOString(), checks: 15, failures: down ? 15 : 0, avg_ms: down ? null : (id === 'um-web' ? 170 : 40) + ((i * 11) % 9) * 6, max_ms: down ? null : (id === 'um-web' ? 260 : 70) };
+	});
+const backupJobsMock = [
+	{ agent_id: 'a-2', hostname: 'acme-fs01', online: true, client_id: 'c-acme', client_name: 'Acme Corp', site_name: 'Head office', provider: 'veeam', job: 'Nightly file server', last_run_at: ago(60 * 7), last_success_at: ago(60 * 31), last_result: 'failed', message: 'Error: There is not enough space on the disk.', size_bytes: null, updated_at: ago(12), alerting: true },
+	{ agent_id: 'a-2', hostname: 'acme-fs01', online: true, client_id: 'c-acme', client_name: 'Acme Corp', site_name: 'Head office', provider: 'wsb', job: 'Windows Server Backup', last_run_at: ago(60 * 6), last_success_at: ago(60 * 6), last_result: 'success', message: '14 versions', size_bytes: null, updated_at: ago(12), alerting: false },
+	{ agent_id: 'a-1', hostname: 'acme-dc01', online: true, client_id: 'c-acme', client_name: 'Acme Corp', site_name: 'Head office', provider: 'wsb', job: 'Windows Server Backup', last_run_at: ago(60 * 5), last_success_at: ago(60 * 5), last_result: 'warning', message: 'One of the volumes was skipped.', size_bytes: null, updated_at: ago(20), alerting: false },
+	{ agent_id: 'a-6', hostname: 'globex-db01', online: true, client_id: 'c-globex', client_name: 'Globex', site_name: 'Main', provider: 'restic', job: 'sftp:backup@nas.globex.example:/srv/restic/db01', last_run_at: ago(60 * 3), last_success_at: ago(60 * 3), last_result: 'success', message: 'snapshot 5e4f3a2b of /var/lib/postgresql', size_bytes: 52_428_800_000, updated_at: ago(40), alerting: false },
+	{ agent_id: 'a-5', hostname: 'globex-app01', online: true, client_id: 'c-globex', client_name: 'Globex', site_name: 'Main', provider: 'file_age', job: '/srv/dumps/*.sql.gz', last_run_at: ago(60 * 50), last_success_at: ago(60 * 50), last_result: 'success', message: 'newest file app-2026-06-13.sql.gz', size_bytes: 734_003_200, updated_at: ago(33), alerting: true }
+];
+
+// Disk encryption and local admin rotation (docs/design/disk-encryption.md, docs/design/local-admin.md).
+const diskVol = (agentId: string, volume: string, role: 'os' | 'data', kind: string, status: string, o: Record<string, unknown> = {}) => {
+	const a = agents.find((x) => x.id === agentId)!;
+	return {
+		agent_id: agentId, hostname: a.hostname, online: a.online, client_id: a.client_id, client_name: a.client_name, site_name: a.site_name, volume_id: volume,
+		mount: kind === 'bitlocker' || volume.endsWith(':') ? `${volume}\\` : volume, device: '', kind, role, status, percent: status === 'unencrypted' ? 0 : 100,
+		method: kind === 'bitlocker' ? 'XTS-AES-128' : kind === 'luks' ? 'aes-xts-plain64' : null, protectors: kind === 'bitlocker' ? ['tpm', 'recovery_password'] : kind === 'luks' ? ['passphrase'] : [],
+		protection_on: status === 'encrypted', locked: false, recovery_protector_id: kind === 'bitlocker' ? '{3F2A6C1D-4B8E-4F0A-9C21-7D5E8B1A0C33}' : null,
+		escrowed: kind === 'bitlocker', escrowed_at: kind === 'bitlocker' ? ago(60 * 24 * 3) : null, escrow_error: null, vault_item_id: null as string | null,
+		suspended_since: null as string | null, updated_at: ago(40), alerting: false, ...o
+	};
+};
+const diskVolumes = [
+	diskVol('a-1', 'C:', 'os', 'bitlocker', 'encrypted', { vault_item_id: '6f1c0c1e-9a51-4c0e-b6c9-0a4de1f3a1f0' }),
+	diskVol('a-2', 'C:', 'os', 'bitlocker', 'suspended', { protection_on: false, suspended_since: ago(60 * 30), escrowed: false, recovery_protector_id: '{9A1B2C3D-0000-4000-8000-00000000A2C0}', alerting: true }),
+	diskVol('a-2', 'D:', 'data', 'none', 'unencrypted'),
+	diskVol('a-2', 'E:', 'data', 'bitlocker', 'encrypting', { percent: 62, protectors: ['external_key'], recovery_protector_id: null, escrowed: false, escrow_error: 'adding a recovery password failed: ProtectKeyWithNumericalPassword (Group Policy may forbid recovery passwords) failed: 0x8031005A' }),
+	diskVol('a-3', '/', 'os', 'none', 'unencrypted', { alerting: true }),
+	diskVol('a-4', 'C:', 'os', 'bitlocker', 'encrypted'),
+	diskVol('a-5', '/', 'os', 'luks', 'encrypted'),
+	diskVol('a-5', '/srv', 'data', 'luks', 'encrypted'),
+	diskVol('a-6', '/', 'os', 'none', 'unencrypted')
+];
+const diskencFor = (id: string) => {
+	const v = diskVolumes.filter((x) => x.agent_id === id);
+	const win = agents.find((a) => a.id === id)?.os_family === 'windows';
+	return {
+		reported_at: v.length ? ago(40) : null, error: null, tpm: v.length ? (win ? { present: true, ready: true, enabled: true, activated: true, version: '2.0', manufacturer: 'INTC' } : { present: false }) : null,
+		summary: encryptionOf[id] ?? null, escrow_recovery_keys: true, add_recovery_protector: id === 'a-2', volumes: v
+	};
+};
+const localAdminFor = (id: string) => {
+	const win = agents.find((a) => a.id === id)?.os_family === 'windows';
+	const policy = { enabled: win, account: 'rmmadmin', create: true, rotate_days: 14, length: 20, rotate_after_reveal_hours: 24 };
+	if (id === 'a-2')
+		return { policy, managed_state: 'current', needs_data_key: false, state: { agent_id: id, account: 'rmmadmin', vault_item_id: '7a2d1c3e-6b5f-4c8d-9e0a-1b2c3d4e5f60', status: 'ok', rotated_at: ago(60 * 24 * 6), next_rotate_at: ago(-60 * 24 * 8), rotate_reason: 'schedule', attempts: 0, sent_at: ago(60 * 24 * 6), last_error: null, updated_at: ago(60 * 24 * 6) } };
+	if (id === 'a-1')
+		return { policy, managed_state: 'pending', needs_data_key: false, state: { agent_id: id, account: 'rmmadmin', vault_item_id: null, status: 'failed', rotated_at: ago(60 * 24 * 20), next_rotate_at: ago(-25), rotate_reason: 'schedule', attempts: 3, sent_at: ago(35), last_error: 'NetUserSetInfo: the password doesn\'t meet the local password policy (length, complexity or history)', updated_at: ago(35) } };
+	return { policy, managed_state: null, needs_data_key: false, state: null };
+};
+// --- vulnerabilities ---------------------------------------------------------------------------
+const vulnRows = [
+	{ key: 'CVE-2024-6387', cve: 'CVE-2024-6387', advisories: ['UBUNTU-CVE-2024-6387'], summary: 'regreSSHion: signal handler race condition in OpenSSH’s server (sshd)', severity: 'critical', cvss: 9.8, epss: 0.38, kev: false, published: ago(60 * 24 * 400), devices: 2, accepted_devices: 0, fix_available: true, packages: ['openssh'], first_seen: ago(60 * 24 * 21) },
+	{ key: 'CVE-2024-7971', cve: 'CVE-2024-7971', advisories: ['CVE-2024-7971'], summary: 'Type confusion in V8 in Google Chrome prior to 128.0.6613.84', severity: 'high', cvss: 8.8, epss: 0.61, kev: true, published: ago(60 * 24 * 300), devices: 2, accepted_devices: 0, fix_available: true, packages: ['google:chrome'], first_seen: ago(60 * 24 * 9) },
+	{ key: 'CVE-2024-6119', cve: 'CVE-2024-6119', advisories: ['UBUNTU-CVE-2024-6119'], summary: 'OpenSSL: possible denial of service in X.509 name checks', severity: 'medium', cvss: 5.9, epss: 0.004, kev: false, published: ago(60 * 24 * 280), devices: 3, accepted_devices: 1, fix_available: true, packages: ['openssl'], first_seen: ago(60 * 24 * 40) },
+	{ key: 'CVE-2025-0167', cve: 'CVE-2025-0167', advisories: ['UBUNTU-CVE-2025-0167'], summary: 'curl: netrc and default credential leak', severity: 'high', cvss: 7.5, epss: 0.02, kev: false, published: ago(60 * 24 * 160), devices: 1, accepted_devices: 0, fix_available: false, packages: ['curl'], first_seen: ago(60 * 24 * 3) },
+	{ key: 'CVE-2023-38545', cve: 'CVE-2023-38545', advisories: ['CVE-2023-38545'], summary: 'SOCKS5 heap buffer overflow in 7-Zip’s bundled curl', severity: 'critical', cvss: 9.8, epss: 0.27, kev: false, published: ago(60 * 24 * 600), devices: 1, accepted_devices: 0, fix_available: true, packages: ['7-zip:7-zip'], first_seen: ago(60 * 24 * 60) }
+];
+const vulnPatch = { kind: 'patch', update_id: 'openssh-server', title: 'openssh-server', version: '1:9.6p1-3ubuntu13.4', approval: 'pending', state: 'missing' };
+const agentFindings = (id: string) =>
+	id === 'a-3'
+		? [
+				{ key: 'CVE-2024-6387', cve: 'CVE-2024-6387', vuln_id: 'UBUNTU-CVE-2024-6387', summary: vulnRows[0].summary, severity: 'critical', cvss: 9.8, epss: 0.38, kev: false, package: 'openssh', software_name: 'openssh-server', installed_version: '1:9.6p1-3ubuntu13', fixed_version: '1:9.6p1-3ubuntu13.4', fix_available: true, first_seen: ago(60 * 24 * 21), accepted: false, remediation: vulnPatch },
+				{ key: 'CVE-2025-0167', cve: 'CVE-2025-0167', vuln_id: 'UBUNTU-CVE-2025-0167', summary: vulnRows[3].summary, severity: 'high', cvss: 7.5, epss: 0.02, kev: false, package: 'curl', software_name: 'libcurl4t64', installed_version: '8.5.0-2ubuntu10.6', fixed_version: null, fix_available: false, first_seen: ago(60 * 24 * 3), accepted: false, remediation: null },
+				{ key: 'CVE-2024-6119', cve: 'CVE-2024-6119', vuln_id: 'UBUNTU-CVE-2024-6119', summary: vulnRows[2].summary, severity: 'medium', cvss: 5.9, epss: 0.004, kev: false, package: 'openssl', software_name: 'libssl3t64', installed_version: '3.0.13-0ubuntu3.1', fixed_version: '3.0.13-0ubuntu3.4', fix_available: true, first_seen: ago(60 * 24 * 40), accepted: true, remediation: null }
+			]
+		: id === 'a-1'
+			? [
+					{ key: 'CVE-2024-7971', cve: 'CVE-2024-7971', vuln_id: 'CVE-2024-7971', summary: vulnRows[1].summary, severity: 'high', cvss: 8.8, epss: 0.61, kev: true, package: 'google:chrome', software_name: 'Google Chrome', installed_version: '127.0.6533.120', fixed_version: '128.0.6613.84', fix_available: true, first_seen: ago(60 * 24 * 9), accepted: false, remediation: { kind: 'upgrade', package_id: 'sw-chrome', package_name: 'Google Chrome' } },
+					{ key: 'CVE-2023-38545', cve: 'CVE-2023-38545', vuln_id: 'CVE-2023-38545', summary: vulnRows[4].summary, severity: 'critical', cvss: 9.8, epss: 0.27, kev: false, package: '7-zip:7-zip', software_name: '7-Zip 22.01 (x64)', installed_version: '22.01', fixed_version: '23.01', fix_available: true, first_seen: ago(60 * 24 * 60), accepted: false, remediation: { kind: 'catalog', product_id: 'vp-7zip', product_name: '7-Zip' } }
+				]
+			: [];
+const vulnAgent = (id: string) => {
+	const f = agentFindings(id);
+	const unassessed = id === 'a-7' ? 'old_agent' : null;
+	const a = agents.find((x) => x.id === id);
+	return {
+		ecosystem: unassessed ? null : a?.os_family === 'windows' ? 'Windows' : 'Ubuntu:24.04', unassessed, evaluated_at: unassessed ? null : ago(42),
+		critical: f.filter((x) => x.severity === 'critical' && !x.accepted).length, high: f.filter((x) => x.severity === 'high' && !x.accepted).length, findings: f
+	};
+};
+const vulnDevices = (key: string) => {
+	const rows = ['a-1', 'a-2', 'a-3', 'a-5', 'a-6'].flatMap((id) => agentFindings(id === 'a-2' ? 'a-1' : id === 'a-5' || id === 'a-6' ? 'a-3' : id).filter((f) => f.key === key).map((f) => ({ f, a: agents.find((x) => x.id === id)! })));
+	return rows.map(({ f, a }) => ({
+		agent_id: a.id, hostname: a.hostname, online: a.online, os_family: a.os_family, os_name: a.os_name, client_id: a.client_id, client_name: a.client_name, site_name: a.site_name,
+		vuln_id: f.vuln_id, package: f.package, software_name: f.software_name, installed_version: f.installed_version, fixed_version: f.fixed_version, fix_available: f.fix_available,
+		first_seen: f.first_seen, accepted: f.accepted, product_id: f.package.includes(':') ? 'vp-x' : null, remediation: f.remediation
+	}));
+};
+const vulnDetail = (key: string) => {
+	const r = vulnRows.find((x) => x.key === key)!;
+	const nvd = r.advisories[0].startsWith('CVE-');
+	return {
+		key, cve: key, summary: r.summary, severity: r.severity, cvss: r.cvss, cvss_vector: 'CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:H/A:H', epss: r.epss, epss_percentile: 0.97, kev: r.kev,
+		kev_added: r.kev ? '2024-08-26' : null, kev_due: r.kev ? '2024-09-16' : null, devices: r.devices, accepted_devices: r.accepted_devices,
+		advisories: [{ id: r.advisories[0], source: nvd ? 'nvd' : 'osv:Ubuntu', aliases: [], summary: r.summary, details: `${r.summary}. A remote, unauthenticated attacker may be able to run code as root on glibc-based Linux systems.`, severity: r.severity, cvss: r.cvss, cvss_vector: null, published: r.published, modified: ago(60 * 24 * 30), url: 'https://ubuntu.com/security/CVE-2024-6387' }],
+		ranges: nvd
+			? [{ vuln_id: r.advisories[0], ecosystem: 'NVD', package: r.packages[0], introduced: null, fixed: '128.0.6613.84', last_affected: null }]
+			: [
+					{ vuln_id: r.advisories[0], ecosystem: 'Ubuntu:24.04', package: r.packages[0], introduced: '0', fixed: '1:9.6p1-3ubuntu13.4', last_affected: null },
+					{ vuln_id: r.advisories[0], ecosystem: 'Ubuntu:22.04', package: r.packages[0], introduced: '1:8.5p1-1', fixed: '1:8.9p1-3ubuntu0.10', last_affected: null }
+				],
+		acceptances: key === 'CVE-2024-6387' ? [{ id: 'va-1', vuln_id: key, client_id: 'c-globex', client_name: 'Globex', agent_id: 'a-5', hostname: 'globex-app01', note: 'sshd is only reachable over the VPN; upgrade planned for the July window.', expires_at: ago(-60 * 24 * 30), by_name: 'Dana Admin', created_at: ago(60 * 24 * 5), active: true }] : []
+	};
+};
+const vulnFeeds = {
+	running: false, nvd_api_key: false, automatic: true,
+	feeds: [
+		{ name: 'osv:Ubuntu', label: 'OSV: Ubuntu', enabled: true, needed: true, last_sync_at: ago(300), last_attempt_at: ago(300), progress: null, records: 48213, error: null },
+		{ name: 'osv:Debian', label: 'OSV: Debian', enabled: true, needed: false, last_sync_at: null, last_attempt_at: null, progress: null, records: 0, error: null },
+		{ name: 'arch', label: 'Arch Linux security tracker', enabled: true, needed: false, last_sync_at: null, last_attempt_at: null, progress: null, records: 0, error: null },
+		{ name: 'nvd', label: 'NVD (Windows applications in the product map)', enabled: true, needed: true, last_sync_at: ago(310), last_attempt_at: ago(310), progress: null, records: 1874, error: null },
+		{ name: 'kev', label: 'CISA Known Exploited Vulnerabilities', enabled: true, needed: true, last_sync_at: ago(312), last_attempt_at: ago(312), progress: null, records: 1239, error: null },
+		{ name: 'epss', label: 'EPSS (FIRST)', enabled: true, needed: true, last_sync_at: null, last_attempt_at: ago(312), progress: null, records: 0, error: 'GET https://epss.empiricalsecurity.com/epss_scores-current.csv.gz: 503 Service Unavailable' }
+	],
+	attribution: ['This product uses the NVD API but is not endorsed or certified by the NVD.', 'Advisory data from OSV.dev (CC-BY 4.0), collected from the distributions’ security teams.', 'Known exploited vulnerabilities from CISA’s KEV catalog (CC0).', 'EPSS scores from FIRST (first.org/epss).']
+};
+const vulnProducts = [
+	{ id: 'vp-7zip', vendor: '7-zip', product: '7-zip', name: '7-Zip', name_patterns: ['7-Zip*'], publisher_pattern: 'Igor Pavlov*', package_id: null, package_name: null, builtin: true, nvd_synced_at: ago(310), devices: 1 },
+	{ id: 'vp-chrome', vendor: 'google', product: 'chrome', name: 'Google Chrome', name_patterns: ['Google Chrome'], publisher_pattern: 'Google*', package_id: 'sw-chrome', package_name: 'Google Chrome', builtin: true, nvd_synced_at: ago(310), devices: 2 },
+	{ id: 'vp-erp', vendor: 'contoso', product: 'erp_client', name: 'Contoso ERP client', name_patterns: ['Contoso ERP*'], publisher_pattern: 'Contoso*', package_id: null, package_name: null, builtin: false, nvd_synced_at: ago(310), devices: 0 }
+];
+
 const netDevices = [
 	netDev(1, 'Core switch', 'switch', '192.168.10.2', 'up', { sys_descr: 'Cisco IOS Software, Catalyst L3 Switch Software (CAT9K_IOSXE), Version 17.9.4', vendor: 'Cisco Systems', mac: '00:1b:54:aa:10:02', cpu_percent: 17, mem_used: 612_000_000, mem_total: 2_000_000_000, interfaces: 8, interfaces_up: 5, storage: [{ descr: 'flash:', kind: 'disk', used: 410_000_000, total: 1_600_000_000 }] }),
 	netDev(2, 'Edge firewall', 'firewall', '192.168.10.1', 'down', { sys_descr: 'Fortinet FortiGate-60F v7.4.3', vendor: 'Fortinet', mac: '90:6c:ac:11:22:33', interfaces: 4, interfaces_up: 0 }),
@@ -1315,7 +1588,129 @@ const openapi = {
 	components: { schemas: { NewTicket: { type: 'object', required: ['subject'], properties: { subject: { type: 'string' }, client_id: { type: 'string', format: 'uuid' }, priority: { type: 'integer' } } } } }
 };
 
-export async function mockApi(p: Page, opts: { signedIn?: boolean; ssoRequired?: boolean } = {}) {
+// White-labelling (branding.rs): a branded instance, and a client (Acme) with its own override.
+// The palette is what branding::theme derives for #1d4ed8.
+const brandImages: Record<string, Buffer> = Object.fromEntries(
+	['logo_light', 'logo_dark', 'icon'].map((v) => [v, readFileSync(new URL(`./fixtures/brand-${v.replace('_', '-')}.png`, import.meta.url))])
+);
+const brandTheme = {
+	light: { accent: '#1d4ed8', accent_hover: '#183fa1', accent_soft: '#e4eafa', on_accent: '#ffffff', accent_ink: '#1d4ed8', cta: '#1d4ed8', cta_hover: '#1b48c2', on_cta: '#ffffff', focus: '#1d4ed8', nav_indicator: '#6183e4' },
+	dark: { accent: '#6c8ce6', accent_hover: '#98afee', accent_soft: '#102649', on_accent: '#0c1b21', accent_ink: '#6c8ce6', cta: '#1d4ed8', cta_hover: '#1b48c2', on_cta: '#ffffff', focus: '#6c8ce6', nav_indicator: '#6183e4' }
+};
+const branding = {
+	product_name: 'Northwind Remote',
+	name: 'Northwind Remote',
+	logo_light: '/api/branding/logo_light?v=1a2b3c4d',
+	logo_dark: '/api/branding/logo_dark?v=1a2b3c4d',
+	icon: '/api/branding/icon?v=1a2b3c4d',
+	accent: '#1d4ed8',
+	theme: brandTheme,
+	support: { email: 'help@northwind.example', phone: '+1 555 0100', url: 'https://northwind.example/support', hours: 'Mon–Fri 8:00–18:00' },
+	source_url: 'https://github.com/ItzLcky/rivvie-rmm'
+};
+const brandingView = {
+	exists: true,
+	product_name: 'Northwind Remote',
+	accent: '#1d4ed8',
+	support_email: 'help@northwind.example',
+	support_phone: '+1 555 0100',
+	support_url: 'https://northwind.example/support',
+	support_hours: 'Mon–Fri 8:00–18:00',
+	email_from_name: 'Northwind Help Desk',
+	email_footer: 'Northwind IT · 12 Harbour Rd · +1 555 0100',
+	logo_light: '/api/settings/branding/logo_light?v=1a2b3c4d',
+	logo_dark: '/api/settings/branding/logo_dark?v=1a2b3c4d',
+	icon: '/api/settings/branding/icon?v=1a2b3c4d',
+	updated_at: ago(60 * 24 * 3),
+	resolved: branding
+};
+const acmeBranding = { ...branding, support: { ...branding.support, email: 'acme-desk@northwind.example', hours: '24/7' } };
+const acmeBrandingView = {
+	exists: true,
+	product_name: null,
+	accent: null,
+	support_email: 'acme-desk@northwind.example',
+	support_phone: null,
+	support_url: null,
+	support_hours: '24/7',
+	email_from_name: 'Northwind for Acme',
+	email_footer: null,
+	logo_light: null,
+	logo_dark: null,
+	icon: null,
+	updated_at: ago(60 * 24),
+	resolved: acmeBranding
+};
+const portalMe = {
+	contact: { id: 'ct-ann', client_id: 'c-acme', client_name: 'Acme Corp', site_id: 's-acme-hq', name: 'Ann Lopez', email: 'ann@acme.example', is_primary: true, portal_all_tickets: false },
+	company_name: 'Northwind IT',
+	welcome: 'Tell us what is wrong and we will get back to you.',
+	devices: true,
+	sees_all_tickets: true,
+	invoices: false,
+	has_password: true,
+	totp_enabled: false,
+	attachment_max_mb: 100
+};
+const portalTickets = [
+	{ id: 'pt-1', number: 1042, subject: 'Printer on the second floor jams', status_name: 'In progress', status_category: 'open', priority: 3, contact_name: 'Ann Lopez', created_at: ago(60 * 26), last_activity_at: ago(45), merged_into: null },
+	{ id: 'pt-2', number: 1031, subject: 'New starter laptop for Raj', status_name: 'Resolved', status_category: 'resolved', priority: 3, contact_name: 'Ann Lopez', created_at: ago(60 * 24 * 6), last_activity_at: ago(60 * 24 * 2), merged_into: null }
+];
+
+
+// --- identity: directories, users, Intune devices, ticket templates ------------------------------
+const identitySources = [
+	{ id: 'is-ad', client_id: 'c-acme', kind: 'ad', name: 'acme.local', agent_id: 'a-1', agent_hostname: 'acme-dc01', agent_online: true, tenant_id: '', app_client_id: '', has_secret: false, sync_devices: false, sync_minutes: 60, enabled: true, last_sync_at: ago(12), last_error: null, users: 5, groups: 4, devices: 0 },
+	{ id: 'is-entra', client_id: 'c-acme', kind: 'entra', name: 'Acme Microsoft 365', agent_id: null, agent_hostname: null, agent_online: null, tenant_id: 'acmecorp.onmicrosoft.com', app_client_id: '3c1d2e4f-5a6b-4c7d-8e9f-0a1b2c3d4e5f', has_secret: true, sync_devices: true, sync_minutes: 60, enabled: true, last_sync_at: ago(34), last_error: null, users: 2, groups: 1, devices: 4 }
+];
+const dirUser = (id: string, src: 'is-ad' | 'is-entra', username: string, display: string, extra: Record<string, unknown> = {}) => ({
+	id, source_id: src, source_name: src === 'is-ad' ? 'acme.local' : 'Acme Microsoft 365', kind: src === 'is-ad' ? 'ad' : 'entra', external_id: src === 'is-ad' ? `S-1-5-21-1004336348-1177238915-682003330-${1100 + id.length}` : `8d4c1f1e-0000-4000-8000-0000000000${id.slice(-2)}`,
+	username, upn: `${username}@acme.example`, display_name: display, email: `${username}@acme.example`, enabled: true, locked: false, privileged: false, synced_from_ad: false,
+	last_logon_at: ago(60 * 3), password_last_set: ago(60 * 24 * 40), password_expires_at: src === 'is-ad' ? ago(-60 * 24 * 50) : null, mfa_registered: src === 'is-ad' ? null : true,
+	department: '', title: '', contact_id: null as string | null, contact_name: null as string | null, deleted_at: null, synced_at: ago(12), ...extra
+});
+const dirUsers = [
+	dirUser('iu-01', 'is-ad', 'ann.lopez', 'Ann Lopez', { department: 'Office', title: 'Office manager', contact_id: 'ct-ann', contact_name: 'Ann Lopez', locked: true }),
+	dirUser('iu-02', 'is-ad', 'raj.patel', 'Raj Patel', { department: 'Warehouse', title: 'Warehouse lead', contact_id: 'ct-raj', contact_name: 'Raj Patel' }),
+	dirUser('iu-03', 'is-ad', 'it.admin', 'IT Admin', { privileged: true, last_logon_at: ago(60 * 24 * 2) }),
+	dirUser('iu-04', 'is-ad', 'temp.sales', 'Temp Sales', { enabled: false, last_logon_at: ago(60 * 24 * 130) }),
+	dirUser('iu-05', 'is-ad', 'svc.backup', 'Backup service', { last_logon_at: null, password_last_set: ago(60 * 24 * 700), password_expires_at: null }),
+	dirUser('iu-06', 'is-entra', 'ann', 'Ann Lopez', { contact_id: 'ct-ann', contact_name: 'Ann Lopez', synced_from_ad: true, last_logon_at: null }),
+	dirUser('iu-07', 'is-entra', 'kim.ng', 'Kim Ng', { mfa_registered: false, last_logon_at: null, department: 'Sales', title: 'Account manager' })
+];
+const dirUserDetail = (u: (typeof dirUsers)[number]) => ({
+	...u, client_id: 'c-acme', can_manage: true, vault_item_id: u.id === 'iu-02' ? 'v-1' : null,
+	groups: u.kind === 'ad' ? [{ id: 'ig-1', name: 'Warehouse', privileged: false }, { id: 'ig-2', name: 'VPN Users', privileged: false }, ...(u.privileged ? [{ id: 'ig-3', name: 'Domain Admins', privileged: true }] : [])] : [{ id: 'ig-9', name: 'Sales', privileged: false }]
+});
+const mdmDevice = (n: number, name: string, os: string, compliance: string, extra: Record<string, unknown> = {}) => ({
+	id: `md-${n}`, source_id: 'is-entra', source_name: 'Acme Microsoft 365', external_id: `0f5e0000-0000-4000-8000-00000000000${n}`, name, user_upn: 'ann@acme.example', os, os_version: os === 'Windows' ? '10.0.22631.4460' : '18.1',
+	compliance, encrypted: true, ownership: 'company', serial: `5CD12${n}4XYZ`, model: 'EliteBook 840 G9', manufacturer: 'HP', enrolled_at: ago(60 * 24 * 300), last_sync_at: ago(60 * n + 7),
+	agent_id: null as string | null, agent_hostname: null as string | null, agent_online: null as boolean | null, synced_at: ago(34), ...extra
+});
+const mdmDevices = [
+	mdmDevice(1, 'ACME-DC01', 'Windows', 'compliant', { agent_id: 'a-1', agent_hostname: 'acme-dc01', agent_online: true, user_upn: 'it.admin@acme.example' }),
+	mdmDevice(2, 'ACME-FS01', 'Windows', 'noncompliant', { agent_id: 'a-2', agent_hostname: 'acme-fs01', agent_online: true, encrypted: false, user_upn: 'raj.patel@acme.example' }),
+	mdmDevice(3, 'Ann’s iPhone', 'iOS', 'compliant', { ownership: 'personal', model: 'iPhone 15', manufacturer: 'Apple', serial: 'F2LXK0000000' }),
+	mdmDevice(4, 'ACME-LT07', 'Windows', 'inGracePeriod', { user_upn: 'kim.ng@acme.example' })
+];
+const ticketTemplates = [
+	{ id: 'tt-starter', name: 'New starter', client_id: null, client_name: null, board_id: null, type_id: null, priority: 3, subject: 'New starter: {name}', body: 'Set up a new member of staff.', updated_at: ago(60 * 24 * 10),
+	  checklist: [{ text: 'Confirm start date, role and manager' }, { text: 'Set an initial password and send it to the manager', action: 'identity.reset_password' }, { text: 'Add to the right groups' }, { text: 'Prepare and enroll a device' }] },
+	{ id: 'tt-leaver', name: 'Leaver', client_id: null, client_name: null, board_id: null, type_id: null, priority: 2, subject: 'Leaver: {name}', body: 'Offboard a member of staff who is leaving.', updated_at: ago(60 * 24 * 10),
+	  checklist: [{ text: 'Confirm the leaving date with the client' }, { text: 'Disable the account', action: 'identity.disable' }, { text: 'Sign out of every session', action: 'identity.revoke_sessions' }, { text: 'Remove from groups', action: 'identity.remove_groups' }, { text: 'Reset the password', action: 'identity.reset_password' }, { text: 'Collect equipment and convert or forward the mailbox' }] },
+	{ id: 'tt-laptop', name: 'Laptop swap', client_id: 'c-acme', client_name: 'Acme Corp', board_id: null, type_id: null, priority: 3, subject: 'Laptop swap: {name}', body: '', updated_at: ago(60 * 24 * 2), checklist: [{ text: 'Wipe the old laptop' }, { text: 'Sign out of every session', action: 'identity.revoke_sessions' }] }
+];
+const ticketChecklist = {
+	identity_user: { id: 'iu-02', display_name: 'Raj Patel', username: 'raj.patel', upn: 'raj.patel@acme.example', kind: 'ad', enabled: true, privileged: false, deleted: false },
+	items: [
+		{ id: 'ci-1', position: 0, text: 'Confirm the leaving date with the client', action: null, action_state: null, done_by: 'u-1', done_by_name: 'Dana Admin', done_at: ago(50) },
+		{ id: 'ci-2', position: 1, text: 'Disable the account', action: 'identity.disable', action_state: 'done', done_by: 'u-1', done_by_name: 'Dana Admin', done_at: ago(40) },
+		{ id: 'ci-3', position: 2, text: 'Remove from groups', action: 'identity.remove_groups', action_state: 'failed: the domain controller’s agent is offline', done_by: null, done_by_name: null, done_at: null },
+		{ id: 'ci-4', position: 3, text: 'Collect equipment and convert or forward the mailbox', action: null, action_state: null, done_by: null, done_by_name: null, done_at: null }
+	]
+};
+
+export async function mockApi(p: Page, opts: { signedIn?: boolean; ssoRequired?: boolean; branded?: boolean } = {}) {
 	const signedIn = opts.signedIn ?? true;
 	await p.clock.setFixedTime(NOW);
 	await p.route('**/api/**', async (route: Route) => {
@@ -1331,9 +1726,23 @@ export async function mockApi(p: Page, opts: { signedIn?: boolean; ssoRequired?:
 		}
 		if (route.request().method() === 'POST' && /^\/vault\/[^/]+\/reveal$/.test(path)) return json({ value: 'Tr0ub4dor&3-hx9Q' });
 		if (route.request().method() === 'POST' && /^\/vault\/[^/]+\/totp$/.test(path)) return json({ code: '492039', digits: 6, period: 30, remaining: 17 });
+		if (route.request().method() === 'POST' && path === '/agents/wake')
+			return json({ results: [{ agent_id: 'a-5', outcome: 'sent', sender_id: 'a-3' }], sent: 1, no_mac: 0, no_sender: 0, online: 0 });
+		if (route.request().method() === 'POST' && /^\/agents\/[^/]+\/wake$/.test(path))
+			return json({ results: [{ agent_id: path.split('/')[2], outcome: 'sent', sender_id: 'a-3' }], sent: 1, no_mac: 0, no_sender: 0, online: 0, outcome: 'sent' });
+		if (route.request().method() === 'POST' && /^\/identity\/users\/[^/]+\/reset-password$/.test(path))
+			return json(route.request().postDataJSON()?.delivery === 'show' ? { ok: true, delivered: 'shown', password: 'Kq7#vRm2xP9-tLw4' } : { ok: true, delivered: 'vault', item_id: 'v-1' });
 		if (route.request().method() !== 'GET') return json({ ok: true });
 		let m: RegExpMatchArray | null;
-		if (path === '/settings/public') return json({ company_name: 'Northwind IT' });
+		if (path === '/settings/public') return json({ company_name: 'Northwind IT', ...(opts.branded ? { branding } : {}) });
+		if ((m = path.match(/^\/(?:portal\/|settings\/|clients\/[^/]+\/)?branding\/(logo_light|logo_dark|icon)$/)) && brandImages[m[1]]) {
+			return route.fulfill({ status: 200, contentType: 'image/png', body: brandImages[m[1]] });
+		}
+		if (path === '/settings/branding') return json(brandingView);
+		if (path === '/clients/c-acme/branding') return json(acmeBrandingView);
+		if (path === '/portal/info') return json({ company_name: 'Northwind IT', welcome: portalMe.welcome, ...(opts.branded ? { branding } : {}) });
+		if (path === '/portal/me') return json({ ...portalMe, ...(opts.branded ? { branding: acmeBranding } : {}) });
+		if (path === '/portal/tickets') return json(portalTickets);
 		if (path === '/auth/me') return signedIn ? json(admin) : json({ error: 'not authenticated' }, 401);
 		if (path === '/dashboard') return json(dashboard(q.get('client_id')));
 		if (path === '/clients') return json(clients.map(clientOut));
@@ -1346,7 +1755,10 @@ export async function mockApi(p: Page, opts: { signedIn?: boolean; ssoRequired?:
 		if (path === '/doc-categories') return json(docCategories.map(categoryOut));
 		if (path === '/doc-templates') return json(docTemplates);
 		if ((m = path.match(/^\/doc-templates\/([^/]+)$/))) return json({ ...docTemplates.find((t) => t.id === m![1])!, body: '# {{client.name}}\n\n```fields\nLabel:\n```\n' });
-		if ((m = path.match(/^\/clients\/([^/]+)\/vault$/))) return json(vaultItems.filter((v) => v.client_id === m![1]));
+		if ((m = path.match(/^\/clients\/([^/]+)\/vault$/))) {
+			const kind = url.searchParams.get('kind');
+			return json(vaultItems.filter((v) => v.client_id === m![1] && (!kind || (kind === 'manual' ? !v.managed_kind : kind === 'managed' ? !!v.managed_kind : v.managed_kind === kind))));
+		}
 		if ((m = path.match(/^\/vault\/([^/]+)$/))) return json(vaultDetail(m![1]));
 		if (path === '/tags') return json(tagsOut());
 		if (path === '/custom-fields') return json(fieldDefs.filter((f) => !q.get('entity') || f.entity === q.get('entity')));
@@ -1533,10 +1945,92 @@ export async function mockApi(p: Page, opts: { signedIn?: boolean; ssoRequired?:
 		if ((m = path.match(/^\/agents\/([^/]+)\/processes$/))) return json({ processes });
 		if ((m = path.match(/^\/agents\/([^/]+)\/files$/))) return json(listing(q.get('path') ?? ''));
 		if (path === '/notification-channels') return json(channels);
+		if (path === '/oncall/now') return json(oncallSchedules.map((s) => s.now));
+		if (path === '/oncall/schedules') return json(oncallSchedules);
+		if ((m = path.match(/^\/oncall\/schedules\/([^/]+)\/shifts$/))) return json(m[1] === 'os-1' ? oncallShifts : { ...oncallShifts, layers: [], overrides: [], final: [] });
+		if (path === '/oncall/people') return json(oncallPeople);
+		if (path === '/oncall/escalation-policies') return json(escalationPolicies);
+		if (path === '/oncall/settings') return json({ p1_escalation_policy_id: 'ep-servers' });
+		if (path === '/oncall/pages') return json(oncallPages.filter((p) => !q.get('alert_id') || p.alert_id === q.get('alert_id')));
+		if (path === '/settings/sms') return json({ account_sid: 'AC5f1e0c2b9d', from: '+15005550006', base_url: 'https://api.twilio.com', token_set: true });
+		if (path === '/account/contact-methods') return json({ phone: '+447700900123', phone_verified: true, sms_available: true, devices: 1, rules: [{ method: 'push', delay_minutes: 0 }, { method: 'sms', delay_minutes: 5 }] });
+		if (path === '/account/notification-prefs') return json(notificationPrefs);
+		if (path === '/push/subscriptions') return json([]);
 		if (path === '/notifications') return json(deliveries);
 		if (path === '/settings/smtp') return json({ host: 'smtp.office365.com', port: 587, security: 'starttls', username: 'rmm@northwind.example', password_set: true, from: 'Northwind RMM <rmm@northwind.example>' });
 		if (path === '/api-keys') return json(q.get('all') ? allApiKeys : apiKeys);
 		if (path === '/api-keys/options') return json({ groups: [{ id: 'clients', label: 'Clients and sites' }, { id: 'agents', label: 'Agents, inventory and metrics' }, { id: 'jobs', label: 'Jobs and results' }, { id: 'scripts', label: 'Script library' }, { id: 'alerts', label: 'Alerts' }, { id: 'tickets', label: 'Tickets' }, { id: 'security', label: 'Endpoint protection (needs the security.read permission)' }], permissions: admin.permissions, can_write: true, default_rate_limit: 600 });
+		if ((m = path.match(/^\/clients\/([^/]+)\/identity-sources$/))) return json(identitySources.filter((x) => x.client_id === m![1]));
+		if ((m = path.match(/^\/clients\/([^/]+)\/identity\/users$/))) {
+			const f = q.get('filter');
+			const rows = m[1] !== 'c-acme' ? [] : dirUsers.filter((u) => (!q.get('contact_id') || u.contact_id === q.get('contact_id')) && (!q.get('source_id') || u.source_id === q.get('source_id')) && (!f || (f === 'locked' ? u.locked : f === 'disabled' ? !u.enabled : f === 'privileged' ? u.privileged : f === 'no_mfa' ? u.mfa_registered === false : true)));
+			return json(page(rows, Number(q.get('limit') ?? 50)));
+		}
+		if ((m = path.match(/^\/clients\/([^/]+)\/identity\/groups$/))) return json([]);
+		if ((m = path.match(/^\/identity\/users\/([^/]+)$/))) {
+			const u = dirUsers.find((x) => x.id === m![1]);
+			return u ? json(dirUserDetail(u)) : json({ error: 'directory user not found' }, 404);
+		}
+		if ((m = path.match(/^\/clients\/([^/]+)\/mdm\/summary$/)))
+			return json(m[1] === 'c-acme' ? { sources: 1, total: 4, by_compliance: { compliant: 2, inGracePeriod: 1, noncompliant: 1 }, unmatched: 2, agents_not_in_intune: [{ id: 'a-3', hostname: 'acme-web01', os_family: 'windows', online: true, last_seen_at: ago(0) }] } : { sources: 0, total: 0, by_compliance: {}, unmatched: 0, agents_not_in_intune: [] });
+		if ((m = path.match(/^\/clients\/([^/]+)\/mdm\/devices$/))) {
+			const rank: Record<string, number> = { noncompliant: 0, error: 1, conflict: 2, inGracePeriod: 3, unknown: 4, compliant: 5 };
+			const rows = (m[1] === 'c-acme' ? mdmDevices : []).filter((d) => (!q.get('unmatched') || !d.agent_id) && (!q.get('compliance') || q.get('compliance')!.split(',').includes(d.compliance)));
+			return json(page([...rows].sort((a, b) => rank[a.compliance] - rank[b.compliance] || a.name.localeCompare(b.name)), Number(q.get('limit') ?? 50)));
+		}
+		if (path === '/ticket-templates') return json(ticketTemplates.filter((t) => !q.get('client_id') || !t.client_id || t.client_id === q.get('client_id')));
+		if ((m = path.match(/^\/tickets\/([^/]+)\/checklist$/))) return json(m[1] === 't-1' ? ticketChecklist : { identity_user: null, items: [] });
+		if (path === '/uptime/summary') {
+			const ms = uptimeMonitors.filter((m) => !q.get('client_id') || m.client_id === q.get('client_id'));
+			return json({ monitors: ms.length, up: ms.filter((m) => m.state === 'up').length, down: ms.filter((m) => m.state === 'down').length, unknown: ms.filter((m) => m.state === 'unknown').length, disabled: 0, uptime_30d: 99.71 });
+		}
+		if (path === '/uptime/monitors') return json(uptimeMonitors.filter((m) => (!q.get('client_id') || m.client_id === q.get('client_id')) && (!q.get('state') || m.state === q.get('state')) && (!q.get('kind') || m.kind === q.get('kind'))));
+		if ((m = path.match(/^\/uptime\/monitors\/([^/]+)\/results$/))) return json(uptimePoints(m[1]));
+		if ((m = path.match(/^\/uptime\/monitors\/([^/]+)$/))) {
+			const mon = uptimeMonitors.find((x) => x.id === m![1]);
+			return mon ? json(monitorDetail(mon)) : json({ error: 'monitor not found' }, 404);
+		}
+		if (path === '/backups') {
+			const rank: Record<string, number> = { failed: 0, warning: 1, unknown: 2, running: 3, success: 4 };
+			const rows = backupJobsMock.filter((j) => (!q.get('client_id') || j.client_id === q.get('client_id')) && (!q.get('result') || q.get('result')!.split(',').includes(j.last_result)) && (!q.get('alerting') || j.alerting));
+			return json(page([...rows].sort((a, b) => rank[a.last_result] - rank[b.last_result]), Number(q.get('limit') ?? 50)));
+		}
+		if ((m = path.match(/^\/agents\/([^/]+)\/backups$/))) return json(backupJobsMock.filter((j) => j.agent_id === m![1]));
+		if (path === '/disk-encryption') {
+			const rank: Record<string, number> = { unencrypted: 0, suspended: 1, decrypting: 2, unknown: 3, encrypting: 4, encrypted: 5 };
+			const rows = diskVolumes.filter((v) => (!q.get('client_id') || v.client_id === q.get('client_id')) && (!q.get('status') || q.get('status')!.split(',').includes(v.status)) && (!q.get('os_only') || v.role === 'os') && (q.get('escrowed') == null || (v.kind === 'bitlocker' && String(v.escrowed) === q.get('escrowed'))));
+			return json(page([...rows].sort((a, b) => rank[a.status] - rank[b.status]), Number(q.get('limit') ?? 50)));
+		}
+		if ((m = path.match(/^\/agents\/([^/]+)\/disk-encryption$/))) return json(diskencFor(m[1]));
+		if ((m = path.match(/^\/agents\/([^/]+)\/local-admin$/))) return json(localAdminFor(m[1]));
+		if (path === '/vulnerabilities/summary') return json(q.get('client_id') === 'c-globex' ? { critical: 0, high: 0, devices_affected: 0, kev: 0, unassessed: 0, assessed: 2, last_sync_at: ago(300) } : { critical: 3, high: 3, devices_affected: 3, kev: 1, unassessed: 1, assessed: 6, last_sync_at: ago(300) });
+		if (path === '/vulnerabilities') {
+			const sev = q.get('severity')?.split(',');
+			return json(page(vulnRows.filter((r) => (!sev || sev.includes(r.severity)) && (!q.get('kev') || r.kev)), Number(q.get('limit') ?? 50)));
+		}
+		if (path === '/vulnerabilities/agents')
+			return json(['a-1', 'a-2', 'a-3'].map((id) => { const a = agents.find((x) => x.id === id)!; const v = vulnAgent(id === 'a-2' ? 'a-1' : id); return { agent_id: id, hostname: a.hostname, online: a.online, os_family: a.os_family, os_name: a.os_name, client_name: a.client_name, site_name: a.site_name, ecosystem: v.ecosystem, critical: v.critical, high: v.high, open: v.findings.filter((f) => !f.accepted).length, kev: v.findings.filter((f) => f.kev).length, fixable: v.findings.filter((f) => f.fix_available && !f.accepted).length, evaluated_at: v.evaluated_at }; }));
+		if (path === '/vulnerabilities/software')
+			return json([
+				{ package: 'openssh', ecosystems: ['Ubuntu:24.04'], product_id: null, product_name: null, package_id: null, devices: 2, cves: 1, severity: 'critical', kev: false, fix_available: true, fixed_versions: ['1:9.6p1-3ubuntu13.4'] },
+				{ package: '7-zip:7-zip', ecosystems: ['Windows'], product_id: 'vp-7zip', product_name: '7-Zip', package_id: null, devices: 1, cves: 1, severity: 'critical', kev: false, fix_available: true, fixed_versions: ['23.01'] },
+				{ package: 'google:chrome', ecosystems: ['Windows'], product_id: 'vp-chrome', product_name: 'Google Chrome', package_id: 'sw-chrome', devices: 2, cves: 1, severity: 'high', kev: true, fix_available: true, fixed_versions: ['128.0.6613.84'] },
+				{ package: 'curl', ecosystems: ['Ubuntu:24.04'], product_id: null, product_name: null, package_id: null, devices: 1, cves: 1, severity: 'high', kev: false, fix_available: false, fixed_versions: [] }
+			]);
+		if (path === '/vulnerabilities/unassessed')
+			return json({
+				products: 150,
+				devices: [{ agent_id: 'a-7', hostname: 'initech-ws-12', os_family: 'windows', os_name: 'Windows 11 Pro', agent_version: '0.2.0', client_name: 'Initech', reason: 'old_agent' }],
+				titles: [
+					{ title: 'Contoso Line-of-Business Suite', publisher: 'Contoso Ltd', devices: 3, versions: ['4.2.1', '4.3.0'] },
+					{ title: 'Sage 50 Accounts', publisher: 'Sage (UK) Ltd', devices: 1, versions: ['30.1.211.0'] }
+				]
+			});
+		if (path === '/vulnerabilities/feeds') return json(vulnFeeds);
+		if (path === '/vulnerabilities/products') return json(vulnProducts);
+		if ((m = path.match(/^\/vulnerabilities\/([^/]+)\/devices$/))) return json(vulnDevices(decodeURIComponent(m[1])));
+		if ((m = path.match(/^\/vulnerabilities\/([^/]+)$/))) return vulnRows.some((r) => r.key === decodeURIComponent(m![1])) ? json(vulnDetail(decodeURIComponent(m[1]))) : json({ error: 'vulnerability not found' }, 404);
+		if ((m = path.match(/^\/agents\/([^/]+)\/vulnerabilities$/))) return json(vulnAgent(m[1]));
 		if (path === '/network/summary') return json({ unmanaged: discoveredHosts.filter((d) => d.state === 'unmanaged' && d.online).length, devices: netDevices.length, down: netDevices.filter((d) => d.state === 'down').length });
 		if (path === '/network/devices')
 			return json(netDevices.filter((d) => (!q.get('state') || d.state === q.get('state')) && (!q.get('kind') || d.kind === q.get('kind')) && (!q.get('client_id') || d.client_id === q.get('client_id'))));
@@ -1566,12 +2060,16 @@ export async function mockApi(p: Page, opts: { signedIn?: boolean; ssoRequired?:
 		if (path === '/tickets/meta') return json({ boards, types: ticketTypes, technicians: [{ id: 'u-1', name: 'Dana Admin', email: admin.email, client_ids: null }, { id: 'u-2', name: 'Terry Tech', email: 'terry@northwind.example', client_ids: ['c-acme', 'c-globex'] }], teams: [] });
 		if (path === '/tickets') return json(page(ticketList(q), Number(q.get('limit') ?? 50)));
 		if ((m = path.match(/^\/tickets\/([^/]+)$/))) return json(ticketDetail(tickets.find((t) => t.id === m![1])!));
+		if (path === '/report-schedules') return json(reportSchedules);
+		if ((m = path.match(/^\/report-schedules\/([^/]+)\/runs$/))) return json(reportRuns.filter((r) => r.schedule_id === m![1]));
+		if ((m = path.match(/^\/report-schedules\/([^/]+)$/))) return json(reportSchedules.find((r) => r.id === m![1]));
 		if (path === '/contacts') return json(contacts.filter((c) => !q.get('client_id') || c.client_id === q.get('client_id')));
 		if (path === '/boards') return json(boards);
 		if (path === '/mailboxes') return json(mailboxes);
 		if (path === '/mailboxes/inbound') return json(inboundMail);
 		if (path === '/search') return json({ agents: agents.filter((a) => a.hostname.includes(q.get('q') ?? '')).slice(0, 5).map((a) => ({ id: a.id, hostname: a.hostname, os_family: a.os_family, online: a.online, client_name: a.client_name, site_name: a.site_name })), clients: [], sites: [], scripts: [], tickets: [] });
-		if (path === '/canned-responses' || path === '/teams' || path === '/charges' || path === '/products' || path === '/sla/policies' || path === '/sla/calendars') return json([]);
+		if (path === '/canned-responses' || path === '/teams' || path === '/charges' || path === '/products' || path === '/sla/policies') return json([]);
+		if (path === '/sla/calendars') return json([{ id: 'cal-office', name: 'Office hours', timezone: 'Europe/London', hours: [] }]);
 		if (path === '/time/timer') return json(null);
 		if (path === '/work-types')
 			return json([

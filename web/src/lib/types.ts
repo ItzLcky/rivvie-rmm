@@ -36,6 +36,8 @@ export interface AgentSummary {
 	patches_overdue: number; patches_failed: number; reboot_pending: boolean; reboot_pending_since: string | null;
 	/** A maintenance window or snooze is holding its alerts back right now. */
 	alerts_muted: boolean;
+	/** Disk encryption of its fixed volumes; null until it reports. */
+	encryption?: 'encrypted' | 'partial' | 'none' | null;
 	/** Policy management: its device category and the policy set it uses. */
 	platform?: 'workstation' | 'server'; category_id?: string; category_name?: string; policy_set_id?: string; policy_set_name?: string;
 	/** Labels on it, by name. */
@@ -100,10 +102,17 @@ export interface Client {
 }
 
 export type Interpreter = 'bash' | 'sh' | 'powershell' | 'cmd' | 'python';
+export type ParamType = 'text' | 'number' | 'bool' | 'select' | 'secret';
+/** A parameter a saved script declares: passed to it as the environment variable RMM_PARAM_<NAME>. */
+export interface ParamSpec {
+	name: string; label: string; type: ParamType; required: boolean;
+	default?: string | number | boolean | null; choices?: string[]; description: string;
+}
 export interface Script {
 	id: string; name: string; description: string; interpreter: Interpreter; body: string; timeout_secs: number;
 	/** null = MSP-wide */
 	client_id: string | null; client_name: string | null;
+	params: ParamSpec[];
 	created_at: string; updated_at: string;
 }
 
@@ -115,6 +124,8 @@ export interface Job {
 }
 export interface JobDetail extends Job {
 	body: string; args: string[]; timeout_secs: number; stdout: string; stderr: string;
+	/** The parameters it was given, after placeholders were expanded; secrets as "•••". */
+	params: Record<string, string | number | boolean>;
 	/** Full output lengths, to pass back as since_stdout/since_stderr for the next chunk. */
 	stdout_len: number; stderr_len: number;
 }
@@ -141,13 +152,16 @@ export interface Session { id: string; created_at: string; last_seen_at: string;
 
 export type Severity = 'critical' | 'warning' | 'info';
 export type AlertState = 'open' | 'acknowledged' | 'resolved';
-export type PolicyKind = 'offline' | 'cpu' | 'memory' | 'disk' | 'service' | 'job_failed' | 'log' | 'security' | 'patch' | 'net_down' | 'net_interface' | 'net_threshold';
+export type PolicyKind = 'offline' | 'cpu' | 'memory' | 'disk' | 'service' | 'job_failed' | 'log' | 'security' | 'patch' | 'net_down' | 'net_interface' | 'net_threshold' | 'uptime' | 'backup' | 'disk_encryption' | 'local_admin' | 'vulnerability';
 export type LogLevel = 'critical' | 'error' | 'warning' | 'info';
 
 export interface Alert {
-	id: string; policy_id: string | null; policy_name: string | null; agent_id: string; hostname: string; client_id: string;
-	client_name: string; site_name: string; kind: PolicyKind; severity: Severity; title: string; details: Record<string, unknown>;
-	occurrences: number; state: AlertState; device_id?: string | null; device_name?: string | null; opened_at: string; last_seen_at: string; acknowledged_at: string | null;
+	/** agent_id and hostname are null for an alert without an agent (a monitor the server runs). */
+	id: string; policy_id: string | null; policy_name: string | null; agent_id: string | null; hostname: string | null; client_id: string;
+	/** The agent's site, or the monitor's. */
+	client_name: string; site_name: string | null; kind: PolicyKind; severity: Severity; title: string; details: Record<string, unknown>;
+	occurrences: number; state: AlertState; device_id?: string | null; device_name?: string | null;
+	monitor_id?: string | null; monitor_name?: string | null; opened_at: string; last_seen_at: string; acknowledged_at: string | null;
 	acknowledged_by_name: string | null; resolved_at: string | null; resolved_by_name: string | null;
 	/** cleared (condition went away), manual, policy (policy changed or deleted) */
 	resolution: 'cleared' | 'manual' | 'policy' | null;
@@ -178,11 +192,11 @@ export interface Process {
 export interface DirEntry { name: string; path: string; dir: boolean; symlink: boolean; size: number; modified: string | null; error: string | null }
 export interface DirListing { path: string; parent: string | null; entries: DirEntry[]; truncated: boolean }
 
-export type ChannelKind = 'email' | 'webhook' | 'slack' | 'teams';
+export type ChannelKind = 'email' | 'webhook' | 'slack' | 'teams' | 'sms' | 'pagerduty' | 'opsgenie' | 'oncall';
 export interface Channel {
 	id: string; name: string; kind: ChannelKind; enabled: boolean; policies: number; created_at: string; has_secret: boolean;
 	/** Admins only. */
-	config?: { to?: string[]; url?: string };
+	config?: { to?: string[]; url?: string; region?: 'us' | 'eu'; escalation_policy_id?: string; when?: 'always' | 'outside_hours'; calendar_id?: string };
 }
 export interface DeliveryRow extends Delivery { channel_id: string; alert_id: string | null; alert_title: string | null; hostname: string | null; next_attempt_at: string }
 export interface Smtp { host: string; port: number; security: 'starttls' | 'tls' | 'none'; username: string; password_set: boolean; from: string }
@@ -273,7 +287,7 @@ export interface Compliance {
 
 export type Priority = 1 | 2 | 3 | 4;
 export type StatusCategory = 'new' | 'open' | 'waiting_client' | 'waiting_vendor' | 'resolved' | 'closed';
-export type TicketSource = 'dashboard' | 'email' | 'alert' | 'portal' | 'api';
+export type TicketSource = 'dashboard' | 'email' | 'alert' | 'portal' | 'api' | 'agent';
 export interface BoardStatus { id: string; name: string; category: StatusCategory; position: number }
 export interface Board {
 	id: string; name: string; description: string; position: number; statuses: BoardStatus[]; open_tickets: number;
@@ -340,7 +354,7 @@ export interface KbArticle {
 	id: string; title: string; category: string; public: boolean; client_id: string | null; client_name: string | null; body?: string | null;
 	excerpt: string; updated_by_name: string | null; created_at: string; updated_at: string;
 }
-export interface DeskSettings { portal_board_id: string | null; portal_welcome: string; csat_enabled: boolean }
+export interface DeskSettings { portal_board_id: string | null; portal_welcome: string; csat_enabled: boolean; tray_board_id?: string | null }
 
 export interface Contact {
 	id: string; client_id: string; client_name: string; site_id: string | null; site_name: string | null; name: string; email: string;
@@ -546,3 +560,28 @@ export interface RareProgram {
 }
 /** What the server's reputation set holds: `db:<version>` (the newest database) or `list:<name>`. */
 export interface ReputationSource { source: string; hashes: number; added_at: string }
+
+// --- on-call and paging ---------------------------------------------------------------------
+export interface OncallWindow { days: number[]; start: number; end: number }
+export interface OncallLayer { id?: string; position?: number; name: string; user_ids: string[]; start_at: string; shift_hours: number; restrict: OncallWindow[] }
+export interface OncallOverride { id: string; schedule_id: string; user_id: string; user_name: string; starts_at: string; ends_at: string }
+export interface OnCallNow { schedule_id: string; schedule_name: string; user_id: string | null; user_name: string | null; until: string | null; source: 'override' | 'layer' | null }
+export interface OncallSchedule { id: string; name: string; timezone: string; layers: OncallLayer[]; overrides: OncallOverride[]; now: OnCallNow }
+export interface ShiftSegment { user_id: string; user_name: string; start: string; end: string }
+export interface OncallShifts { from: string; to: string; timezone: string; layers: { id: string; name: string; position: number; segments: ShiftSegment[] }[]; overrides: ShiftSegment[]; final: ShiftSegment[] }
+export type EscalationTarget = { schedule: string } | { user: string } | { channel: string };
+export interface EscalationPolicy { id: string; name: string; repeat: number; steps: { delay_minutes: number; targets: EscalationTarget[] }[]; channels: { id: string; name: string }[] }
+export interface OncallPerson { id: string; name: string; email: string; phone_verified: boolean }
+export interface PageDelivery {
+	id: string; user_name: string | null; channel_name: string | null; method: 'sms' | 'email' | 'push' | 'channel'; step: number; round: number;
+	status: 'pending' | 'sent' | 'failed' | 'cancelled'; attempts: number; error: string | null; created_at: string; sent_at: string | null; next_attempt_at: string;
+}
+export interface OncallPage {
+	id: string; alert_id: string | null; ticket_id: string | null; title: string; severity: string; status: 'held' | 'triggered' | 'acknowledged' | 'resolved';
+	step: number; round: number; policy_name: string | null; acked_by_name: string | null; acked_at: string | null; resolved_at: string | null; created_at: string;
+	next_escalation_at: string | null; deliveries: PageDelivery[];
+}
+export interface ContactMethods { phone: string | null; phone_verified: boolean; sms_available: boolean; devices: number; rules: { method: 'sms' | 'email' | 'push'; delay_minutes: number }[] }
+export interface SmsSettings { account_sid: string; from: string; base_url: string; token_set: boolean }
+export interface NotificationPrefs { hide_details: boolean; events: { event: string; label: string; push: boolean; email: boolean; email_applies: boolean }[] }
+export interface PushDevice { id: string; user_agent: string; created_at: string; last_ok_at: string | null; endpoint: string }

@@ -55,7 +55,7 @@
 		<ul class="border-border flex w-max min-w-full gap-1 border-b lg:w-auto lg:flex-col lg:gap-4 lg:border-b-0">
 			{#each shown as g, gi (gi)}
 				<li class="contents lg:block">
-					{#if g.label}<span class="text-muted mb-1 hidden px-2.5 text-[11px] font-semibold tracking-wide uppercase lg:block">{g.label}</span>{/if}
+					{#if g.label}<span class="text-muted mb-1 hidden px-2.5 text-xs font-medium lg:block">{g.label}</span>{/if}
 					<ul class="contents lg:flex lg:flex-col lg:gap-0.5">
 						{#each g.items as t (t.value)}
 							{@const on = t.value === value}

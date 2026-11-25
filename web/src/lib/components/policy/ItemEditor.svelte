@@ -19,6 +19,8 @@
 	import Select from '#lib/ui/Select.svelte';
 	import Switch from '#lib/ui/Switch.svelte';
 	import AgentForm, { normalize as agentNorm } from './AgentForm.svelte';
+	import DiskEncryptionForm, { normalize as diskencNorm } from './DiskEncryptionForm.svelte';
+	import LocalAdminForm, { normalize as localAdminNorm } from './LocalAdminForm.svelte';
 	import AlertForm, { blankAlert, normalize as alertNorm } from './AlertForm.svelte';
 	import AutomationForm, { blankAutomation, normalize as automationNorm } from './AutomationForm.svelte';
 	import AutomationRuns from './AutomationRuns.svelte';
@@ -29,6 +31,7 @@
 	import ScheduleForm, { blankSchedule, normalize as scheduleNorm } from './ScheduleForm.svelte';
 	import SecurityForm, { normalize as securityNorm } from './SecurityForm.svelte';
 	import SoftwareForm, { blankSoftware, normalize as softwareNorm } from './SoftwareForm.svelte';
+	import TrayForm, { normalize as trayNorm } from './TrayForm.svelte';
 
 	/**
 	 * One policy as it applies in one set. Where it's defined, edits change the policy itself;
@@ -64,9 +67,12 @@
 		security: securityNorm,
 		remote_access: remoteNorm,
 		agent: agentNorm,
-		software: softwareNorm
+		software: softwareNorm,
+		disk_encryption: diskencNorm,
+		local_admin: localAdminNorm,
+		tray: trayNorm
 	};
-	const singleForms: Partial<Record<Module, Component<FormProps>>> = { patch: PatchForm, security: SecurityForm, remote_access: RemoteAccessForm, agent: AgentForm };
+	const singleForms: Partial<Record<Module, Component<FormProps>>> = { patch: PatchForm, security: SecurityForm, remote_access: RemoteAccessForm, agent: AgentForm, disk_encryption: DiskEncryptionForm, local_admin: LocalAdminForm, tray: TrayForm };
 	// svelte-ignore state_referenced_locally
 	const norm = norms[module];
 	// svelte-ignore state_referenced_locally

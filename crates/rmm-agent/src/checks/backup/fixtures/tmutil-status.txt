@@ -1,0 +1,9 @@
+Backup session status:
+{
+    BackupPhase = Copying;
+    ClientID = "com.apple.backupd";
+    DateOfStateChange = "2026-11-23 10:15:03 +0000";
+    DestinationID = "7C2A1B1E-0F8E-4C51-9C1D-1A2B3C4D5E6F";
+    Percent = "0.4123";
+    Running = 1;
+}

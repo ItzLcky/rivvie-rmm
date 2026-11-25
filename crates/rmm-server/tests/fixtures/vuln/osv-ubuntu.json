@@ -1,0 +1,24 @@
+{
+  "id": "UBUNTU-CVE-2024-3094",
+  "summary": "xz-utils backdoor",
+  "details": "Malicious code was discovered in the upstream tarballs of xz, starting with version 5.6.0.",
+  "aliases": [],
+  "upstream": ["CVE-2024-3094"],
+  "published": "2024-03-29T17:15:00Z",
+  "modified": "2024-06-01T00:00:00Z",
+  "severity": [
+    { "type": "CVSS_V3", "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H" },
+    { "type": "Ubuntu", "score": "critical" }
+  ],
+  "affected": [
+    {
+      "package": { "ecosystem": "Ubuntu:24.04:LTS", "name": "xz-utils" },
+      "ranges": [ { "type": "ECOSYSTEM", "events": [ { "introduced": "0" } ] } ]
+    },
+    {
+      "package": { "ecosystem": "Ubuntu:Pro:18.04:LTS", "name": "xz-utils" },
+      "ranges": [ { "type": "ECOSYSTEM", "events": [ { "introduced": "0" } ] } ]
+    }
+  ],
+  "references": [ { "type": "REPORT", "url": "https://ubuntu.com/security/CVE-2024-3094" } ]
+}

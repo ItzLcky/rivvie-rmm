@@ -5,6 +5,7 @@
 		ArrowRightLeft,
 		BellRing,
 		Copy,
+		MonitorSmartphone,
 		ExternalLink,
 		FileText,
 		GitMerge,
@@ -39,6 +40,7 @@
 	import { targetLabels, until } from '#lib/servicedesk/sla.js';
 	import SlaBadge from '#lib/components/ticket/SlaBadge.svelte';
 	import TicketTime from '#lib/components/work/TicketTime.svelte';
+	import TicketChecklist from '#lib/components/ticket/TicketChecklist.svelte';
 	import Async from '#lib/ui/Async.svelte';
 	import Badge from '#lib/ui/Badge.svelte';
 	import Button from '#lib/ui/Button.svelte';
@@ -306,6 +308,7 @@
 				<TicketStatus name={t.status_name} category={t.status_category} />
 				<PriorityBadge priority={t.priority} long />
 				{#if t.client_name}<span>{t.client_name}{#if t.contact_name}{' · '}{t.contact_name}{/if}</span>{:else}<Badge tone="warning">Triage</Badge>{/if}
+				{#if t.source === 'agent'}<Badge icon={MonitorSmartphone} title="Asked for through the tray app on the linked device">From device</Badge>{/if}
 			{/snippet}
 			{#snippet actions()}
 				{#if tech && !t.merged_into}
@@ -586,6 +589,10 @@
 					</dl>
 				</section>
 
+				{#if tech && t.client_id}
+					<TicketChecklist ticketId={t.id} clientId={t.client_id} contactId={t.contact_id} locked={!!t.merged_into || t.status_category === 'closed'} />
+				{/if}
+
 				{#if tech}
 					<TicketTime ticketId={t.id} clientId={t.client_id} locked={!!t.merged_into || t.status_category === 'closed'} number={t.number} subject={t.subject} />
 				{/if}
@@ -754,7 +761,7 @@
 							<header class="border-border flex flex-wrap items-start justify-between gap-x-4 gap-y-3 border-b px-5 pb-4">
 								<div class="min-w-0">
 									<p class="eyebrow">{d.category || 'Uncategorised'}</p>
-									<h2 id="peek-title" class="mt-1 text-xl font-bold break-words">{d.title}</h2>
+									<h2 id="peek-title" class="mt-1 text-xl font-medium break-words">{d.title}</h2>
 									<p class="text-muted mt-1 text-xs">
 										Saved <time datetime={d.updated_at} title={datetime(d.updated_at)}>{ago(d.updated_at)}</time>{d.updated_by_name ? ` by ${d.updated_by_name}` : ''}
 									</p>

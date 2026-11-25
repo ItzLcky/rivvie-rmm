@@ -18,6 +18,9 @@
 	let { mobile = false, onnavigate }: { mobile?: boolean; onnavigate?: () => void } = $props();
 	const collapsed = $derived(!mobile && !!prefs.sidebarCollapsed);
 	const openAlerts = $derived(alertCounts.critical + alertCounts.warning + alertCounts.info);
+	const b = $derived(company.branding);
+	// The rail is ink in both themes: the logo made for dark backgrounds, else the light one.
+	const logo = $derived(b?.logo_dark ?? b?.logo_light ?? null);
 	const groups = $derived(nav.map((g) => ({ ...g, items: g.items.filter((i) => (!i.role || can(i.role)) && (!i.perm || allowed(i.perm))) })).filter((g) => g.items.length));
 </script>
 
@@ -27,10 +30,12 @@
 		class={cx('border-nav-border flex h-14 shrink-0 items-center gap-3 border-b', collapsed ? 'justify-center' : 'px-5')}
 		onclick={onnavigate}
 	>
-		<img src={favicon} alt="" class="size-7 shrink-0" />
-		{#if !collapsed}
+		{#if collapsed || !logo}<img src={b?.icon ?? favicon} alt="" class="size-7 shrink-0" />{/if}
+		{#if !collapsed && logo}
+			<img src={logo} alt={b?.product_name || company.name || 'Home'} class="h-8 max-w-[11rem] object-contain object-left" />
+		{:else if !collapsed}
 			<span class="min-w-0 leading-tight">
-				<span class="font-display block truncate text-base font-bold tracking-[-0.02em] text-white">{company.name || 'Rivvie'}</span>
+				<span class="font-display block truncate text-base font-semibold text-white">{b?.product_name || company.name || 'Rivvie'}</span>
 				<span class="text-nav-muted block truncate text-xs">Remote management</span>
 			</span>
 		{/if}
@@ -41,7 +46,7 @@
 				{#if collapsed}
 					<div class="bg-nav-border mx-2 mb-3 h-px first:hidden" aria-hidden="true"></div>
 				{:else}
-					<div class="text-nav-label px-3 pb-1.5 text-[0.6875rem] font-semibold tracking-[0.08em] uppercase">{g.label}</div>
+					<div class="text-nav-label px-3 pb-2 text-xs font-medium">{g.label}</div>
 				{/if}
 				<ul class="space-y-0.5">
 					{#each g.items as item (item.href)}

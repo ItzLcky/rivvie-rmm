@@ -164,6 +164,124 @@ pub struct NetThresholdRule {
     pub kinds: Vec<String>,
 }
 
+fn two() -> i32 {
+    2
+}
+
+fn fourteen() -> i32 {
+    14
+}
+
+/// An uptime monitor that fails, whose certificate nears expiry, or that answers slowly.
+/// Evaluated per monitor as its runner agent reports ([`crate::uptime`]); the item is the
+/// runner agent's, like the network kinds.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UptimeRule {
+    /// Consecutive failed checks before the monitor counts as down.
+    #[serde(default = "two")]
+    pub failures: i32,
+    /// Only these kinds of monitor (`ping`, `tcp`, `http`, `tls`, `dns`). Empty: all.
+    #[serde(default)]
+    pub kinds: Vec<String>,
+    /// A certificate that expires within this many days (0: don't check).
+    #[serde(default = "fourteen")]
+    pub cert_days: i32,
+    /// Slower than this for `failures` checks in a row. None: don't check.
+    #[serde(default)]
+    pub latency_ms: Option<i32>,
+}
+
+impl Default for UptimeRule {
+    fn default() -> Self {
+        UptimeRule { failures: 2, kinds: vec![], cert_days: 14, latency_ms: None }
+    }
+}
+
+/// Where a `backup` item tells the agent to look (secrets stay on the machine: restic and borg
+/// read an env file that is already there).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct BackupSourceRule {
+    pub provider: String,
+    #[serde(default)]
+    pub env_file: Option<String>,
+    #[serde(default)]
+    pub repo: Option<String>,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub glob: Option<String>,
+}
+
+fn auto() -> Vec<String> {
+    vec!["auto".into()]
+}
+
+fn every_job() -> Vec<String> {
+    vec!["*".into()]
+}
+
+fn twenty_six() -> i32 {
+    26
+}
+
+/// Backup jobs on the device that failed, or haven't succeeded for `max_age_hours`
+/// ([`crate::backups`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BackupRule {
+    /// `auto`, `wsb`, `veeam`, `restic`, `borg`, `timemachine`, `file_age`.
+    #[serde(default = "auto")]
+    pub providers: Vec<String>,
+    #[serde(default)]
+    pub sources: Vec<BackupSourceRule>,
+    /// Job names (`*` globs).
+    #[serde(default = "every_job")]
+    pub jobs: Vec<String>,
+    #[serde(default = "twenty_six")]
+    pub max_age_hours: i32,
+    #[serde(default)]
+    pub warning_is_failure: bool,
+    /// Alert when no job is found at all (for server sets, where a backup must exist).
+    #[serde(default)]
+    pub require: bool,
+}
+
+impl Default for BackupRule {
+    fn default() -> Self {
+        BackupRule { providers: auto(), sources: vec![], jobs: every_job(), max_age_hours: 26, warning_is_failure: false, require: false }
+    }
+}
+
+fn critical() -> String {
+    "critical".into()
+}
+
+/// Vulnerable software on the device ([`crate::vuln`]): one alert per device, with counts and
+/// the top five CVEs in its details, not one per CVE.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VulnerabilityRule {
+    /// critical, high, medium or low: findings at least this severe count.
+    #[serde(default = "critical")]
+    pub min_severity: String,
+    /// Only CVEs in CISA's known-exploited catalogue.
+    #[serde(default)]
+    pub kev_only: bool,
+    /// Only findings with a fixed version to install.
+    #[serde(default = "yes")]
+    pub fix_available_only: bool,
+    /// Only findings first seen at least this many days ago (time to patch normally).
+    #[serde(default = "fourteen")]
+    pub older_than_days: i32,
+    /// Only CVEs with an EPSS score at least this (0-1). None: any.
+    #[serde(default)]
+    pub min_epss: Option<f64>,
+}
+
+impl Default for VulnerabilityRule {
+    fn default() -> Self {
+        VulnerabilityRule { min_severity: critical(), kev_only: false, fix_available_only: true, older_than_days: 14, min_epss: None }
+    }
+}
+
 /// What a policy checks: `kind` and `params` columns together.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "params", rename_all = "snake_case")]
@@ -183,6 +301,11 @@ pub enum Rule {
     NetDown(NetDownRule),
     NetInterface(NetInterfaceRule),
     NetThreshold(NetThresholdRule),
+    Uptime(UptimeRule),
+    Backup(BackupRule),
+    DiskEncryption(crate::diskenc::DiskEncryptionRule),
+    LocalAdmin(crate::localadmin::LocalAdminRule),
+    Vulnerability(VulnerabilityRule),
 }
 
 impl Rule {
@@ -271,6 +394,36 @@ impl Rule {
                 }
                 list(&r.names, "interfaces")?;
                 list(&r.kinds, "device kinds")
+            }
+            Rule::Uptime(r) => {
+                if !(1..=20).contains(&r.failures) {
+                    return Err("failures must be 1-20 checks in a row".into());
+                }
+                if !(0..=365).contains(&r.cert_days) {
+                    return Err("certificate days must be 0-365 (0: don't check)".into());
+                }
+                if r.latency_ms.is_some_and(|l| !(1..=120_000).contains(&l)) {
+                    return Err("latency must be 1-120000 ms".into());
+                }
+                if let Some(k) = r.kinds.iter().find(|k| !crate::uptime::KINDS.contains(&k.as_str())) {
+                    return Err(format!("unknown monitor kind {k:?}: {}", crate::uptime::KINDS.join(", ")));
+                }
+                Ok(())
+            }
+            Rule::Backup(r) => crate::backups::validate(r),
+            Rule::DiskEncryption(r) => crate::diskenc::validate(r),
+            Rule::LocalAdmin(r) => crate::localadmin::validate(r),
+            Rule::Vulnerability(r) => {
+                if !["critical", "high", "medium", "low"].contains(&r.min_severity.as_str()) {
+                    return Err("min_severity is critical, high, medium or low".into());
+                }
+                if !(0..=365).contains(&r.older_than_days) {
+                    return Err("older_than_days must be 0-365".into());
+                }
+                if r.min_epss.is_some_and(|e| !(0.0..=1.0).contains(&e)) {
+                    return Err("min_epss is a probability, 0-1".into());
+                }
+                Ok(())
             }
             Rule::Patch(r) => {
                 if r.reboot_hours.is_some_and(|h| !(1..=8760).contains(&h)) {
@@ -371,9 +524,29 @@ pub(crate) async fn policies_for(st: &AppState, agent_id: Uuid, kind: &str) -> s
     Ok(rows.into_iter().filter_map(PolicyRow::policy).collect())
 }
 
-/// What an alert's item says for the alert's agent: its channels and whether to announce
-/// clearing (none if the item is gone).
-async fn alert_channels(st: &AppState, policy_id: Option<Uuid>, agent_id: Uuid) -> sqlx::Result<(Vec<Uuid>, bool)> {
+/// Enabled alert items of one kind defined in All devices whose limit covers this client and
+/// site, with their own config: what applies to something without an agent (a monitor the
+/// server runs). Overrides in sets below don't apply (there's no agent to be in a set).
+pub(crate) async fn root_policies_for(st: &AppState, client_id: Uuid, site_id: Uuid, kind: &str) -> sqlx::Result<Vec<Policy>> {
+    let rows: Vec<PolicyRow> = sqlx::query_as(
+        "SELECT i.id, i.name, i.client_id, i.site_id, i.excluded_agents, i.config, ARRAY[i.set_id] AS sets
+           FROM policy_items i
+          WHERE i.set_id = $1 AND i.module = 'alert' AND i.enabled AND i.config ->> 'kind' = $2
+            AND (i.client_id IS NULL OR i.client_id = $3) AND (i.site_id IS NULL OR i.site_id = $4)
+          ORDER BY i.created_at",
+    )
+    .bind(crate::policy::ROOT)
+    .bind(kind)
+    .bind(client_id)
+    .bind(site_id)
+    .fetch_all(&st.db)
+    .await?;
+    Ok(rows.into_iter().filter_map(PolicyRow::policy).collect())
+}
+
+/// What an alert's item says for the alert's agent (the item's own config without one): its
+/// channels and whether to announce clearing (none if the item is gone).
+async fn alert_channels(st: &AppState, policy_id: Option<Uuid>, agent_id: Option<Uuid>) -> sqlx::Result<(Vec<Uuid>, bool)> {
     let Some(pid) = policy_id else { return Ok((vec![], false)) };
     let config: Option<Value> = sqlx::query_scalar("SELECT policy_config($1, $2)").bind(pid).bind(agent_id).fetch_one(&st.db).await?;
     Ok(match config.and_then(|c| serde_json::from_value::<crate::policy::AlertConfig>(c).ok()) {
@@ -393,10 +566,8 @@ pub(crate) async fn announce(st: &AppState, ids: &[Uuid], event: &'static str, c
     if ids.is_empty() {
         return;
     }
-    let rows: Vec<(Uuid, Uuid, Uuid, bool)> = match sqlx::query_as(
-        "SELECT al.id, al.agent_id, s.client_id, al.suppressed FROM alerts al JOIN agents a ON a.id = al.agent_id
-           JOIN sites s ON s.id = a.site_id
-          WHERE al.id = ANY($1)",
+    let rows: Vec<(Uuid, Option<Uuid>, Uuid, bool)> = match sqlx::query_as(
+        "SELECT al.id, al.agent_id, al.client_id, al.suppressed FROM alerts al WHERE al.id = ANY($1)",
     )
     .bind(ids)
     .fetch_all(&st.db)
@@ -424,8 +595,11 @@ pub(crate) async fn announce(st: &AppState, ids: &[Uuid], event: &'static str, c
                 warn!(alert = %id, "running the alert's script: {e:#}");
             }
             crate::automation::alert_opened(st, id).await;
+            crate::push::alert_opened(st, id).await;
         } else {
             crate::tickets::alert_resolved(st, id).await;
+            crate::oncall::alert_changed(st, id).await;
+            crate::notify::close_incidents(st, id).await;
         }
     }
     if woke {
@@ -435,9 +609,9 @@ pub(crate) async fn announce(st: &AppState, ids: &[Uuid], event: &'static str, c
 
 /// Alerts held back by a mute that has ended and are still open: announce them now.
 pub async fn unsuppress(st: &AppState) -> sqlx::Result<()> {
-    let rows: Vec<(Uuid, Option<Uuid>, Uuid)> = sqlx::query_as(
+    let rows: Vec<(Uuid, Option<Uuid>, Option<Uuid>)> = sqlx::query_as(
         "UPDATE alerts SET suppressed = false, last_notified_at = now()
-          WHERE suppressed AND resolved_at IS NULL AND NOT agent_muted(agent_id, now())
+          WHERE suppressed AND resolved_at IS NULL AND NOT alert_muted(agent_id, client_id, monitor_id, now())
           RETURNING id, policy_id, agent_id",
     )
     .fetch_all(&st.db)
@@ -458,7 +632,7 @@ async fn remind(st: &AppState) -> sqlx::Result<()> {
                   WHERE o.resolved_at IS NULL AND o.acknowledged_at IS NULL AND NOT o.suppressed AND o.policy_id IS NOT NULL) x
           WHERE x.id = al.id AND (x.c ->> 'renotify_minutes') IS NOT NULL
             AND coalesce(al.last_notified_at, al.opened_at) < now() - make_interval(mins => (x.c ->> 'renotify_minutes')::int)
-            AND NOT agent_muted(al.agent_id, now())
+            AND NOT alert_muted(al.agent_id, al.client_id, al.monitor_id, now())
           RETURNING al.id, x.c -> 'channel_ids'",
     )
     .fetch_all(&st.db)
@@ -483,7 +657,7 @@ async fn run_alert_script(st: &AppState, alert_id: Uuid) -> anyhow::Result<()> {
         "SELECT al.agent_id, s.client_id, sc.id, sc.interpreter, sc.body, sc.timeout_secs, sc.client_id, al.details
            FROM alerts al JOIN agents a ON a.id = al.agent_id JOIN sites s ON s.id = a.site_id
            JOIN scripts sc ON sc.id = (policy_config(al.policy_id, al.agent_id) ->> 'run_script_id')::uuid
-          WHERE al.id = $1 AND al.policy_id IS NOT NULL AND al.script_job_id IS NULL AND al.device_id IS NULL",
+          WHERE al.id = $1 AND al.policy_id IS NOT NULL AND al.script_job_id IS NULL AND al.device_id IS NULL AND al.monitor_id IS NULL",
     )
     .bind(alert_id)
     .fetch_optional(&st.db)
@@ -495,9 +669,16 @@ async fn run_alert_script(st: &AppState, alert_id: Uuid) -> anyhow::Result<()> {
     }
     let interpreter = crate::agent_ws::parse_interpreter(&interp).ok_or_else(|| anyhow::anyhow!("script has unknown interpreter {interp}"))?;
     let job_id = Uuid::new_v4();
+    // An alert passes no values: only the script's defaults (a script with required parameters
+    // can't be chosen, see params::check_policy).
+    let (params, sealed, why) = match crate::params::env_for(st, script_id, &Default::default(), agent_id, client_id, job_id, "alert").await? {
+        Ok((p, s)) => (p, s, None),
+        Err(why) => (Value::Object(Default::default()), None, Some(why)),
+    };
     let mut tx = st.db.begin().await?;
     sqlx::query(
-        "INSERT INTO jobs (id, agent_id, script_id, interpreter, body, args, timeout_secs) VALUES ($1, $2, $3, $4, $5, '[]', $6)",
+        "INSERT INTO jobs (id, agent_id, script_id, interpreter, body, args, timeout_secs, params, env_sealed)
+         VALUES ($1, $2, $3, $4, $5, '[]', $6, $7, $8)",
     )
     .bind(job_id)
     .bind(agent_id)
@@ -505,6 +686,8 @@ async fn run_alert_script(st: &AppState, alert_id: Uuid) -> anyhow::Result<()> {
     .bind(&interp)
     .bind(&body)
     .bind(timeout.clamp(1, 86400))
+    .bind(params)
+    .bind(sealed)
     .execute(&mut *tx)
     .await?;
     let claimed = sqlx::query("UPDATE alerts SET script_job_id = $2 WHERE id = $1 AND script_job_id IS NULL")
@@ -517,7 +700,11 @@ async fn run_alert_script(st: &AppState, alert_id: Uuid) -> anyhow::Result<()> {
         return Ok(());
     }
     tx.commit().await?;
-    let job = rmm_proto::ScriptJob { job_id, interpreter, script: body, args: vec![], timeout_secs: timeout.clamp(1, 86400) as u32 };
+    if let Some(why) = why {
+        crate::api::end_job_with_error(st, job_id, agent_id, client_id, &why).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+        return Ok(());
+    }
+    let job = rmm_proto::ScriptJob { job_id, interpreter, script: body, args: vec![], timeout_secs: timeout.clamp(1, 86400) as u32, env: vec![] };
     let status = crate::api::deliver_job(st, agent_id, client_id, job).await.map_err(|e| anyhow::anyhow!("{e}"))?;
     info!(alert = %alert_id, %job_id, status, "alert script started");
     Ok(())
@@ -525,8 +712,8 @@ async fn run_alert_script(st: &AppState, alert_id: Uuid) -> anyhow::Result<()> {
 
 /// Opens (or refreshes) the alert for (policy, agent, key). `bump` adds to its occurrence
 /// count when it was already open.
-async fn fire(st: &AppState, p: &Policy, agent_id: Uuid, key: &str, title: &str, details: Value, bump: i32) -> sqlx::Result<()> {
-    fire_for(st, p, agent_id, None, key, title, details, bump).await
+pub(crate) async fn fire(st: &AppState, p: &Policy, agent_id: Uuid, key: &str, title: &str, details: Value, bump: i32) -> sqlx::Result<()> {
+    fire_on(st, p, agent_id, None, None, key, title, details, bump).await
 }
 
 /// [`fire`], for an alert about a network device (read through `agent_id`).
@@ -541,17 +728,58 @@ pub(crate) async fn fire_for(
     details: Value,
     bump: i32,
 ) -> sqlx::Result<()> {
-    let (id, inserted): (Uuid, bool) = sqlx::query_as(
-        "INSERT INTO alerts (id, policy_id, agent_id, key, kind, severity, title, details, occurrences, device_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, greatest($9, 1), $10)
-         ON CONFLICT (policy_id, agent_id, key) WHERE resolved_at IS NULL
+    fire_on(st, p, agent_id, device_id, None, key, title, details, bump).await
+}
+
+/// [`fire`], for an alert about a network device or an uptime monitor (checked through `agent_id`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn fire_on(
+    st: &AppState,
+    p: &Policy,
+    agent_id: Uuid,
+    device_id: Option<Uuid>,
+    monitor_id: Option<Uuid>,
+    key: &str,
+    title: &str,
+    details: Value,
+    bump: i32,
+) -> sqlx::Result<()> {
+    open(st, p, Subject::Agent(agent_id), device_id, monitor_id, key, title, details, bump).await
+}
+
+/// [`fire`], for an alert without an agent: about an uptime monitor the server runs, under an
+/// item of All devices. It belongs to the client; one is open per (policy, client, key).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn fire_agentless(st: &AppState, p: &Policy, client_id: Uuid, monitor_id: Option<Uuid>, key: &str, title: &str, details: Value, bump: i32) -> sqlx::Result<()> {
+    open(st, p, Subject::Client(client_id), None, monitor_id, key, title, details, bump).await
+}
+
+/// Who an alert belongs to: an agent (the client follows from its site) or, without one, a client.
+#[derive(Debug, Clone, Copy)]
+enum Subject {
+    Agent(Uuid),
+    Client(Uuid),
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn open(st: &AppState, p: &Policy, who: Subject, device_id: Option<Uuid>, monitor_id: Option<Uuid>, key: &str, title: &str, details: Value, bump: i32) -> sqlx::Result<()> {
+    let (agent_id, client_id, conflict) = match who {
+        // The insert trigger fills in the agent's client.
+        Subject::Agent(a) => (Some(a), None, "(policy_id, agent_id, key) WHERE resolved_at IS NULL"),
+        Subject::Client(c) => (None, Some(c), "(policy_id, client_id, key) WHERE resolved_at IS NULL AND agent_id IS NULL"),
+    };
+    let (id, client_id, inserted): (Uuid, Uuid, bool) = sqlx::query_as(AssertSqlSafe(format!(
+        "INSERT INTO alerts (id, policy_id, agent_id, client_id, key, kind, severity, title, details, occurrences, device_id, monitor_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, greatest($10, 1), $11, $12)
+         ON CONFLICT {conflict}
          DO UPDATE SET last_seen_at = now(), title = EXCLUDED.title, details = EXCLUDED.details,
-                       occurrences = alerts.occurrences + $9
-         RETURNING id, (xmax = 0)",
-    )
+                       occurrences = alerts.occurrences + $10
+         RETURNING id, client_id, (xmax = 0)"
+    )))
     .bind(Uuid::new_v4())
     .bind(p.id)
     .bind(agent_id)
+    .bind(client_id)
     .bind(key)
     .bind(&p.kind)
     .bind(&p.severity)
@@ -559,30 +787,22 @@ pub(crate) async fn fire_for(
     .bind(details)
     .bind(bump)
     .bind(device_id)
+    .bind(monitor_id)
     .fetch_one(&st.db)
     .await?;
     if inserted {
-        info!(alert = %id, policy = %p.name, %agent_id, key, "alert opened");
+        info!(alert = %id, policy = %p.name, agent_id = ?agent_id, %client_id, key, "alert opened");
         announce(st, &[id], "opened", &p.channel_ids, true).await;
     } else if bump > 0 {
         // Occurrence count changed: let open lists redraw.
-        if let Ok(client_id) = client_of(st, agent_id).await {
-            st.hub.publish(Event::Alert { id, agent_id, client_id, state: "open".into() });
-        }
+        st.hub.publish(Event::Alert { id, agent_id, client_id, state: "open".into() });
     }
     Ok(())
 }
 
-async fn client_of(st: &AppState, agent_id: Uuid) -> sqlx::Result<Uuid> {
-    sqlx::query_scalar("SELECT s.client_id FROM agents a JOIN sites s ON s.id = a.site_id WHERE a.id = $1")
-        .bind(agent_id)
-        .fetch_one(&st.db)
-        .await
-}
-
 /// Resolves the policy's open alerts on this agent whose key is in `keys` (all keys if None),
 /// except those in `keep`.
-async fn clear(st: &AppState, p: &Policy, agent_id: Uuid, keys: Option<&[String]>, keep: &[String]) -> sqlx::Result<()> {
+pub(crate) async fn clear(st: &AppState, p: &Policy, agent_id: Uuid, keys: Option<&[String]>, keep: &[String]) -> sqlx::Result<()> {
     let ids: Vec<Uuid> = sqlx::query_scalar(
         "UPDATE alerts SET resolved_at = now(), resolution = 'cleared'
           WHERE policy_id = $1 AND agent_id = $2 AND resolved_at IS NULL
@@ -600,15 +820,22 @@ async fn clear(st: &AppState, p: &Policy, agent_id: Uuid, keys: Option<&[String]
 }
 
 /// After a policy change: closes open alerts whose item no longer applies to their agent (the
-/// item is gone or disabled there, the agent left its reach or its limit), quietly.
+/// item is gone or disabled there, the agent left its reach or its limit), quietly. An alert
+/// without an agent (a server-run monitor's) stays while its item is an enabled `uptime` item of
+/// All devices whose limit covers the monitor.
 pub async fn close_inapplicable(st: &AppState) {
-    let res: sqlx::Result<Vec<Uuid>> = sqlx::query_scalar(
+    let res: sqlx::Result<Vec<Uuid>> = sqlx::query_scalar(AssertSqlSafe(format!(
         "UPDATE alerts al SET resolved_at = now(), resolution = 'policy'
           WHERE al.resolved_at IS NULL
-            AND NOT EXISTS (SELECT 1 FROM agent_policy ap
-                             WHERE ap.agent_id = al.agent_id AND ap.item_id = al.policy_id AND ap.module = 'alert' AND ap.enabled)
+            AND CASE WHEN al.agent_id IS NOT NULL
+                     THEN NOT EXISTS (SELECT 1 FROM agent_policy ap
+                                       WHERE ap.agent_id = al.agent_id AND ap.item_id = al.policy_id AND ap.module = 'alert' AND ap.enabled)
+                     ELSE NOT EXISTS (SELECT 1 FROM uptime_monitors m JOIN policy_items i ON i.id = al.policy_id
+                                       WHERE m.id = al.monitor_id AND {})
+                END
           RETURNING al.id",
-    )
+        crate::uptime::SERVER_ITEM_COVERS
+    )))
     .fetch_all(&st.db)
     .await;
     match res {
@@ -633,6 +860,11 @@ pub async fn close_for_item(st: &AppState, item_id: Uuid) {
 /// An alert item changed: re-check event-driven kinds against every agent it covers now.
 pub async fn recheck_item(st: &AppState, item_id: Uuid) {
     crate::netalerts::recheck_item(st, item_id).await;
+    crate::uptime::recheck_item(st, item_id).await;
+    crate::backups::recheck_item(st, item_id).await;
+    crate::diskenc::recheck_item(st, item_id).await;
+    crate::localadmin::recheck_item(st, item_id).await;
+    crate::vuln::matcher::recheck_item(st, item_id).await;
     let rows: sqlx::Result<Vec<(Uuid, Uuid)>> = sqlx::query_as(
         "SELECT ap.agent_id, a.policy_set_id FROM agent_policy ap JOIN agents a ON a.id = ap.agent_id
           WHERE ap.item_id = $1 AND ap.module = 'alert' AND ap.enabled
@@ -655,6 +887,11 @@ pub async fn recheck_item(st: &AppState, item_id: Uuid) {
 /// event-driven alerts from its last reports.
 pub async fn recheck_agent(st: &AppState, agent_id: Uuid) {
     crate::netalerts::recheck_agent(st, agent_id).await;
+    crate::uptime::recheck_agent(st, agent_id).await;
+    crate::backups::recheck_agent(st, agent_id).await;
+    crate::diskenc::recheck_agent(st, agent_id).await;
+    crate::localadmin::recheck_agent(st, agent_id).await;
+    vulns_changed(st, agent_id).await;
     for kind in ["service", "security", "patch"] {
         match policies_for(st, agent_id, kind).await {
             Ok(ps) => {
@@ -875,7 +1112,7 @@ pub async fn agent_online(st: &AppState, agent_id: Uuid) {
         .fetch_all(&st.db)
         .await?;
         for (id, policy_id) in cleared {
-            let (channels, notify) = alert_channels(st, policy_id, agent_id).await?;
+            let (channels, notify) = alert_channels(st, policy_id, Some(agent_id)).await?;
             announce(st, &[id], "resolved", &channels, notify).await;
         }
         Ok(())
@@ -1424,6 +1661,12 @@ async fn check_patches(st: &AppState, p: &Policy, agent_id: Uuid) -> sqlx::Resul
     clear(st, p, agent_id, None, &keep).await
 }
 
+/// The device's vulnerability findings changed (an evaluation, an acceptance): its
+/// `vulnerability` alerts again.
+pub async fn vulns_changed(st: &AppState, agent_id: Uuid) {
+    crate::vuln::matcher::check_alerts(st, agent_id).await;
+}
+
 /// The agent's patch state changed (a scan, an install's result).
 pub async fn patches_changed(st: &AppState, agent_id: Uuid) {
     let res: sqlx::Result<()> = async {
@@ -1673,6 +1916,40 @@ mod tests {
         assert!(Rule::Security(SecurityRule { stale_hours: Some(1), ..rule.clone() }).validate().is_err());
         let f = security_findings(&rule, &[], &[], &[], None, &r(true, h(30), h(40)), now);
         assert_eq!(f.iter().map(|f| f.0.as_str()).collect::<Vec<_>>(), ["stale"]);
+    }
+
+    #[test]
+    fn vulnerability_rule() {
+        let r = Rule::parse("vulnerability", &json!({})).unwrap();
+        assert_eq!(r, Rule::Vulnerability(VulnerabilityRule::default()));
+        assert_eq!(r.params(), json!({ "min_severity": "critical", "kev_only": false, "fix_available_only": true, "older_than_days": 14, "min_epss": null }));
+        assert!(r.validate().is_ok());
+        assert!(Rule::parse("vulnerability", &json!({ "min_severity": "urgent" })).unwrap().validate().is_err());
+        assert!(Rule::parse("vulnerability", &json!({ "older_than_days": 400 })).unwrap().validate().is_err());
+        assert!(Rule::parse("vulnerability", &json!({ "min_epss": 1.5 })).unwrap().validate().is_err());
+        assert!(Rule::parse("vulnerability", &json!({ "min_severity": "high", "kev_only": true, "min_epss": 0.1, "older_than_days": 0 })).unwrap().validate().is_ok());
+    }
+
+    #[test]
+    fn uptime_and_backup_rules() {
+        assert_eq!(Rule::parse("uptime", &json!({})).unwrap(), Rule::Uptime(UptimeRule::default()));
+        assert!(Rule::parse("uptime", &json!({ "failures": 0 })).unwrap().validate().is_err());
+        assert!(Rule::parse("uptime", &json!({ "kinds": ["smtp"] })).unwrap().validate().is_err());
+        assert!(Rule::parse("uptime", &json!({ "kinds": ["http", "tls"], "latency_ms": 800, "cert_days": 0 })).unwrap().validate().is_ok());
+        let b = Rule::parse("backup", &json!({})).unwrap();
+        assert_eq!(b, Rule::Backup(BackupRule::default()));
+        assert_eq!(b.params()["max_age_hours"], 26);
+        assert!(b.validate().is_ok());
+        assert!(Rule::parse("backup", &json!({ "providers": ["tape"] })).unwrap().validate().is_err());
+        assert!(Rule::parse("backup", &json!({ "max_age_hours": 0 })).unwrap().validate().is_err());
+        let src = |s: Value| Rule::parse("backup", &json!({ "providers": [], "sources": [s] })).unwrap().validate();
+        assert!(src(json!({ "provider": "restic", "env_file": "/etc/restic/env" })).is_ok());
+        assert!(src(json!({ "provider": "restic", "env_file": "relative/env" })).is_err());
+        assert!(src(json!({ "provider": "restic", "env_file": "/etc/../root/env" })).is_err());
+        assert!(src(json!({ "provider": "restic" })).is_err(), "restic needs an env file or a repository");
+        assert!(src(json!({ "provider": "file_age", "path": "C:\\Backups", "glob": "*.bak" })).is_ok());
+        assert!(src(json!({ "provider": "file_age" })).is_err());
+        assert!(src(json!({ "provider": "wsb" })).is_err(), "Windows Server Backup takes no source");
     }
 
     #[test]

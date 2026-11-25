@@ -105,7 +105,7 @@ re-request them (Let's Encrypt rate-limits that). The compose file already sets
 
 | Secret | What it protects | If it leaks | If it's lost |
 |---|---|---|---|
-| `RMM_DATA_KEY` | Two-factor secrets, single sign-on client secrets, webhook signing secrets, IMAP and SMTP passwords, SIEM destination tokens, SNMP community strings and passphrases, the password vault's per-client keys, mailbox and accounting (QuickBooks, Xero) credentials, and detection context, all encrypted at rest | The encryption in the database and in backups is worthless to anyone who also gets the dump. Replacing the key needs the rotation procedure ([below](#rotating-rmm_data_key)) | The vault is gone for good; users with 2FA can't sign in until `rmm-server reset2fa` clears it; the server refuses to start once anything has been encrypted. **Keep it with your backups, in a password manager and a sealed copy off-site.** A backup without its key is half a backup |
+| `RMM_DATA_KEY` | Two-factor secrets, single sign-on client secrets, webhook signing secrets, IMAP and SMTP passwords, SIEM destination tokens, SNMP community strings and passphrases, the SMS provider's auth token and the Web Push (VAPID) signing key, the password vault's per-client keys, mailbox and accounting (QuickBooks, Xero) credentials, and detection context, all encrypted at rest | The encryption in the database and in backups is worthless to anyone who also gets the dump. Replacing the key needs the rotation procedure ([below](#rotating-rmm_data_key)) | The vault is gone for good; users with 2FA can't sign in until `rmm-server reset2fa` clears it; the server refuses to start once anything has been encrypted. **Keep it with your backups, in a password manager and a sealed copy off-site.** A backup without its key is half a backup |
 | `POSTGRES_PASSWORD` | The database | Full read/write of everything. The database isn't published, so this takes access to the host or its Docker network first | Reset it in Postgres (`ALTER USER`) and in `deploy/.env` |
 | Release signing key (`release.key`, from `rmm-sign keygen`) | Every agent self-update and all detection content: agents only run code signed by it | Anyone holding it can push their own binary to every agent. Treat it like a CA key: offline, never on the RMM server or the image, in CI only as the `RMM_UPDATE_SIGNING_KEY` secret | Agents can't be updated again; the public half is compiled into them, so they have to be reinstalled with a new key. Keep two copies off-site |
 | `RMM_METRICS_TOKEN` | `/metrics` | Series names and fleet sizes; low impact. Rotate by changing it and the scraper | Set a new one |
@@ -121,7 +121,7 @@ covered in [RELEASING.md](RELEASING.md) and the README's [Agent updates](../READ
 
 `rmm-server rotate-data-key` re-encrypts everything sealed with the key under a new one, in one
 transaction: two-factor secrets, single sign-on client secrets, webhook signing secrets, IMAP and
-SMTP passwords, SIEM tokens, mailbox and accounting credentials, detection context, and the vault's per-client keys (the vault's items
+SMTP passwords, SIEM tokens, mailbox and accounting credentials, detection context, the secret script parameters of jobs not yet delivered, and the vault's per-client keys (the vault's items
 aren't touched). Stop the server first, then:
 
 ```sh
@@ -210,6 +210,7 @@ that fails to parse falls back to its default.
 | `RMM_JOB_QUEUE_DAYS` | `7` | Jobs queued for an offline agent expire after this |
 | `RMM_AUTOMATION_RESTART_GRACE_MINUTES` | `10` | After the server starts, an agent's offline time (for the *comes back online* automation trigger) is counted from the start for this long, so a restart doesn't fire every automation |
 | `RMM_ALERT_EVAL_SECS` | `60` | How often polled alert policies (offline, CPU, memory, disk) are evaluated |
+| `RMM_UPTIME_ALLOW_PRIVATE` | off | `1`: uptime monitors run by the server may reach loopback, private (RFC 1918, CGNAT, ULA), link-local and cloud metadata addresses. Off, they are refused after the name resolves and on every redirect, so a monitor can't be pointed at the server's own network. Turn it on only when everyone who can add monitors may probe that network; checks that need private space belong on an agent |
 | `RMM_CONTENT_SOAK_MINUTES` | `1440` | How long new detection content stays on canary clients before everyone gets it |
 | `RMM_UPDATE_PUBKEY` | empty | The release public key (hex); when set, uploaded detection content is verified against it too. Build-time for agents (see [RELEASING.md](RELEASING.md)) |
 
@@ -224,6 +225,9 @@ that fails to parse falls back to its default.
 | `RMM_TICKET_CLOSE_DAYS` | `7` | Resolved tickets move to Closed after this |
 | `RMM_SESSION_IDLE_HOURS` | `12` | Idle dashboard sessions are signed out (overridable in Company settings; 7 days at most) |
 | `RMM_MAIL_POLL_SECS` | `60` | How often IMAP support mailboxes are checked |
+| `RMM_NVD_API_KEY` | empty | **Secret.** An NVD API key (free, nvd.nist.gov): NVD is then fetched at 50 requests in 30 seconds instead of 5 |
+| `RMM_VULN_SYNC_HOURS` | `24` | How old a vulnerability feed may get before the hourly check syncs it again (only feeds the fleet needs; the first check is an hour after start). `0` turns the automatic sync off: use **Sync now** or `rmm-server vuln-import <dir>` |
+| `RMM_SOURCE_URL` | the upstream repository | Where the console and portal's "Licence and source" link points (AGPL-3.0 §13). Set it to your own copy if you run modified code |
 
 **Observability**
 
@@ -239,12 +243,22 @@ that fails to parse falls back to its default.
 |---|---|---|
 | `RMM_QBO_API_URL`, `RMM_QBO_AUTH_URL`, `RMM_QBO_TOKEN_URL` | Intuit production | `RMM_QBO_API_URL=https://sandbox-quickbooks.api.intuit.com` for the QuickBooks sandbox |
 | `RMM_XERO_API_URL`, `RMM_XERO_AUTH_URL`, `RMM_XERO_TOKEN_URL` | Xero production | |
-| `RMM_GRAPH_URL`, `RMM_GRAPH_LOGIN_URL`, `RMM_GRAPH_SCOPE` | Microsoft public cloud | Microsoft 365 mailboxes through Graph |
+| `RMM_GRAPH_URL`, `RMM_GRAPH_LOGIN_URL`, `RMM_GRAPH_SCOPE` | Microsoft public cloud | Microsoft Graph: Microsoft 365 mailboxes, and the Entra ID and Intune connections of identity management |
+| `RMM_PAGERDUTY_URL` | `https://events.pagerduty.com` | PagerDuty Events API v2 (PagerDuty channels) |
+| `RMM_OPSGENIE_URL` | the channel's region (`api.opsgenie.com`, `api.eu.opsgenie.com`) | Opsgenie channels; replaces both regions |
+| `RMM_VULN_OSV_URL` | `https://osv-vulnerabilities.storage.googleapis.com` | OSV dumps (`<url>/<Ecosystem>/all.zip`) for Linux vulnerability data |
+| `RMM_VULN_ARCH_URL` | `https://security.archlinux.org/issues/all.json` | The Arch Linux security tracker |
+| `RMM_VULN_NVD_URL` | `https://services.nvd.nist.gov/rest/json/cves/2.0` | NVD API 2.0, for Windows applications in the product map |
+| `RMM_VULN_KEV_URL` | CISA's `known_exploited_vulnerabilities.json` | Known exploited vulnerabilities |
+| `RMM_VULN_EPSS_URL` | `https://epss.empiricalsecurity.com/epss_scores-current.csv.gz` | EPSS scores |
+| `RMM_PUSH_ALLOW_HOSTS` | empty | Extra host names, comma-separated, Web Push subscriptions may point at (http allowed). Tests only: by default only Google, Mozilla, Microsoft and Apple push services are accepted |
 
 QuickBooks and Xero redirect to `<RMM_PUBLIC_URL>/api/billing/accounting/qbo/callback` (and
 `/xero/callback`): register that in the provider's developer portal.
 
-`RMM_SLA_SWEEP_SECS` (default 30) exists for tests; leave it alone.
+`RMM_SLA_SWEEP_SECS` (default 30), `RMM_ONCALL_MINUTE_SECS` (default 60: how many seconds
+one minute of escalation delay lasts) and `RMM_LOCALADMIN_TICK_SECS` (default 60: how often due
+local admin rotations are sent) exist for tests; leave them alone.
 
 **Compose-only** (`deploy/.env`): `RMM_DOMAIN`, `POSTGRES_PASSWORD`, `BACKUP_KEEP_DAYS`,
 `BACKUP_INTERVAL_HOURS`. The Arcane stack also takes `RMM_TAG` (image tag), `RMM_PORT` (published
@@ -256,7 +270,8 @@ port, 8080).
 |---|---|
 | `RMM_AGENT_CONFIG` | Path to `agent.toml` (default `/etc/rmm-agent/agent.toml`, or `C:\ProgramData\RMM\agent.toml`) |
 | `RMM_ENROLL_TOKEN` | Enrollment token for `rmm-agent enroll`, as an alternative to `--token` |
-| `RMM_STATE_DIR` | Where the agent keeps content, quarantine, telemetry and unsent results (tests run it unprivileged) |
+| `RMM_STATE_DIR` | Where the agent keeps content, quarantine, telemetry and unsent results (tests run it unprivileged); when set, the tray socket is `tray.sock` inside it |
+| `RMM_TRAY_SOCKET` | Unix only: the tray app's socket, for the service and `rmm-agent tray` alike (default `/run/rmm-agent/tray.sock`) |
 | `RMM_SENSOR_SCAN_ROOTS`, `RMM_SENSOR_WATCH`, `RMM_SENSOR_CANARY_DIRS` | Sensor scan roots, watched directories and canary directories |
 | `RMM_UPDATE_PUBKEY` (build time) | The release public key compiled into the agent |
 | `RMM_AGENT_VERSION` (build time) | Version the agent reports, instead of the crate's |
@@ -389,7 +404,24 @@ The README's [Installing an agent](../README.md#deploying) covers the options. S
 [policies](../README.md#policies) your fleet should have, and an alert notification channel
 (Company settings → Notifications), before enrolling many machines.
 
-## Network discovery and SNMP
+## On-call, text messages and push
+
+Paging ([design/oncall.md](design/oncall.md)) and the installable app
+([design/pwa.md](design/pwa.md)) need nothing on the server beyond outbound HTTPS:
+
+- **Text messages** go through Twilio's Messages API, or any service that speaks it (set the API
+  URL under Company settings → Notifications → SMS provider). Getting messages delivered is your
+  side of it: buy a number, and in the US register the sender for A2P 10DLC (or use a toll-free
+  verified number) before relying on it, or carriers drop the texts. Technicians verify their own
+  mobile number with a code under Account → How to reach me.
+- **PagerDuty and Opsgenie** channels reach `events.pagerduty.com` and `api(.eu).opsgenie.com`.
+  Acknowledging in those services doesn't come back here (no inbound webhooks yet).
+- **Web Push** reaches Google (`fcm.googleapis.com`), Mozilla, Microsoft and Apple push services.
+  The server makes its VAPID key on first use and keeps it sealed with `RMM_DATA_KEY`; rotating
+  the data key keeps it, and every browser's subscription stays valid. Push needs the dashboard
+  on HTTPS. On iPhone and iPad it works only once the app is added to the Home Screen (iOS 16.4
+  or later).
+
 
 Nothing to install or open on the server: the site's **designated agent** (Network → Settings)
 does the scanning and the SNMP reads, and sends the results over its normal connection. What it

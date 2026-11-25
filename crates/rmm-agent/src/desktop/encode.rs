@@ -110,6 +110,22 @@ impl Encoder {
     }
 }
 
+/// The whole picture as one JPEG, `scale` times smaller each way.
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
+pub fn jpeg(img: &Image, scale: usize, quality: u8) -> anyhow::Result<Vec<u8>> {
+    let (w, h) = ((img.width / scale.max(1)).max(1), (img.height / scale.max(1)).max(1));
+    anyhow::ensure!(w <= usize::from(u16::MAX) && h <= usize::from(u16::MAX), "picture too large");
+    let mut px = Vec::new();
+    if scale <= 1 {
+        px.extend_from_slice(&img.data[..w * h * 4]);
+    } else {
+        downscale(img, scale, &mut px);
+    }
+    let mut out = Vec::new();
+    jpeg_encoder::Encoder::new(&mut out, quality).encode(&px, w as u16, h as u16, jpeg_encoder::ColorType::Bgra)?;
+    Ok(out)
+}
+
 /// Box filter: each output pixel averages a `scale` x `scale` block.
 fn downscale(img: &Image, scale: usize, out: &mut Vec<u8>) {
     let (w, h) = ((img.width / scale).max(1), (img.height / scale).max(1));
@@ -155,6 +171,8 @@ mod tests {
         assert!(rects.iter().all(|r| r.data.starts_with(&[0xff, 0xd8])));
 
         assert!(e.encode(&Image { data: &px, width: w, height: h }).is_empty(), "nothing changed");
+        let one = jpeg(&Image { data: &px, width: w, height: h }, 2, 70).unwrap();
+        assert!(one.starts_with(&[0xff, 0xd8, 0xff]));
 
         // Touch one pixel in tile (2, 1) and two adjacent tiles in band 0.
         px[(70 * w + 150) * 4] ^= 0xff;

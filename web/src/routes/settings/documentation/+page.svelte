@@ -203,7 +203,7 @@
 				{#snippet children(rows)}
 					{#if rows.length}
 						{#each grouped as g (g.key)}
-							<h3 class="text-muted bg-sunken/60 border-border border-b px-4 py-1.5 font-sans text-[0.6875rem] font-semibold tracking-[0.08em] uppercase">{g.name}</h3>
+							<h3 class="text-muted bg-sunken/60 border-border border-b px-4 py-1.5 font-sans text-xs font-medium">{g.name}</h3>
 							<ul class="divide-border border-border divide-y border-b last:border-b-0">
 								{#each g.rows as t (t.id)}
 									<li class="flex items-center gap-3 px-4 py-2.5">

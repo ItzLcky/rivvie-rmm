@@ -1,11 +1,15 @@
+mod checks;
 mod collect;
 mod config;
 mod conn;
 mod deploy;
 mod desktop;
+mod diskenc;
 mod fetch;
 mod fsutil;
+mod identity;
 mod jobs;
+mod localadmin;
 mod logwatch;
 mod net;
 mod patch;
@@ -16,6 +20,7 @@ mod services;
 mod shell;
 mod software;
 mod tools;
+mod tray;
 mod update;
 #[cfg(windows)]
 mod winjob;
@@ -64,6 +69,9 @@ enum Cmd {
         /// Also append the outcome to this file (the MSI has no console to show it on).
         #[arg(long)]
         log_file: Option<PathBuf>,
+        /// The MSP's product name: the service is shown as "<name> Agent". Kept in agent.toml.
+        #[arg(long)]
+        product_name: Option<String>,
     },
     /// Run in the foreground (what the service runs).
     Run,
@@ -89,6 +97,9 @@ enum Cmd {
         #[arg(long)]
         run: Option<String>,
     },
+    /// The help desk app for the person at the machine: an icon on Windows, a request form on
+    /// Linux. Runs as the signed-in user and talks to the agent service.
+    Tray(tray::Args),
     /// Remote desktop capture and input, started by the agent inside the user's session.
     #[command(hide = true)]
     DesktopHelper,
@@ -126,6 +137,17 @@ fn main() -> Result<()> {
         return desktop::helper_main();
     }
 
+    if let Cmd::Tray(args) = cli.cmd {
+        // A GUI process: no console on Windows, so warnings go to stderr if anyone is looking.
+        tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()))
+            .with_writer(std::io::stderr)
+            .with_ansi(false)
+            .without_time()
+            .init();
+        return tray::main(args);
+    }
+
     if let Cmd::Sensor = cli.cmd {
         // stdout carries messages to the agent; logs go to stderr (the agent's log).
         tracing_subscriber::fmt()
@@ -158,16 +180,22 @@ fn main() -> Result<()> {
     install_crypto();
 
     match cli.cmd {
-        Cmd::Enroll { server, token, from_file, install, insecure, keep_existing, log_file } => {
+        Cmd::Enroll { server, token, from_file, install, insecure, keep_existing, log_file, product_name } => {
             let res = (|| {
-                let (server, token) = match from_file {
+                let (server, token, product_name) = match from_file {
                     Some(path) => {
                         let f = config::EnrollFile::load(&path)?;
-                        (f.server, f.token)
+                        (f.server, f.token, f.product_name.or(product_name))
                     }
-                    None => (server.unwrap_or_default(), token.unwrap_or_default()),
+                    None => (server.unwrap_or_default(), token.unwrap_or_default(), product_name),
                 };
-                if keep_existing && let Some(existing) = enrolled_with(&config_path, &server, insecure) {
+                let product_name = product_name.map(|p| p.trim().to_string()).filter(|p| !p.is_empty());
+                if keep_existing && let Some(mut existing) = enrolled_with(&config_path, &server, insecure) {
+                    // An upgrade with a newly branded package renames the service.
+                    if product_name.is_some() && product_name != existing.product_name {
+                        existing.product_name = product_name.clone();
+                        existing.save(&config_path)?;
+                    }
                     let msg = format!("already enrolled as {} with {}; keeping it", existing.agent_id, existing.server_url);
                     println!("{msg}");
                     if install {
@@ -180,7 +208,8 @@ fn main() -> Result<()> {
                 // Re-enrolling: prove ownership of the existing record so the server keeps it.
                 // Never hand the old secret to a different server.
                 let previous = config::Config::load(&config_path).ok().filter(|c| c.server_url == server);
-                let cfg = runtime()?.block_on(conn::enroll(&server, &token, previous.as_ref()))?;
+                let mut cfg = runtime()?.block_on(conn::enroll(&server, &token, previous.as_ref()))?;
+                cfg.product_name = product_name.or_else(|| previous.and_then(|p| p.product_name));
                 cfg.save(&config_path)?;
                 let msg = format!("enrolled as {} (config: {})", cfg.agent_id, config_path.display());
                 println!("{msg}");
@@ -220,7 +249,7 @@ fn main() -> Result<()> {
         }
         Cmd::Patches { install, no_refresh } => patch::cli(&install, !no_refresh),
         Cmd::Security { run } => security::cli(run.as_deref()),
-        Cmd::Service | Cmd::UpdateWatchdog | Cmd::DesktopHelper | Cmd::Sensor | Cmd::SuperviseSensor => unreachable!(),
+        Cmd::Service | Cmd::UpdateWatchdog | Cmd::DesktopHelper | Cmd::Sensor | Cmd::SuperviseSensor | Cmd::Tray(_) => unreachable!(),
     }
 }
 

@@ -43,7 +43,22 @@
 //! private address such as the Docker bridge's) for the network section: scan, monitor, rates,
 //! device-down alerts. The container name, if given, is paused and unpaused to make it go
 //! quiet. Without it that section checks everything that doesn't need a device.
-//! `RMM_E2E_ONLY=network` runs only that section (after the enrollment it needs).
+//! `RMM_E2E_ONLY=network` runs only that section (after the enrollment it needs), and so do
+//! `RMM_E2E_ONLY=oncall` (paging, with a stand-in Twilio, PagerDuty and Opsgenie) and `push`.
+//!
+//! `RMM_E2E_ONLY=branding` runs only the white-labelling section (after the sign-in and tenancy).
+//! `RMM_E2E_ONLY=script_params` runs only enrollment and the script parameters section.
+//!
+//! `RMM_E2E_ONLY=identity` runs only identity management (a fake Active Directory on a second
+//! agent, Entra ID and Intune through the Graph stand-in, ticket templates and checklists).
+//! `RMM_E2E_ONLY=uptime` and `RMM_E2E_ONLY=backups` run only those sections (uptime monitors
+//! against local HTTP, TCP, TLS and DNS listeners; backup alerts through the agent's fake
+//! provider, and a real restic repository when `restic` is on PATH).
+//!
+//! `RMM_E2E_ONLY=disk_encryption` and `RMM_E2E_ONLY=local_admin` run only those sections
+//! (BitLocker escrow and local admin rotation, through the agent's fakes).
+//! `RMM_E2E_ONLY=tray` runs only the tray app section (the headless `rmm-agent tray` over a1's
+//! real Unix socket).
 //!
 //! `RMM_E2E_ONLY=desk` runs only the core and service desk sections (faster while working on
 //! tickets, the portal and billing); `RMM_E2E_ONLY=api` only enrollment and the API keys and webhooks.
@@ -134,6 +149,12 @@ impl Server {
             .env("RMM_QBO_API_URL", format!("{}/qbo/api", ACCT_URL.get().map(String::as_str).unwrap_or("http://127.0.0.1:9")))
             .env("RMM_GRAPH_LOGIN_URL", GRAPH_URL.get().map(String::as_str).unwrap_or("http://127.0.0.1:9"))
             .env("RMM_GRAPH_URL", GRAPH_URL.get().map(String::as_str).unwrap_or("http://127.0.0.1:9"))
+            .env("RMM_PAGERDUTY_URL", format!("{}/pd", PAGING_URL.get().map(String::as_str).unwrap_or("http://127.0.0.1:9")))
+            .env("RMM_OPSGENIE_URL", format!("{}/og", PAGING_URL.get().map(String::as_str).unwrap_or("http://127.0.0.1:9")))
+            .env("RMM_PUSH_ALLOW_HOSTS", "127.0.0.1")
+            // A "minute" of escalation delay is a second here.
+            .env("RMM_ONCALL_MINUTE_SECS", "1")
+            .env("RMM_LOCALADMIN_TICK_SECS", "2")
             // Offline time counts in full right after the server starts (the restart grace would
             // hide the hours the automations e2e makes an agent absent for).
             .env("RMM_AUTOMATION_RESTART_GRACE_MINUTES", "0")
@@ -209,12 +230,21 @@ impl Agent {
                 .env("RMM_DESKTOP_FAKE", log_dir.join(format!("{name}-desktop.jsonl")))
                 // And report antivirus state from this file.
                 .env("RMM_SECURITY_FAKE", log_dir.join(format!("{name}-security.json")))
+                // And backup jobs from this one, while it exists.
+                .env("RMM_BACKUP_FAKE", log_dir.join(format!("{name}-backups.json")))
+                // And an Active Directory from this one, if it exists when the agent starts.
+                .env("RMM_IDENTITY_FAKE", log_dir.join(format!("{name}-identity.json")))
+                // Disk encryption from this one while it exists; local admin passwords go here.
+                .env("RMM_DISKENC_FAKE", log_dir.join(format!("{name}-diskenc.json")))
+                .env("RMM_LOCALADMIN_FAKE", log_dir.join(format!("{name}-localadmin.json")))
                 // The sensor runs unprivileged on scratch directories, with test-signed content.
                 .env("RMM_STATE_DIR", sensor_dir(log_dir, &name, "state"))
                 .env("RMM_CONTENT_PUBKEY", content_pubkey())
                 .env("RMM_SENSOR_WATCH", sensor_dir(log_dir, &name, "watch"))
                 .env("RMM_SENSOR_CANARY_DIRS", sensor_dir(log_dir, &name, "home"))
                 .env("RMM_SENSOR_SCAN_ROOTS", sensor_dir(log_dir, &name, "scan"))
+                // Wake-on-LAN packets go to the test's socket, not the LAN.
+                .env("RMM_WOL_FAKE", wol_sink().local_addr().unwrap().to_string())
                 .stdout(log.try_clone().unwrap())
                 .stderr(log)
                 .spawn()
@@ -486,6 +516,9 @@ async fn end_to_end() {
     let (graph_url, graph) = graph_mock().await;
     let _ = GRAPH_URL.set(graph_url);
     let _ = GRAPH.set(graph);
+    let (paging_url, paging) = paging_sink().await;
+    let _ = PAGING_URL.set(paging_url);
+    let _ = PAGING.set(paging);
     let (acct_url, acct) = accounting_mock().await;
     let _ = ACCT_URL.set(acct_url);
     let _ = ACCT.set(acct);
@@ -565,6 +598,11 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
     let b_id = client_b["id"].as_str().unwrap();
     let token = admin.post(&format!("/sites/{a_site}/enrollment-tokens"), json!({ "label": "e2e" })).await;
     let token = token["token"].as_str().unwrap().to_string();
+    // RMM_E2E_ONLY=branding: white-labelling needs no agent.
+    if std::env::var("RMM_E2E_ONLY").as_deref() == Ok("branding") {
+        branding(&url, &admin, db, a_id, a_site, b_id).await;
+        return Ok(());
+    }
 
     // --- enrollment: reuse only with the old credential ----------------------------------
     let mut a1 = Agent::new(dir, "a1");
@@ -589,8 +627,62 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
         return Ok(());
     }
 
+    if std::env::var("RMM_E2E_ONLY").as_deref() == Ok("script_params") {
+        script_params(&admin, db, dir, &mut a1, &id1, a_id, b_id).await;
+        a1.kill();
+        return Ok(());
+    }
+    // RMM_E2E_ONLY=oncall / push: on-call and paging, or Web Push, on the enrolled agent.
+    if std::env::var("RMM_E2E_ONLY").as_deref() == Ok("oncall") {
+        oncall(&url, &admin, db, &id1, a_id).await;
+        a1.kill();
+        return Ok(());
+    }
+    if std::env::var("RMM_E2E_ONLY").as_deref() == Ok("push") {
+        push(&url, &admin, db, &id1, a_id, b_id).await;
+        a1.kill();
+        return Ok(());
+    }
+    if std::env::var("RMM_E2E_ONLY").as_deref() == Ok("uptime") {
+        uptime(server, &url, &admin, db, dir, &id1, a_id, a_site, b_id).await;
+        a1.kill();
+        return Ok(());
+    }
+    if std::env::var("RMM_E2E_ONLY").as_deref() == Ok("tray") {
+        tray(server, &admin, db, dir, &id1, a_id).await;
+        a1.kill();
+        return Ok(());
+    }
+    if std::env::var("RMM_E2E_ONLY").as_deref() == Ok("backups") {
+        backups(&url, &admin, db, dir, &id1, b_id).await;
+        a1.kill();
+        return Ok(());
+    }
+    if std::env::var("RMM_E2E_ONLY").as_deref() == Ok("disk_encryption") {
+        disk_encryption(&url, &admin, db, dir, &id1, b_id).await;
+        a1.kill();
+        return Ok(());
+    }
+    if std::env::var("RMM_E2E_ONLY").as_deref() == Ok("local_admin") {
+        local_admin(&url, &admin, db, dir, &id1, b_id).await;
+        a1.kill();
+        return Ok(());
+    }
+
+    if std::env::var("RMM_E2E_ONLY").as_deref() == Ok("identity") {
+        identity(&url, &admin, db, dir, &token, &id1, a_id, b_id).await;
+        a1.kill();
+        return Ok(());
+    }
+    if std::env::var("RMM_E2E_ONLY").as_deref() == Ok("vulnerabilities") {
+        vulnerabilities(server, &url, &admin, db, &id1, &id3, a_id, b_id).await;
+        a1.kill();
+        return Ok(());
+    }
+
     if std::env::var("RMM_E2E_ONLY").as_deref() == Ok("network") {
         network(&url, &admin, db, &id1, a_id, a_site, b_id).await;
+        wake_on_lan(&url, &admin, db, dir, &id1, a_id, a_site).await;
         a1.kill();
         return Ok(());
     }
@@ -1202,11 +1294,23 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
     }
     portal_and_sla(&url, &admin, db, a_id, b_id).await;
     billing(&url, &admin, &tech, db, a_id, b_id).await;
-    docs_and_vault(&url, &admin, db, a_id, b_id).await;
+    script_params(&admin, db, dir, &mut a1, &id1, a_id, b_id).await;
+    docs_and_vault(server, &url, &admin, db, dir, a_id, b_id).await;
+    branding(&url, &admin, db, a_id, a_site, b_id).await;
     ticket_docs(&url, &admin, a_id, b_id).await;
     api_keys_and_webhooks(&url, &admin, db, &id1, a_id, b_id).await;
     fields_tags_notes_views(&url, &admin, db, dir, &id1, a_id, b_id).await;
     network(&url, &admin, db, &id1, a_id, a_site, b_id).await;
+    wake_on_lan(&url, &admin, db, dir, &id1, a_id, a_site).await;
+    oncall(&url, &admin, db, &id1, a_id).await;
+    push(&url, &admin, db, &id1, a_id, b_id).await;
+    if all {
+        uptime(server, &url, &admin, db, dir, &id1, a_id, a_site, b_id).await;
+        backups(&url, &admin, db, dir, &id1, b_id).await;
+        disk_encryption(&url, &admin, db, dir, &id1, b_id).await;
+        local_admin(&url, &admin, db, dir, &id1, b_id).await;
+    }
+    identity(&url, &admin, db, dir, &token, &id1, a_id, b_id).await;
     sso_and_passkeys(server, db, dir, &secret).await;
 
     // --- rate limits ------------------------------------------------------------------------------
@@ -1257,6 +1361,14 @@ async fn run(server: &mut Server, db: &sqlx::PgPool, dir: &Path) -> Result<(), S
     assert_eq!(limited, Some(20));
 
     observability(&url, dir).await;
+    // After the counters are checked: it restarts the server (with the mock feeds' URLs).
+    if all {
+        vulnerabilities(server, &url, &admin, db, &id1, &id3, a_id, b_id).await;
+    }
+    // After the counters are checked: it stops the server to queue a request offline.
+    if all {
+        tray(server, &admin, db, dir, &id1, a_id).await;
+    }
     // After the counters are checked: it restarts the server.
     audit_export_siem_sealing(server, &admin, &tech, db).await;
     // Last but the drill: it restarts the server, which would reset the counters checked above.
@@ -1303,6 +1415,17 @@ fn opens_with(key_hex: &str, bytes: &[u8]) -> bool {
 }
 
 /// A value sealed with this hex key, as `crypto.rs` stores it (nonce || ciphertext).
+/// [`seal_with`] with associated data, as `DataKey::seal_aad` does.
+fn seal_aad_with(key_hex: &str, plain: &[u8], aad: &str) -> Vec<u8> {
+    use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+    use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+    let key: [u8; 32] = hex::decode(key_hex).unwrap().try_into().unwrap();
+    let nonce = [7u8; 12];
+    let mut out = nonce.to_vec();
+    out.extend(ChaCha20Poly1305::new(&Key::from(key)).encrypt(&Nonce::from(nonce), Payload { msg: plain, aad: aad.as_bytes() }).unwrap());
+    out
+}
+
 fn seal_with(key_hex: &str, plain: &[u8]) -> Vec<u8> {
     use chacha20poly1305::aead::{Aead, KeyInit};
     use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
@@ -1332,6 +1455,9 @@ const SEALED: &[(&str, &str, &str)] = &[
     ("notification_channels", "secret", "secret_sealed"),
     ("siem_destinations", "token", "token_sealed"),
     ("net_credentials", "secret", "secret_sealed"),
+    ("company_settings", "sms_token_enc", "sms_token_sealed"),
+    ("push_keys", "private", "private_sealed"),
+    ("identity_sources", "secret", "secret_sealed"),
 ];
 
 async fn sealed_values(db: &sqlx::PgPool) -> Vec<(&'static str, Vec<u8>)> {
@@ -1349,6 +1475,129 @@ async fn sealed_values(db: &sqlx::PgPool) -> Vec<(&'static str, Vec<u8>)> {
 /// Network discovery and SNMP monitoring: the designated agent, credentials sealed at rest, what
 /// a site may be told to scan, and, with `RMM_E2E_SNMP`, a real scan and reading of a net-snmp
 /// device, its counters and alerts, and the public API.
+/// Where every test agent sends its Wake-on-LAN packets (`RMM_WOL_FAKE`).
+fn wol_sink() -> &'static std::net::UdpSocket {
+    static SINK: std::sync::OnceLock<std::net::UdpSocket> = std::sync::OnceLock::new();
+    SINK.get_or_init(|| std::net::UdpSocket::bind("127.0.0.1:0").unwrap())
+}
+
+/// The packets that reach [`wol_sink`] within `secs`: after the first, until half a second passes without one.
+async fn wol_packets(secs: u64) -> Vec<Vec<u8>> {
+    tokio::task::spawn_blocking(move || {
+        let sock = wol_sink();
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        let mut out = Vec::new();
+        let mut buf = [0u8; 512];
+        loop {
+            // Zero seconds drains what is queued already.
+            let left = if out.is_empty() { deadline.saturating_duration_since(Instant::now()) } else { Duration::from_millis(500) };
+            sock.set_read_timeout(Some(left.max(Duration::from_millis(5)))).unwrap();
+            match sock.recv(&mut buf) {
+                Ok(n) => out.push(buf[..n].to_vec()),
+                Err(_) => break,
+            }
+        }
+        out
+    })
+    .await
+    .unwrap()
+}
+
+fn magic_packet(mac: [u8; 6]) -> Vec<u8> {
+    let mut p = vec![0xff; 6];
+    for _ in 0..16 {
+        p.extend_from_slice(&mac);
+    }
+    p
+}
+
+/// Wake-on-LAN (docs/design/wake-on-lan.md): an offline device is woken through the online
+/// agent of its site, a site with nobody online can't be, and a patch window wakes once.
+async fn wake_on_lan(url: &str, admin: &Api, db: &sqlx::PgPool, dir: &Path, id1: &str, a_id: &str, a_site: &str) {
+    use reqwest::Method;
+    eventually(30, "the agent lists the wol capability", || async {
+        let caps: Vec<String> = sqlx::query_scalar("SELECT capabilities FROM agents WHERE id = $1::uuid").bind(id1).fetch_one(db).await.unwrap();
+        caps.iter().any(|c| c == "wol").then_some(())
+    })
+    .await;
+    // B: a device of the same site that is switched off. Its inventory is written here, so its
+    // MAC is known whatever machine runs the test.
+    let token = admin.post(&format!("/sites/{a_site}/enrollment-tokens"), json!({ "label": "wol" })).await["token"].as_str().unwrap().to_string();
+    let b = Agent::new(dir, "wol-b").enroll(url, &token).unwrap();
+    let b_mac = [0x5c, 0x26, 0x0a, 0xe2, 0xe0, 0x01];
+    let inventory = |mac: &str| {
+        json!({ "network": [
+            { "name": "lo", "mac": "00:00:00:00:00:00", "addrs": ["127.0.0.1/8"] },
+            { "name": "docker0", "mac": "02:42:ac:11:00:01", "addrs": ["172.17.0.1/16"] },
+            { "name": "eth0", "mac": mac, "addrs": ["10.99.0.5/24"] },
+        ]})
+    };
+    sqlx::query("UPDATE agents SET inventory = $2 WHERE id = $1::uuid").bind(&b).bind(inventory("5C-26-0A-E2-E0-01")).execute(db).await.unwrap();
+    wol_packets(0).await;
+
+    let r = admin.post(&format!("/agents/{b}/wake"), json!({})).await;
+    assert_eq!((r["outcome"].as_str(), r["results"][0]["sender_id"].as_str()), (Some("sent"), Some(id1)), "{r}");
+    let packets = wol_packets(10).await;
+    assert!(!packets.is_empty() && packets.iter().all(|p| *p == magic_packet(b_mac)), "B's magic packet only: {packets:?}");
+    assert!(packets.len() >= 3, "sent three times: {}", packets.len());
+    let sent_at: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar("SELECT wol_sent_at FROM agents WHERE id = $1::uuid").bind(&b).fetch_one(db).await.unwrap();
+    assert!(sent_at.is_some());
+    let audit = admin.get(&format!("/agents/{b}/activity")).await;
+    assert!(audit.as_array().unwrap().iter().any(|r| r["action"] == "agent.wake"), "{audit}");
+    // An online device has nothing to wake.
+    assert_eq!(admin.post(&format!("/agents/{id1}/wake"), json!({})).await["outcome"], "online");
+
+    // Bulk: B again, and C at a site where nobody is online; one invisible id spoils it all.
+    let site_c = admin.post(&format!("/clients/{a_id}/sites"), json!({ "name": "Branch (nobody on)" })).await["id"].as_str().unwrap().to_string();
+    let token_c = admin.post(&format!("/sites/{site_c}/enrollment-tokens"), json!({ "label": "wol" })).await["token"].as_str().unwrap().to_string();
+    let c = Agent::new(dir, "wol-c").enroll(url, &token_c).unwrap();
+    sqlx::query("UPDATE agents SET inventory = $2 WHERE id = $1::uuid").bind(&c).bind(inventory("5c:26:0a:e2:e0:02")).execute(db).await.unwrap();
+    let d = Agent::new(dir, "wol-d").enroll(url, &token).unwrap(); // no inventory: no MAC
+    let (s, _) = admin.call(Method::POST, "/agents/wake", Some(json!({ "agent_ids": [b, uuid::Uuid::new_v4()] }))).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    let (s, _) = admin.call(Method::POST, "/agents/wake", Some(json!({ "agent_ids": [] }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let r = admin.post("/agents/wake", json!({ "agent_ids": [b, c, d, id1] })).await;
+    assert_eq!((r["sent"].as_i64(), r["no_sender"].as_i64(), r["no_mac"].as_i64(), r["online"].as_i64()), (Some(1), Some(1), Some(1), Some(1)), "{r}");
+    let outcome = |id: &str| r["results"].as_array().unwrap().iter().find(|x| x["agent_id"] == id).unwrap()["outcome"].clone();
+    assert_eq!((outcome(&b), outcome(&c), outcome(&d)), (json!("sent"), json!("no_sender"), json!("no_mac")));
+    assert!(wol_packets(10).await.iter().all(|p| *p == magic_packet(b_mac)), "nothing for C");
+
+    // Before a patch window: B has an approved update, its policy installs automatically in a
+    // window that opens in ten minutes, and wakes 30 minutes before.
+    let before = admin.item_in(ROOT_SET, PATCH_ITEM).await["item_config"].clone();
+    let (s, v) = admin.set_root_item(PATCH_ITEM, json!({ "wake_before_minutes": 61 })).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    sqlx::query("UPDATE agents SET wol_sent_at = NULL WHERE id = $1::uuid").bind(&b).execute(db).await.unwrap();
+    sqlx::query(
+        "INSERT INTO patches (agent_id, update_id, title, category, approval, approval_manual) VALUES ($1::uuid, 'wol-upd', 'Update for WoL', 'security', 'approved', true)",
+    )
+    .bind(&b)
+    .execute(db)
+    .await
+    .unwrap();
+    let start = (chrono::Utc::now() + chrono::Duration::minutes(10)).format("%H:%M").to_string();
+    let (s, v) = admin
+        .set_root_item(
+            PATCH_ITEM,
+            json!({ "auto_install": true, "wake_before_minutes": 30, "window": { "days": [0, 1, 2, 3, 4, 5, 6], "start": start, "minutes": 60, "tz": "UTC" } }),
+        )
+        .await;
+    assert!(s.is_success(), "{v}");
+    wol_packets(0).await;
+    let packets = wol_packets(75).await;
+    assert!(!packets.is_empty() && packets.iter().all(|p| *p == magic_packet(b_mac)), "the patch scheduler woke B: {packets:?}");
+    let sent_at: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar("SELECT wol_sent_at FROM agents WHERE id = $1::uuid").bind(&b).fetch_one(db).await.unwrap();
+    assert!(sent_at.is_some());
+    assert!(wol_packets(70).await.is_empty(), "once: not again on the next tick");
+    let (s, v) = admin.call(Method::PUT, &format!("/policy-items/{PATCH_ITEM}"), Some(json!({ "config": before }))).await;
+    assert!(s.is_success(), "{v}");
+    for id in [&b, &c, &d] {
+        let (s, _) = admin.call(Method::DELETE, &format!("/agents/{id}"), None).await;
+        assert!(s.is_success());
+    }
+}
+
 async fn network(url: &str, admin: &Api, db: &sqlx::PgPool, id1: &str, a_id: &str, a_site: &str, b_id: &str) {
     use reqwest::Method;
     let snmp = std::env::var("RMM_E2E_SNMP").ok().filter(|s| !s.is_empty());
@@ -1601,6 +1850,26 @@ async fn key_rotation(server: &mut Server, admin: &Api, db: &sqlx::PgPool, admin
         .await
         .unwrap();
     let wrapped = || async { sqlx::query_scalar::<_, Vec<u8>>("SELECT wrapped_key FROM vault_keys WHERE client_id = $1::uuid").bind(a_id).fetch_one(db).await.unwrap() };
+    // A managed item (opened through its client key after the rotation, like any item), and a
+    // queued job whose secret parameter is sealed with the data key itself (`jobs.env_sealed`):
+    // the agent gets it once the server is back on the new key.
+    let out = put_managed_cli(server, &["--client", a_id, "--kind", "local_admin", "--reference", "rotation-e2e", "--name", "Rotation admin"], "managed-rot-pw");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let managed_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let env_job = uuid::Uuid::new_v4();
+    let env_agent: Option<uuid::Uuid> = sqlx::query_scalar("SELECT id FROM agents WHERE online AND 'script_env' = ANY(capabilities) LIMIT 1").fetch_optional(db).await.unwrap();
+    if let Some(agent) = env_agent {
+        sqlx::query(
+            "INSERT INTO jobs (id, agent_id, interpreter, body, args, timeout_secs, params, env_sealed)
+             VALUES ($1, $2, 'bash', 'printf %s \"$RMM_PARAM_TOKEN\"', '[]', 30, '{\"token\": \"•••\"}', $3)",
+        )
+        .bind(env_job)
+        .bind(agent)
+        .bind(seal_aad_with(&server.data_key, br#"{"token":"rotated-env-secret"}"#, &format!("job-env:{env_job}")))
+        .execute(db)
+        .await
+        .unwrap();
+    }
 
     let before = sealed_values(db).await;
     let tables_before: std::collections::BTreeSet<_> = before.iter().map(|(t, _)| *t).collect();
@@ -1681,6 +1950,12 @@ async fn key_rotation(server: &mut Server, admin: &Api, db: &sqlx::PgPool, admin
     assert!(code["code"] == c1.as_str() || code["code"] == c2.as_str(), "the vault TOTP still computes: {code}");
     let other = admin.get(&format!("/clients/{a_id}/vault")).await;
     assert!(other.as_array().unwrap().iter().any(|i| i["id"] == item_id.as_str()));
+    assert_eq!(admin.post(&format!("/vault/{managed_id}/reveal"), json!({ "field": "password" })).await["value"], "managed-rot-pw");
+    admin.call(reqwest::Method::DELETE, &format!("/vault/{managed_id}"), None).await;
+    if env_agent.is_some() {
+        let j = admin.wait_job(&env_job.to_string(), 60).await;
+        assert_eq!((j["status"].as_str(), j["stdout"].as_str()), (Some("succeeded"), Some("rotated-env-secret")), "the job's sealed parameters were rewrapped: {j}");
+    }
     // A new item sealed after the rotation, read back through the same client key.
     let fresh = admin.post(&format!("/clients/{a_id}/vault"), json!({ "name": "After rotation", "password": "after-rot" })).await;
     assert_eq!(admin.post(&format!("/vault/{}/reveal", fresh["id"].as_str().unwrap()), json!({ "field": "password" })).await["value"], "after-rot");
@@ -3419,10 +3694,19 @@ ExecStart=/tmp/x
     let (s, v) = admin.call(reqwest::Method::PUT, "/security/rules/E2E-B-1", Some(json!({ "mode": "block" }))).await;
     assert!(s == StatusCode::BAD_REQUEST && v["error"].as_str().unwrap().contains("can't block yet"), "{v}");
     admin.call(reqwest::Method::PUT, "/security/rules/E2E-B-1", Some(json!({ "mode": "disabled", "reason": "e2e kill switch" }))).await;
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    admin.run_script(id1, "sh -c 'sleep 4; true' rmm-e2e-marker-again", 30).await;
-    tokio::time::sleep(Duration::from_secs(8)).await;
-    assert_eq!(detections_for(admin, id1, "E2E-B-1").await.len(), 1, "a disabled rule doesn't fire");
+    // Nothing tells us when the sensor has the new mode, so run the marker until a run of it
+    // leaves no new detection (under load the first run can still beat the policy push).
+    let mut quiet = false;
+    for _ in 0..6 {
+        let before = detections_for(admin, id1, "E2E-B-1").await.len();
+        admin.run_script(id1, "sh -c 'sleep 4; true' rmm-e2e-marker-again", 30).await;
+        tokio::time::sleep(Duration::from_secs(8)).await;
+        if detections_for(admin, id1, "E2E-B-1").await.len() == before {
+            quiet = true;
+            break;
+        }
+    }
+    assert!(quiet, "a disabled rule doesn't fire");
     admin.call(reqwest::Method::PUT, "/security/rules/E2E-B-1", Some(json!({ "mode": null }))).await;
 
     // --- response: kill a process tree, triage, isolation ----------------------------------------
@@ -5099,6 +5383,8 @@ async fn graph_mock() -> (String, GraphMock) {
                 Code::ACCEPTED
             }),
         )
+        // Users, groups, roles and Intune devices (e2e_parts/identity.rs).
+        .merge(entra_routes())
         .with_state(mock.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
@@ -5959,7 +6245,139 @@ async fn billing(url: &str, admin: &Api, tech: &Api, db: &sqlx::PgPool, a_id: &s
     assert!(String::from_utf8_lossy(&qbr).contains("(Quarterly business review)"));
     let ov = admin.get("/billing/overview").await;
     assert!(ov["currencies"].as_array().unwrap().iter().any(|c| c["currency"] == "USD"), "{ov}");
+    scheduled_reports(url, admin, db, a_id, b_id, &mail, payer["id"].as_str().unwrap()).await;
     println!("time, contracts, invoices, accounting, projects, schedule, reports: ok");
+}
+
+/// Scheduled reports (docs/design/scheduled-reports.md): send now, the PDF reaches a user and a
+/// contact, who may receive what, the owner's access at run time, and the timetable.
+async fn scheduled_reports(url: &str, admin: &Api, db: &sqlx::PgPool, a_id: &str, b_id: &str, mail: &Mail, payer_id: &str) {
+    use reqwest::Method;
+    let pdf_to = |raw: &str| {
+        let m = mail_parser::MessageParser::default().parse(raw.as_bytes()).unwrap();
+        let att = m.attachments().next().expect("a PDF attached");
+        (att.attachment_name().unwrap_or_default().to_string(), att.decoded().starts_with(b"%PDF"))
+    };
+    // A QBR for client A, monthly, to the admin and client A's billing contact.
+    let admin_id = admin.get("/auth/me").await["id"].as_str().unwrap().to_string();
+    let qbr = admin
+        .post(
+            "/report-schedules",
+            json!({ "name": "Client A monthly review", "report": "qbr", "client_id": a_id, "params": { "range": "last_month" },
+                    "cron": "0 7 1 * *", "timezone": "Europe/London", "user_ids": [admin_id], "contact_ids": [payer_id],
+                    "message": "Here is last month's review." }),
+        )
+        .await;
+    let qbr_id = qbr["id"].as_str().unwrap().to_string();
+    let next = chrono::DateTime::parse_from_rfc3339(qbr["next_run_at"].as_str().expect("a next run")).unwrap();
+    let local = next.with_timezone(&chrono_tz::Europe::London);
+    assert_eq!(local.format("%d %H:%M").to_string(), "01 07:00", "the 1st at 07:00 in London: {next}");
+    assert!(next > chrono::Utc::now());
+    let before = mail.lock().unwrap().len();
+    let run = admin.post(&format!("/report-schedules/{qbr_id}/run"), json!({})).await;
+    assert_eq!(run["status"], "sent", "{run}");
+    assert_eq!(run["trigger"], "manual");
+    let queued: Vec<&str> = run["recipients"].as_array().unwrap().iter().filter(|r| r["status"] == "queued").map(|r| r["email"].as_str().unwrap()).collect();
+    assert_eq!(queued, [ADMIN_EMAIL, "paula@client-a.example"], "{run}");
+    for to in [ADMIN_EMAIL, "paula@client-a.example"] {
+        let raw = eventually(30, "the report email", || async {
+            mail.lock().unwrap()[before..].iter().find(|(r, d)| r.iter().any(|x| x == to) && d.contains("monthly review")).map(|(_, d)| d.clone())
+        })
+        .await;
+        let (name, pdf) = pdf_to(&raw);
+        assert!(pdf && name.starts_with("QBR-ClientA-") && name.ends_with(".pdf"), "{name}");
+        assert!(mail_text(&raw).contains("Here is last month's review."));
+        let to_header = header(&raw, "To").unwrap_or_default().to_string();
+        assert!(!to_header.contains(if to == ADMIN_EMAIL { "paula" } else { "admin" }), "one message per recipient: {to_header}");
+    }
+    let runs = admin.get(&format!("/report-schedules/{qbr_id}/runs")).await;
+    assert_eq!(runs.as_array().unwrap().len(), 1);
+    let res = admin.http.get(format!("{}/report-runs/{}/download", admin.base, run["id"].as_str().unwrap())).send().await.unwrap();
+    assert!(res.status().is_success() && res.bytes().await.unwrap().starts_with(b"%PDF"));
+    let audit: i64 = sqlx::query_scalar("SELECT count(*) FROM audit_log WHERE action = 'report.sent' AND target_id = $1::uuid").bind(&qbr_id).fetch_one(db).await.unwrap();
+    assert_eq!(audit, 1);
+
+    // Who may receive what.
+    let body = |report: &str, client: Option<&str>, contacts: Vec<&str>| {
+        json!({ "name": "x", "report": report, "client_id": client, "cron": "0 7 * * 1", "user_ids": [admin_id], "contact_ids": contacts })
+    };
+    for (what, b) in [
+        ("a contact on a profitability report", body("profitability", None, vec![payer_id])),
+        ("a contact on utilisation", body("utilisation", None, vec![payer_id])),
+        ("a contact on another client's QBR", body("qbr", Some(b_id), vec![payer_id])),
+        ("a contact on an all-clients service desk report", body("service_desk", None, vec![payer_id])),
+        ("a QBR without a client", body("qbr", None, vec![])),
+        ("a bad cron", json!({ "name": "x", "report": "service_desk", "cron": "every day", "user_ids": [admin_id] })),
+        ("nobody to send to", json!({ "name": "x", "report": "service_desk", "cron": "0 7 * * 1" })),
+        ("an unknown range", json!({ "name": "x", "report": "service_desk", "cron": "0 7 * * 1", "user_ids": [admin_id], "params": { "range": "forever" } })),
+    ] {
+        let (s, v) = admin.call(Method::POST, "/report-schedules", Some(b)).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{what}: {v}");
+    }
+    let desk = admin.post("/report-schedules", body("service_desk", Some(a_id), vec![payer_id])).await;
+    assert_eq!(desk["report"], "service_desk", "a client's service desk report may go to its contact");
+
+    // A technician: their own schedules only, money only with billing.read, no other addresses.
+    let tech = signed_in(url, admin, "reports-tech@e2e.test", "technician", None, false).await;
+    let tech_id = tech.get("/auth/me").await["id"].as_str().unwrap().to_string();
+    let mine = json!({ "name": "Margins", "report": "profitability", "cron": "0 8 * * 1", "user_ids": [tech_id] });
+    let (s, _) = tech.call(Method::POST, "/report-schedules", Some(mine.clone())).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "no billing.read");
+    let (s, _) = tech
+        .call(Method::POST, "/report-schedules", Some(json!({ "name": "x", "report": "service_desk", "cron": "0 8 * * 1", "extra_emails": ["boss@elsewhere.example"] })))
+        .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "other addresses are an admin's call");
+    admin.put(&format!("/users/{tech_id}/permissions"), json!({ "permissions": ["security.read", "billing.read"] })).await;
+    let margins = tech.post("/report-schedules", mine).await;
+    let margins_id = margins["id"].as_str().unwrap().to_string();
+    assert!(tech.get("/report-schedules").await.as_array().unwrap().iter().all(|r| r["owner_id"] == tech_id.as_str()), "only their own");
+    let (s, _) = tech.call(Method::GET, &format!("/report-schedules/{qbr_id}"), None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    assert!(admin.get("/report-schedules").await.as_array().unwrap().len() >= 3, "admins see all");
+    let ok = tech.post(&format!("/report-schedules/{margins_id}/run"), json!({})).await;
+    assert_eq!(ok["status"], "sent", "{ok}");
+    // Its mail leaves through the outbox; let it arrive before counting what comes after.
+    wait_mail(mail, "the margins report", |to, _| to.iter().any(|t| t == "reports-tech@e2e.test")).await;
+    // The owner loses billing.read: the next run fails, saying why, and mails nothing.
+    admin.put(&format!("/users/{tech_id}/permissions"), json!({ "permissions": ["security.read"] })).await;
+    let sent_before = mail.lock().unwrap().len();
+    let failed = admin.post(&format!("/report-schedules/{margins_id}/run"), json!({})).await;
+    assert_eq!(failed["status"], "failed", "{failed}");
+    assert!(failed["error"].as_str().unwrap().contains("billing.read"), "{failed}");
+    let s = admin.get(&format!("/report-schedules/{margins_id}")).await;
+    assert_eq!((s["last_status"].as_str(), s["last_error"].is_string()), (Some("failed"), true));
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(
+        !mail.lock().unwrap()[sent_before..].iter().any(|(to, _)| to.iter().any(|t| t == "reports-tech@e2e.test")),
+        "nothing was mailed"
+    );
+
+    // The timetable: a due schedule runs on its own and moves to its next time.
+    sqlx::query("UPDATE report_schedules SET next_run_at = now() - interval '1 minute' WHERE id = $1::uuid").bind(&qbr_id).execute(db).await.unwrap();
+    let r = eventually(60, "the scheduled run", || async {
+        let runs = admin.get(&format!("/report-schedules/{qbr_id}/runs")).await;
+        runs.as_array().unwrap().iter().find(|r| r["trigger"] == "schedule" && r["status"] != "running").cloned()
+    })
+    .await;
+    assert_eq!(r["status"], "sent", "{r}");
+    let s = admin.get(&format!("/report-schedules/{qbr_id}")).await;
+    let next = chrono::DateTime::parse_from_rfc3339(s["next_run_at"].as_str().unwrap()).unwrap();
+    assert!(next > chrono::Utc::now(), "moved on: {next}");
+    // Off: no next run. Deleting takes the runs and their PDFs with it.
+    let mut off = s.clone();
+    off["enabled"] = json!(false);
+    let off = admin.put(&format!("/report-schedules/{qbr_id}"), off).await;
+    assert!(off["next_run_at"].is_null(), "{off}");
+    let keys: Vec<String> = sqlx::query_scalar("SELECT storage_key FROM report_runs WHERE schedule_id = $1::uuid AND storage_key IS NOT NULL").bind(&qbr_id).fetch_all(db).await.unwrap();
+    assert_eq!(keys.len(), 2);
+    let (s, _) = admin.call(Method::DELETE, &format!("/report-schedules/{qbr_id}"), None).await;
+    assert!(s.is_success());
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM report_runs WHERE schedule_id = $1::uuid").bind(&qbr_id).fetch_one(db).await.unwrap();
+    assert_eq!(left, 0);
+    for id in [desk["id"].as_str().unwrap(), &margins_id] {
+        admin.call(Method::DELETE, &format!("/report-schedules/{id}"), None).await;
+    }
+    println!("scheduled reports: ok");
 }
 
 /// A user signed in through their own session, with two-factor authentication turned on when
@@ -5984,7 +6402,7 @@ async fn signed_in(url: &str, admin: &Api, email: &str, role: &str, client: Opti
 /// Client documentation (categories, templates, pages, links, export) and the password vault
 /// (encryption at rest, reveal, history, TOTP, who is refused, and that no secret ever shows
 /// up outside a reveal).
-async fn docs_and_vault(url: &str, admin: &Api, db: &sqlx::PgPool, a_id: &str, b_id: &str) {
+async fn docs_and_vault(server: &Server, url: &str, admin: &Api, db: &sqlx::PgPool, dir: &Path, a_id: &str, b_id: &str) {
     use reqwest::Method;
     let tech = signed_in(url, admin, "docs-tech@e2e.test", "technician", None, true).await;
 
@@ -6219,7 +6637,71 @@ async fn docs_and_vault(url: &str, admin: &Api, db: &sqlx::PgPool, a_id: &str, b
     assert_eq!(admin.call(Method::GET, &format!("/vault/{item_id}"), None).await.0, StatusCode::NOT_FOUND);
     let d = admin.get(&format!("/docs/{linked_id}")).await;
     assert_eq!((d["credentials"].clone(), d["body"].as_str()), (json!([]), Some(format!("[admin](vault:{item_id})").as_str())));
+
+    // --- managed items: the system write path (vault::put_managed) ------------------------------
+    let site: (uuid::Uuid,) = sqlx::query_as("SELECT id FROM sites WHERE client_id = $1::uuid LIMIT 1").bind(a_id).fetch_one(db).await.unwrap();
+    let token = admin.post(&format!("/sites/{}/enrollment-tokens", site.0), json!({ "label": "vault e2e" })).await["token"].as_str().unwrap().to_string();
+    let dev = Agent::new(dir, "vaultdev").enroll(&server.url(), &token).unwrap();
+    let reference = format!("{dev}:C:");
+    let put = |password: &str| {
+        let out = put_managed_cli(server, &["--client", a_id, "--kind", "disk_recovery", "--reference", &reference, "--name", "BitLocker recovery: VAULTDEV C:",
+            "--username", "{PROTECTOR-1}", "--agent", &dev], password);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let managed = put("111111-222222-333333");
+    assert_eq!(put("444444-555555-666666"), managed, "the same reference updates the same item");
+    assert_eq!(put("444444-555555-666666"), managed, "writing the same key again changes nothing");
+    let (items, history): (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM vault_items WHERE managed_ref = $1), (SELECT count(*) FROM vault_item_history WHERE item_id = $2::uuid)",
+    )
+    .bind(&reference)
+    .bind(&managed)
+    .fetch_one(db)
+    .await
+    .unwrap();
+    assert_eq!((items, history), (1, 1), "one item, one earlier key");
+    let writes: Vec<(Value,)> = sqlx::query_as("SELECT details FROM audit_log WHERE action = 'vault.system_write' AND target_id = $1::uuid ORDER BY id").bind(&managed).fetch_all(db).await.unwrap();
+    assert_eq!(writes.len(), 2, "unchanged writes aren't audited: {writes:?}");
+    assert_eq!((writes[0].0["created"].as_bool(), writes[1].0["fields"].clone()), (Some(true), json!(["password"])), "{writes:?}");
+    assert!(!writes.iter().any(|(w,)| w.to_string().contains("111111") || w.to_string().contains("444444")), "no value in the audit log");
+    let listed = admin.get(&format!("/clients/{a_id}/vault?kind=disk_recovery")).await;
+    let row = listed.as_array().unwrap().iter().find(|r| r["id"] == managed.as_str()).cloned().expect("listed under its kind");
+    assert_eq!((row["managed_kind"].as_str(), row["agent_id"].as_str()), (Some("disk_recovery"), Some(dev.as_str())), "{row}");
+    assert!(admin.get(&format!("/clients/{a_id}/vault?kind=manual")).await.as_array().unwrap().iter().all(|r| r["managed_kind"].is_null()));
+    assert_eq!(admin.call(Method::GET, &format!("/clients/{a_id}/vault?kind=bogus"), None).await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(admin.post(&format!("/vault/{managed}/reveal"), json!({ "field": "password" })).await["value"], "444444-555555-666666");
+    let hist = admin.get(&format!("/vault/{managed}")).await["history"][0]["id"].as_i64().unwrap();
+    assert_eq!(admin.post(&format!("/vault/{managed}/reveal"), json!({ "history": hist })).await["value"], "111111-222222-333333");
+    // People can't change what the server keeps, but may rename it.
+    for body in [json!({ "password": "typed-in" }), json!({ "username": "someone" })] {
+        let (s, v) = admin.call(Method::PUT, &format!("/vault/{managed}"), Some(body)).await;
+        assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    }
+    assert_eq!(admin.put(&format!("/vault/{managed}"), json!({ "name": "VAULTDEV system drive" })).await["name"], "VAULTDEV system drive");
+    // Deleting the device keeps its recovery key.
+    assert!(admin.call(Method::DELETE, &format!("/agents/{dev}"), None).await.0.is_success());
+    let kept = admin.get(&format!("/vault/{managed}")).await;
+    assert!(kept["agent_id"].is_null() && kept["managed_kind"] == "disk_recovery", "{kept}");
+    assert_eq!(admin.post(&format!("/vault/{managed}/reveal"), json!({ "field": "password" })).await["value"], "444444-555555-666666");
+    // An unknown client is refused; the CLI never prints the password.
+    let out = put_managed_cli(server, &["--client", &uuid::Uuid::new_v4().to_string(), "--kind", "local_admin", "--reference", "x", "--name", "x"], "pw-never-echoed");
+    assert!(!out.status.success() && !String::from_utf8_lossy(&out.stderr).contains("pw-never-echoed"));
+    admin.call(Method::DELETE, &format!("/vault/{managed}"), None).await;
     println!("documentation and the vault: ok");
+}
+
+/// `rmm-server vault-put-managed` (the test hook into `vault::put_managed`), the password in
+/// RMM_VAULT_PASSWORD.
+fn put_managed_cli(server: &Server, args: &[&str], password: &str) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_rmm-server"))
+        .arg("vault-put-managed")
+        .args(args)
+        .env("DATABASE_URL", &server.db_url)
+        .env("RMM_DATA_KEY", &server.data_key)
+        .env("RMM_VAULT_PASSWORD", password)
+        .output()
+        .expect("running rmm-server vault-put-managed")
 }
 
 /// Documentation pages linked to tickets: link, duplicate, the client rule, unlink, the timeline,
@@ -7927,9 +8409,13 @@ async fn software(url: &str, admin: &Api, db: &sqlx::PgPool, dir: &Path, id1: &s
         (fake_state()["installed"].get("a-only-e2e").is_some()).then_some(())
     })
     .await;
-    let v = admin.get(&format!("/agents/{id1}/software")).await;
-    let row = v["items"].as_array().unwrap().iter().find(|i| i["package_id"] == a_only_id.as_str()).cloned().unwrap();
-    assert_eq!((row["desired"].as_str(), row["compliant"].as_bool()), (Some("present"), Some(true)), "{row}");
+    // The package is in place; the server marks the device compliant once the run's result is in.
+    let row = eventually(30, "the device to be compliant", || async {
+        let v = admin.get(&format!("/agents/{id1}/software")).await;
+        v["items"].as_array().unwrap().iter().find(|i| i["package_id"] == a_only_id.as_str() && i["compliant"] == true).cloned()
+    })
+    .await;
+    assert_eq!(row["desired"].as_str(), Some("present"), "{row}");
     // The policy page of the device lists the requirement.
     let pol = admin.get(&format!("/agents/{id1}/policy")).await;
     assert!(pol["policies"].as_array().unwrap().iter().any(|p| p["module"] == "software"), "{pol}");
@@ -8288,3 +8774,691 @@ async fn fields_tags_notes_views(url: &str, admin: &Api, db: &sqlx::PgPool, dir:
     assert!(s.is_success() && spec["paths"]["/agents/{id}/fields"]["put"]["operationId"] == "setAgentFields", "documented in the OpenAPI document");
     println!("tags, custom fields, notes, saved views: ok");
 }
+
+/// A small RGBA PNG for the branding uploads.
+fn brand_png(w: u32, h: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    {
+        let mut enc = png::Encoder::new(&mut out, w, h);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        let mut wr = enc.write_header().unwrap();
+        let data: Vec<u8> = (0..w * h).flat_map(|i| [29, 78, 216, if i % 3 == 0 { 255 } else { 160 }]).collect();
+        wr.write_image_data(&data).unwrap();
+    }
+    out
+}
+
+async fn brand_upload(admin: &Api, path: &str, name: &str, bytes: Vec<u8>) -> (StatusCode, Value) {
+    let form = reqwest::multipart::Form::new().part("file", reqwest::multipart::Part::bytes(bytes).file_name(name.to_string()));
+    portal_form(admin, path, form).await
+}
+
+/// White-labelling (docs/design/branding.md): the instance's branding and a client's override
+/// reach the public settings, the portal, mail, the MSI and the QBR PDF. `RMM_E2E_ONLY=branding`
+/// runs just this (after the sign-in and the tenancy it needs). It puts everything back.
+async fn branding(url: &str, admin: &Api, db: &sqlx::PgPool, a_id: &str, a_site: &str, b_id: &str) {
+    let http = reqwest::Client::new();
+    let (smtp_port, mail) = smtp_sink().await;
+    admin
+        .call(reqwest::Method::PUT, "/settings/smtp", Some(json!({ "host": "127.0.0.1", "port": smtp_port, "security": "none", "from": "Help <help@msp.example>" })))
+        .await;
+
+    // --- the instance -----------------------------------------------------------------------------
+    let (s, v) = admin.call(reqwest::Method::PUT, "/settings/branding", Some(json!({ "accent": "#808080" }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "a mid-tone neither text colour reads on: {v}");
+    let (s, _) = admin.call(reqwest::Method::PUT, "/settings/branding", Some(json!({ "support_url": "javascript:alert(1)" }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let (s, _) = admin.call(reqwest::Method::PUT, "/settings/branding", Some(json!({ "support_email": "not an address" }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let saved = admin
+        .put(
+            "/settings/branding",
+            json!({ "product_name": "Brand Remote", "accent": "#1D4ED8", "support_email": "help@brand.example", "support_phone": "+1 555 0100",
+                    "email_from_name": "Brand Help Desk", "email_footer": "Brand IT, 1 Harbour Rd" }),
+        )
+        .await;
+    assert_eq!((saved["accent"].as_str(), saved["resolved"]["name"].as_str()), (Some("#1d4ed8"), Some("Brand Remote")), "{saved}");
+    assert_eq!(saved["resolved"]["theme"]["light"]["on_cta"], "#ffffff");
+
+    // Images: PNG or JPEG only (no SVG), the icon square.
+    let (s, _) = brand_upload(admin, "/settings/branding/logo_light", "logo.svg", b"<svg xmlns='http://www.w3.org/2000/svg'/>".to_vec()).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let (s, v) = brand_upload(admin, "/settings/branding/icon", "icon.png", brand_png(64, 32)).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    let logo = brand_png(120, 30);
+    let (s, v) = brand_upload(admin, "/settings/branding/logo_light", "logo.png", logo.clone()).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let (s, v) = brand_upload(admin, "/settings/branding/icon", "icon.png", brand_png(64, 64)).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let (s, _) = Api::new(url).call(reqwest::Method::GET, "/settings/branding", None).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "not public");
+
+    // Public: the sign-in pages get it without a session, and the image with an ETag.
+    let public: Value = http.get(format!("{url}/api/settings/public")).send().await.unwrap().json().await.unwrap();
+    let b = &public["branding"];
+    assert_eq!((b["product_name"].as_str(), b["support"]["email"].as_str()), (Some("Brand Remote"), Some("help@brand.example")), "{public}");
+    assert!(b["source_url"].as_str().is_some_and(|u| u.starts_with("https://")), "the source offer is always there");
+    assert!(b.get("email_footer").is_none(), "mail settings aren't public");
+    let logo_url = b["logo_light"].as_str().unwrap().to_string();
+    assert!(logo_url.starts_with("/api/branding/logo_light?v="));
+    let res = http.get(format!("{url}{logo_url}")).send().await.unwrap();
+    assert_eq!((res.status(), res.headers()["content-type"].to_str().unwrap()), (StatusCode::OK, "image/png"));
+    let etag = res.headers()["etag"].to_str().unwrap().to_string();
+    assert_eq!(res.bytes().await.unwrap().to_vec(), logo);
+    let res = http.get(format!("{url}/api/branding/logo_light")).header("if-none-match", &etag).send().await.unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(http.get(format!("{url}/api/branding/logo_dark")).send().await.unwrap().status(), StatusCode::NOT_FOUND);
+    let info: Value = http.get(format!("{url}/api/portal/info")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(info["branding"]["name"], "Brand Remote");
+
+    // --- a client's override ----------------------------------------------------------------------
+    let (s, _) = admin.call(reqwest::Method::GET, &format!("/clients/{}/branding", uuid::Uuid::new_v4()), None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    let a = admin.put(&format!("/clients/{a_id}/branding"), json!({ "support_email": "a-desk@brand.example", "email_from_name": "Brand for A" })).await;
+    assert_eq!((a["resolved"]["support"]["email"].as_str(), a["resolved"]["support"]["phone"].as_str()), (Some("a-desk@brand.example"), Some("+1 555 0100")), "{a}");
+
+    // Mail: the client's sender name for its contacts, the instance's for others, the footer on both.
+    let ca = admin.post("/contacts", json!({ "client_id": a_id, "name": "Ada Brand", "email": "ada@client-a.example", "portal_enabled": true })).await;
+    let cb = admin.post("/contacts", json!({ "client_id": b_id, "name": "Ben Brand", "email": "ben@client-b.example", "portal_enabled": true })).await;
+    admin.post(&format!("/contacts/{}/portal-invite", ca["id"].as_str().unwrap()), json!({})).await;
+    admin.post(&format!("/contacts/{}/portal-invite", cb["id"].as_str().unwrap()), json!({})).await;
+    let ma = wait_mail(&mail, "A's invitation", |to, _| to.iter().any(|t| t == "ada@client-a.example")).await;
+    let mb = wait_mail(&mail, "B's invitation", |to, _| to.iter().any(|t| t == "ben@client-b.example")).await;
+    let from_a = header(&ma, "From").unwrap();
+    let from_b = header(&mb, "From").unwrap();
+    assert!(from_a.contains("Brand for A") && from_a.contains("help@msp.example"), "{from_a}");
+    assert!(from_b.contains("Brand Help Desk"), "{from_b}");
+    for m in [&ma, &mb] {
+        let text = mail_text(m).replace("\r\n", "\n");
+        assert!(text.trim_end().ends_with("Brand IT, 1 Harbour Rd") && text.contains("\n--"), "the footer goes last: {text}");
+    }
+    let stored: Vec<Option<String>> = sqlx::query_scalar("SELECT from_name FROM email_messages WHERE purpose = 'portal_link' AND $1 = ANY(to_addrs)")
+        .bind("ada@client-a.example")
+        .fetch_all(db)
+        .await
+        .unwrap();
+    assert_eq!(stored, [Some("Brand for A".to_string())]);
+
+    // The portal: each contact sees their own client's branding.
+    let pa = Api::new(url);
+    pa.post("/portal/auth/verify", json!({ "token": token_after(&mail_text(&ma), "/portal/login?token=") })).await;
+    let pb = Api::new(url);
+    pb.post("/portal/auth/verify", json!({ "token": token_after(&mail_text(&mb), "/portal/login?token=") })).await;
+    assert_eq!(pa.get("/portal/me").await["branding"]["support"]["email"], "a-desk@brand.example");
+    assert_eq!(pb.get("/portal/me").await["branding"]["support"]["email"], "help@brand.example", "B has no override");
+    // A's own logo is served to A's contacts only; others get the instance's.
+    let dark = brand_png(100, 20);
+    let (s, v) = brand_upload(admin, &format!("/clients/{a_id}/branding/logo_dark"), "dark.png", dark.clone()).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let me_a = pa.get("/portal/me").await;
+    let own = me_a["branding"]["logo_dark"].as_str().unwrap().to_string();
+    assert!(own.starts_with("/api/portal/branding/logo_dark"), "{me_a}");
+    assert_eq!(pa.http.get(format!("{url}{own}")).send().await.unwrap().bytes().await.unwrap().to_vec(), dark);
+    assert_eq!(pb.http.get(format!("{url}{own}")).send().await.unwrap().status(), StatusCode::NOT_FOUND, "B's contact gets the instance's (none)");
+    assert_eq!(http.get(format!("{url}{own}")).send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    assert!(pb.get("/portal/me").await["branding"]["logo_dark"].is_null());
+
+    // --- packages ------------------------------------------------------------------------------------
+    let pkg = admin.post(&format!("/sites/{a_site}/enrollment-tokens"), json!({ "purpose": "package" })).await;
+    let res = http.get(pkg["windows_packages"]["msi"].as_str().unwrap()).send().await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let disposition = res.headers()["content-disposition"].to_str().unwrap().to_string();
+    assert!(disposition.contains("filename=\"brand-remote-agent-") && disposition.ends_with(".msi\""), "{disposition}");
+    let mut msi = msi::Package::open(std::io::Cursor::new(res.bytes().await.unwrap().to_vec())).unwrap();
+    let props: std::collections::HashMap<String, String> = msi
+        .select_rows(msi::Select::table("Property"))
+        .unwrap()
+        .map(|r| (r[0].as_str().unwrap().to_string(), r[1].as_str().unwrap().to_string()))
+        .collect();
+    assert_eq!(props["ProductName"], "Brand Remote Agent");
+    assert_eq!(props["ARPPRODUCTICON"], "AgentIcon.ico");
+    let ca_row: Vec<_> = msi.select_rows(msi::Select::table("CustomAction")).unwrap().collect();
+    assert!(ca_row[0][3].as_str().unwrap().contains("--product-name \"Brand Remote\""));
+    let res = http.get(pkg["packages"]["deb"].as_str().unwrap()).send().await.unwrap();
+    let disposition = res.headers()["content-disposition"].to_str().unwrap().to_string();
+    assert!(disposition.contains("filename=\"brand-remote-agent_"), "{disposition}");
+
+    // --- the QBR PDF carries the logo -------------------------------------------------------------------
+    let res = admin.http.get(format!("{}/reports/qbr/{a_id}", admin.base)).send().await.unwrap();
+    assert_eq!(res.headers()["content-type"], "application/pdf");
+    let pdf = res.bytes().await.unwrap();
+    let text = String::from_utf8_lossy(&pdf);
+    assert!(text.contains("/XObject << /Im0 ") && text.contains("/Subtype /Image"), "the QBR has the logo");
+
+    assert!(audit_count(db, "branding.update").await >= 5);
+
+    // --- put it back ---------------------------------------------------------------------------------------
+    admin.call(reqwest::Method::DELETE, &format!("/clients/{a_id}/branding"), None).await;
+    assert!(pa.get("/portal/me").await["branding"]["logo_dark"].is_null(), "the override is gone");
+    for v in ["logo_light", "icon"] {
+        admin.call(reqwest::Method::DELETE, &format!("/settings/branding/{v}"), None).await;
+    }
+    let cleared = admin.put("/settings/branding", json!({})).await;
+    assert!(cleared["resolved"]["product_name"].is_null() && cleared["resolved"]["logo_light"].is_null(), "{cleared}");
+    for c in [&ca, &cb] {
+        admin.call(reqwest::Method::DELETE, &format!("/contacts/{}", c["id"].as_str().unwrap()), None).await;
+    }
+    println!("branding: ok");
+}
+
+/// Script parameters (docs/design/script-params.md): typed values reach the script as
+/// RMM_PARAM_<NAME> environment variables, never in its text; secrets stay out of `jobs` and
+/// `audit_log`, wait sealed for an offline agent, and come from the vault for policies.
+async fn script_params(admin: &Api, db: &sqlx::PgPool, dir: &Path, a1: &mut Agent, id1: &str, a_id: &str, b_id: &str) {
+    use reqwest::Method;
+    const SECRET: &str = "s3cret-param-value";
+    let marker = dir.join("params-injected");
+    let _ = std::fs::remove_file(&marker);
+    let hostname = admin.get(&format!("/agents/{id1}")).await["hostname"].as_str().unwrap().to_string();
+    // A custom field to expand, set on the agent.
+    let field = admin.post("/custom-fields", json!({ "entity": "agent", "name": "params_rack", "label": "Rack", "kind": "text" })).await;
+    let field_id = field["id"].as_str().unwrap().to_string();
+    admin.put(&format!("/agents/{id1}/fields"), json!({ "values": { "params_rack": "R7" } })).await;
+
+    // --- declaring them --------------------------------------------------------------------------
+    let body = "printf 'T=%s|C=%s|F=%s|S=%s|M=%s|H=%s|J=%s|A=%s\\n' \"$RMM_PARAM_TARGET\" \"$RMM_PARAM_COUNT\" \"$RMM_PARAM_FORCE\" \"$RMM_PARAM_TOKEN\" \"$RMM_PARAM_MODE\" \"$RMM_AGENT_HOSTNAME\" \"$RMM_JOB_ID\" \"$1\"";
+    let specs = json!([
+        { "name": "target", "label": "Target", "type": "text", "required": true },
+        { "name": "count", "type": "number", "default": 3 },
+        { "name": "force", "type": "bool", "default": false },
+        { "name": "mode", "type": "select", "choices": ["fast", "safe"], "default": "safe" },
+        { "name": "token", "type": "secret" },
+    ]);
+    for bad in [
+        json!([{ "name": "Bad", "type": "text" }]),
+        json!([{ "name": "t", "type": "text", "default": "{{agent.nope}}" }]),
+        json!([{ "name": "t", "type": "text", "default": "{{field.no_such_field}}" }]),
+        json!([{ "name": "p", "type": "secret", "default": "x" }]),
+    ] {
+        let (s, v) = admin.call(Method::POST, "/scripts", Some(json!({ "name": "bad params", "interpreter": "bash", "body": "true", "params": bad }))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    }
+    let script = admin.post("/scripts", json!({ "name": "params e2e", "interpreter": "bash", "body": body, "params": specs })).await;
+    let sid = script["id"].as_str().unwrap().to_string();
+    assert_eq!(script["params"].as_array().unwrap().len(), 5, "{script}");
+    assert_eq!(script["params"][0]["label"], "Target");
+    let listed = admin.get("/scripts").await;
+    assert!(listed.as_array().unwrap().iter().any(|s| s["id"] == sid.as_str() && s["params"][1]["default"] == 3), "listScripts has params");
+
+    let run = |params: Value| {
+        let sid = sid.clone();
+        let id1 = id1.to_string();
+        async move { admin.call(Method::POST, "/jobs", Some(json!({ "agent_ids": [id1], "script_id": sid, "args": ["arg1"], "params": params }))).await }
+    };
+    let started = |v: &Value| v["jobs"][0]["job_id"].as_str().unwrap().to_string();
+
+    // --- values arrive verbatim, as environment only -----------------------------------------------
+    let evil = format!("$(touch {}); \"`'", marker.display());
+    let (s, v) = run(json!({ "target": evil, "force": "yes", "token": SECRET })).await;
+    assert!(s.is_success(), "{v}");
+    let job = started(&v);
+    let j = admin.wait_job(&job, 30).await;
+    assert_eq!(j["status"], "succeeded", "{j}");
+    assert_eq!(j["stdout"], format!("T={evil}|C=3|F=true|S={SECRET}|M=safe|H={hostname}|J={job}|A=arg1\n"), "{j}");
+    assert!(!marker.exists(), "the value was never run as code");
+    assert_eq!(j["body"], body, "the body is never rewritten");
+    assert_eq!(j["params"]["token"], "•••", "{j}");
+    assert_eq!(j["params"]["target"], evil.as_str());
+    // The secret is in no table but its output, and in no audit entry.
+    let (stored, sealed): (String, Option<Vec<u8>>) = sqlx::query_as("SELECT (to_jsonb(j) - 'stdout')::text, env_sealed FROM jobs j WHERE id = $1::uuid").bind(&job).fetch_one(db).await.unwrap();
+    assert!(!stored.contains(SECRET) && sealed.is_none(), "secrets leave the job once it ran: {stored}");
+    let (in_audit,): (i64,) = sqlx::query_as("SELECT count(*) FROM audit_log WHERE details::text LIKE '%' || $1 || '%'").bind(SECRET).fetch_one(db).await.unwrap();
+    assert_eq!(in_audit, 0);
+    let (audited,): (Value,) = sqlx::query_as("SELECT details FROM audit_log WHERE action = 'job.create' AND target_id = $1::uuid ORDER BY id DESC LIMIT 1").bind(&sid).fetch_one(db).await.unwrap();
+    assert_eq!((audited["params"]["token"].as_str(), audited["params"]["force"].as_bool()), (Some("•••"), Some(true)), "names and non-secret values: {audited}");
+
+    // --- refused values -----------------------------------------------------------------------------
+    for (bad, why) in [
+        (json!({}), "is required"),
+        (json!({ "target": "x", "nope": 1 }), "no parameter nope"),
+        (json!({ "target": "x", "count": "many" }), "number"),
+        (json!({ "target": "x", "mode": "reckless" }), "not one of"),
+        (json!({ "target": "{{agent.bogus}}" }), "unknown placeholder"),
+        (json!({ "target": "{{field.no_such_field}}" }), "no custom field"),
+    ] {
+        let (s, v) = run(bad).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+        assert!(v["error"].as_str().unwrap().contains(why), "{why}: {v}");
+    }
+    let (s, v) = admin.call(Method::POST, "/jobs", Some(json!({ "agent_ids": [id1], "interpreter": "bash", "body": "true", "params": { "x": "1" } }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "ad-hoc scripts take no parameters: {v}");
+
+    // --- placeholders expand per device --------------------------------------------------------------
+    let (_, v) = run(json!({ "target": "rack-{{field.params_rack}}-{{ agent.hostname }}", "count": 7, "mode": "fast" })).await;
+    let j = admin.wait_job(&started(&v), 30).await;
+    assert!(j["stdout"].as_str().unwrap().starts_with(&format!("T=rack-R7-{hostname}|C=7|F=false|S=|M=fast|")), "{j}");
+
+    // --- from the vault ---------------------------------------------------------------------------------
+    let item = admin.post(&format!("/clients/{a_id}/vault"), json!({ "name": "Param secret", "password": "from-the-vault" })).await;
+    let item_id = item["id"].as_str().unwrap().to_string();
+    let (_, v) = run(json!({ "target": "v", "token": format!("vault:{item_id}") })).await;
+    let j = admin.wait_job(&started(&v), 30).await;
+    assert!(j["stdout"].as_str().unwrap().contains("|S=from-the-vault|"), "{j}");
+    let (used,): (i64,) = sqlx::query_as("SELECT count(*) FROM audit_log WHERE action = 'vault.use' AND target_id = $1::uuid").bind(&item_id).fetch_one(db).await.unwrap();
+    assert_eq!(used, 1, "using a vault item is audited");
+    // Another client's vault item can't reach this agent.
+    let other = admin.post(&format!("/clients/{b_id}/vault"), json!({ "name": "B secret", "password": "b-only" })).await;
+    let (s, v) = run(json!({ "target": "v", "token": format!("vault:{}", other["id"].as_str().unwrap()) })).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+
+    // --- a queued job keeps its secret sealed until the agent is back ----------------------------------------
+    a1.kill();
+    admin.wait_online(id1, false).await;
+    let (_, v) = run(json!({ "target": "later", "token": SECRET })).await;
+    assert_eq!(v["jobs"][0]["status"], "queued", "{v}");
+    let queued = started(&v);
+    let (sealed, params): (Option<Vec<u8>>, Value) = sqlx::query_as("SELECT env_sealed, params FROM jobs WHERE id = $1::uuid").bind(&queued).fetch_one(db).await.unwrap();
+    let sealed = sealed.expect("the secret waits sealed");
+    assert!(!sealed.windows(SECRET.len()).any(|w| w == SECRET.as_bytes()) && params["token"] == "•••");
+    a1.run(dir);
+    admin.wait_online(id1, true).await;
+    let j = admin.wait_job(&queued, 60).await;
+    assert!(j["stdout"].as_str().unwrap().contains(&format!("T=later|C=3|F=false|S={SECRET}|")), "{j}");
+    let (sealed,): (Option<Vec<u8>>,) = sqlx::query_as("SELECT env_sealed FROM jobs WHERE id = $1::uuid").bind(&queued).fetch_one(db).await.unwrap();
+    assert!(sealed.is_none(), "dropped once delivered and finished");
+
+    // --- an agent without the capability gets an error, not a run without its values ---------------------------
+    sqlx::query("UPDATE agents SET capabilities = array_remove(capabilities, 'script_env') WHERE id = $1::uuid").bind(id1).execute(db).await.unwrap();
+    let (_, v) = run(json!({ "target": "old" })).await;
+    assert_eq!(v["jobs"][0]["status"], "error", "{v}");
+    let j = admin.job(&started(&v)).await;
+    assert!(j["stderr"].as_str().unwrap().contains("agent too old for script parameters") && j["stdout"] == "", "{j}");
+    sqlx::query("UPDATE agents SET capabilities = array_append(capabilities, 'script_env') WHERE id = $1::uuid").bind(id1).execute(db).await.unwrap();
+
+    // --- schedules: values in the item, one overridden in a set below ------------------------------------------
+    let item_body = |params: Value| json!({ "module": "schedule", "name": "Params nightly", "client_id": a_id,
+        "config": { "script_id": sid, "cron": "0 3 * * *", "params": params } });
+    let (s, v) = admin.call(Method::POST, &format!("/policy-sets/{ROOT_SET}/items"), Some(item_body(json!({ "target": "x", "token": "literal" })))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "a policy never stores a secret: {v}");
+    let (s, v) = admin.call(Method::POST, &format!("/policy-sets/{ROOT_SET}/items"), Some(item_body(json!({ "count": "2" })))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "the required one is missing: {v}");
+    let (s, v) = admin.call(Method::POST, &format!("/policy-sets/{ROOT_SET}/items"), Some(json!({ "module": "schedule", "name": "Params everywhere",
+        "config": { "script_id": sid, "cron": "0 3 * * *", "params": { "target": "x", "token": format!("vault:{item_id}") } } }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "a vault item needs the policy limited to its client: {v}");
+    let sched = admin.post(&format!("/policy-sets/{ROOT_SET}/items"), item_body(json!({ "target": "{{agent.hostname}}", "count": "2", "token": format!("vault:{item_id}") }))).await;
+    let sched_id = sched["id"].as_str().unwrap().to_string();
+    // a1 in a set of its own below its current one, overriding one value.
+    let current = admin.get(&format!("/agents/{id1}/policy")).await["set"]["id"].as_str().unwrap().to_string();
+    admin.put(&format!("/agents/{id1}/policy-pin"), json!({ "policy_set_id": current })).await;
+    let custom = admin.post(&format!("/agents/{id1}/policy-pin/customize"), json!({})).await;
+    let custom_set = custom["set"]["id"].as_str().unwrap().to_string();
+    admin.put(&format!("/policy-items/{sched_id}/overrides/{custom_set}"), json!({ "config": { "params": { "count": "9" } } })).await;
+    let (s, v) = admin.call(Method::PUT, &format!("/policy-items/{sched_id}/overrides/{custom_set}"), Some(json!({ "config": { "params": { "count": "nine" } } }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "overrides are checked against the script: {v}");
+    let r = admin.post(&format!("/schedules/{sched_id}/run"), json!({})).await;
+    assert_eq!(r["sent"].as_i64(), Some(1), "{r}");
+    let runs = admin.get(&format!("/jobs?schedule_id={sched_id}")).await;
+    let run_id = runs["items"].as_array().unwrap().iter().find(|j| j["agent_id"] == id1).unwrap()["id"].as_str().unwrap().to_string();
+    let j = admin.wait_job(&run_id, 30).await;
+    assert!(j["stdout"].as_str().unwrap().starts_with(&format!("T={hostname}|C=9|F=false|S=from-the-vault|")), "the override changed one value: {j}");
+
+    // --- changing the script's parameters re-checks the policies that use it -----------------------------------
+    let mut stricter = specs.clone();
+    stricter.as_array_mut().unwrap().push(json!({ "name": "extra", "type": "text", "required": true }));
+    let (s, v) = admin.call(Method::PUT, &format!("/scripts/{sid}"), Some(json!({ "name": "params e2e", "interpreter": "bash", "body": body, "params": stricter }))).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("Params nightly"), "names the policy: {v}");
+    assert_eq!(admin.get(&format!("/scripts/{sid}")).await["params"].as_array().unwrap().len(), 5, "nothing changed");
+
+    // Clean up.
+    admin.put(&format!("/agents/{id1}/policy-pin"), json!({ "policy_set_id": null })).await;
+    admin.call(Method::DELETE, &format!("/policy-sets/{custom_set}"), None).await;
+    assert_eq!(admin.delete_policy(&sched_id).await, StatusCode::OK);
+    admin.call(Method::DELETE, &format!("/scripts/{sid}"), None).await;
+    admin.call(Method::DELETE, &format!("/vault/{item_id}"), None).await;
+    admin.call(Method::DELETE, &format!("/vault/{}", other["id"].as_str().unwrap()), None).await;
+    admin.call(Method::DELETE, &format!("/custom-fields/{field_id}"), None).await;
+    println!("script parameters: ok");
+}
+
+// ---------------------------------------------------------------------------------------------
+// On-call and paging, Web Push
+// ---------------------------------------------------------------------------------------------
+
+/// One request the paging sink received: method, path (with query), headers, body.
+#[derive(Clone, Debug)]
+struct Received {
+    path: String,
+    headers: std::collections::HashMap<String, String>,
+    body: Vec<u8>,
+}
+
+type Sink = std::sync::Arc<std::sync::Mutex<Vec<Received>>>;
+
+static PAGING_URL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static PAGING: std::sync::OnceLock<Sink> = std::sync::OnceLock::new();
+
+/// A stand-in for Twilio (`/twilio/...`), PagerDuty (`/pd/v2/enqueue`), Opsgenie (`/og/v2/...`)
+/// and push services (`/push/<id>`; `/push/gone` answers 410). Records everything.
+async fn paging_sink() -> (String, Sink) {
+    let got: Sink = Default::default();
+    let store = got.clone();
+    let app = axum::Router::new().fallback(move |uri: axum::http::Uri, headers: axum::http::HeaderMap, body: axum::body::Bytes| {
+        let store = store.clone();
+        async move {
+            let path = uri.path_and_query().map(|p| p.to_string()).unwrap_or_default();
+            let headers = headers.iter().map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or_default().to_string())).collect();
+            store.lock().unwrap().push(Received { path: path.clone(), headers, body: body.to_vec() });
+            use axum::response::IntoResponse;
+            if path.starts_with("/twilio/") {
+                (StatusCode::CREATED, axum::Json(json!({ "sid": format!("SM{}", uuid::Uuid::new_v4().simple()) }))).into_response()
+            } else if path == "/push/gone" {
+                StatusCode::GONE.into_response()
+            } else if path.starts_with("/push/") {
+                StatusCode::CREATED.into_response()
+            } else {
+                (StatusCode::ACCEPTED, axum::Json(json!({ "status": "success" }))).into_response()
+            }
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (url, got)
+}
+
+fn received(pred: impl Fn(&Received) -> bool) -> Vec<Received> {
+    PAGING.get().unwrap().lock().unwrap().iter().filter(|r| pred(r)).cloned().collect()
+}
+
+/// Text messages to `to` (the form fields of Twilio's Messages API).
+fn texts_to(to: &str) -> Vec<String> {
+    received(|r| r.path.starts_with("/twilio/"))
+        .into_iter()
+        .filter_map(|r| {
+            let form: std::collections::HashMap<String, String> = serde_urlencoded::from_bytes(&r.body).unwrap();
+            (form.get("To").map(String::as_str) == Some(to)).then(|| form["Body"].clone())
+        })
+        .collect()
+}
+
+fn json_to(prefix: &str) -> Vec<(String, Value)> {
+    received(|r| r.path.starts_with(prefix)).into_iter().map(|r| (r.path, serde_json::from_slice(&r.body).unwrap_or(Value::Null))).collect()
+}
+
+/// A technician with a verified mobile number, texted only.
+async fn paged_tech(url: &str, admin: &Api, email: &str, phone: &str, client: Option<&str>) -> (Api, String) {
+    let api = signed_in(url, admin, email, "technician", client, false).await;
+    let id = api.get("/auth/me").await["id"].as_str().unwrap().to_string();
+    let c = api.put("/account/contact-methods", json!({ "phone": phone, "rules": [{ "method": "sms", "delay_minutes": 0 }] })).await;
+    assert_eq!((c["phone"].as_str(), c["phone_verified"].as_bool()), (Some(phone), Some(false)));
+    api.post("/account/phone/verify", json!({})).await;
+    eventually(20, "the verification code", || async { texts_to(phone).into_iter().find(|t| t.contains("verification code")) }).await;
+    let (s, _) = api.call(reqwest::Method::POST, "/account/phone/verify", Some(json!({ "code": "000000" }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "a wrong code fails (and uses the code up)");
+    api.post("/account/phone/verify", json!({})).await;
+    let text = eventually(20, "a second code", || async { texts_to(phone).into_iter().filter(|t| t.contains("verification code")).nth(1) }).await;
+    let code: String = text.split(|c: char| !c.is_ascii_digit()).find(|w| w.len() == 6).unwrap().to_string();
+    api.post("/account/phone/verify", json!({ "code": code })).await;
+    assert_eq!(api.get("/account/contact-methods").await["phone_verified"], true);
+    (api, id)
+}
+
+/// On-call: a critical alert texts whoever is on call; no acknowledgement pages step two; an
+/// acknowledgement stops it; resolving sends PagerDuty's resolve and Opsgenie's close;
+/// `outside_hours` holds a page inside business hours; the SMS token is sealed at rest.
+async fn oncall(url: &str, admin: &Api, db: &sqlx::PgPool, id1: &str, a_id: &str) {
+    use reqwest::Method;
+    let sink = PAGING_URL.get().unwrap().clone();
+
+    // --- the SMS provider, token sealed ---------------------------------------------------
+    let s = admin.put("/settings/sms", json!({ "account_sid": "AC0e2e", "from": "+15005550006", "base_url": format!("{sink}/twilio"), "token": "twilio-token-e2e" })).await;
+    assert_eq!((s["token_set"].as_bool(), s.get("token")), (Some(true), None), "the token is never shown");
+    let (stored, sealed): (Vec<u8>, bool) = sqlx::query_as("SELECT sms_token_enc, sms_token_sealed FROM company_settings").fetch_one(db).await.unwrap();
+    assert!(sealed && stored != b"twilio-token-e2e", "the SMS token is sealed");
+    let t = admin.post("/settings/sms/test", json!({ "to": "+447700900999" })).await;
+    assert_eq!(t["ok"], true, "{t}");
+    let req = eventually(10, "the test text", || async { received(|r| r.path == "/twilio/2010-04-01/Accounts/AC0e2e/Messages.json").into_iter().next() }).await;
+    let basic = data_encoding::BASE64.encode(b"AC0e2e:twilio-token-e2e");
+    assert_eq!(req.headers["authorization"], format!("Basic {basic}"), "the opened token authenticates");
+
+    // --- people, a schedule, a policy -----------------------------------------------------
+    let (_t1, u1) = paged_tech(url, admin, "oncall-1@e2e.test", "+447700900111", None).await;
+    let (t2, u2) = paged_tech(url, admin, "oncall-2@e2e.test", "+447700900222", None).await;
+    let hour_ago = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+    let sched = admin
+        .post("/oncall/schedules", json!({ "name": "E2E primary", "timezone": "Europe/London", "layers": [{ "name": "Week", "user_ids": [u1], "start_at": hour_ago, "shift_hours": 168 }] }))
+        .await;
+    let sched_id = sched["id"].as_str().unwrap().to_string();
+    assert_eq!(sched["now"]["user_id"], u1.as_str(), "{sched}");
+    let now = admin.get("/oncall/now").await;
+    assert!(now.as_array().unwrap().iter().any(|n| n["schedule_id"] == sched_id.as_str() && n["user_id"] == u1.as_str()), "{now}");
+    let shifts = admin.get(&format!("/oncall/schedules/{sched_id}/shifts")).await;
+    assert_eq!(shifts["final"][0]["user_id"], u1.as_str(), "{shifts}");
+    // Technicians may only put themselves on call.
+    let soon = |h: i64| (chrono::Utc::now() + chrono::Duration::hours(h)).to_rfc3339();
+    let (s, _) = t2.call(Method::POST, "/oncall/overrides", Some(json!({ "schedule_id": sched_id, "user_id": u1, "starts_at": soon(1), "ends_at": soon(2) }))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    let o = t2.post("/oncall/overrides", json!({ "schedule_id": sched_id, "user_id": u2, "starts_at": soon(24), "ends_at": soon(25) })).await;
+    let (s, _) = t2.call(Method::POST, "/oncall/schedules", Some(json!({ "name": "Mine", "layers": [] }))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "schedules need oncall.manage");
+    t2.call(Method::DELETE, &format!("/oncall/overrides/{}", o["id"].as_str().unwrap()), None).await;
+
+    let policy = admin
+        .post("/oncall/escalation-policies", json!({ "name": "E2E servers", "repeat": 0, "steps": [
+            { "delay_minutes": 4, "targets": [{ "schedule": sched_id }] },
+            { "delay_minutes": 4, "targets": [{ "user": u2 }] },
+        ] }))
+        .await;
+    let policy_id = policy["id"].as_str().unwrap().to_string();
+    let (s, _) = admin.call(Method::POST, "/oncall/escalation-policies", Some(json!({ "name": "Bad", "steps": [{ "delay_minutes": 1, "targets": [{ "team": u1 }] }] }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+
+    let page_ch = admin.post("/notification-channels", json!({ "name": "E2E page", "kind": "oncall", "config": { "escalation_policy_id": policy_id } })).await;
+    let (s, _) = admin.call(Method::POST, "/notification-channels", Some(json!({ "name": "E2E PD bad", "kind": "pagerduty", "config": {} }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "PagerDuty needs its key");
+    let pd = admin.post("/notification-channels", json!({ "name": "E2E PD", "kind": "pagerduty", "config": { "secret": "pdroutingkey0e2e" } })).await;
+    assert_eq!((pd["has_secret"].as_bool(), pd["config"].get("secret")), (Some(true), None));
+    let og = admin.post("/notification-channels", json!({ "name": "E2E Opsgenie", "kind": "opsgenie", "config": { "region": "eu", "secret": "og-key-e2e" } })).await;
+    let (s, _) = admin.call(Method::DELETE, &format!("/oncall/escalation-policies/{policy_id}"), None).await;
+    assert_eq!(s, StatusCode::CONFLICT, "an on-call channel uses it");
+    let channels = [&page_ch, &pd, &og].map(|c| c["id"].as_str().unwrap().to_string());
+    let item = admin
+        .alert_policy(json!({ "name": "Paging (e2e)", "kind": "job_failed", "params": {}, "severity": "critical", "client_id": a_id, "channel_ids": channels }))
+        .await;
+    let item_id = item["id"].as_str().unwrap().to_string();
+
+    // --- a critical alert pages the person on call ----------------------------------------
+    let job = admin.run_script(id1, "exit 4", 30).await;
+    admin.wait_job(&job, 30).await;
+    let alert = eventually(30, "the paging alert", || async {
+        alerts_for(admin, &format!("agent_id={id1}&kind=job_failed&state=active")).await.into_iter().find(|a| a["policy_id"] == item_id.as_str())
+    })
+    .await;
+    let alert_id = alert["id"].as_str().unwrap().to_string();
+    let text = eventually(30, "the page's text to the on-call tech", || async { texts_to("+447700900111").into_iter().find(|t| t.contains("/a/")) }).await;
+    assert!(text.starts_with("[") && text.contains("CRITICAL") && text.chars().count() <= 300, "{text}");
+    let pd_trigger = eventually(30, "PagerDuty trigger", || async { json_to("/pd/v2/enqueue").into_iter().find(|(_, b)| b["event_action"] == "trigger").map(|x| x.1) }).await;
+    assert_eq!((pd_trigger["dedup_key"].as_str(), pd_trigger["routing_key"].as_str()), (Some(alert_id.as_str()), Some("pdroutingkey0e2e")));
+    assert_eq!(pd_trigger["payload"]["severity"], "critical");
+    let og_req = eventually(30, "Opsgenie create", || async { received(|r| r.path == "/og/v2/alerts").into_iter().next() }).await;
+    assert_eq!(og_req.headers["authorization"], "GenieKey og-key-e2e");
+    assert_eq!(serde_json::from_slice::<Value>(&og_req.body).unwrap()["alias"], alert_id.as_str());
+
+    // The short link opens the alert, once.
+    let link = text.rsplit(' ').next().unwrap().to_string();
+    assert!(link.starts_with(&format!("{url}/a/")), "{link}");
+    let raw = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
+    let res = raw.get(&link).send().await.unwrap();
+    assert!(res.status().is_redirection(), "{}", res.status());
+    assert_eq!(res.headers()["location"], format!("/alerts/{alert_id}").as_str());
+    assert_eq!(raw.get(&link).send().await.unwrap().status(), StatusCode::GONE, "single use");
+
+    // --- nobody acknowledges: step two texts the second tech ------------------------------
+    eventually(30, "step two's text", || async { texts_to("+447700900222").into_iter().find(|t| t.contains("/a/")) }).await;
+    let pages = admin.get(&format!("/oncall/pages?alert_id={alert_id}")).await;
+    let page = &pages[0];
+    assert_eq!((page["status"].as_str(), page["step"].as_i64()), (Some("triggered"), Some(1)), "{pages}");
+    let page_id = page["id"].as_str().unwrap().to_string();
+
+    // --- an acknowledgement stops it, and acknowledges the alert ---------------------------
+    let acked = t2.post(&format!("/oncall/pages/{page_id}/ack"), json!({})).await;
+    assert_eq!(acked["status"], "acknowledged", "{acked}");
+    let a = admin.get(&format!("/alerts/{alert_id}")).await;
+    assert_eq!(a["state"], "acknowledged", "the alert follows the page");
+    let before = texts_to("+447700900111").len() + texts_to("+447700900222").len();
+    tokio::time::sleep(Duration::from_secs(9)).await;
+    assert_eq!(texts_to("+447700900111").len() + texts_to("+447700900222").len(), before, "no more pages after the acknowledgement");
+    // The audit log has it.
+    let (n,): (i64,) = sqlx::query_as("SELECT count(*) FROM audit_log WHERE action = 'page.ack' AND target_id = $1::uuid").bind(&page_id).fetch_one(db).await.unwrap();
+    assert_eq!(n, 1);
+
+    // --- resolving closes the PagerDuty incident and the Opsgenie alert --------------------
+    let ok = admin.run_script(id1, "true", 30).await;
+    admin.wait_job(&ok, 30).await;
+    let resolve = eventually(30, "PagerDuty resolve", || async { json_to("/pd/v2/enqueue").into_iter().find(|(_, b)| b["event_action"] == "resolve").map(|x| x.1) }).await;
+    assert_eq!(resolve["dedup_key"], alert_id.as_str());
+    eventually(30, "Opsgenie close", || async { received(|r| r.path == format!("/og/v2/alerts/{alert_id}/close?identifierType=alias")).into_iter().next() }).await;
+    let pages = admin.get(&format!("/oncall/pages?alert_id={alert_id}")).await;
+    assert_eq!(pages[0]["status"], "resolved", "{pages}");
+
+    // --- `outside_hours` holds a page inside business hours --------------------------------
+    let open_all_week: Vec<Value> = (0..7).map(|_| json!([[0, 1440]])).collect();
+    let cal = admin.post("/sla/calendars", json!({ "name": "E2E always open", "timezone": "UTC", "hours": open_all_week })).await;
+    let held_ch = admin
+        .post("/notification-channels", json!({ "name": "E2E page out of hours", "kind": "oncall", "config": { "escalation_policy_id": policy_id, "when": "outside_hours", "calendar_id": cal["id"] } }))
+        .await;
+    let (s, v) = admin
+        .update_alert_policy(&item_id, json!({ "name": "Paging (e2e)", "kind": "job_failed", "params": {}, "severity": "critical", "client_id": a_id, "channel_ids": [held_ch["id"]] }))
+        .await;
+    assert!(s.is_success(), "{v}");
+    let texts = texts_to("+447700900111").len();
+    let job = admin.run_script(id1, "exit 5", 30).await;
+    admin.wait_job(&job, 30).await;
+    let held = eventually(30, "the held page", || async {
+        let a = alerts_for(admin, &format!("agent_id={id1}&kind=job_failed&state=active")).await.into_iter().find(|a| a["policy_id"] == item_id.as_str())?;
+        let p = admin.get(&format!("/oncall/pages?alert_id={}", a["id"].as_str().unwrap())).await;
+        p.as_array().unwrap().first().cloned()
+    })
+    .await;
+    assert_eq!(held["status"], "held", "{held}");
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    assert_eq!(texts_to("+447700900111").len(), texts, "nobody is texted inside business hours");
+    let ok = admin.run_script(id1, "true", 30).await;
+    admin.wait_job(&ok, 30).await;
+    eventually(30, "the held page resolves with its alert", || async {
+        let p = admin.get(&format!("/oncall/pages?alert_id={}", held["alert_id"].as_str().unwrap())).await;
+        (p[0]["status"] == "resolved").then_some(())
+    })
+    .await;
+
+    // Read-only users can't acknowledge.
+    let ro = signed_in(url, admin, "oncall-ro@e2e.test", "readonly", None, false).await;
+    let (s, _) = ro.call(Method::POST, &format!("/oncall/pages/{page_id}/ack"), Some(json!({}))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    admin.delete_policy(&item_id).await;
+}
+
+/// Web Push: a subscription on a test endpoint receives an encrypted, VAPID-signed push for a
+/// critical alert (the test decrypts it); a 410 removes the subscription; someone who can't see
+/// the client gets nothing.
+async fn push(url: &str, admin: &Api, db: &sqlx::PgPool, id1: &str, a_id: &str, b_id: &str) {
+    use data_encoding::BASE64URL_NOPAD as B64;
+    use ring::{aead, agreement, hkdf};
+    let sink = PAGING_URL.get().unwrap().clone();
+
+    // The manifest, for installing.
+    let m: Value = reqwest::get(format!("{url}/manifest.webmanifest")).await.unwrap().json().await.unwrap();
+    assert_eq!(m["display"], "standalone");
+    assert!(m["icons"].as_array().unwrap().iter().any(|i| i["sizes"] == "512x512"), "{m}");
+
+    let tech = signed_in(url, admin, "push-a@e2e.test", "technician", Some(a_id), false).await;
+    let other = signed_in(url, admin, "push-b@e2e.test", "technician", Some(b_id), false).await;
+    let key = tech.get("/push/key").await;
+    let vapid_public = B64.decode(key["public_key"].as_str().unwrap().as_bytes()).unwrap();
+    assert_eq!(vapid_public.len(), 65);
+    let (stored, sealed): (Vec<u8>, bool) = sqlx::query_as("SELECT private, private_sealed FROM push_keys").fetch_one(db).await.unwrap();
+    assert!(sealed && stored.len() > 60, "the VAPID private key is sealed");
+
+    // A browser's keys.
+    let rng = ring::rand::SystemRandom::new();
+    let ua = agreement::EphemeralPrivateKey::generate(&agreement::ECDH_P256, &rng).unwrap();
+    let ua_public = ua.compute_public_key().unwrap().as_ref().to_vec();
+    let auth = [42u8; 16];
+    let sub = |endpoint: String| json!({ "endpoint": endpoint, "keys": { "p256dh": B64.encode(&ua_public), "auth": B64.encode(&auth) } });
+    let (s, v) = tech.call(reqwest::Method::POST, "/push/subscriptions", Some(sub("https://evil.example/push".into()))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "only known push services: {v}");
+    tech.post("/push/subscriptions", sub(format!("{sink}/push/a"))).await;
+    tech.post("/push/subscriptions", sub(format!("{sink}/push/gone"))).await;
+    other.post("/push/subscriptions", sub(format!("{sink}/push/b"))).await;
+    assert_eq!(tech.get("/push/subscriptions").await.as_array().unwrap().len(), 2);
+
+    let item = admin.alert_policy(json!({ "name": "Push (e2e)", "kind": "job_failed", "params": {}, "severity": "critical", "client_id": a_id })).await;
+    let job = admin.run_script(id1, "exit 6", 30).await;
+    admin.wait_job(&job, 30).await;
+    let req = eventually(30, "the push to the technician's device", || async { received(|r| r.path == "/push/a").into_iter().next() }).await;
+    assert_eq!(req.headers["content-encoding"], "aes128gcm");
+    let authz = req.headers["authorization"].clone();
+    let (jwt, k) = authz.strip_prefix("vapid t=").unwrap().split_once(", k=").unwrap();
+    assert_eq!(B64.decode(k.as_bytes()).unwrap(), vapid_public);
+    let (input, sig) = jwt.rsplit_once('.').unwrap();
+    ring::signature::UnparsedPublicKey::new(&ring::signature::ECDSA_P256_SHA256_FIXED, &vapid_public)
+        .verify(input.as_bytes(), &B64.decode(sig.as_bytes()).unwrap())
+        .expect("the VAPID JWT verifies");
+    let claims: Value = serde_json::from_slice(&B64.decode(input.split_once('.').unwrap().1.as_bytes()).unwrap()).unwrap();
+    assert_eq!(claims["aud"], sink.as_str());
+
+    // Decrypt it as the browser would (RFC 8291).
+    let body = &req.body;
+    let (salt, rest) = body.split_at(16);
+    let idlen = rest[4] as usize;
+    let as_public = &rest[5..5 + idlen];
+    let record = &rest[5 + idlen..];
+    let secret = agreement::agree_ephemeral(ua, &agreement::UnparsedPublicKey::new(&agreement::ECDH_P256, as_public), |s| s.to_vec()).unwrap();
+    struct L(usize);
+    impl hkdf::KeyType for L {
+        fn len(&self) -> usize {
+            self.0
+        }
+    }
+    let expand = |prk: &hkdf::Prk, info: &[&[u8]], n: usize| {
+        let mut out = vec![0u8; n];
+        prk.expand(info, L(n)).unwrap().fill(&mut out).unwrap();
+        out
+    };
+    let prk_key = hkdf::Salt::new(hkdf::HKDF_SHA256, &auth).extract(&secret);
+    let ikm = expand(&prk_key, &[b"WebPush: info\0", &ua_public, as_public], 32);
+    let prk = hkdf::Salt::new(hkdf::HKDF_SHA256, salt).extract(&ikm);
+    let cek = expand(&prk, &[b"Content-Encoding: aes128gcm\0"], 16);
+    let nonce: [u8; 12] = expand(&prk, &[b"Content-Encoding: nonce\0"], 12).try_into().unwrap();
+    let key = aead::LessSafeKey::new(aead::UnboundKey::new(&aead::AES_128_GCM, &cek).unwrap());
+    let mut buf = record.to_vec();
+    let plain = key.open_in_place(aead::Nonce::assume_unique_for_key(nonce), aead::Aad::empty(), &mut buf).unwrap();
+    assert_eq!(plain.last(), Some(&2), "the last-record delimiter");
+    let payload: Value = serde_json::from_slice(&plain[..plain.len() - 1]).unwrap();
+    assert!(payload["title"].as_str().unwrap().starts_with("CRITICAL: Job failed"), "{payload}");
+    assert!(payload["url"].as_str().unwrap().starts_with("/alerts/"), "{payload}");
+    assert!(payload["alert_id"].is_string());
+
+    // 410: the subscription is gone. The other client's technician got nothing.
+    eventually(20, "the expired subscription to be removed", || async {
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM push_subscriptions WHERE endpoint LIKE '%/push/gone'").fetch_one(db).await.unwrap();
+        (n == 0).then_some(())
+    })
+    .await;
+    assert!(received(|r| r.path == "/push/b").is_empty(), "no push for a client they can't see");
+
+    // Preferences: alerts off, and nothing more arrives.
+    let prefs = tech.get("/account/notification-prefs").await;
+    assert!(prefs["events"].as_array().unwrap().iter().any(|e| e["event"] == "alert_critical" && e["push"] == true), "{prefs}");
+    tech.put("/account/notification-prefs", json!({ "hide_details": true, "events": [{ "event": "alert_critical", "push": false, "email": true }] })).await;
+    let ok = admin.run_script(id1, "true", 30).await;
+    admin.wait_job(&ok, 30).await;
+    let n = received(|r| r.path == "/push/a").len();
+    let job = admin.run_script(id1, "exit 7", 30).await;
+    admin.wait_job(&job, 30).await;
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert_eq!(received(|r| r.path == "/push/a").len(), n, "opted out of critical alerts");
+    let t = tech.post("/push/test", json!({})).await;
+    assert_eq!(t["sent"], 1, "{t}");
+    tech.call(reqwest::Method::DELETE, "/push/subscriptions", Some(json!({ "endpoint": format!("{sink}/push/a") }))).await;
+    assert_eq!(tech.get("/push/subscriptions").await.as_array().unwrap().len(), 0);
+    admin.delete_policy(item["id"].as_str().unwrap()).await;
+}
+
+include!("e2e_parts/monitoring.rs");
+include!("e2e_parts/identity.rs");
+include!("e2e_parts/device_security.rs");
+include!("e2e_parts/vulnerabilities.rs");
+include!("e2e_parts/tray.rs");

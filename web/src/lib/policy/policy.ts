@@ -10,6 +10,9 @@ export const PATCH_ITEM = '00000000-0000-4000-8000-000000000001';
 export const SECURITY_ITEM = '00000000-0000-4000-8000-000000000002';
 export const REMOTE_ITEM = '00000000-0000-4000-8000-000000000003';
 export const AGENT_ITEM = '00000000-0000-4000-8000-000000000004';
+export const DISKENC_ITEM = '00000000-0000-4000-8000-000000000005';
+export const LOCAL_ADMIN_ITEM = '00000000-0000-4000-8000-000000000006';
+export const TRAY_ITEM = '00000000-0000-4000-8000-000000000007';
 
 export const moduleLabels: Record<Module, string> = {
 	alert: 'Alerts',
@@ -19,7 +22,10 @@ export const moduleLabels: Record<Module, string> = {
 	remote_access: 'Remote access',
 	agent: 'Agent',
 	software: 'Software',
-	automation: 'Automations'
+	automation: 'Automations',
+	disk_encryption: 'Disk encryption',
+	local_admin: 'Local admin',
+	tray: 'Tray app'
 };
 /** Singular, for one item: "the Patching policy". */
 export const moduleNoun: Record<Module, string> = {
@@ -30,7 +36,10 @@ export const moduleNoun: Record<Module, string> = {
 	remote_access: 'remote access policy',
 	agent: 'agent policy',
 	software: 'software requirement',
-	automation: 'automation'
+	automation: 'automation',
+	disk_encryption: 'disk encryption policy',
+	local_admin: 'local admin policy',
+	tray: 'tray app policy'
 };
 
 /** Sections of the policy set page, in order; `?section=`. */
@@ -42,10 +51,13 @@ export const sections = [
 	{ value: 'patching', module: 'patch' },
 	{ value: 'security', module: 'security' },
 	{ value: 'remote', module: 'remote_access' },
-	{ value: 'agent', module: 'agent' }
+	{ value: 'encryption', module: 'disk_encryption' },
+	{ value: 'localadmin', module: 'local_admin' },
+	{ value: 'agent', module: 'agent' },
+	{ value: 'tray', module: 'tray' }
 ] as const satisfies { value: string; module: Module }[];
 export const sectionOf: Record<Module, string> = Object.fromEntries(sections.map((s) => [s.module, s.value])) as Record<Module, string>;
-export const singleModules: Module[] = ['patch', 'security', 'remote_access', 'agent'];
+export const singleModules: Module[] = ['patch', 'security', 'remote_access', 'disk_encryption', 'local_admin', 'agent', 'tray'];
 
 /** Where one item is edited, as it applies in `setId`. */
 export function itemHref(setId: string, item: Pick<ItemView, 'id' | 'module'>): string {
@@ -195,6 +207,7 @@ export const fieldLabels: Record<string, string> = {
 	auto_install: 'Automatic install',
 	reboot_policy: 'Restart',
 	window: 'Install window',
+	wake_before_minutes: 'Wake before window',
 	sensor_enabled: 'Sensor',
 	quick_scan_hours: 'Quick scans',
 	full_scan_days: 'Full scans',

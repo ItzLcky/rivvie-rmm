@@ -59,14 +59,12 @@
 		clearTimeout(timer);
 		timer = setTimeout(() => setParams({ q: search }), 300);
 	}
-
-	const firstName = $derived(me.data?.contact.name.split(' ')[0] ?? '');
 </script>
 
 <div class="space-y-6">
 	<div class="flex flex-wrap items-end justify-between gap-4">
 		<div class="min-w-0">
-			<h1 class="text-2xl font-semibold tracking-tight">{firstName ? `Hi ${firstName}` : 'Your requests'}</h1>
+			<h1 class="text-2xl font-medium">Your requests</h1>
 			<p class="text-muted mt-1 text-sm">
 				{me.data?.sees_all_tickets ? `Support requests for ${me.data.contact.client_name}.` : 'Your support requests.'}
 				{#if me.data?.welcome}<span class="block whitespace-pre-line">{me.data.welcome}</span>{/if}

@@ -28,6 +28,11 @@ pub const ROOT: Uuid = Uuid::from_u128(0x00000000_0000_4000_8001_000000000000);
 /// MSP-wide rows they replaced; the views in 0022_policies.sql name them).
 pub const REMOTE_ITEM: Uuid = Uuid::from_u128(0x00000000_0000_4000_8000_000000000003);
 pub const AGENT_ITEM: Uuid = Uuid::from_u128(0x00000000_0000_4000_8000_000000000004);
+/// Disk encryption (escrow), and the managed local admin account (0038, 0039).
+pub const DISKENC_ITEM: Uuid = Uuid::from_u128(0x00000000_0000_4000_8000_000000000005);
+pub const LOCAL_ADMIN_ITEM: Uuid = Uuid::from_u128(0x00000000_0000_4000_8000_000000000006);
+/// The end-user tray app (0052_tray.sql).
+pub const TRAY_ITEM: Uuid = Uuid::from_u128(0x00000000_0000_4000_8000_000000000007);
 /// Levels below All devices a set may sit at (the built-in OS and platform levels count).
 pub const MAX_DEPTH: i32 = 8;
 
@@ -42,6 +47,9 @@ pub enum Module {
     Agent,
     Software,
     Automation,
+    DiskEncryption,
+    LocalAdmin,
+    Tray,
 }
 
 impl Module {
@@ -55,6 +63,9 @@ impl Module {
             "agent" => Module::Agent,
             "software" => Module::Software,
             "automation" => Module::Automation,
+            "disk_encryption" => Module::DiskEncryption,
+            "local_admin" => Module::LocalAdmin,
+            "tray" => Module::Tray,
             _ => return None,
         })
     }
@@ -69,6 +80,9 @@ impl Module {
             Module::Agent => "agent",
             Module::Software => "software",
             Module::Automation => "automation",
+            Module::DiskEncryption => "disk_encryption",
+            Module::LocalAdmin => "local_admin",
+            Module::Tray => "tray",
         }
     }
 
@@ -86,7 +100,7 @@ impl Module {
             // The rule's type is what its open alerts mean.
             Module::Alert => field != "kind" && ALERT_FIELDS.contains(&field),
             // One cron clock per item.
-            Module::Schedule => matches!(field, "args" | "timeout_secs"),
+            Module::Schedule => matches!(field, "args" | "timeout_secs" | "params"),
             Module::Patch => PATCH_FIELDS.contains(&field),
             Module::Security => SECURITY_FIELDS.contains(&field),
             Module::RemoteAccess => REMOTE_FIELDS.contains(&field),
@@ -95,12 +109,15 @@ impl Module {
             Module::Software => SOFTWARE_FIELDS.contains(&field),
             // One trigger and one script per item; the rest tunes how it runs.
             Module::Automation => AUTOMATION_OVERRIDABLE.contains(&field),
+            Module::DiskEncryption => DISKENC_FIELDS.contains(&field),
+            Module::LocalAdmin => LOCAL_ADMIN_FIELDS.contains(&field),
+            Module::Tray => TRAY_FIELDS.contains(&field),
         }
     }
 }
 
 const AUTOMATION_OVERRIDABLE: &[&str] =
-    &["args", "timeout_secs", "retry_failed", "max_attempts", "retry_minutes", "cooldown_minutes", "max_runs_per_hour", "respect_window"];
+    &["args", "params", "timeout_secs", "retry_failed", "max_attempts", "retry_minutes", "cooldown_minutes", "max_runs_per_hour", "respect_window"];
 
 const ALERT_FIELDS: &[&str] = &[
     "kind",
@@ -114,7 +131,7 @@ const ALERT_FIELDS: &[&str] = &[
     "ticket_auto_resolve",
     "run_script_id",
 ];
-const PATCH_FIELDS: &[&str] = &["auto_approve_severities", "auto_approve_categories", "deferral_days", "auto_install", "reboot_policy", "window"];
+const PATCH_FIELDS: &[&str] = &["auto_approve_severities", "auto_approve_categories", "deferral_days", "auto_install", "reboot_policy", "window", "wake_before_minutes"];
 const SECURITY_FIELDS: &[&str] = &[
     "sensor_enabled",
     "quick_scan_hours",
@@ -130,6 +147,9 @@ const SECURITY_FIELDS: &[&str] = &[
 ];
 const SOFTWARE_FIELDS: &[&str] = &["state", "bootstrap_choco", "window"];
 const REMOTE_FIELDS: &[&str] = &["desktop_enabled", "desktop_consent", "shell_enabled", "files_enabled"];
+const DISKENC_FIELDS: &[&str] = &["escrow_recovery_keys", "add_recovery_protector"];
+const LOCAL_ADMIN_FIELDS: &[&str] = &["enabled", "account", "create", "rotate_days", "length", "rotate_after_reveal_hours"];
+const TRAY_FIELDS: &[&str] = &["enabled", "request_help", "contact_card", "screenshot_default", "links"];
 
 // ---------------------------------------------------------------------------
 // Module configs
@@ -207,6 +227,10 @@ pub struct ScheduleConfig {
     pub timezone: String,
     #[serde(default)]
     pub args: Vec<String>,
+    /// Values of the script's parameters (crate::params), by name; a descendant set can
+    /// override single ones. Text may hold placeholders; a secret is `vault:<item id>`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub params: BTreeMap<String, String>,
     /// None: the script's own timeout.
     #[serde(default)]
     pub timeout_secs: Option<i32>,
@@ -226,6 +250,7 @@ impl ScheduleConfig {
         if self.args.len() > 50 || self.args.iter().any(|a| a.len() > 4096) {
             return Err("at most 50 arguments of at most 4096 characters".into());
         }
+        check_param_shape(&self.params)?;
         crate::scheduler::next_run(&self.cron, &self.timezone, chrono::Utc::now()).map(|_| ())
     }
 }
@@ -281,7 +306,7 @@ fn hundred() -> i32 {
 }
 
 /// The alert kinds `alert_opened` can name (the `kind` of an alert item).
-pub const ALERT_KINDS: &[&str] = &["offline", "cpu", "memory", "disk", "service", "job_failed", "log", "security", "patch"];
+pub const ALERT_KINDS: &[&str] = &["offline", "cpu", "memory", "disk", "service", "job_failed", "log", "security", "patch", "backup", "disk_encryption", "local_admin", "vulnerability"];
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -290,6 +315,9 @@ pub struct AutomationConfig {
     pub script_id: Uuid,
     #[serde(default)]
     pub args: Vec<String>,
+    /// Values of the script's parameters, as on [`ScheduleConfig::params`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub params: BTreeMap<String, String>,
     /// None: the script's own timeout.
     #[serde(default)]
     pub timeout_secs: Option<i32>,
@@ -391,8 +419,24 @@ impl AutomationConfig {
         if self.args.len() > 50 || self.args.iter().any(|a| a.len() > 4096) {
             return Err("at most 50 arguments of at most 4096 characters".into());
         }
+        check_param_shape(&self.params)?;
         Ok(())
     }
+}
+
+/// What can be checked of parameter values without the script (that is
+/// [`crate::params::check_policy`], from [`validate_effective`]).
+fn check_param_shape(params: &BTreeMap<String, String>) -> Result<(), String> {
+    if params.len() > crate::params::MAX_PARAMS {
+        return Err(format!("at most {} parameters", crate::params::MAX_PARAMS));
+    }
+    if let Some(k) = params.keys().find(|k| !crate::params::valid_name(k)) {
+        return Err(format!("{k:?} isn't a parameter name"));
+    }
+    if params.values().any(|v| v.len() > crate::params::VALUE_MAX) {
+        return Err(format!("a parameter value is at most {} bytes", crate::params::VALUE_MAX));
+    }
+    Ok(())
 }
 
 /// A patch window of the policy's own (otherwise the site's maintenance window applies).
@@ -417,6 +461,10 @@ pub struct PatchConfig {
     pub auto_install: bool,
     pub reboot_policy: String,
     pub window: Option<PatchWindow>,
+    /// Wake offline devices with Wake-on-LAN this many minutes before the window opens (0-60;
+    /// `None` or 0: don't). See [`crate::patches::wake_before_window`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake_before_minutes: Option<i32>,
 }
 
 impl PatchConfig {
@@ -435,6 +483,9 @@ impl PatchConfig {
         }
         if let Some(w) = &self.window {
             validate_window(w)?;
+        }
+        if self.wake_before_minutes.is_some_and(|m| !(0..=60).contains(&m)) {
+            return Err("wake_before_minutes must be 0-60".into());
         }
         Ok(())
     }
@@ -507,6 +558,52 @@ pub struct AgentConfig {
     pub auto_update: bool,
 }
 
+/// What the tray app on the device offers (docs/design/tray.md).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrayConfig {
+    /// Show the tray at all.
+    pub enabled: bool,
+    /// The "Request help" entry.
+    pub request_help: bool,
+    /// The branded contact card (support phone, email, web, hours).
+    pub contact_card: bool,
+    /// "Attach a screenshot" starts ticked.
+    pub screenshot_default: bool,
+    /// Extra menu entries, opened in the browser.
+    #[serde(default)]
+    pub links: Vec<TrayLink>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrayLink {
+    pub label: String,
+    pub url: String,
+}
+
+impl TrayConfig {
+    pub const DEFAULT: TrayConfig = TrayConfig { enabled: true, request_help: true, contact_card: true, screenshot_default: true, links: vec![] };
+
+    fn validate(&mut self) -> Result<(), String> {
+        if self.links.len() > rmm_proto::tray::MAX_LINKS {
+            return Err(format!("at most {} links", rmm_proto::tray::MAX_LINKS));
+        }
+        for l in &mut self.links {
+            l.label = l.label.split_whitespace().collect::<Vec<_>>().join(" ");
+            l.url = l.url.trim().to_string();
+            if l.label.is_empty() || l.label.chars().count() > 60 {
+                return Err("each link needs a label of up to 60 characters".into());
+            }
+            let ok_scheme = l.url.starts_with("https://") || l.url.starts_with("http://");
+            if !ok_scheme || l.url.len() > 500 || l.url.chars().any(|c| c.is_whitespace() || c.is_control() || c == '"') || reqwest::Url::parse(&l.url).is_err() {
+                return Err(format!("{}: links must be http:// or https:// addresses", l.label));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// One package requirement: the package, and whether it must be there, kept current, or gone.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -527,6 +624,58 @@ impl SoftwareConfig {
     fn validate(&self) -> Result<(), String> {
         if let Some(w) = &self.window {
             validate_window(w)?;
+        }
+        Ok(())
+    }
+}
+
+/// What the server does with BitLocker recovery passwords (docs/design/disk-encryption.md).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiskEncryptionConfig {
+    /// Pull each volume's recovery password into the client's vault.
+    pub escrow_recovery_keys: bool,
+    /// Add a recovery password protector to an encrypted volume that has none.
+    pub add_recovery_protector: bool,
+}
+
+/// The managed local admin account (docs/design/local-admin.md).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalAdminConfig {
+    pub enabled: bool,
+    pub account: String,
+    /// Create the account when it doesn't exist.
+    pub create: bool,
+    pub rotate_days: i32,
+    /// Generated password length.
+    pub length: i32,
+    /// Rotate this long after someone reveals the password (0: don't).
+    pub rotate_after_reveal_hours: i32,
+}
+
+impl Default for LocalAdminConfig {
+    fn default() -> Self {
+        LocalAdminConfig { enabled: false, account: "rmmadmin".into(), create: true, rotate_days: 30, length: 20, rotate_after_reveal_hours: 24 }
+    }
+}
+
+impl LocalAdminConfig {
+    fn validate(&self) -> Result<(), String> {
+        if !rmm_proto::localadmin::valid_account(&self.account) {
+            return Err("the account is 1-20 lower-case letters, digits, '-' or '_', starting with a letter".into());
+        }
+        if ["administrator", "admin", "root", "guest", "defaultaccount", "wdagutilityaccount"].contains(&self.account.as_str()) {
+            return Err(format!("{} is a built-in account; pick a name of its own", self.account));
+        }
+        if !(1..=365).contains(&self.rotate_days) {
+            return Err("rotate every 1-365 days".into());
+        }
+        if !(crate::localadmin::MIN_LENGTH..=crate::localadmin::MAX_LENGTH).contains(&self.length) {
+            return Err(format!("the password is {}-{} characters", crate::localadmin::MIN_LENGTH, crate::localadmin::MAX_LENGTH));
+        }
+        if !(0..=720).contains(&self.rotate_after_reveal_hours) {
+            return Err("rotate 0-720 hours after a reveal (0: don't)".into());
         }
         Ok(())
     }
@@ -563,6 +712,11 @@ pub fn validate(module: Module, config: &Value) -> Result<Value, String> {
         }
         Module::RemoteAccess => serde_json::to_value(parse::<RemoteAccessConfig>(config)?),
         Module::Agent => serde_json::to_value(parse::<AgentConfig>(config)?),
+        Module::Tray => {
+            let mut c: TrayConfig = parse(config)?;
+            c.validate()?;
+            serde_json::to_value(c)
+        }
         Module::Software => {
             let c: SoftwareConfig = parse(config)?;
             c.validate()?;
@@ -570,6 +724,12 @@ pub fn validate(module: Module, config: &Value) -> Result<Value, String> {
         }
         Module::Automation => {
             let c: AutomationConfig = parse(config)?;
+            c.validate()?;
+            serde_json::to_value(c)
+        }
+        Module::DiskEncryption => serde_json::to_value(parse::<DiskEncryptionConfig>(config)?),
+        Module::LocalAdmin => {
+            let c: LocalAdminConfig = parse(config)?;
             c.validate()?;
             serde_json::to_value(c)
         }
@@ -584,8 +744,8 @@ pub fn clean_override(module: Module, config: &Value) -> Result<Value, String> {
     if let Some(bad) = m.keys().find(|k| !module.overridable(k)) {
         return Err(match (module, bad.as_str()) {
             (Module::Alert, "kind") => "an alert's type can't be overridden".into(),
-            (Module::Schedule, _) => format!("{bad} can't be overridden: a scheduled script's overrides are limited to enabled, args and timeout_secs"),
-            (Module::Automation, _) => format!("{bad} can't be overridden: an automation's trigger and script are fixed; its args, timeout, retries and limits can change"),
+            (Module::Schedule, _) => format!("{bad} can't be overridden: a scheduled script's overrides are limited to enabled, args, params and timeout_secs"),
+            (Module::Automation, _) => format!("{bad} can't be overridden: an automation's trigger and script are fixed; its args, params, timeout, retries and limits can change"),
             _ => format!("{bad} isn't a {} setting", module.as_str()),
         });
     }
@@ -720,6 +880,50 @@ pub async fn auto_update(st: &AppState, agent_id: Uuid) -> sqlx::Result<bool> {
     Ok(v.flatten().unwrap_or(false))
 }
 
+/// The effective config of a single-instance item for an agent (None: no such agent).
+async fn single_config(st: &AppState, agent_id: Uuid, item: Uuid) -> sqlx::Result<Option<(bool, Value)>> {
+    sqlx::query_as(
+        "SELECT e.enabled, e.config FROM agents a JOIN policy_effective e ON e.set_id = a.policy_set_id AND e.item_id = $2 WHERE a.id = $1",
+    )
+    .bind(agent_id)
+    .bind(item)
+    .fetch_optional(&st.db)
+    .await
+}
+
+/// The agent's disk encryption policy; escrow and protectors off when the item is disabled.
+pub async fn disk_encryption(st: &AppState, agent_id: Uuid) -> sqlx::Result<DiskEncryptionConfig> {
+    let off = DiskEncryptionConfig { escrow_recovery_keys: false, add_recovery_protector: false };
+    Ok(match single_config(st, agent_id, DISKENC_ITEM).await? {
+        Some((true, c)) => serde_json::from_value(c).unwrap_or(off),
+        _ => off,
+    })
+}
+
+/// The agent's local admin policy; `enabled` false when the item is disabled.
+pub async fn local_admin(st: &AppState, agent_id: Uuid) -> sqlx::Result<LocalAdminConfig> {
+    Ok(match single_config(st, agent_id, LOCAL_ADMIN_ITEM).await? {
+        Some((on, c)) => {
+            let mut c: LocalAdminConfig = serde_json::from_value(c).unwrap_or_default();
+            c.enabled &= on;
+            c
+        }
+        None => LocalAdminConfig::default(),
+    })
+}
+
+/// The effective tray policy for an agent.
+pub async fn tray(st: &AppState, agent_id: Uuid) -> sqlx::Result<TrayConfig> {
+    let v: Option<Value> = sqlx::query_scalar(
+        "SELECT e.config FROM agents a JOIN policy_effective e ON e.set_id = a.policy_set_id AND e.item_id = $2 WHERE a.id = $1",
+    )
+    .bind(agent_id)
+    .bind(TRAY_ITEM)
+    .fetch_optional(&st.db)
+    .await?;
+    Ok(v.and_then(|v| serde_json::from_value(v).ok()).unwrap_or(TrayConfig::DEFAULT))
+}
+
 // ---------------------------------------------------------------------------
 // Writes
 // ---------------------------------------------------------------------------
@@ -738,22 +942,43 @@ pub async fn rebuild(tx: &mut PgConnection, items: Option<&[Uuid]>) -> sqlx::Res
 
 /// Every merged config of these items (in every set they reach) must still be valid. The error
 /// names the set.
+///
+/// Schedules and automations are also checked against their script's parameters
+/// ([`crate::params::check_policy`]), and an alert's script must not need any.
 pub async fn validate_effective(tx: &mut PgConnection, items: &[Uuid]) -> sqlx::Result<Result<(), String>> {
-    let rows: Vec<(String, String, Value)> = sqlx::query_as(
-        "SELECT ps.name, e.module, e.config FROM policy_effective e JOIN policy_sets ps ON ps.id = e.set_id
+    let rows: Vec<(String, String, Value, String, Option<Uuid>)> = sqlx::query_as(
+        "SELECT ps.name, e.module, e.config, i.name, i.client_id FROM policy_effective e JOIN policy_sets ps ON ps.id = e.set_id
+           JOIN policy_items i ON i.id = e.item_id
           WHERE e.item_id = ANY($1) ORDER BY ps.parent_id NULLS FIRST, ps.name",
     )
     .bind(items)
     .fetch_all(&mut *tx)
     .await?;
     let mut seen = HashSet::new();
-    for (set, module, config) in rows {
-        if !seen.insert((module.clone(), config.to_string())) {
+    for (set, module, config, item, item_client) in rows {
+        if !seen.insert((module.clone(), config.to_string(), item_client)) {
             continue;
         }
         let Some(m) = Module::parse(&module) else { continue };
         if let Err(e) = validate(m, &config) {
             return Ok(Err(format!("in {set}: {e}")));
+        }
+        let params = match m {
+            Module::Schedule | Module::Automation => crate::params::check_policy(&mut *tx, &config, item_client).await?,
+            Module::Alert => match config.get("run_script_id").and_then(Value::as_str).and_then(|s| Uuid::parse_str(s).ok()) {
+                Some(script) => {
+                    let mut alert_cfg = json!({ "script_id": script });
+                    alert_cfg["params"] = json!({});
+                    crate::params::check_policy(&mut *tx, &alert_cfg, item_client)
+                        .await?
+                        .map_err(|e| format!("its script needs parameters an alert can't pass ({e})"))
+                }
+                None => Ok(()),
+            },
+            _ => Ok(()),
+        };
+        if let Err(e) = params {
+            return Ok(Err(format!("{item} in {set}: {e}")));
         }
     }
     Ok(Ok(()))
@@ -841,7 +1066,11 @@ pub async fn changed(st: &Arc<AppState>, ch: Change) {
         });
     }
     crate::alerts::push_watchers(st, agents).await;
+    crate::checks::push(st, agents, &[]).await;
+    crate::helpdesk_agent::push_config(st, agents).await;
     crate::security::push_policies_to(st, agents).await;
+    crate::diskenc::policy_changed(st, agents).await;
+    crate::localadmin::policy_changed(st, agents).await;
     let res = async { crate::patches::apply_policies(&mut *st.db.acquire().await?, agents).await }.await;
     if let Err(e) = res {
         warn!("re-applying patch approvals: {e}");
@@ -914,6 +1143,15 @@ mod tests {
         assert!(validate(Module::Patch, &merge(&patch, &json!({ "window": { "tz": "Mars/Olympus" } }))).is_err());
         assert!(validate(Module::Patch, &merge(&patch, &json!({ "reboot_policy": "sometimes" }))).is_err());
         assert!(validate(Module::RemoteAccess, &json!({ "desktop_enabled": true, "desktop_consent": false, "shell_enabled": true })).is_err(), "missing field");
+        let tray = json!({ "enabled": true, "request_help": true, "contact_card": true, "screenshot_default": false, "links": [{ "label": " Status  page ", "url": "https://status.example.com" }] });
+        assert_eq!(validate(Module::Tray, &tray).unwrap()["links"][0]["label"], "Status page");
+        for bad in ["javascript:alert(1)", "file:///c:/x", "https://a b", "https://"] {
+            assert!(validate(Module::Tray, &merge(&tray, &json!({ "links": [{ "label": "x", "url": bad }] }))).is_err(), "{bad}");
+        }
+        assert!(validate(Module::Tray, &merge(&tray, &json!({ "links": [{ "label": "", "url": "https://a.example" }] }))).is_err());
+        assert!(validate(Module::Tray, &merge(&tray, &json!({ "links": vec![json!({ "label": "x", "url": "https://a.example" }); 11] }))).is_err());
+        assert!(Module::Tray.single() && clean_override(Module::Tray, &json!({ "links": [] })).is_ok());
+        assert!(clean_override(Module::Tray, &json!({ "color": "red" })).is_err());
     }
 
     #[test]
@@ -959,6 +1197,29 @@ mod tests {
         assert!(clean_override(Module::Automation, &json!({ "trigger": "run_once" })).is_err());
         assert!(clean_override(Module::Automation, &json!({ "script_id": id })).is_err());
         assert!(!Module::Automation.single(), "defined in any set, like alerts and schedules");
+    }
+
+    #[test]
+    fn device_security_modules() {
+        assert!(Module::DiskEncryption.single() && Module::LocalAdmin.single());
+        assert_eq!(Module::parse("disk_encryption"), Some(Module::DiskEncryption));
+        assert!(validate(Module::DiskEncryption, &json!({ "escrow_recovery_keys": true, "add_recovery_protector": false })).is_ok());
+        assert!(validate(Module::DiskEncryption, &json!({ "escrow_recovery_keys": true })).is_err(), "missing field");
+        let la = serde_json::to_value(LocalAdminConfig::default()).unwrap();
+        assert!(validate(Module::LocalAdmin, &la).is_ok());
+        for bad in [json!({ "account": "Administrator" }), json!({ "account": "administrator" }), json!({ "length": 8 }), json!({ "rotate_days": 0 }), json!({ "rotate_after_reveal_hours": -1 })] {
+            assert!(validate(Module::LocalAdmin, &merge(&la, &bad)).is_err(), "{bad}");
+        }
+        assert!(clean_override(Module::LocalAdmin, &json!({ "enabled": true, "rotate_days": 7 })).is_ok());
+        assert!(clean_override(Module::LocalAdmin, &json!({ "password": "x" })).is_err());
+        // The seed items in the migrations are valid configs.
+        for (sql, module) in [(include_str!("../migrations/0038_disk_encryption.sql"), Module::DiskEncryption), (include_str!("../migrations/0039_local_admin.sql"), Module::LocalAdmin)] {
+            let start = sql.find("'{\"").unwrap() + 1;
+            let end = sql[start..].find("}'").unwrap() + start + 1;
+            let v: Value = serde_json::from_str(&sql[start..end].replace('\n', " ")).unwrap();
+            assert!(validate(module, &v).is_ok(), "{v}");
+            assert!(sql.contains(&format!("'{}'", module.as_str())));
+        }
     }
 
     #[test]

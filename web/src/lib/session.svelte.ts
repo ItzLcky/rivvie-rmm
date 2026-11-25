@@ -1,14 +1,15 @@
 import type { User } from './types';
+import { applyBranding, type Branding } from './branding';
 
 /** Logged-in user, loaded once by the root layout. */
 export const session = $state<{ user: User | null; loaded: boolean }>({ user: null, loaded: false });
 
 /** Public company settings (shown on the login page and in the sidebar). */
-export const company = $state<{ name: string; attachmentMaxMb?: number }>({ name: '' });
+export const company = $state<{ name: string; attachmentMaxMb?: number; branding?: Branding | null }>({ name: '' });
 
-/** "Acme IT RMM" when a company name is set, otherwise "RMM". */
+/** The branded product name; else "Acme IT RMM" when a company name is set, otherwise "RMM". */
 export function brand(): string {
-	return company.name ? `${company.name} RMM` : 'RMM';
+	return company.branding?.product_name || (company.name ? `${company.name} RMM` : 'RMM');
 }
 
 let companyRequested = false;
@@ -21,6 +22,9 @@ export function loadCompany(force = false) {
 			if (!d) return;
 			company.name = d.company_name ?? '';
 			if (typeof d.attachment_max_mb === 'number') company.attachmentMaxMb = d.attachment_max_mb;
+			company.branding = d.branding ?? null;
+			// The portal applies its contact's own branding instead (see the portal layout).
+			if (!location.pathname.startsWith('/portal')) applyBranding(company.branding);
 		})
 		.catch(() => {});
 }
@@ -39,7 +43,10 @@ export type Permission =
 	| 'time.approve'
 	| 'vault.read'
 	| 'vault.manage'
-	| 'audit.read';
+	| 'audit.read'
+	| 'oncall.manage'
+	| 'identity.read'
+	| 'identity.manage';
 
 /** Holds a named permission (the server sends the effective set; older servers: role defaults). */
 export function allowed(perm: Permission): boolean {
@@ -47,5 +54,5 @@ export function allowed(perm: Permission): boolean {
 	if (!u) return false;
 	if (u.permissions) return u.permissions.includes(perm);
 	if (perm === 'security.read') return true;
-	return perm === 'security.respond' || perm === 'vault.read' || perm === 'vault.manage' ? can('technician') : can('admin');
+	return ['security.respond', 'vault.read', 'vault.manage', 'identity.read', 'identity.manage'].includes(perm) ? can('technician') : can('admin');
 }

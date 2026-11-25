@@ -12,6 +12,8 @@
 //! - a `ServiceControl` row stops the service before files are replaced and stops and deletes
 //!   it on uninstall. `C:\ProgramData\RMM` (config, state, logs) is left behind, so a reinstall
 //!   keeps the same agent record;
+//! - a `Registry` row writes the tray app's `HKLM\…\Run` value (`"…\rmm-agent.exe" tray`),
+//!   which goes with the component on uninstall;
 //! - every package has a new ProductCode under a fixed UpgradeCode, and the Upgrade table
 //!   removes any other installed version first (a major upgrade).
 //!
@@ -31,6 +33,11 @@ const COMPONENT_ID: &str = "{037A78A8-13FF-4752-B2EB-8B761DE76E4F}";
 const FILE_KEY: &str = "rmm_agent.exe";
 const CABINET: &str = "agent.cab";
 const SERVICE_NAME: &str = "RmmAgent";
+/// The tray app's `Run` value (the agent's `rmm-agent install` writes the same one).
+const RUN_KEY: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run";
+const RUN_VALUE: &str = "RmmAgentTray";
+/// Registry.Root: HKEY_LOCAL_MACHINE.
+const HKLM: i32 = 2;
 
 // CustomAction types: 18 = run an EXE installed by this package (Source = File key,
 // Target = arguments), plus deferred (in the install script), no impersonation (as SYSTEM)
@@ -58,6 +65,23 @@ pub struct MsiInput<'a> {
     pub token: &'a str,
     pub version: &'a str,
     pub manufacturer: &'a str,
+    /// ProductName (what "Apps & features" lists) and the feature title: "RMM Agent", or the
+    /// branded "<product> Agent".
+    pub product_name: &'a str,
+    /// The configured product name, passed to `enroll --product-name` so the service gets the
+    /// same display name. `None` when unbranded (an older agent binary doesn't know the flag).
+    pub branded_name: Option<&'a str>,
+    /// An `.ico` for "Apps & features" (ARPPRODUCTICON).
+    pub icon: Option<&'a [u8]>,
+}
+
+/// The Icon table key (also part of its stream name).
+const ICON_KEY: &str = "AgentIcon.ico";
+
+/// A value safe inside the custom action's quoted, formatted argument: no quotes, no
+/// brackets or braces (formatted-string syntax), no backslashes or control characters.
+fn cli_arg(v: &str) -> String {
+    v.chars().filter(|c| !c.is_control() && !"\"[]{}\\".contains(*c)).collect::<String>().trim().to_string()
 }
 
 /// Windows Installer versions are `major.minor.build` with major and minor below 256 and
@@ -110,7 +134,7 @@ pub fn build(input: &MsiInput) -> anyhow::Result<Vec<u8>> {
         let si = pkg.summary_info_mut();
         si.set_codepage(CodePage::Windows1252);
         si.set_title("Installation Database");
-        si.set_subject("RMM Agent");
+        si.set_subject(input.product_name);
         si.set_author(input.manufacturer);
         si.set_comments("Installs the RMM agent and enrolls it with the server it was downloaded from.");
         si.set_arch("x64");
@@ -133,7 +157,7 @@ pub fn build(input: &MsiInput) -> anyhow::Result<Vec<u8>> {
     let product_code = guid();
     let mut props: Vec<(&str, String)> = vec![
         ("ProductCode", product_code),
-        ("ProductName", "RMM Agent".into()),
+        ("ProductName", input.product_name.into()),
         ("ProductVersion", version.clone()),
         ("ProductLanguage", "1033".into()),
         ("Manufacturer", input.manufacturer.into()),
@@ -143,6 +167,9 @@ pub fn build(input: &MsiInput) -> anyhow::Result<Vec<u8>> {
         ("SecureCustomProperties", "OLDPRODUCTS;RMM_SERVER;RMM_TOKEN".into()),
         ("MsiHiddenProperties", "RMM_TOKEN".into()),
     ];
+    if input.icon.is_some() {
+        props.push(("ARPPRODUCTICON", ICON_KEY.into()));
+    }
     // Property values can't be empty; an unset property is simply absent.
     if !input.server.is_empty() {
         props.push(("RMM_SERVER", input.server.into()));
@@ -188,7 +215,8 @@ pub fn build(input: &MsiInput) -> anyhow::Result<Vec<u8>> {
             Column::build("Attributes").int16(),
         ],
     )?;
-    pkg.insert_rows(Insert::into("Feature").row(vec![s("Agent"), Value::Null, s("RMM Agent"), Value::Null, i(0), i(1), s("INSTALLDIR"), i(0)]))?;
+    let title: String = input.product_name.chars().take(64).collect();
+    pkg.insert_rows(Insert::into("Feature").row(vec![s("Agent"), Value::Null, s(&title), Value::Null, i(0), i(1), s("INSTALLDIR"), i(0)]))?;
 
     pkg.create_table("FeatureComponents", vec![Column::build("Feature_").primary_key().id_string(38), Column::build("Component_").primary_key().id_string(72)])?;
     pkg.insert_rows(Insert::into("FeatureComponents").row(vec![s("Agent"), s("AgentExe")]))?;
@@ -272,6 +300,26 @@ pub fn build(input: &MsiInput) -> anyhow::Result<Vec<u8>> {
     ]))?;
 
     pkg.create_table(
+        "Registry",
+        vec![
+            Column::build("Registry").primary_key().id_string(72),
+            Column::build("Root").int16(),
+            Column::build("Key").localizable().text_string(255),
+            Column::build("Name").nullable().localizable().formatted_string(255),
+            Column::build("Value").nullable().localizable().formatted_string(0),
+            id("Component_", 72),
+        ],
+    )?;
+    pkg.insert_rows(Insert::into("Registry").row(vec![
+        s("TrayRun"),
+        i(HKLM),
+        s(RUN_KEY),
+        s(RUN_VALUE),
+        s(&format!("\"[#{FILE_KEY}]\" tray")),
+        s("AgentExe"),
+    ]))?;
+
+    pkg.create_table(
         "CustomAction",
         vec![
             Column::build("Action").primary_key().id_string(72),
@@ -282,13 +330,17 @@ pub fn build(input: &MsiInput) -> anyhow::Result<Vec<u8>> {
     )?;
     // Properties are expanded when the action is scheduled, so the deferred action gets the
     // values. Errors go to install.log next to the agent's own log.
-    let target = "enroll --server \"[RMM_SERVER]\" --token \"[RMM_TOKEN]\" --install --keep-existing \
-                  --log-file \"[CommonAppDataFolder]RMM\\logs\\install.log\"";
+    let mut target = "enroll --server \"[RMM_SERVER]\" --token \"[RMM_TOKEN]\" --install --keep-existing \
+                  --log-file \"[CommonAppDataFolder]RMM\\logs\\install.log\""
+        .to_string();
+    if let Some(name) = input.branded_name.map(cli_arg).filter(|n| !n.is_empty()) {
+        target.push_str(&format!(" --product-name \"{name}\""));
+    }
     pkg.insert_rows(Insert::into("CustomAction").row(vec![
         s("EnrollAgent"),
         i(CA_EXE_FROM_FILE | CA_IN_SCRIPT | CA_NO_IMPERSONATE | CA_HIDE_TARGET),
         s(FILE_KEY),
-        s(target),
+        s(&target),
     ]))?;
 
     pkg.create_table(
@@ -332,8 +384,10 @@ pub fn build(input: &MsiInput) -> anyhow::Result<Vec<u8>> {
         ("UnpublishFeatures", None, 1800),
         ("StopServices", Some("VersionNT"), 1900),
         ("DeleteServices", Some("VersionNT"), 2000),
+        ("RemoveRegistryValues", None, 2600),
         ("RemoveFiles", None, 3500),
         ("InstallFiles", None, 4000),
+        ("WriteRegistryValues", None, 5000),
         ("RegisterUser", None, 6000),
         ("RegisterProduct", None, 6100),
         ("PublishFeatures", None, 6300),
@@ -351,6 +405,12 @@ pub fn build(input: &MsiInput) -> anyhow::Result<Vec<u8>> {
         &[("FindRelatedProducts", 25), ("CostInitialize", 800), ("FileCost", 900), ("CostFinalize", 1000), ("MigrateFeatureStates", 1200), ("ExecuteAction", 1300)];
     pkg.insert_rows(Insert::into("InstallUISequence").rows(ui.iter().map(|(a, n)| vec![s(a), Value::Null, i(*n)]).collect()))?;
 
+    if let Some(icon) = input.icon {
+        pkg.create_table("Icon", vec![Column::build("Name").primary_key().id_string(72), Column::build("Data").binary()])?;
+        pkg.insert_rows(Insert::into("Icon").row(vec![s(ICON_KEY), Value::Binary]))?;
+        let mut w = pkg.write_stream(&format!("Icon.{ICON_KEY}"))?;
+        w.write_all(icon)?;
+    }
     {
         let mut w = pkg.write_stream(CABINET)?;
         w.write_all(&cab)?;
@@ -394,8 +454,49 @@ mod tests {
             token: "abc123",
             version: "0.4.2-rc.1",
             manufacturer: "Acme IT",
+            product_name: "RMM Agent",
+            branded_name: None,
+            icon: None,
         })
         .unwrap()
+    }
+
+    fn props(pkg: &mut Package<Cursor<Vec<u8>>>) -> std::collections::HashMap<String, String> {
+        pkg.select_rows(msi::Select::table("Property"))
+            .unwrap()
+            .map(|r| (r[0].as_str().unwrap().to_string(), r[1].as_str().unwrap().to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn branded_package() {
+        let png = crate::branding::tests::sample_png(64, 64);
+        let ico = crate::branding::ico(&png, 64, 64);
+        let bytes = build(&MsiInput {
+            binary: b"MZ fake agent binary",
+            server: "https://rmm.example.com",
+            token: "abc123",
+            version: "1.0.0",
+            manufacturer: "Acme IT",
+            product_name: "Acme Remote Agent",
+            branded_name: Some("Acme \"Remote\" [x]"),
+            icon: Some(&ico),
+        })
+        .unwrap();
+        let mut pkg = Package::open(Cursor::new(bytes)).unwrap();
+        let p = props(&mut pkg);
+        assert_eq!(p["ProductName"], "Acme Remote Agent");
+        assert_eq!(p["ARPPRODUCTICON"], ICON_KEY);
+        assert_eq!(pkg.summary_info().subject(), Some("Acme Remote Agent"));
+        let ca: Vec<_> = pkg.select_rows(msi::Select::table("CustomAction")).unwrap().collect();
+        assert!(ca[0][3].as_str().unwrap().ends_with(" --product-name \"Acme Remote x\""), "{}", ca[0][3]);
+        let feature: Vec<_> = pkg.select_rows(msi::Select::table("Feature")).unwrap().collect();
+        assert_eq!(feature[0][2].as_str(), Some("Acme Remote Agent"));
+        let icons: Vec<_> = pkg.select_rows(msi::Select::table("Icon")).unwrap().collect();
+        assert_eq!(icons[0][0].as_str(), Some(ICON_KEY));
+        let mut stream = Vec::new();
+        pkg.read_stream(&format!("Icon.{ICON_KEY}")).unwrap().read_to_end(&mut stream).unwrap();
+        assert_eq!(stream, ico);
     }
 
     #[test]
@@ -418,11 +519,9 @@ mod tests {
         assert_eq!(pkg.summary_info().codepage(), CodePage::Windows1252);
         assert_eq!(pkg.summary_info().arch(), Some("x64"));
 
-        let props: std::collections::HashMap<String, String> = pkg
-            .select_rows(msi::Select::table("Property"))
-            .unwrap()
-            .map(|r| (r[0].as_str().unwrap().to_string(), r[1].as_str().unwrap().to_string()))
-            .collect();
+        let props = props(&mut pkg);
+        assert_eq!(props["ProductName"], "RMM Agent");
+        assert!(!props.contains_key("ARPPRODUCTICON"));
         assert_eq!(props["RMM_SERVER"], "https://rmm.example.com");
         assert_eq!(props["RMM_TOKEN"], "abc123");
         assert_eq!(props["ProductVersion"], "0.4.2");
@@ -433,6 +532,7 @@ mod tests {
         assert_eq!(ca.len(), 1);
         assert_eq!(ca[0][1].as_int(), Some(18 | 0x400 | 0x800 | 0x2000));
         assert!(ca[0][3].as_str().unwrap().contains("--keep-existing"));
+        assert!(!ca[0][3].as_str().unwrap().contains("--product-name"), "an unbranded package works with any agent binary");
 
         let seq: Vec<(String, i32)> = pkg
             .select_rows(msi::Select::table("InstallExecuteSequence"))
@@ -442,6 +542,16 @@ mod tests {
         let at = |a: &str| seq.iter().find(|(n, _)| n == a).unwrap().1;
         assert!(at("InstallFiles") < at("EnrollAgent") && at("EnrollAgent") < at("InstallFinalize"));
         assert!(at("StopServices") < at("RemoveFiles"));
+
+        assert!(at("InstallFiles") < at("WriteRegistryValues") && at("RemoveRegistryValues") < at("RemoveFiles"));
+        // The tray starts at sign-in for everyone, from the installed binary.
+        let reg: Vec<_> = pkg.select_rows(msi::Select::table("Registry")).unwrap().collect();
+        assert_eq!(reg.len(), 1);
+        assert_eq!(reg[0][1].as_int(), Some(2), "HKLM");
+        assert_eq!(reg[0][2].as_str(), Some(r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run"));
+        assert_eq!(reg[0][3].as_str(), Some("RmmAgentTray"));
+        assert_eq!(reg[0][4].as_str(), Some("\"[#rmm_agent.exe]\" tray"));
+        assert_eq!(reg[0][5].as_str(), Some("AgentExe"));
 
         // Uninstall also removes what the self-update leaves beside the binary.
         let removed: Vec<String> = pkg.select_rows(msi::Select::table("RemoveFile")).unwrap().map(|r| r[2].as_str().unwrap().to_string()).collect();

@@ -11,6 +11,19 @@ pub struct Config {
     pub server_url: String,
     pub agent_id: Uuid,
     pub secret: String,
+    /// The MSP's branded product name, from the package or the MSI (`enroll --product-name`):
+    /// the service is shown as "<product> Agent". `None` keeps "RMM Agent".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product_name: Option<String>,
+}
+
+/// The service's display name: "<product> Agent", or "RMM Agent". One line, at most 80 characters.
+pub fn service_display_name(product: Option<&str>) -> String {
+    let p: String = product.unwrap_or_default().chars().filter(|c| !c.is_control()).take(60).collect();
+    match p.trim() {
+        "" => "RMM Agent".into(),
+        p => format!("{p} Agent"),
+    }
 }
 
 pub fn default_path() -> PathBuf {
@@ -50,6 +63,8 @@ impl Config {
 pub struct EnrollFile {
     pub server: String,
     pub token: String,
+    #[serde(default)]
+    pub product_name: Option<String>,
 }
 
 impl EnrollFile {
@@ -199,5 +214,21 @@ mod tests {
     fn ws_url_mapping() {
         assert_eq!(super::ws_url("https://a.b/"), "wss://a.b/api/agent/ws");
         assert_eq!(super::ws_url("http://localhost:8080"), "ws://localhost:8080/api/agent/ws");
+    }
+
+    #[test]
+    fn branded_names() {
+        use super::service_display_name as n;
+        assert_eq!(n(None), "RMM Agent");
+        assert_eq!(n(Some("  ")), "RMM Agent");
+        assert_eq!(n(Some("Acme Remote")), "Acme Remote Agent");
+        assert_eq!(n(Some("Evil\nName")), "EvilName Agent");
+        // Older packages have no product name; older agents ignore the key.
+        let f: super::EnrollFile = toml::from_str("server = \"https://x\"\ntoken = \"t\"\n").unwrap();
+        assert_eq!(f.product_name, None);
+        let f: super::EnrollFile = toml::from_str("server = \"https://x\"\ntoken = \"t\"\nproduct_name = \"Acme\"\n").unwrap();
+        assert_eq!(f.product_name.as_deref(), Some("Acme"));
+        let c: super::Config = toml::from_str("server_url = \"https://x\"\nagent_id = \"00000000-0000-0000-0000-000000000000\"\nsecret = \"s\"\n").unwrap();
+        assert!(c.product_name.is_none() && !toml::to_string(&c).unwrap().contains("product_name"));
     }
 }

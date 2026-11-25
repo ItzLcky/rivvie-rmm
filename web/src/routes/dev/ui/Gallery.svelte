@@ -67,7 +67,7 @@
 	const series = Array.from({ length: 60 }, (_, i) => ({ t: Date.UTC(2026, 0, 1, 0, i * 5), v: 30 + 25 * Math.sin(i / 6) + ((i * 7) % 11) }));
 </script>
 
-{#snippet section(title: string)}<h2 class="text-muted mt-10 mb-3 border-b border-border pb-1 text-xs font-semibold tracking-wide uppercase">{title}</h2>{/snippet}
+{#snippet section(title: string)}<h2 class="text-muted mt-10 mb-3 border-b border-border pb-1 text-xs font-medium">{title}</h2>{/snippet}
 
 <div class="bg-surface min-h-dvh p-6">
 	<div class="mx-auto max-w-6xl">

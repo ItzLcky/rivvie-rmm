@@ -11,7 +11,11 @@ use crate::state::{AppState, Company};
 
 /// What the login page and sidebar need; served without a session.
 pub async fn public(State(st): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    Json(json!({ "company_name": st.company().company_name, "attachment_max_mb": st.cfg.attachment_max_mb }))
+    Json(json!({
+        "company_name": st.company().company_name,
+        "attachment_max_mb": st.cfg.attachment_max_mb,
+        "branding": crate::branding::resolve(&st, None),
+    }))
 }
 
 #[derive(Serialize)]

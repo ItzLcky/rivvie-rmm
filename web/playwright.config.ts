@@ -17,8 +17,13 @@ export default defineConfig({
 	reporter: process.env.CI ? [['list'], ['html', { open: 'never' }]] : 'list',
 	timeout: 60_000,
 	expect: { toHaveScreenshot: { maxDiffPixelRatio: 0.002, animations: 'disabled', caret: 'hide' } },
-	use: { baseURL: 'http://127.0.0.1:4173', trace: 'retain-on-failure', locale: 'en-US', timezoneId: 'UTC' },
-	projects: [{ name: 'chromium', use: { ...devices['Desktop Chrome'], viewport: { width: 1440, height: 900 } } }],
+	// The service worker would sit between the page and the mocked API; only the PWA test lets it in.
+	use: { baseURL: 'http://127.0.0.1:4173', trace: 'retain-on-failure', locale: 'en-US', timezoneId: 'UTC', serviceWorkers: 'block' },
+	projects: [
+		{ name: 'chromium', testIgnore: /mobile\.spec\.ts/, use: { ...devices['Desktop Chrome'], viewport: { width: 1440, height: 900 } } },
+		// The technician's phone (docs/design/pwa.md): 390×844, touch, the installed app's tab bar.
+		{ name: 'mobile', testMatch: /mobile\.spec\.ts/, use: { ...devices['Desktop Chrome'], viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true } }
+	],
 	webServer: {
 		command: 'node node_modules/vite/bin/vite.js dev --port 4173 --strictPort --host 127.0.0.1',
 		url: 'http://127.0.0.1:4173/login',

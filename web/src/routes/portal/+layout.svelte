@@ -9,6 +9,9 @@
 	import Button from '#lib/ui/Button.svelte';
 	import ErrorState from '#lib/ui/ErrorState.svelte';
 	import Spinner from '#lib/ui/Spinner.svelte';
+	import SourceLink from '#lib/components/branding/SourceLink.svelte';
+	import SupportCard from '#lib/components/branding/SupportCard.svelte';
+	import { applyBranding } from '#lib/branding.js';
 	import type { LayoutProps } from './$types';
 
 	let { children }: LayoutProps = $props();
@@ -46,11 +49,19 @@
 		}
 	}
 
-	const company = $derived(me.data?.company_name || 'Support');
+	const b = $derived(me.data?.branding);
+	const company = $derived(b?.product_name || me.data?.company_name || 'Support');
+	// The contact's client may have its own accent.
+	$effect(() => {
+		if (me.data) applyBranding(b);
+	});
+	// The header is ink in both themes: the logo made for dark backgrounds, else the light one.
+	const logo = $derived(b?.logo_dark ?? b?.logo_light ?? null);
 </script>
 
 <svelte:head>
 	<title>{signIn ? 'Sign in' : company} · Support portal</title>
+	{#if b?.icon}<link rel="icon" href={b.icon} />{/if}
 </svelte:head>
 
 {#if signIn}
@@ -61,8 +72,12 @@
 		<header class="bg-nav text-nav-fg border-nav-border border-b">
 			<div class="mx-auto flex h-14 w-full max-w-5xl items-center gap-3 px-4 sm:px-6">
 				<a href="/portal" class="flex min-w-0 items-center gap-2.5 rounded-md focus-visible:ring-2 focus-visible:ring-white/60 focus-visible:outline-none">
-					<img src={favicon} alt="" class="size-7 shrink-0" />
-					<span class="truncate text-[0.9375rem] font-semibold tracking-tight text-white">{company}</span>
+					{#if logo}
+						<img src={logo} alt={company} class="h-8 max-w-[12rem] object-contain object-left" />
+					{:else}
+						<img src={b?.icon ?? favicon} alt="" class="size-7 shrink-0" />
+						<span class="truncate text-[0.9375rem] font-semibold tracking-tight text-white">{company}</span>
+					{/if}
 					<span class="text-nav-muted hidden text-sm sm:inline">Support</span>
 				</a>
 				{#if me.data}
@@ -143,10 +158,12 @@
 			{/if}
 		</main>
 
-		{#if me.data}
-			<footer class="text-muted mx-auto w-full max-w-5xl px-4 pb-6 text-xs sm:px-6">
-				Signed in as {me.data.contact.name || me.data.contact.email} · {me.data.contact.client_name}
-			</footer>
-		{/if}
+		<footer class="text-muted mx-auto w-full max-w-5xl space-y-4 px-4 pb-6 text-xs sm:px-6">
+			{#if b}<SupportCard support={b.support} />{/if}
+			<p>
+				{#if me.data}Signed in as {me.data.contact.name || me.data.contact.email} · {me.data.contact.client_name} ·{/if}
+				<SourceLink href={b?.source_url} />
+			</p>
+		</footer>
 	</div>
 {/if}

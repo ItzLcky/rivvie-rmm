@@ -80,17 +80,48 @@ pub async fn download(
     let binary = tokio::fs::read(&path).await.map_err(anyhow::Error::from)?;
     // The signed release's version if there is one; otherwise this server's (same workspace).
     let version = st.releases.get(&st, &platform).map(|r| r.manifest.version.clone()).unwrap_or_else(|| env!("CARGO_PKG_VERSION").into());
-    let enroll = enroll_toml(&st.cfg.public_url, &q.token);
+    // The package's client sees its own branding (the agent ends up on its machines).
+    let client_id: Option<uuid::Uuid> =
+        sqlx::query_scalar("SELECT s.client_id FROM enrollment_tokens t JOIN sites s ON s.id = t.site_id WHERE t.token_hash = $1")
+            .bind(crate::auth::token_hash(&q.token))
+            .fetch_optional(&st.db)
+            .await?;
+    let brand = crate::branding::resolve(&st, client_id);
+    let icon = match (format, crate::branding::image(&st, client_id, crate::branding::Variant::Icon).await) {
+        (Format::Msi, Ok(Some((png, _, _)))) => crate::branding::check_image(crate::branding::Variant::Icon, &png)
+            .ok()
+            .map(|i| crate::branding::ico(&png, i.width, i.height)),
+        (_, Err(e)) => {
+            tracing::warn!("branding icon for a package: {e:#}");
+            None
+        }
+        _ => None,
+    };
+    let enroll = enroll_toml(&st.cfg.public_url, &q.token, brand.product_name.as_deref());
     let (server, token) = (st.cfg.public_url.clone(), q.token.clone());
     let company = st.company().company_name;
     let manufacturer = if company.trim().is_empty() { "RMM".to_string() } else { company };
+    let (slug, agent_name, branded) = (brand.slug(), brand.agent_name(), brand.product_name.clone());
+    let summary = match &branded {
+        Some(p) => format!("{p} agent: remote monitoring and management"),
+        None => DESCRIPTION.to_string(),
+    };
     let (bytes, name) = tokio::task::spawn_blocking(move || -> anyhow::Result<(Vec<u8>, String)> {
         Ok(match format {
-            Format::Deb => (deb(&binary, &enroll, &version, deb_arch)?, format!("rmm-agent_{version}_{deb_arch}.deb")),
-            Format::Rpm => (rpm(&binary, &enroll, &version, rpm_arch)?, format!("rmm-agent-{version}-1.{rpm_arch}.rpm")),
+            Format::Deb => (deb(&binary, &enroll, &version, deb_arch, &summary)?, format!("{slug}-agent_{version}_{deb_arch}.deb")),
+            Format::Rpm => (rpm(&binary, &enroll, &version, rpm_arch, &summary)?, format!("{slug}-agent-{version}-1.{rpm_arch}.rpm")),
             Format::Msi => {
-                let input = super::msi::MsiInput { binary: &binary, server: &server, token: &token, version: &version, manufacturer: &manufacturer };
-                (super::msi::build(&input)?, format!("rmm-agent-{version}-x64.msi"))
+                let input = super::msi::MsiInput {
+                    binary: &binary,
+                    server: &server,
+                    token: &token,
+                    version: &version,
+                    manufacturer: &manufacturer,
+                    product_name: &agent_name,
+                    branded_name: branded.as_deref(),
+                    icon: icon.as_deref(),
+                };
+                (super::msi::build(&input)?, format!("{slug}-agent-{version}-x64.msi"))
             }
         })
     })
@@ -137,9 +168,13 @@ fn toml_str(s: &str) -> String {
     out
 }
 
-fn enroll_toml(server: &str, token: &str) -> Vec<u8> {
-    format!("# Read once by the package's post-install script, then deleted.\nserver = {}\ntoken = {}\n", toml_str(server), toml_str(token))
-        .into_bytes()
+/// `product_name` (when branded) names the service; older agents ignore the key.
+fn enroll_toml(server: &str, token: &str, product_name: Option<&str>) -> Vec<u8> {
+    let mut out = format!("# Read once by the package's post-install script, then deleted.\nserver = {}\ntoken = {}\n", toml_str(server), toml_str(token));
+    if let Some(p) = product_name {
+        out.push_str(&format!("product_name = {}\n", toml_str(p)));
+    }
+    out.into_bytes()
 }
 
 fn now() -> u64 {
@@ -150,10 +185,19 @@ fn now() -> u64 {
 // .deb: an ar archive of debian-binary, control.tar.gz and data.tar.gz
 // ---------------------------------------------------------------------------
 
-fn deb(binary: &[u8], enroll: &[u8], version: &str, arch: &str) -> anyhow::Result<Vec<u8>> {
+/// The tray app on Linux desktops (docs/design/tray.md): a launcher that opens the request
+/// form, and an autostart entry that stays connected for consent prompts and notices.
+const TRAY_LAUNCHER: &str = "[Desktop Entry]\nType=Application\nName=Request help\nComment=Ask the help desk for help with this computer\n\
+Exec=/usr/bin/rmm-agent tray\nIcon=help-browser\nTerminal=false\nCategories=Utility;\n";
+const TRAY_AUTOSTART: &str = "[Desktop Entry]\nType=Application\nName=Help desk link\nComment=Shows the help desk's prompts and notices\n\
+Exec=/usr/bin/rmm-agent tray --background\nTerminal=false\nNoDisplay=true\nX-GNOME-Autostart-enabled=true\n";
+
+fn deb(binary: &[u8], enroll: &[u8], version: &str, arch: &str, summary: &str) -> anyhow::Result<Vec<u8>> {
+    // One line: a newline would start another control field.
+    let summary = summary.replace(['\n', '\r'], " ");
     let control = format!(
         "Package: rmm-agent\nVersion: {version}\nArchitecture: {arch}\nMaintainer: RMM <root@localhost>\n\
-         Section: admin\nPriority: optional\nDepends: systemd\nInstalled-Size: {}\nDescription: {DESCRIPTION}\n \
+         Section: admin\nPriority: optional\nDepends: systemd\nInstalled-Size: {}\nDescription: {summary}\n \
          Installs the agent and enrolls it with the server it was downloaded from.\n",
         binary.len().div_ceil(1024)
     );
@@ -173,6 +217,12 @@ fn deb(binary: &[u8], enroll: &[u8], version: &str, arch: &str) -> anyhow::Resul
         Entry::dir("./etc/", 0o755),
         Entry::dir("./etc/rmm-agent/", 0o700),
         Entry::file("./etc/rmm-agent/enroll.toml", 0o600, enroll),
+        Entry::dir("./etc/xdg/", 0o755),
+        Entry::dir("./etc/xdg/autostart/", 0o755),
+        Entry::file("./etc/xdg/autostart/rmm-tray.desktop", 0o644, TRAY_AUTOSTART.as_bytes()),
+        Entry::dir("./usr/share/", 0o755),
+        Entry::dir("./usr/share/applications/", 0o755),
+        Entry::file("./usr/share/applications/rmm-tray.desktop", 0o644, TRAY_LAUNCHER.as_bytes()),
     ])?;
     let mut out = b"!<arch>\n".to_vec();
     for (name, data) in [("debian-binary", &b"2.0\n"[..]), ("control.tar.gz", &control_tar), ("data.tar.gz", &data_tar)] {
@@ -240,18 +290,20 @@ fn tar_gz(entries: &[Entry]) -> anyhow::Result<Vec<u8>> {
 // .rpm
 // ---------------------------------------------------------------------------
 
-fn rpm(binary: &[u8], enroll: &[u8], version: &str, arch: &str) -> anyhow::Result<Vec<u8>> {
+fn rpm(binary: &[u8], enroll: &[u8], version: &str, arch: &str, summary: &str) -> anyhow::Result<Vec<u8>> {
     // rpm versions can't contain '-'; a pre-release tag becomes part of the version.
     let version = version.replace('-', "~");
     // $1 is the number of instances left after the operation: 0 means a real uninstall.
     let preun = "if [ \"$1\" = 0 ]; then\n    /usr/bin/rmm-agent uninstall || true\nfi\n";
-    let pkg = rpm::PackageBuilder::new("rmm-agent", &version, "AGPL-3.0-or-later", arch, DESCRIPTION)
+    let pkg = rpm::PackageBuilder::new("rmm-agent", &version, "AGPL-3.0-or-later", arch, summary)
         .description("Installs the agent and enrolls it with the server it was downloaded from.")
         .release("1")
         .using_config(rpm::BuildConfig::v4().compression(rpm::CompressionType::Gzip))
         .with_file_contents(binary.to_vec(), rpm::FileOptions::new("/usr/bin/rmm-agent").permissions(0o755))?
         .with_dir_entry(rpm::FileOptions::dir("/etc/rmm-agent").permissions(0o700))?
         .with_file_contents(enroll.to_vec(), rpm::FileOptions::new("/etc/rmm-agent/enroll.toml").permissions(0o600).missingok())?
+        .with_file_contents(TRAY_AUTOSTART.as_bytes().to_vec(), rpm::FileOptions::new("/etc/xdg/autostart/rmm-tray.desktop").permissions(0o644))?
+        .with_file_contents(TRAY_LAUNCHER.as_bytes().to_vec(), rpm::FileOptions::new("/usr/share/applications/rmm-tray.desktop").permissions(0o644))?
         .post_install_script(format!("set -e\n{POSTINST}"))
         .pre_uninstall_script(preun)
         .build()?;
@@ -267,10 +319,13 @@ mod tests {
     #[test]
     fn toml_escaping() {
         assert_eq!(toml_str(r#"a"b\c"#), r#""a\"b\\c""#);
-        let raw = String::from_utf8(enroll_toml("https://rmm.example.com", "ab12")).unwrap();
+        let raw = String::from_utf8(enroll_toml("https://rmm.example.com", "ab12", None)).unwrap();
         let v: toml_check::Enroll = toml_check::parse(&raw);
         assert_eq!(v.server, "https://rmm.example.com");
         assert_eq!(v.token, "ab12");
+        assert!(!raw.contains("product_name"));
+        let raw = String::from_utf8(enroll_toml("https://x", "t", Some("Acme \"Remote\""))).unwrap();
+        assert!(raw.contains("product_name = \"Acme \\\"Remote\\\"\"\n"), "{raw}");
     }
 
     /// Minimal parser for the two-key file, so the test doesn't need a toml dependency.
@@ -292,10 +347,30 @@ mod tests {
 
     #[test]
     fn deb_layout() {
-        let pkg = deb(b"\x7fELF fake", &enroll_toml("https://x", "t"), "0.1.0", "amd64").unwrap();
+        let pkg = deb(b"\x7fELF fake", &enroll_toml("https://x", "t", None), "0.1.0", "amd64", DESCRIPTION).unwrap();
         assert!(pkg.starts_with(b"!<arch>\ndebian-binary   "));
         let names: Vec<String> = ar_names(&pkg);
         assert_eq!(names, ["debian-binary", "control.tar.gz", "data.tar.gz"]);
+        // The data archive carries the tray's launcher and autostart entry.
+        let data = ar_member_data(&pkg, "data.tar.gz");
+        let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(&data[..]));
+        let paths: Vec<String> = tar.entries().unwrap().map(|e| e.unwrap().path().unwrap().to_string_lossy().into_owned()).collect();
+        assert!(paths.iter().any(|p| p.trim_start_matches("./") == "usr/share/applications/rmm-tray.desktop"), "{paths:?}");
+        assert!(paths.iter().any(|p| p.trim_start_matches("./") == "etc/xdg/autostart/rmm-tray.desktop"), "{paths:?}");
+        assert!(TRAY_AUTOSTART.contains("Exec=/usr/bin/rmm-agent tray --background\n"));
+    }
+
+    fn ar_member_data(pkg: &[u8], want: &str) -> Vec<u8> {
+        let mut i = 8;
+        while i + 60 <= pkg.len() {
+            let h = &pkg[i..i + 60];
+            let size: usize = String::from_utf8_lossy(&h[48..58]).trim().parse().unwrap();
+            if String::from_utf8_lossy(&h[..16]).trim() == want {
+                return pkg[i + 60..i + 60 + size].to_vec();
+            }
+            i += 60 + size + size % 2;
+        }
+        panic!("no {want}");
     }
 
     fn ar_names(pkg: &[u8]) -> Vec<String> {
@@ -312,7 +387,7 @@ mod tests {
 
     #[test]
     fn rpm_builds() {
-        let pkg = rpm(b"\x7fELF fake", &enroll_toml("https://x", "t"), "0.2.0-rc.1", "x86_64").unwrap();
+        let pkg = rpm(b"\x7fELF fake", &enroll_toml("https://x", "t", None), "0.2.0-rc.1", "x86_64", "Acme agent").unwrap();
         assert_eq!(&pkg[..4], &[0xed, 0xab, 0xee, 0xdb], "rpm lead magic");
     }
 }

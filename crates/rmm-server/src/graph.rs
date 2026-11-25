@@ -22,7 +22,7 @@ fn login_base() -> String {
     std::env::var("RMM_GRAPH_LOGIN_URL").unwrap_or_else(|_| "https://login.microsoftonline.com".into()).trim_end_matches('/').to_string()
 }
 
-fn graph_base() -> String {
+pub fn graph_base() -> String {
     std::env::var("RMM_GRAPH_URL").unwrap_or_else(|_| "https://graph.microsoft.com".into()).trim_end_matches('/').to_string()
 }
 
@@ -35,22 +35,29 @@ fn secret(st: &AppState, mb: &Mailbox) -> Result<String> {
 }
 
 async fn token(st: &AppState, mb: &Mailbox) -> Result<String> {
+    let secret = secret(st, mb)?;
+    app_token(&st.http, &mb.graph_tenant, &mb.graph_client_id, &secret).await
+}
+
+/// A client-credentials token for an app registration in `tenant`, for Graph. Used by the
+/// mailboxes here and by the per-client Entra connections ([`crate::entra`]).
+pub async fn app_token(http: &reqwest::Client, tenant: &str, client_id: &str, secret: &str) -> Result<String> {
     #[derive(Deserialize)]
     struct Token {
         access_token: String,
     }
-    let url = format!("{}/{}/oauth2/v2.0/token", login_base(), mb.graph_tenant);
+    let mut url = reqwest::Url::parse(&login_base()).context("login URL")?;
+    url.path_segments_mut()
+        .map_err(|_| anyhow::anyhow!("login URL can't have a path"))?
+        .pop_if_empty()
+        .push(tenant)
+        .push("oauth2")
+        .push("v2.0")
+        .push("token");
     let scope = format!("{}/.default", graph_scope());
-    let secret = secret(st, mb)?;
-    let res = st
-        .http
-        .post(&url)
-        .form(&[
-            ("grant_type", "client_credentials"),
-            ("client_id", mb.graph_client_id.as_str()),
-            ("client_secret", secret.as_str()),
-            ("scope", scope.as_str()),
-        ])
+    let res = http
+        .post(url)
+        .form(&[("grant_type", "client_credentials"), ("client_id", client_id), ("client_secret", secret), ("scope", scope.as_str())])
         .send()
         .await
         .context("signing in to Microsoft")?;
@@ -68,7 +75,7 @@ fn graph_scope() -> String {
 }
 
 /// The useful part of a Graph or identity-platform error body.
-fn error_text(body: &str) -> String {
+pub fn error_text(body: &str) -> String {
     let v: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
     v["error"]["message"]
         .as_str()

@@ -45,7 +45,8 @@
 		'time.approve': 'Approve timesheets',
 		'vault.read': 'See vault passwords',
 		'vault.manage': 'Manage vault passwords',
-		'audit.read': 'Read and export the audit log'
+		'audit.read': 'Read and export the audit log',
+		'identity.read': 'See Intune devices'
 	};
 
 	const blank = () => ({
