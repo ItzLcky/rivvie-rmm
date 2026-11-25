@@ -56,7 +56,7 @@
 
 <div class="space-y-6">
 	<div>
-		<h1 class="text-2xl font-semibold tracking-tight">Knowledge base</h1>
+		<h1 class="text-2xl font-medium">Knowledge base</h1>
 		<p class="text-muted mt-1 text-sm">Guides and answers to common questions.</p>
 	</div>
 

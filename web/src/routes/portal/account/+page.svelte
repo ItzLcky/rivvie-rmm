@@ -102,7 +102,7 @@
 
 <div class="mx-auto max-w-2xl space-y-6">
 	<div>
-		<h1 class="text-2xl font-semibold tracking-tight">Account</h1>
+		<h1 class="text-2xl font-medium">Account</h1>
 		<p class="text-muted mt-1 text-sm">How you sign in to the support portal.</p>
 	</div>
 

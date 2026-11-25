@@ -143,7 +143,7 @@
 		<div class="flex flex-wrap items-start justify-between gap-4">
 			<div class="min-w-0">
 				<p class="text-muted font-mono text-xs">{ticketNumber(t.number)}</p>
-				<h1 class="mt-1 text-2xl font-semibold tracking-tight break-words">{t.subject}</h1>
+				<h1 class="mt-1 text-2xl font-medium break-words">{t.subject}</h1>
 				<div class="text-muted mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-sm">
 					<StatusBadge category={t.status_category} />
 					<span>Opened <time datetime={t.created_at} title={datetime(t.created_at)}>{ago(t.created_at)}</time>{#if t.contact_name} by {t.contact_name}{/if}</span>

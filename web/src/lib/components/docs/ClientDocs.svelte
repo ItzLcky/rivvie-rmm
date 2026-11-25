@@ -224,7 +224,7 @@
 						</div>
 						<div class="max-h-[calc(100dvh-14rem)] overflow-y-auto py-1.5">
 							{#each groups as g (g.key)}
-								<h3 class="text-muted px-4 pt-2.5 pb-1 font-sans text-[0.6875rem] font-semibold tracking-[0.08em] uppercase">{g.name}</h3>
+								<h3 class="text-muted px-4 pt-2.5 pb-1 font-sans text-xs font-medium">{g.name}</h3>
 								<ul>
 									{#each g.docs as d (d.id)}
 										<li>
@@ -283,7 +283,7 @@
 								<header class="border-border flex flex-wrap items-start justify-between gap-x-4 gap-y-3 border-b px-6 py-4">
 									<div class="min-w-0">
 										<p class="eyebrow">{d.category || 'Uncategorised'}</p>
-										<h2 id="doc-title" class="mt-1 text-2xl font-bold break-words">{d.title}</h2>
+										<h2 id="doc-title" class="mt-1 text-2xl font-medium break-words">{d.title}</h2>
 										<p class="text-muted mt-1 text-xs">
 											Saved <time datetime={d.updated_at} title={datetime(d.updated_at)}>{ago(d.updated_at)}</time>{d.updated_by_name ? ` by ${d.updated_by_name}` : ''}{d.history.length ? ` · ${plural(d.history.length, 'earlier version')}` : ''}
 										</p>

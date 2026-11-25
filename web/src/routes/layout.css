@@ -210,10 +210,10 @@
 	h3 {
 		text-wrap: balance;
 	}
-	/* Headings are Space Grotesk: bold, tight tracking, short line-height. */
+	/* Headings are Space Grotesk at 500: hierarchy from size, not weight. */
 	h1 {
-		@apply font-display font-bold;
-		letter-spacing: -0.025em;
+		@apply font-display font-medium;
+		letter-spacing: -0.015em;
 		line-height: 1.1;
 	}
 	h2,
@@ -256,9 +256,9 @@
 	.panel-title {
 		@apply text-fg font-display text-[0.9375rem] font-semibold tracking-[-0.01em];
 	}
-	/* A small uppercase teal label above a title or a group. */
+	/* A small sentence-case teal label above a title or a group. */
 	.eyebrow {
-		@apply text-accent text-[0.6875rem] font-semibold tracking-[0.12em] uppercase;
+		@apply text-accent text-xs font-medium;
 	}
 	.link {
 		@apply text-accent hover:text-accent-hover decoration-accent/40 hover:decoration-accent-hover underline underline-offset-2;

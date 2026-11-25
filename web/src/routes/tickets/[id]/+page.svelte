@@ -761,7 +761,7 @@
 							<header class="border-border flex flex-wrap items-start justify-between gap-x-4 gap-y-3 border-b px-5 pb-4">
 								<div class="min-w-0">
 									<p class="eyebrow">{d.category || 'Uncategorised'}</p>
-									<h2 id="peek-title" class="mt-1 text-xl font-bold break-words">{d.title}</h2>
+									<h2 id="peek-title" class="mt-1 text-xl font-medium break-words">{d.title}</h2>
 									<p class="text-muted mt-1 text-xs">
 										Saved <time datetime={d.updated_at} title={datetime(d.updated_at)}>{ago(d.updated_at)}</time>{d.updated_by_name ? ` by ${d.updated_by_name}` : ''}
 									</p>

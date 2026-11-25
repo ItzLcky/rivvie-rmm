@@ -52,7 +52,7 @@
 	{:else}
 		<article class="card p-5 sm:p-8">
 			{#if article.category}<p class="text-muted text-xs font-medium tracking-wide uppercase">{article.category}</p>{/if}
-			<h1 class="mt-1 text-2xl font-semibold tracking-tight break-words">{article.title}</h1>
+			<h1 class="mt-1 text-2xl font-medium break-words">{article.title}</h1>
 			<p class="text-muted mt-1 text-xs">Updated <time datetime={article.updated_at}>{datetime(article.updated_at)}</time></p>
 			<!-- Plain text: line breaks kept, nothing interpreted as markup. -->
 			<div class="mt-6 text-[0.9375rem] leading-relaxed break-words whitespace-pre-wrap">{article.body}</div>

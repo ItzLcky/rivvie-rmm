@@ -32,7 +32,7 @@
 <svelte:element
 	this={href ? 'a' : 'div'}
 	{href}
-	class={cx('card group block min-w-0 p-4', href && 'hover:border-border-strong transition-[border-color,box-shadow] duration-150 hover:shadow-[var(--shadow-lg)]')}
+	class={cx('card group block min-w-0 p-4', href && 'hover:border-border-strong transition-colors duration-150')}
 >
 	<div class="flex items-start justify-between gap-3">
 		<div class="text-muted min-w-0 truncate text-[0.8125rem] font-medium">{label}</div>
@@ -40,7 +40,7 @@
 			<span class={cx('flex size-8 shrink-0 items-center justify-center rounded-md transition-colors', chip)} aria-hidden="true"><Icon class="size-4" /></span>
 		{/if}
 	</div>
-	<div class={cx('text-[1.75rem] leading-none font-semibold tracking-tight tabular', Icon ? '-mt-1' : 'mt-2', color)}>
-		{num(value)}{capped ? '+' : ''}{#if of !== undefined}<span class="text-muted ml-1.5 text-sm font-normal tracking-normal">of {num(of)}</span>{/if}
+	<div class={cx('text-[1.75rem] leading-none font-medium tabular', Icon ? '-mt-1' : 'mt-2', color)}>
+		{num(value)}{capped ? '+' : ''}{#if of !== undefined}<span class="text-muted ml-1.5 text-sm font-normal">of {num(of)}</span>{/if}
 	</div>
 </svelte:element>

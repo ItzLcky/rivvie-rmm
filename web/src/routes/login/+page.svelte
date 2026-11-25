@@ -118,7 +118,7 @@
 
 <div class="bg-raised grid min-h-dvh lg:grid-cols-[minmax(0,5fr)_minmax(0,6fr)]">
 	<!-- Brand panel: navy like the navigation rail. Hidden on small screens, where the form is all there is. -->
-	<aside class="brand-panel bg-nav text-nav-fg relative hidden flex-col justify-between overflow-hidden p-10 lg:flex xl:p-14">
+	<aside class="bg-nav text-nav-fg relative hidden flex-col justify-between overflow-hidden p-10 lg:flex xl:p-14">
 		<div class="relative flex items-center gap-3">
 			{#if company.branding?.logo_dark || company.branding?.logo_light}
 				<img src={company.branding.logo_dark ?? company.branding.logo_light} alt={brand()} class="h-10 max-w-[16rem] object-contain object-left" />
@@ -128,7 +128,7 @@
 			{/if}
 		</div>
 		<div class="relative max-w-md">
-			<h2 class="text-3xl leading-tight font-semibold tracking-tight text-white xl:text-4xl">Monitor, patch and support every client device from one console.</h2>
+			<h2 class="text-3xl leading-tight font-medium tracking-tight text-white xl:text-4xl">Monitor, patch and support every client device from one console.</h2>
 			<ul class="text-nav-muted mt-8 space-y-3 text-sm">
 				<li class="flex items-center gap-3"><Activity class="text-nav-indicator size-4 shrink-0" />Live health, alerts and remote sessions</li>
 				<li class="flex items-center gap-3"><PackageCheck class="text-nav-indicator size-4 shrink-0" />Patch policies with maintenance windows</li>
@@ -142,7 +142,7 @@
 		<div class="w-full max-w-sm">
 			<div class="mb-8">
 				<img src={company.branding?.icon ?? favicon} alt="" class="mb-6 size-9 lg:hidden" />
-				<h1 class="text-2xl font-semibold tracking-tight">{second ? 'Two-factor verification' : 'Sign in'}</h1>
+				<h1 class="text-2xl font-medium">{second ? 'Two-factor verification' : 'Sign in'}</h1>
 				<p class="text-muted mt-1.5 text-sm">
 					{#if !second}Use your {brand()} account.
 					{:else if second.passkey && second.totp}Use a passkey, or enter the code from your authenticator app.
@@ -188,16 +188,3 @@
 		</div>
 	</main>
 </div>
-
-<style>
-	/* A soft light source in the top corner, in the accent's hue: depth without decoration. */
-	.brand-panel::before {
-		content: '';
-		position: absolute;
-		inset: 0;
-		background:
-			radial-gradient(60% 50% at 100% 0%, rgb(91 154 255 / 0.22), transparent 70%),
-			radial-gradient(50% 40% at 0% 100%, rgb(91 154 255 / 0.08), transparent 70%);
-		pointer-events: none;
-	}
-</style>

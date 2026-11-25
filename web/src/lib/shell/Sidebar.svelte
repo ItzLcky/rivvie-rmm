@@ -35,7 +35,7 @@
 			<img src={logo} alt={b?.product_name || company.name || 'Home'} class="h-8 max-w-[11rem] object-contain object-left" />
 		{:else if !collapsed}
 			<span class="min-w-0 leading-tight">
-				<span class="font-display block truncate text-base font-bold tracking-[-0.02em] text-white">{b?.product_name || company.name || 'Rivvie'}</span>
+				<span class="font-display block truncate text-base font-semibold text-white">{b?.product_name || company.name || 'Rivvie'}</span>
 				<span class="text-nav-muted block truncate text-xs">Remote management</span>
 			</span>
 		{/if}
@@ -46,7 +46,7 @@
 				{#if collapsed}
 					<div class="bg-nav-border mx-2 mb-3 h-px first:hidden" aria-hidden="true"></div>
 				{:else}
-					<div class="text-nav-label px-3 pb-1.5 text-[0.6875rem] font-semibold tracking-[0.08em] uppercase">{g.label}</div>
+					<div class="text-nav-label px-3 pb-2 text-xs font-medium">{g.label}</div>
 				{/if}
 				<ul class="space-y-0.5">
 					{#each g.items as item (item.href)}

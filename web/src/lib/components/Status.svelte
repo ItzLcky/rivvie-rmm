@@ -10,8 +10,6 @@
 </script>
 
 <span class={cx('inline-flex h-5 items-center gap-1.5 align-middle leading-5 whitespace-nowrap', size === 'md' && 'text-sm', online ? 'text-fg' : 'text-muted')}>
-	<span class={cx('relative inline-flex size-2 shrink-0 rounded-full', online ? 'bg-success' : 'border-subtle border-[1.5px]')}>
-		{#if online}<span class="bg-success absolute inset-0 animate-ping rounded-full opacity-40 [animation-duration:2.5s]"></span>{/if}
-	</span>
+	<span class={cx('inline-flex size-2 shrink-0 rounded-full', online ? 'bg-success' : 'border-subtle border-[1.5px]')}></span>
 	{online ? 'Online' : 'Offline'}
 </span>

@@ -32,7 +32,7 @@
 	<div class="grid gap-6 sm:grid-cols-2">
 		{#each groups as g (g.title)}
 			<section>
-				<h3 class="text-muted mb-2 text-xs font-medium tracking-wide uppercase">{g.title}</h3>
+				<h3 class="text-muted mb-2 text-xs font-medium">{g.title}</h3>
 				<dl class="space-y-1.5">
 					{#each g.rows as [keys, what] (what)}
 						<div class="flex items-center justify-between gap-3 text-sm"><dt>{what}</dt><dd><Kbd {keys} /></dd></div>

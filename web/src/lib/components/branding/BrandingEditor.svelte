@@ -225,14 +225,14 @@
 			</form>
 
 			<aside class="min-w-0 space-y-4" aria-label="Preview" style={previewStyle(r)}>
-				<h2 class="text-muted text-xs font-semibold tracking-[0.08em] uppercase">Preview</h2>
+				<h2 class="text-muted text-xs font-medium">Preview</h2>
 				<div class="bg-nav border-nav-border rounded-panel overflow-hidden border">
 					<div class="border-nav-border flex h-14 items-center gap-3 border-b px-4">
 						{#if r.logo_dark ?? r.logo_light}
 							<img src={r.logo_dark ?? r.logo_light} alt="" class="h-8 max-w-[11rem] object-contain object-left" />
 						{:else}
 							<img src={r.icon ?? favicon} alt="" class="size-7" />
-							<span class="font-display truncate font-bold text-white">{name}</span>
+							<span class="font-display truncate font-semibold text-white">{name}</span>
 						{/if}
 					</div>
 					<div class="space-y-0.5 p-3 text-sm">

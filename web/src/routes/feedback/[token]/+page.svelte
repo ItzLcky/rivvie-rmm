@@ -84,16 +84,16 @@
 		</div>
 		<div class="card p-6 sm:p-8">
 			{#if missing}
-				<h1 class="text-2xl font-semibold tracking-tight">Survey not found</h1>
+				<h1 class="text-2xl font-medium">Survey not found</h1>
 				<p class="text-muted mt-2 text-sm">This survey link isn't valid any more. Thanks for wanting to tell us how we did.</p>
 			{:else if loadError}
-				<h1 class="text-2xl font-semibold tracking-tight">Something went wrong</h1>
+				<h1 class="text-2xl font-medium">Something went wrong</h1>
 				<p class="text-muted mt-2 text-sm" role="alert">{loadError}</p>
 				<Button class="mt-4" onclick={() => location.reload()}>Try again</Button>
 			{:else if !s || (busy && !rating)}
 				<p class="text-muted flex items-center gap-2 text-sm" role="status"><Spinner />{s ? 'Saving your rating…' : 'Loading…'}</p>
 			{:else if !rating}
-				<h1 class="text-2xl font-semibold tracking-tight">How did we do?</h1>
+				<h1 class="text-2xl font-medium">How did we do?</h1>
 				<p class="text-muted mt-2 text-sm">
 					About your request <span class="font-mono">{ticketNumber(s.number)}</span>: <span class="text-fg font-medium break-words">{s.subject}</span>
 				</p>
@@ -117,7 +117,7 @@
 			{:else}
 				<div role="status">
 					<div class="bg-success-soft text-success mb-4 flex size-11 items-center justify-center rounded-lg"><CircleCheck class="size-5" aria-hidden="true" /></div>
-					<h1 class="text-2xl font-semibold tracking-tight">Thanks for your feedback</h1>
+					<h1 class="text-2xl font-medium">Thanks for your feedback</h1>
 					<p class="text-muted mt-2 text-sm">
 						You rated <span class="font-mono">{ticketNumber(s.number)}</span>
 						<strong class={cx('font-semibold', rating === 'good' ? 'text-success' : 'text-danger')}>{rating === 'good' ? 'good' : 'bad'}</strong>.

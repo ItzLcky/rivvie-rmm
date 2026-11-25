@@ -150,7 +150,7 @@
 			{/if}
 		</div>
 		<div class="card p-6 sm:p-8">
-			<h1 class="text-2xl font-semibold tracking-tight">{heading}</h1>
+			<h1 class="text-2xl font-medium">{heading}</h1>
 
 			{#if mode === 'verifying'}
 				<p class="text-muted mt-4 flex items-center gap-2 text-sm" role="status"><Spinner />Checking your sign-in link…</p>

@@ -113,7 +113,7 @@
 							<Check class={cx('text-accent size-4 shrink-0', !on && 'invisible')} aria-hidden="true" />
 						</span>
 						<span class="text-muted line-clamp-2 text-xs">{t ? t.description || 'No description' : 'Start from nothing.'}</span>
-						{#if t && category === null && t.category_id}<span class="text-muted text-[0.6875rem] font-medium tracking-wide uppercase">{catName(t.category_id)}</span>{/if}
+						{#if t && category === null && t.category_id}<span class="text-muted text-xs">{catName(t.category_id)}</span>{/if}
 					</label>
 				{/snippet}
 				{@render card(null)}
